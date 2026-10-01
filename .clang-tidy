@@ -1,0 +1,31 @@
+# clang-tidy for ssh3-c (C17, nginx-style core).
+# Naming: public and static code uses s3_ prefix for functions and globals;
+# macros and constants use S3_. Reserved-identifier check is disabled on
+# purpose: header guards follow the nginx convention (_S3_*_H_INCLUDED_).
+#
+# Deliberate suppressions (nginx-style code, false positives here):
+# - performance-no-int-to-ptr: s3_align_ptr() returns a u_char * derived
+#   from uintptr_t by design (pointer alignment arithmetic);
+# - clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling:
+#   memcpy/memset are used with caller-provided exact bounds on purpose
+#   (zero-copy buffers, sprintf_num temp array).
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  performance-*,
+  portability-*,
+  readability-identifier-naming,
+  clang-analyzer-core.*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -performance-no-int-to-ptr,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: readability-identifier-naming.FunctionPrefix
+    value: 's3_'
+  - key: readability-identifier-naming.GlobalVariablePrefix
+    value: 's3_'
