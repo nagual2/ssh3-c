@@ -57,24 +57,6 @@ typedef void (*s3_quic_shutdown_pt)(s3_connection_t *c);
 /* RFC 9221, 5.  Datagram Handlers */
 typedef void (*s3_quic_datagram_pt)(s3_connection_t *c, const u_char *data, size_t len);
 
-typedef enum {
-    S3_QUIC_STREAM_SEND_READY = 0,
-    S3_QUIC_STREAM_SEND_SEND,
-    S3_QUIC_STREAM_SEND_DATA_SENT,
-    S3_QUIC_STREAM_SEND_DATA_RECVD,
-    S3_QUIC_STREAM_SEND_RESET_SENT,
-    S3_QUIC_STREAM_SEND_RESET_RECVD
-} s3_quic_stream_send_state_e;
-
-typedef enum {
-    S3_QUIC_STREAM_RECV_RECV = 0,
-    S3_QUIC_STREAM_RECV_SIZE_KNOWN,
-    S3_QUIC_STREAM_RECV_DATA_RECVD,
-    S3_QUIC_STREAM_RECV_DATA_READ,
-    S3_QUIC_STREAM_RECV_RESET_RECVD,
-    S3_QUIC_STREAM_RECV_RESET_READ
-} s3_quic_stream_recv_state_e;
-
 typedef struct {
     uint64_t    size;
     uint64_t    offset;
@@ -120,6 +102,9 @@ typedef struct s3_quic_conf_s s3_quic_conf_t;
  * are not ported
  */
 struct s3_quic_conf_s {
+    /* the event context for the quic timers and posted events */
+    s3_event_ctx_t *ctx;
+
     s3_ssl_t *ssl;
 
     unsigned retry : 1;
@@ -190,92 +175,12 @@ typedef struct {
 } s3_quic_tp_t;
 
 /*
- * RFC 9000, 12.3.  Packet Numbers
- *
- * Conceptually, a packet number space is the context in which a packet
- * can be processed and acknowledged.  Initial packets can only be sent
- * with Initial packet protection keys and acknowledged in packets that
- * are also Initial packets.
+ * public API (the D2 core); the stream functions follow in D4
  */
-struct s3_quic_send_ctx_s {
-    s3_uint_t level;
+void s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf);
 
-    s3_quic_buffer_t crypto;
-    uint64_t         crypto_sent;
-
-    uint64_t pnum;        /* to be sent */
-    uint64_t largest_ack; /* received from peer */
-    uint64_t largest_pn;  /* received from peer */
-
-    s3_queue_t frames;  /* generated frames */
-    s3_queue_t sending; /* frames assigned to pkt */
-    s3_queue_t sent;    /* frames waiting ACK */
-
-    uint64_t            pending_ack; /* non sent ack-eliciting */
-    uint64_t            largest_range;
-    uint64_t            first_range;
-    s3_msec_t           largest_received;
-    s3_msec_t           ack_delay_start;
-    s3_uint_t           nranges;
-    s3_quic_ack_range_t ranges[S3_QUIC_MAX_RANGES];
-    s3_uint_t           send_ack;
-};
-
-struct s3_quic_client_id_s {
-    s3_queue_t queue;
-    uint64_t   seqnum;
-    size_t     len;
-    u_char     id[S3_QUIC_CID_LEN_MAX];
-    u_char     sr_token[S3_QUIC_SR_TOKEN_LEN];
-    s3_uint_t  used; /* unsigned  used:1; */
-};
-
-struct s3_quic_server_id_s {
-    uint64_t seqnum;
-    size_t   len;
-    u_char   id[S3_QUIC_CID_LEN_MAX];
-};
-
-/*
- * D1 subset: the frame/buffer freelists, the packet number spaces and
- * the client id bookkeeping the clean modules (frames, connid) need.
- * D2 completes the structure with paths, sockets, keys, the stream
- * tree, congestion state, events and the lifecycle flags.
- */
-struct s3_quic_connection_s {
-    s3_queue_t free_frames;
-    s3_buf_t  *free_bufs;
-    s3_buf_t  *free_shadow_bufs;
-    s3_uint_t  nframes;
-    s3_uint_t  max_frames;
-
-    s3_quic_send_ctx_t send_ctx[S3_QUIC_SEND_CTX_LAST];
-
-    s3_queue_t client_ids;
-    s3_queue_t free_client_ids;
-    s3_uint_t  nclient_ids;
-    uint64_t   client_seqnum;
-    uint64_t   max_retired_seqnum;
-
-    /* our and the peer transport parameters */
-    s3_quic_tp_t tp;
-    s3_quic_tp_t ctp;
-
-    s3_uint_t   error;
-    const char *error_reason;
-};
-
-#define s3_quic_get_send_ctx(qc, level)                                                            \
-    ((level) == S3_QUIC_ENCRYPTION_INITIAL)                                                        \
-        ? &((qc)->send_ctx[0])                                                                     \
-        : (((level) == S3_QUIC_ENCRYPTION_HANDSHAKE) ? &((qc)->send_ctx[1])                        \
-                                                     : &((qc)->send_ctx[2]))
-
-/*
- * D1 placeholder: the QUIC connection is reached through c->data;
- * D2 replaces this with the socket-based lookup (c->udp -> qsock->quic)
- */
-#define s3_quic_get_connection(c) ((s3_quic_connection_t *)((c)->data))
+void s3_quic_finalize_connection(s3_connection_t *c, s3_uint_t err, const char *reason);
+void s3_quic_shutdown_connection(s3_connection_t *c, s3_uint_t err, const char *reason);
 
 s3_int_t s3_quic_derive_key(s3_log_t *log, const char *label, s3_str_t *secret, s3_str_t *salt,
                             u_char *out, size_t len);

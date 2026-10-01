@@ -4,6 +4,7 @@
  */
 
 #include <s3_quic.h>
+#include <s3_quic_connection.h>
 #include <s3_quic_frames.h>
 
 #define S3_QUIC_BUFFER_SIZE 4096
@@ -248,11 +249,18 @@ s3_quic_queue_frame(s3_quic_connection_t *qc, s3_quic_frame_t *frame)
     frame->len = s3_quic_create_frame(NULL, frame);
     /* always succeeds */
 
+    if (qc->closing) {
+        return;
+    }
+
     /*
-     * D2 posts the push event here once the connection carries
-     * s3_event_t push and the posted queue (nginx: ngx_post_event()
-     * unless qc->closing)
+     * the frames are packed into packets by s3_quic_output() (D3);
+     * until then the push handler only marks the connection as
+     * having pending frames
      */
+    if (qc->ctx != NULL) {
+        s3_post_event(&qc->push, &qc->ctx->posted_events);
+    }
 }
 
 s3_int_t

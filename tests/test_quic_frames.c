@@ -3,6 +3,7 @@
  */
 
 #include <s3_quic.h>
+#include <s3_quic_connection.h>
 #include <s3_quic_frames.h>
 
 #include "s3_test.h"
@@ -11,6 +12,7 @@ static s3_log_t             s3_test_log;
 static s3_pool_t           *s3_test_pool;
 static s3_connection_t      s3_test_conn;
 static s3_quic_connection_t s3_test_qc;
+static s3_quic_socket_t     s3_test_qsock;
 
 static void
 setup(void)
@@ -19,10 +21,14 @@ setup(void)
 
     s3_memzero(&s3_test_conn, sizeof(s3_connection_t));
     s3_memzero(&s3_test_qc, sizeof(s3_quic_connection_t));
+    s3_memzero(&s3_test_qsock, sizeof(s3_quic_socket_t));
 
     s3_test_conn.log = &s3_test_log;
     s3_test_conn.pool = s3_test_pool;
-    s3_test_conn.data = &s3_test_qc;
+
+    /* the D2 socket-based lookup: c->udp -> qsock -> quic */
+    s3_test_qsock.quic = &s3_test_qc;
+    s3_test_conn.udp = (struct s3_udp_connection_s *)&s3_test_qsock;
 
     s3_queue_init(&s3_test_qc.free_frames);
     s3_test_qc.free_bufs = NULL;

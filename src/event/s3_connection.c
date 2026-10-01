@@ -39,6 +39,8 @@ s3_get_connection(s3_event_ctx_t *ctx, s3_fd_t fd)
      *     c->local_sockaddr = NULL;
      *     c->local_socklen = 0;
      *     c->udp = NULL;
+     *     c->buffer = NULL;
+     *     c->ssl = NULL;
      *     c->shared = 0;
      *     and the event flags
      */

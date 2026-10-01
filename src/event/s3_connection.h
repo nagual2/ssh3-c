@@ -9,11 +9,14 @@
 #include <sys/socket.h>
 
 #include <s3_base.h>
+#include <s3_buf.h>
 #include <s3_event.h>
 
 typedef ssize_t (*s3_recv_pt)(s3_connection_t *c, u_char *buf, size_t size);
 
 typedef s3_chain_t *(*s3_send_chain_pt)(s3_connection_t *c, s3_chain_t *in, off_t limit);
+
+typedef struct s3_ssl_conn_s s3_ssl_conn_t;
 
 struct s3_connection_s {
     void       *data;
@@ -40,6 +43,15 @@ struct s3_connection_s {
 
     /* the udp pseudo connection for shared listening sockets */
     struct s3_udp_connection_s *udp;
+
+    /*
+     * the first datagram of a quic connection, consumed by
+     * s3_quic_run(); the porting map 4.3.4
+     */
+    s3_buf_t *buffer;
+
+    /* the ssl connection state, set by the quic ssl layer */
+    s3_ssl_conn_t *ssl;
 
     /* the socket is shared between connections (a udp listening socket) */
     unsigned shared : 1;

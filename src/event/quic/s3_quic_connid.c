@@ -6,15 +6,20 @@
 #include <openssl/rand.h>
 
 #include <s3_quic.h>
+#include <s3_quic_connection.h>
 #include <s3_quic_connid.h>
 #include <s3_quic_frames.h>
 
 #define S3_QUIC_BPF 0
 
+/* the number of server ids the quic layer is willing to issue */
+#define S3_QUIC_MAX_SERVER_IDS 8
+
 #if (S3_QUIC_BPF)
 static s3_int_t s3_quic_bpf_attach_id(s3_connection_t *c, u_char *id);
 #endif
 static s3_int_t             s3_quic_retire_client_id(s3_connection_t *c, s3_quic_client_id_t *cid);
+static s3_int_t             s3_quic_send_server_id(s3_connection_t *c, s3_quic_server_id_t *sid);
 static s3_quic_client_id_t *s3_quic_alloc_client_id(s3_connection_t *c, s3_quic_connection_t *qc);
 
 s3_int_t
@@ -198,16 +203,45 @@ done:
 static s3_int_t
 s3_quic_retire_client_id(s3_connection_t *c, s3_quic_client_id_t *cid)
 {
+    s3_queue_t           *q;
+    s3_quic_path_t       *path;
+    s3_quic_client_id_t  *new_cid;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
     if (!cid->used) {
         return s3_quic_free_client_id(c, cid);
     }
 
-    /*
-     * D2: an in-use client id has to be rebound to the next client id
-     * or the path using it freed (nginx iterates qc->paths here);
-     * nothing marks client ids as used before the path machinery
-     * arrives, so this branch is unreachable yet
-     */
+    /* we are going to retire client id which is in use */
+
+    q = s3_queue_head(&qc->paths);
+
+    while (q != s3_queue_sentinel(&qc->paths)) {
+
+        path = s3_queue_data(q, s3_quic_path_t, queue);
+        q = s3_queue_next(q);
+
+        if (path->cid != cid) {
+            continue;
+        }
+
+        if (path == qc->path) {
+            /* this is the active path: update it with new CID */
+            new_cid = s3_quic_next_client_id(c);
+            if (new_cid == NULL) {
+                return S3_ERROR;
+            }
+
+            qc->path->cid = new_cid;
+            new_cid->used = 1;
+
+            return s3_quic_free_client_id(c, cid);
+        }
+
+        return s3_quic_free_path(c, path);
+    }
 
     return S3_OK;
 }
@@ -319,6 +353,131 @@ s3_quic_free_client_id(s3_connection_t *c, s3_quic_client_id_t *cid)
     s3_queue_insert_head(&qc->free_client_ids, &cid->queue);
 
     qc->nclient_ids--;
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_quic_handle_retire_connection_id_frame(s3_connection_t *c, s3_quic_retire_cid_frame_t *f)
+{
+    s3_quic_socket_t     *qsock;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    if (f->sequence_number >= qc->server_seqnum) {
+        /*
+         * RFC 9000, 19.16.
+         *
+         *  Receipt of a RETIRE_CONNECTION_ID frame containing a sequence
+         *  number greater than any previously sent to the peer MUST be
+         *  treated as a connection error of type PROTOCOL_VIOLATION.
+         */
+        qc->error = S3_QUIC_ERR_PROTOCOL_VIOLATION;
+        qc->error_reason = "sequence number of id to retire was never issued";
+
+        return S3_ERROR;
+    }
+
+    qsock = s3_quic_get_socket(c);
+
+    if (qsock->sid.seqnum == f->sequence_number) {
+
+        /*
+         * RFC 9000, 19.16.
+         *
+         * The sequence number specified in a RETIRE_CONNECTION_ID frame MUST
+         * NOT refer to the Destination Connection ID field of the packet in
+         * which the frame is contained.  The peer MAY treat this as a
+         * connection error of type PROTOCOL_VIOLATION.
+         */
+
+        qc->error = S3_QUIC_ERR_PROTOCOL_VIOLATION;
+        qc->error_reason = "sequence number of id to retire refers DCID";
+
+        return S3_ERROR;
+    }
+
+    qsock = s3_quic_find_socket(c, f->sequence_number);
+    if (qsock == NULL) {
+        return S3_OK;
+    }
+
+    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic socket seq:%uL is retired",
+                  qsock->sid.seqnum);
+
+    s3_quic_close_socket(c, qsock);
+
+    /* restore socket count up to a limit after deletion */
+    if (s3_quic_create_sockets(c) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_quic_send_server_id(s3_connection_t *c, s3_quic_server_id_t *sid)
+{
+    s3_str_t              dcid;
+    s3_quic_frame_t      *frame;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    dcid.len = sid->len;
+    dcid.data = sid->id;
+
+    frame = s3_quic_alloc_frame(c);
+    if (frame == NULL) {
+        return S3_ERROR;
+    }
+
+    frame->level = S3_QUIC_ENCRYPTION_APPLICATION;
+    frame->type = S3_QUIC_FT_NEW_CONNECTION_ID;
+    frame->u.ncid.seqnum = sid->seqnum;
+    frame->u.ncid.retire = 0;
+    frame->u.ncid.len = S3_QUIC_SERVER_CID_LEN;
+    s3_memcpy(frame->u.ncid.cid, sid->id, S3_QUIC_SERVER_CID_LEN);
+
+    if (s3_quic_new_sr_token(c, &dcid, qc->conf->sr_token_key, frame->u.ncid.srt) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    s3_quic_queue_frame(qc, frame);
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_quic_create_sockets(s3_connection_t *c)
+{
+    s3_uint_t             n;
+    s3_quic_socket_t     *qsock;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    n = s3_min(S3_QUIC_MAX_SERVER_IDS, qc->ctp.active_connection_id_limit);
+
+    s3_log_debug2(S3_LOG_DEBUG_EVENT, c->log, 0, "quic create sockets has:%ui max:%ui",
+                  qc->nsockets, n);
+
+    while (qc->nsockets < n) {
+
+        qsock = s3_quic_create_socket(c, qc);
+        if (qsock == NULL) {
+            return S3_ERROR;
+        }
+
+        if (s3_quic_listen(c, qc, qsock) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        if (s3_quic_send_server_id(c, &qsock->sid) != S3_OK) {
+            return S3_ERROR;
+        }
+    }
 
     return S3_OK;
 }

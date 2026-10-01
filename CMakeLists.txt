@@ -29,6 +29,9 @@ set(S3_CORE_SOURCES
     src/event/quic/s3_quic_protection.c
     src/event/quic/s3_quic_tokens.c
     src/event/quic/s3_quic_connid.c
+    src/event/quic/s3_ssl.c
+    src/event/quic/s3_quic_ssl.c
+    src/event/quic/s3_quic.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -52,8 +55,9 @@ find_package(OpenSSL 3.5 REQUIRED)
 
 message(STATUS "OpenSSL ${OPENSSL_VERSION} (crypto: ${OPENSSL_CRYPTO_LIBRARY})")
 
-# the QUIC modules link libcrypto through s3core
-target_link_libraries(s3core PUBLIC OpenSSL::Crypto)
+# the QUIC modules link libcrypto and libssl through s3core;
+# the QUIC TLS API (SSL_set_quic_tls_cbs) lives in libssl
+target_link_libraries(s3core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
 find_package(Threads REQUIRED)
 
@@ -74,6 +78,8 @@ set(S3_TESTS
     test_quic_frames
     test_quic_protection
     test_quic_tokens
+    test_quic_ssl
+    test_quic_core
 )
 
 enable_testing()
