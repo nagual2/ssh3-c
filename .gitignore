@@ -1,0 +1,33 @@
+# Build directories
+/build*/
+/out/
+/cmake-build-*/
+compile_commands.json
+.clangd/
+.cache/
+
+# C artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.profraw
+*.prof
+
+# Logs and local artifacts
+logs/
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local memory vault (EchoVault)
+.memory/
