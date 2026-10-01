@@ -24,6 +24,13 @@ struct s3_buf_s {
     s3_buf_tag_t tag;
     s3_buf_t    *shadow;
 
+    /*
+     * the reference count of the shadow chain: it is set to 1 in the
+     * clone buffer and incremented per shadow clone (used by the QUIC
+     * frame layer, see s3_quic_frames.c)
+     */
+    int num;
+
     /* the buf's content could be changed */
     unsigned temporary : 1;
 

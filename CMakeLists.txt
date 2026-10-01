@@ -24,6 +24,11 @@ set(S3_CORE_SOURCES
     src/event/modules/s3_epoll_module.c
     src/os/unix/s3_udp_sendmsg_chain.c
     src/os/unix/s3_udp_recv.c
+    src/event/quic/s3_quic_transport.c
+    src/event/quic/s3_quic_frames.c
+    src/event/quic/s3_quic_protection.c
+    src/event/quic/s3_quic_tokens.c
+    src/event/quic/s3_quic_connid.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -32,10 +37,23 @@ target_include_directories(s3core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/event/quic
         ${CMAKE_CURRENT_SOURCE_DIR}/src/os/unix
 )
 
 target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
+
+# the QUIC crypto layer (HKDF/AEAD) requires OpenSSL 3.5+
+if(EXISTS $ENV{HOME}/opt/openssl-3.5)
+    list(PREPEND CMAKE_PREFIX_PATH $ENV{HOME}/opt/openssl-3.5)
+endif()
+
+find_package(OpenSSL 3.5 REQUIRED)
+
+message(STATUS "OpenSSL ${OPENSSL_VERSION} (crypto: ${OPENSSL_CRYPTO_LIBRARY})")
+
+# the QUIC modules link libcrypto through s3core
+target_link_libraries(s3core PUBLIC OpenSSL::Crypto)
 
 find_package(Threads REQUIRED)
 
@@ -52,6 +70,10 @@ set(S3_TESTS
     test_log
     test_event
     test_udp
+    test_quic_transport
+    test_quic_frames
+    test_quic_protection
+    test_quic_tokens
 )
 
 enable_testing()
