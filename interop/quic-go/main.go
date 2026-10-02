@@ -56,6 +56,7 @@ func main() {
 	timeout := flag.Duration("timeout", 20*time.Second, "overall deadline (client)")
 	keylog := flag.String("keylog", "", "NSS keylog file for the client TLS secrets")
 	streams := flag.Bool("streams", false, "client test: pump a stream instead of datagrams")
+	hold := flag.Duration("hold", 0, "after the handshake, hold the connection idle this long")
 	min := flag.Int("min", -1, "require at least this many echoed datagrams (-1: all)")
 	flag.Parse()
 
@@ -71,6 +72,11 @@ func main() {
 
 	if *server {
 		runServer(*addr, *certFile, *keyFile, *alpn, *keylog)
+		return
+	}
+
+	if *hold > 0 {
+		runClientHold(*addr, *alpn, *timeout, *keylog, *hold)
 		return
 	}
 
@@ -183,6 +189,42 @@ func acceptStreams(conn *quic.Conn) {
 				stream.CancelRead(0)
 			}
 		}()
+	}
+}
+
+// runClientHold dials and then stays silent: the idle-timeout probe
+// of the server under test
+func runClientHold(addr, alpn string, timeout time.Duration, keylog string, hold time.Duration) {
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		fatalf("local udp: %v", err)
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	tlsCfg := &tls.Config{
+		NextProtos:         []string{alpn},
+		InsecureSkipVerify: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+hold)
+	defer cancel()
+
+	conn, err := tr.Dial(ctx, udpAddr(addr), tlsCfg, &quic.Config{
+		MaxIdleTimeout: 120 * time.Second,
+	})
+	if err != nil {
+		fatalf("dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	fmt.Println("INTEROP-HANDSHAKE-OK")
+
+	select {
+	case <-time.After(hold):
+		fmt.Println("INTEROP-HOLD-DONE connection still alive")
+	case <-conn.Context().Done():
+		fmt.Printf("INTEROP-CONN-CLOSED: %v\n", conn.Context().Err())
 	}
 }
 

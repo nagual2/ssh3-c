@@ -38,6 +38,7 @@ static s3_quic_conf_t s3_interop_conf;
 /* the accepted connections watched for the handshake completion */
 static s3_connection_t *s3_interop_conns[S3_INTEROP_TRACKED];
 static unsigned         s3_interop_reported[S3_INTEROP_TRACKED];
+static unsigned         s3_interop_idle_reported[S3_INTEROP_TRACKED];
 static s3_uint_t        s3_interop_nconns;
 
 static void
@@ -355,7 +356,7 @@ main(int argc, char **argv)
     char               opt;
     const char        *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
     const char        *alpn_name = "s3interop/1";
-    unsigned           dg_size = 1200;
+    unsigned           dg_size = 1200, idle_ms = 60000;
     u_char            *cert, *key, alpn_wire[256];
     size_t             cert_len = 0, key_len = 0;
     s3_str_t           alpn;
@@ -370,7 +371,7 @@ main(int argc, char **argv)
 
     s3_interop_log_init();
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:h")) != -1) {
 
         switch (opt) {
 
@@ -392,6 +393,10 @@ main(int argc, char **argv)
 
         case 'd':
             dg_size = (unsigned)atoi(optarg);
+            break;
+
+        case 'i':
+            idle_ms = (unsigned)atoi(optarg);
             break;
 
         default:
@@ -475,7 +480,7 @@ main(int argc, char **argv)
     s3_interop_conf.gso_enabled = 1;
     s3_interop_conf.ctx = &ctx;
     s3_interop_conf.handshake_timeout = 30000;
-    s3_interop_conf.idle_timeout = 60000;
+    s3_interop_conf.idle_timeout = (s3_msec_t)idle_ms;
     s3_interop_conf.stream_buffer_size = 16384;
     s3_interop_conf.max_concurrent_streams_bidi = 16;
     s3_interop_conf.max_concurrent_streams_uni = 16;
@@ -523,6 +528,15 @@ main(int argc, char **argv)
                 fflush(stdout);
 
                 s3_interop_reported[i] = 1;
+            }
+
+            /* the idle-timeout probe: the silent teardown is visible
+             * as the quic socket vanishing from the connection */
+            if (!s3_interop_idle_reported[i] && s3_interop_reported[i] && c->udp == NULL) {
+                printf("INTEROP-IDLE-CLOSE\n");
+                fflush(stdout);
+
+                s3_interop_idle_reported[i] = 1;
             }
         }
     }

@@ -588,10 +588,8 @@ s3_quic_handshake(s3_connection_t *c)
 
     s3_quic_discard_ctx(c, S3_QUIC_ENCRYPTION_HANDSHAKE);
 
-    /*
-     * the reference starts the MTU discovery here
-     * (D4, s3_quic_migration.c: s3_quic_discover_path_mtu())
-     */
+    /* the reference starts the MTU discovery here */
+    s3_quic_discover_path_mtu(c, qc->path);
 
     if (!qc->client) {
         /* start accepting clients on negotiated number of server ids */

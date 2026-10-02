@@ -377,6 +377,10 @@ nginx — только сервер, поэтому четыре места в �
 | 10 | `ngx_queue_init(&qc->streams.uninitialized)` в new_connection | есть | был пропущен в D2-каркасе — первый вызов init_streams шёл по неинициализированной очереди (UBSan: offset to null) |
 | 11 | бэклинк слушателя | nginx держит слушателя отдельно | D3 гасил `c->data = ul` после регистрации первичных сокетов; выданные позже NEW_CONNECTION_ID не регистрировались в rbtree слушателя → stateless reset при ротации CID клиента; бэклинк теперь живёт всю жизнь соединения |
 | 12 | `c->udp` = сокет текущего пакета | доставка ставит per-packet | lookup возвращал только соединение; RETIRE_CONNECTION_ID сравнивал seq с чужим сокетом → PROTOCOL_VIOLATION на ротации CID; lookup теперь ставит `c->udp` |
+| 13 | `set_path()`, первый датаграмм пути | маркер `c->udp->buffer == NULL` | признак `qsock->socklen == 0`: shared_recv поглощает буфер, per-datagram адрес ставит только `s3_quic_deliver()`; `NGX_DONE`→`S3_ABORT` |
+| 14 | EMSGSIZE в MTU-пробе | `c->write->error` / `c->log_error` | `s3_socket_errno == S3_EMSGSIZE`: send() (output.c) флаг не ставит |
+| 15 | `handle_max_stream_data` будит писателя | `ngx_quic_set_event(wev)` | порт вызывал только flush(); восстановлено (см. также п. 8) |
+| 16 | `handle_path_mtu` → рост MTU | вызов из ack-цикла (ack.c:248) | перенесён, но НЕ проведён (ack.c — зона оптимизации); пробы уходят и безопасно истекаются, MTU остаётся стартовым — одна строка позже |
 
 Отдельно: короткий заголовок не несёт длину DCID, поэтому парсер читает ровно `S3_QUIC_SERVER_CID_LEN` байт, а клиент обязан генерировать CID той же длины (иначе расходится смещение выборки для header protection — симптом: TX-смещение 21 против RX 25).
 

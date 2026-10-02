@@ -61,6 +61,7 @@ set(S3_CORE_SOURCES
     src/event/modules/s3_epoll_module.c
     src/os/unix/s3_udp_sendmsg_chain.c
     src/os/unix/s3_udp_recv.c
+    src/os/unix/s3_sock_ntop.c
     src/event/quic/s3_quic_transport.c
     src/event/quic/s3_quic_frames.c
     src/event/quic/s3_quic_protection.c
@@ -69,6 +70,7 @@ set(S3_CORE_SOURCES
     src/event/quic/s3_ssl.c
     src/event/quic/s3_quic_ssl.c
     src/event/quic/s3_quic.c
+    src/event/quic/s3_quic_migration.c
     src/event/quic/s3_quic_output.c
     src/event/quic/s3_quic_ack.c
     src/event/quic/s3_quic_streams.c

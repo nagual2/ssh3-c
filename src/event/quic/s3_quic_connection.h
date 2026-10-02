@@ -8,12 +8,15 @@
 
 #include <netinet/in.h>
 
+#include <s3_sock_ntop.h>
+
 #include <s3_quic.h>
 #include <s3_quic_transport.h>
 #include <s3_quic_protection.h>
 #include <s3_quic_frames.h>
 #include <s3_quic_streams.h>
 #include <s3_quic_connid.h>
+#include <s3_quic_migration.h>
 #include <s3_ssl.h>
 #include <s3_quic_ssl.h>
 #include <s3_quic_tokens.h>
@@ -125,9 +128,8 @@ struct s3_quic_path_s {
     uint64_t                seqnum;
     uint64_t                mtu_pnum[S3_QUIC_PATH_RETRIES];
     s3_str_t                addr_text;
-    u_char                  text[INET6_ADDRSTRLEN + sizeof("[]:65535")];
+    u_char                  text[S3_SOCKADDR_STRLEN];
 
-    /* set in D4 together with s3_sock_ntop(); empty until then */
     unsigned validated : 1;
     unsigned mtu_unvalidated : 1;
 };
@@ -334,9 +336,8 @@ void     s3_quic_close_connection(s3_connection_t *c, s3_int_t rc);
 void     s3_quic_shutdown_quic(s3_connection_t *c);
 
 /*
- * the D2 subset of socket.c and migration.c; D3 moves the socket
- * functions to s3_quic_socket.c with the listener rbtree lookup,
- * the path functions to s3_quic_migration.c
+ * the socket functions (the reference ngx_event_quic_socket.c); the
+ * path functions live in s3_quic_migration.h
  */
 s3_int_t s3_quic_open_sockets(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_header_t *pkt);
 void     s3_quic_close_sockets(s3_connection_t *c);
@@ -344,9 +345,5 @@ s3_quic_socket_t *s3_quic_create_socket(s3_connection_t *c, s3_quic_connection_t
 s3_int_t s3_quic_listen(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_socket_t *qsock);
 void     s3_quic_close_socket(s3_connection_t *c, s3_quic_socket_t *qsock);
 s3_quic_socket_t *s3_quic_find_socket(s3_connection_t *c, uint64_t seqnum);
-
-s3_quic_path_t *s3_quic_new_path(s3_connection_t *c, struct sockaddr *sockaddr, socklen_t socklen,
-                                 s3_quic_client_id_t *cid);
-s3_int_t        s3_quic_free_path(s3_connection_t *c, s3_quic_path_t *path);
 
 #endif /* _S3_QUIC_CONNECTION_H_INCLUDED_ */

@@ -216,12 +216,9 @@ s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_
     qc->close.data = c;
     qc->close.handler = s3_quic_close_handler;
 
-    /*
-     * the path validation handler lives in s3_quic_migration.c (D4)
-     */
     qc->path_validation.log = c->log;
     qc->path_validation.data = c;
-    qc->path_validation.handler = NULL;
+    qc->path_validation.handler = s3_quic_path_handler;
 
     qc->key_update.log = c->log;
     qc->key_update.data = c;
@@ -534,84 +531,11 @@ s3_quic_find_socket(s3_connection_t *c, uint64_t seqnum)
     return NULL;
 }
 
-s3_quic_path_t *
-s3_quic_new_path(s3_connection_t *c, struct sockaddr *sockaddr, socklen_t socklen,
-                 s3_quic_client_id_t *cid)
-{
-    s3_queue_t           *q;
-    s3_quic_path_t       *path;
-    s3_quic_connection_t *qc;
-
-    qc = s3_quic_get_connection(c);
-
-    if (!s3_queue_empty(&qc->free_paths)) {
-
-        q = s3_queue_head(&qc->free_paths);
-        path = s3_queue_data(q, s3_quic_path_t, queue);
-
-        s3_queue_remove(&path->queue);
-
-        s3_memzero(path, sizeof(s3_quic_path_t));
-
-    } else {
-
-        path = s3_pcalloc(c->pool, sizeof(s3_quic_path_t));
-        if (path == NULL) {
-            return NULL;
-        }
-    }
-
-    s3_queue_insert_tail(&qc->paths, &path->queue);
-
-    path->cid = cid;
-    cid->used = 1;
-
-    path->seqnum = qc->path_seqnum++;
-
-    if (sockaddr != NULL && socklen > 0 && socklen <= sizeof(struct sockaddr_storage)) {
-
-        path->sockaddr = (struct sockaddr *)&path->sa;
-        path->socklen = socklen;
-        s3_memcpy(path->sockaddr, sockaddr, socklen);
-    }
-
-    /*
-     * addr_text is filled in D4 together with s3_sock_ntop()
-     * (porting map 4.5.6); the path logs use the seqnum until then
-     */
-
-    path->mtu = S3_QUIC_MIN_INITIAL_SIZE;
-
-    s3_log_debug2(S3_LOG_DEBUG_EVENT, c->log, 0, "quic path seq:%uL created mtu:%uz", path->seqnum,
-                  path->mtu);
-
-    return path;
-}
-
-s3_int_t
-s3_quic_free_path(s3_connection_t *c, s3_quic_path_t *path)
-{
-    s3_quic_connection_t *qc;
-
-    qc = s3_quic_get_connection(c);
-
-    s3_queue_remove(&path->queue);
-    s3_queue_insert_head(&qc->free_paths, &path->queue);
-
-    /*
-     * invalidate CID that is no longer usable for any other path;
-     * this also requests new CIDs from client
-     */
-    if (path->cid) {
-        if (s3_quic_free_client_id(c, path->cid) != S3_OK) {
-            return S3_ERROR;
-        }
-    }
-
-    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic path seq:%uL retired", path->seqnum);
-
-    return S3_OK;
-}
+/*
+ * s3_quic_new_path() and s3_quic_free_path() live in
+ * s3_quic_migration.c now (the reference keeps them in
+ * ngx_event_quic_migration.c as well)
+ */
 
 static s3_int_t
 s3_quic_handle_stateless_reset(s3_connection_t *c, s3_quic_header_t *pkt)
@@ -995,20 +919,10 @@ s3_quic_handle_datagram(s3_connection_t *c, s3_buf_t *b, s3_quic_conf_t *conf)
 
     if (qc) {
         /*
-         * RFC 9000, 8.1.  Preventing Amplification Attacks:
-         *
-         * An endpoint MUST limit the number of bytes it sends to three
-         * times the number of bytes it has received; the whole datagram
-         * is accounted once, which is what the reference does in its
-         * set_path() (D4 repeats the accounting for a path discovered
-         * later, s3_quic_migration.c)
+         * the per-path bytes are accounted once per datagram in
+         * s3_quic_set_path() (the whole datagram length, the reference
+         * does the same); the connection total feeds the flood check
          */
-
-        if (path) {
-            path->received += (off_t)size;
-        } else {
-            qc->path->received += (off_t)size;
-        }
 
         qc->received += (off_t)size;
 
@@ -1238,11 +1152,12 @@ s3_quic_handle_payload(s3_connection_t *c, s3_quic_header_t *pkt)
     if (pkt->path == NULL) {
         /*
          * the reference resolves the packet path here
-         * (D4, s3_quic_migration.c: s3_quic_set_path()); until the
-         * migration machinery arrives every packet belongs to the
-         * initial active path
+         * (s3_quic_migration.c: s3_quic_set_path())
          */
-        pkt->path = qc->path;
+        rc = s3_quic_set_path(c, pkt);
+        if (rc != S3_OK) {
+            return rc;
+        }
     }
 
     if (c->ssl == NULL) {
@@ -1532,11 +1447,9 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
             break;
 
             /*
-             * the reference handles the stream and flow control frames here
-             * (D4, s3_quic_streams.c) and the path frames in the migration
-             * module (D4, s3_quic_migration.c); until then they are
-             * accepted and ignored: a full handler set cannot be answered
-             * anyway, there is no output until D3
+             * the stream and flow control frames live in
+             * s3_quic_streams.c, the path frames in
+             * s3_quic_migration.c (both ported)
              */
 
         case S3_QUIC_FT_STREAM:
@@ -1622,10 +1535,28 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
             break;
 
         case S3_QUIC_FT_PATH_CHALLENGE:
+
+            if (s3_quic_handle_path_challenge_frame(c, pkt, &frame.u.path_challenge) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_PATH_RESPONSE:
+
+            if (s3_quic_handle_path_response_frame(c, &frame.u.path_response) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_NEW_TOKEN:
-            s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic frame type:%ui ignored until D3/D4",
-                          frame.type);
+            /*
+             * the client stores address validation tokens for later
+             * connections (RFC 9000, 8.7); the token store is not
+             * ported, the frame is accepted and dropped
+             */
+            s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic frame type:%ui ignored", frame.type);
             break;
 
         default:
@@ -1655,11 +1586,10 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
          * An endpoint can migrate a connection to a new local
          * address by sending packets containing non-probing frames
          * from that address.
-         *
-         * handled in D4 (s3_quic_migration.c:
-         * s3_quic_handle_migration()); the initial path is the only
-         * one until then, so the condition cannot fire
          */
+        if (s3_quic_handle_migration(c, pkt) != S3_OK) {
+            return S3_ERROR;
+        }
     }
 
     /*
@@ -2081,7 +2011,7 @@ s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf)
 
     qc->path_validation.log = c->log;
     qc->path_validation.data = c;
-    qc->path_validation.handler = NULL;
+    qc->path_validation.handler = s3_quic_path_handler;
 
     qc->key_update.log = c->log;
     qc->key_update.data = c;
