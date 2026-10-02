@@ -3,6 +3,7 @@
 #
 #   1. our client        -> the quic-go harness server
 #   2. the quic-go harness client -> our server
+#   3. datagrams under 5% netem loss (RFC 9221: N of M echoes)
 #
 # each scenario runs a QUIC handshake followed by N DATAGRAM
 # round-trips; the verdict is printed per scenario as PASS/FAIL.
@@ -11,7 +12,8 @@
 #
 # usage: interop/run-quic-go.sh [count] [size]
 # requires: the C runners (cmake --build build/linux-release), a Go
-# toolchain >= 1.26 (GO overrides $HOME/opt/go1.27.1/bin/go), openssl
+# toolchain >= 1.26 (GO overrides $HOME/opt/go1.27.1/bin/go), openssl,
+# sudo -n tc for scenario 3
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -86,7 +88,6 @@ fi
 pkill -f "s3interop-harness -server" 2>/dev/null
 
 echo "== scenario 2: quic-go client -> C server"
-
 setsid nohup "$BUILD/s3interop_server" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/c-srv.log" 2>&1 < /dev/null &
 
@@ -108,6 +109,92 @@ else
 fi
 
 pkill -f "s3interop_server -l" 2>/dev/null
+
+echo "== scenario 4: stream echo C client -> quic-go server"
+
+setsid nohup "$HARNESS" -server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+    > "$WORK/st-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/st-srv.log"; then
+    PORT=$(port_of "$WORK/st-srv.log")
+
+    # 4 MiB through one stream against the deterministic pattern
+    if timeout 60 "$BUILD/s3interop_client" -a "127.0.0.1:$PORT" -S -n 64 -s 65536 \
+        -t 45000 > "$WORK/st-cli.log" 2>&1; then
+        echo "   PASS (64 x 64 KiB echoed)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/st-cli.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the harness server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop-harness -server" 2>/dev/null
+
+echo "== scenario 5: stream echo quic-go client -> C server"
+
+setsid nohup "$BUILD/s3interop_server" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/st2-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/st2-srv.log"; then
+    PORT=$(port_of "$WORK/st2-srv.log")
+
+    if timeout 60 "$HARNESS" -client -streams -addr "127.0.0.1:$PORT" -count 64 -size 65536 \
+        -timeout 45s > "$WORK/st2-cli.log" 2>&1; then
+        echo "   PASS (64 x 64 KiB echoed)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/st2-cli.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -l" 2>/dev/null
+
+echo "== scenario 3: datagrams under 5% netem loss (C client -> quic-go server)"
+
+# RFC 9221 datagrams are not retransmitted: the run requires at least
+# half of the echoes, not all of them
+LOST=$((COUNT / 2))
+REQUIRED=$((COUNT - LOST))
+
+if sudo -n tc qdisc add dev lo root netem loss 5% 2>/dev/null; then
+
+    setsid nohup "$HARNESS" -server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+        > "$WORK/loss-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/loss-srv.log"; then
+        PORT=$(port_of "$WORK/loss-srv.log")
+
+        if timeout 60 "$BUILD/s3interop_client" -a "127.0.0.1:$PORT" -n "$COUNT" -s "$SIZE" \
+            -m "$REQUIRED" -t 45000 > "$WORK/loss-cli.log" 2>&1; then
+            echo "   PASS (>= $REQUIRED of $COUNT under 5% loss)"
+        else
+            echo "   FAIL (required $REQUIRED of $COUNT)"
+            tail -5 "$WORK/loss-cli.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+    else
+        echo "   FAIL: the harness server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "s3interop-harness -server" 2>/dev/null
+
+    sudo -n tc qdisc del dev lo root
+
+else
+    echo "   SKIP (no sudo -n tc, the loss scenario needs root)"
+fi
 
 rm -rf "$WORK"
 

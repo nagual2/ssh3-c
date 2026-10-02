@@ -57,8 +57,17 @@ typedef s3_int_t (*s3_quic_init_pt)(s3_connection_t *c);
 
 typedef void (*s3_quic_shutdown_pt)(s3_connection_t *c);
 
+typedef struct s3_quic_stream_s s3_quic_stream_t;
+
 /* RFC 9221, 5.  Datagram Handlers */
 typedef void (*s3_quic_datagram_pt)(s3_connection_t *c, const u_char *data, size_t len);
+
+/*
+ * the new stream handler: the ssh3-c replacement of the nginx
+ * c->listening->handler() call on an accepted stream
+ * (porting map 4.3.6)
+ */
+typedef void (*s3_quic_stream_pt)(s3_connection_t *c, s3_quic_stream_t *qs);
 
 typedef struct {
     uint64_t    size;
@@ -138,6 +147,12 @@ struct s3_quic_conf_s {
     /* the datagram handler; called on an accepted DATAGRAM frame */
     s3_quic_datagram_pt datagram_handler;
 
+    /*
+     * the new stream handler; called on an accepted stream, NULL
+     * rejects new streams with conf->stream_reject_code_*
+     */
+    s3_quic_stream_pt stream_handler;
+
     u_char av_token_key[S3_QUIC_AV_KEY_LEN];
     u_char sr_token_key[S3_QUIC_SR_KEY_LEN];
 };
@@ -204,5 +219,15 @@ s3_connection_t *s3_quic_lookup_connection(s3_udp_listen_t *ul, s3_str_t *key);
 
 /* the shared-datagram recv installed as c->recv on the quic connections */
 ssize_t s3_quic_shared_recv(s3_connection_t *c, u_char *buf, size_t size);
+
+/*
+ * the stream API (D4): open a stream initiated by the application,
+ * mark it cancelable, reset the receiving part, shut down directions;
+ * the accepted streams are handed over through conf->stream_handler
+ */
+s3_connection_t *s3_quic_open_stream(s3_connection_t *c, s3_uint_t bidi);
+void             s3_quic_cancelable_stream(s3_connection_t *c);
+s3_int_t         s3_quic_reset_stream(s3_connection_t *c, s3_uint_t err);
+s3_int_t         s3_quic_shutdown_stream(s3_connection_t *c, int how);
 
 #endif /* _S3_QUIC_H_INCLUDED_ */

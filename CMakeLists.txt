@@ -71,6 +71,7 @@ set(S3_CORE_SOURCES
     src/event/quic/s3_quic.c
     src/event/quic/s3_quic_output.c
     src/event/quic/s3_quic_ack.c
+    src/event/quic/s3_quic_streams.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})

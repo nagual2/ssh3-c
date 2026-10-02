@@ -26,6 +26,7 @@
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
+#include <s3_quic_streams.h>
 #include <s3_ssl.h>
 
 #define S3_INTEROP_TRACKED 64
@@ -154,6 +155,173 @@ static void
 s3_interop_datagram_echo(s3_connection_t *c, const u_char *data, size_t len)
 {
     (void)s3_quic_send_datagram(c, data, len);
+}
+
+/*
+ * the stream echo: every accepted bidi stream reads until the peer
+ * half-closes and sends the bytes back.  The send window of the
+ * stream is a 16 KiB quantum, so the echo keeps a pending tail and
+ * flushes it on the write events the library posts when the peer
+ * opens the window (MAX_STREAM_DATA)
+ */
+
+/*
+ * the pending tail is a heap buffer on purpose: the echo must keep
+ * draining the peer no matter how far its read side lags behind our
+ * send window, otherwise the two naive sides deadlock
+ */
+static u_char          *s3_interop_echo_buf;
+static size_t           s3_interop_echo_cap;
+static size_t           s3_interop_echo_len;
+static int              s3_interop_echo_fin;
+static size_t           s3_interop_echo_read_total;
+static int              s3_interop_echo_reads;
+static s3_connection_t *s3_interop_echo_sc;
+
+static void
+s3_interop_stream_flush(void)
+{
+    s3_connection_t *sc = s3_interop_echo_sc;
+    ssize_t          m;
+
+    while (s3_interop_echo_len > 0) {
+
+        m = s3_quic_stream_send(sc, s3_interop_echo_buf, s3_interop_echo_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (m <= 0) {
+            fprintf(stderr, "interop-server: stream send failed\n");
+            s3_interop_echo_len = 0;
+            return;
+        }
+
+        s3_memmove(s3_interop_echo_buf, s3_interop_echo_buf + m, s3_interop_echo_len - m);
+        s3_interop_echo_len -= m;
+    }
+
+    if (s3_interop_echo_fin) {
+        (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+    }
+}
+
+static void
+s3_interop_stream_write(s3_event_t *ev)
+{
+    (void)ev;
+
+    s3_interop_stream_flush();
+}
+
+static void
+s3_interop_stream_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    size_t           free_len;
+    ssize_t          n, m;
+
+    sc = ev->data;
+
+    s3_interop_echo_reads++;
+
+    for (;;) {
+
+        free_len = s3_interop_echo_cap - s3_interop_echo_len;
+
+        if (free_len == 0) {
+            size_t  cap = s3_interop_echo_cap + 262144;
+            u_char *grown = realloc(s3_interop_echo_buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-server: echo buffer growth failed\n");
+                exit(1);
+            }
+
+            s3_interop_echo_buf = grown;
+            s3_interop_echo_cap = cap;
+            free_len = s3_interop_echo_cap - s3_interop_echo_len;
+        }
+
+        n = sc->recv(sc, s3_interop_echo_buf + s3_interop_echo_len, free_len);
+
+        if (n > 0) {
+            s3_interop_echo_read_total += (size_t)n;
+        }
+
+        if (n == (ssize_t)S3_AGAIN || n < 0) {
+            break;
+        }
+
+        if (n == 0) {
+            /* the peer fin: the echo completes after the tail drains */
+            s3_interop_echo_fin = 1;
+            break;
+        }
+
+        s3_interop_echo_len += (size_t)n;
+
+        m = s3_quic_stream_send(sc, s3_interop_echo_buf, s3_interop_echo_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            continue; /* the window is full, the tail flushes on wev */
+        }
+
+        if (m <= 0) {
+            fprintf(stderr, "interop-server: stream send failed\n");
+            s3_interop_echo_len = 0;
+            break;
+        }
+
+        s3_memmove(s3_interop_echo_buf, s3_interop_echo_buf + m, s3_interop_echo_len - m);
+        s3_interop_echo_len -= m;
+    }
+
+    if (s3_interop_echo_fin && s3_interop_echo_len == 0) {
+        (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+    }
+}
+
+static void
+s3_interop_stream_accept(s3_connection_t *c, s3_quic_stream_t *qs)
+{
+    s3_event_t *rev, *wev;
+
+    (void)c;
+
+    s3_interop_echo_sc = qs->connection;
+    s3_interop_echo_len = 0;
+    s3_interop_echo_fin = 0;
+    s3_interop_echo_read_total = 0;
+    s3_interop_echo_reads = 0;
+
+    rev = qs->connection->read;
+    wev = qs->connection->write;
+
+    rev->handler = s3_interop_stream_read;
+    rev->data = qs->connection;
+
+    /*
+     * the app-level read arming, the s3 analog of the reference
+     * ngx_handle_read_event(): without it s3_quic_set_event() only
+     * raises ready and never posts the data events
+     */
+    rev->active = 1;
+
+    wev->handler = s3_interop_stream_write;
+    wev->data = qs->connection;
+    wev->active = 1;
+
+    /*
+     * the first STREAM frame ran before this handler: its data sits
+     * in the receive buffer with ready raised, and the event was lost
+     * on the not yet armed active flag; the reference app reads right
+     * in the accept path (ngx_http_v3_wait_request_handler())
+     */
+    if (rev->ready) {
+        rev->handler(rev);
+    }
 }
 
 static void
@@ -304,6 +472,7 @@ main(int argc, char **argv)
         return 1;
     }
 
+    s3_interop_conf.gso_enabled = 1;
     s3_interop_conf.ctx = &ctx;
     s3_interop_conf.handshake_timeout = 30000;
     s3_interop_conf.idle_timeout = 60000;
@@ -313,6 +482,7 @@ main(int argc, char **argv)
     s3_interop_conf.active_connection_id_limit = 8;
     s3_interop_conf.max_datagram_frame_size = dg_size;
     s3_interop_conf.datagram_handler = s3_interop_datagram_echo;
+    s3_interop_conf.stream_handler = s3_interop_stream_accept;
 
     if (RAND_bytes(s3_interop_conf.av_token_key, S3_QUIC_AV_KEY_LEN) != 1 ||
         RAND_bytes(s3_interop_conf.sr_token_key, S3_QUIC_SR_KEY_LEN) != 1) {

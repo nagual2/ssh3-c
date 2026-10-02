@@ -371,6 +371,12 @@ nginx — только сервер, поэтому четыре места в �
 | 4 | `CRYPTO` после handshake | отвергается всегда | отвергается только сервером; клиент принимает `NewSessionTicket` и прогоняет `SSL_do_handshake()` в `s3_quic_post_handshake()` |
 | 5 | флаг `direction` в `s3_quic_cbs_yield_secret()` | nginx передаёт `direction` в kdf как есть: **1 = write, 0 = read** | в D3 инверсия `!direction` дала согласованный, но зеркальный C↔C — интероп с quic-go вскрыл; исправлено на nginx-семантику, C↔C остался зелёным |
 | 6 | `NEW_TOKEN` (0x07) | маска 0x0: сервер его не получает | клиент принимает в 1-RTT, токен парсится и дропается (адресная валидация — D4) |
+| 7 | `ngx_quic_open_stream()` | две ветки: client- и server-initiated id | в D4-порт попала только server-ветка — клиент открывал id=1 (server uni) и получал STREAM_STATE_ERROR от quic-go; клиентская ветка восстановлена |
+| 8 | `ngx_quic_handle_max_stream_data_frame()` | `ngx_quic_set_event(wev)` будит приложение-писателя | порт вызывал только flush(); set_event(wev) восстановлен — иначе приложение не узнаёт об открытии окна |
+| 9 | чтение стрима приложением | http3 армит `rev->active` через `ngx_handle_read_event()` и читает сразу в accept-пути | `s3_quic_set_event()` постит только при `active`; приложения ssh3 обязаны arm'ить active и делать первое чтение в stream_handler (см. interop_server.c) |
+| 10 | `ngx_queue_init(&qc->streams.uninitialized)` в new_connection | есть | был пропущен в D2-каркасе — первый вызов init_streams шёл по неинициализированной очереди (UBSan: offset to null) |
+| 11 | бэклинк слушателя | nginx держит слушателя отдельно | D3 гасил `c->data = ul` после регистрации первичных сокетов; выданные позже NEW_CONNECTION_ID не регистрировались в rbtree слушателя → stateless reset при ротации CID клиента; бэклинк теперь живёт всю жизнь соединения |
+| 12 | `c->udp` = сокет текущего пакета | доставка ставит per-packet | lookup возвращал только соединение; RETIRE_CONNECTION_ID сравнивал seq с чужим сокетом → PROTOCOL_VIOLATION на ротации CID; lookup теперь ставит `c->udp` |
 
 Отдельно: короткий заголовок не несёт длину DCID, поэтому парсер читает ровно `S3_QUIC_SERVER_CID_LEN` байт, а клиент обязан генерировать CID той же длины (иначе расходится смещение выборки для header protection — симптом: TX-смещение 21 против RX 25).
 

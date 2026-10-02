@@ -8,6 +8,7 @@
 #include <s3_quic_output.h>
 #include <s3_quic_ack.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_streams.h>
 
 #define S3_QUIC_MAX_ACK_GAP 2
 
@@ -24,7 +25,7 @@
 #define S3_QUIC_CUBIC_BETA 7
 #define S3_QUIC_CUBIC_C    4
 
-#define S3_QUIC_MAX_SIZE_T ((size_t)-1)
+#define S3_QUIC_MAX_SIZE_T ((size_t) - 1)
 
 /* send time of ACK'ed packets */
 typedef struct {
@@ -35,21 +36,19 @@ typedef struct {
 
 static inline s3_msec_t s3_quic_time_threshold(s3_quic_connection_t *qc);
 static uint64_t         s3_quic_packet_threshold(s3_quic_send_ctx_t *ctx);
-static void             s3_quic_rtt_sample(s3_connection_t *c, s3_quic_ack_frame_t *ack,
-                                           s3_uint_t level, s3_msec_t send_time);
-static s3_int_t         s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx,
-                                                       uint64_t min, uint64_t max,
-                                                       s3_quic_ack_stat_t *st);
-static size_t           s3_quic_congestion_cubic(s3_connection_t *c);
-static void             s3_quic_drop_ack_ranges(s3_connection_t *c, s3_quic_send_ctx_t *ctx,
-                                                uint64_t pn);
-static s3_int_t         s3_quic_detect_lost(s3_connection_t *c, s3_quic_ack_stat_t *st);
-static s3_msec_t        s3_quic_congestion_cubic_time(s3_connection_t *c);
-static s3_msec_t        s3_quic_pcg_duration(s3_connection_t *c);
-static void             s3_quic_persistent_congestion(s3_connection_t *c);
-static s3_msec_t        s3_quic_oldest_sent_packet(s3_connection_t *c);
-static void             s3_quic_congestion_lost(s3_connection_t *c, s3_quic_frame_t *frame);
-static void             s3_quic_lost_handler(s3_event_t *ev);
+static void      s3_quic_rtt_sample(s3_connection_t *c, s3_quic_ack_frame_t *ack, s3_uint_t level,
+                                    s3_msec_t send_time);
+static s3_int_t  s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx,
+                                                uint64_t min, uint64_t max, s3_quic_ack_stat_t *st);
+static size_t    s3_quic_congestion_cubic(s3_connection_t *c);
+static void      s3_quic_drop_ack_ranges(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint64_t pn);
+static s3_int_t  s3_quic_detect_lost(s3_connection_t *c, s3_quic_ack_stat_t *st);
+static s3_msec_t s3_quic_congestion_cubic_time(s3_connection_t *c);
+static s3_msec_t s3_quic_pcg_duration(s3_connection_t *c);
+static void      s3_quic_persistent_congestion(s3_connection_t *c);
+static s3_msec_t s3_quic_oldest_sent_packet(s3_connection_t *c);
+static void      s3_quic_congestion_lost(s3_connection_t *c, s3_quic_frame_t *frame);
+static void      s3_quic_lost_handler(s3_event_t *ev);
 
 /* RFC 9002, 6.1.2. Time Threshold: kTimeThreshold, kGranularity */
 static inline s3_msec_t
@@ -74,8 +73,8 @@ s3_quic_packet_threshold(s3_quic_send_ctx_t *ctx)
         return S3_QUIC_PKT_THR;
     }
 
-    q  = s3_queue_head(&ctx->sent);
-    f  = s3_queue_data(q, s3_quic_frame_t, queue);
+    q = s3_queue_head(&ctx->sent);
+    f = s3_queue_data(q, s3_quic_frame_t, queue);
     pkt_thr = (ctx->pnum - f->pnum) / 2;
 
     if (pkt_thr <= S3_QUIC_PKT_THR) {
@@ -88,14 +87,14 @@ s3_quic_packet_threshold(s3_quic_send_ctx_t *ctx)
 s3_int_t
 s3_quic_handle_ack_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_frame_t *f)
 {
-    ssize_t                n;
-    u_char                *pos, *end;
-    uint64_t               min, max, gap, range;
-    s3_uint_t              i;
-    s3_quic_ack_stat_t     send_time;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_ack_frame_t   *ack;
-    s3_quic_connection_t  *qc;
+    ssize_t               n;
+    u_char               *pos, *end;
+    uint64_t              min, max, gap, range;
+    s3_uint_t             i;
+    s3_quic_ack_stat_t    send_time;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_ack_frame_t  *ack;
+    s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
 
@@ -198,13 +197,13 @@ s3_quic_rtt_sample(s3_connection_t *c, s3_quic_ack_frame_t *ack, s3_uint_t level
 
     qc = s3_quic_get_connection(c);
 
-    latest_rtt       = s3_current_msec - send_time;
+    latest_rtt = s3_current_msec - send_time;
     qc->latest_rtt = latest_rtt;
 
     if (qc->min_rtt == S3_TIMER_INFINITE) {
-        qc->min_rtt  = latest_rtt;
-        qc->avg_rtt  = latest_rtt;
-        qc->rttvar   = latest_rtt / 2;
+        qc->min_rtt = latest_rtt;
+        qc->avg_rtt = latest_rtt;
+        qc->rttvar = latest_rtt / 2;
         qc->first_rtt = s3_current_msec;
 
     } else {
@@ -227,8 +226,9 @@ s3_quic_rtt_sample(s3_connection_t *c, s3_quic_ack_frame_t *ack, s3_uint_t level
         qc->avg_rtt += (adjusted_rtt >> 3) - (qc->avg_rtt >> 3);
     }
 
-    s3_log_debug4(S3_LOG_DEBUG_EVENT, c->log, 0, "quic rtt sample latest:%uL min:%uL avg:%uL var:%uL",
-                  latest_rtt, qc->min_rtt, qc->avg_rtt, qc->rttvar);
+    s3_log_debug4(S3_LOG_DEBUG_EVENT, c->log, 0,
+                  "quic rtt sample latest:%uL min:%uL avg:%uL var:%uL", latest_rtt, qc->min_rtt,
+                  qc->avg_rtt, qc->rttvar);
 }
 
 static s3_int_t
@@ -250,7 +250,7 @@ s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint
     }
 
     st->max_pn = S3_TIMER_INFINITE;
-    found      = 0;
+    found = 0;
 
     q = s3_queue_head(&ctx->sent);
 
@@ -272,11 +272,10 @@ s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint
                 s3_quic_drop_ack_ranges(c, ctx, f->u.ack.largest);
                 break;
 
-                /*
-                 * the reference acks the stream data here
-                 * (D4, s3_quic_streams.c: s3_quic_handle_stream_ack());
-                 * until then the streams are not sent
-                 */
+            case S3_QUIC_FT_STREAM:
+            case S3_QUIC_FT_RESET_STREAM:
+                s3_quic_handle_stream_ack(c, f);
+                break;
             }
 
             if (f->pnum == max) {
@@ -307,9 +306,9 @@ s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint
 
         s3_log_error(S3_LOG_INFO, c->log, 0, "quic ACK for the packet not sent");
 
-        qc->error         = S3_QUIC_ERR_PROTOCOL_VIOLATION;
-        qc->error_ftype   = S3_QUIC_FT_ACK;
-        qc->error_reason  = "unknown packet number";
+        qc->error = S3_QUIC_ERR_PROTOCOL_VIOLATION;
+        qc->error_ftype = S3_QUIC_FT_ACK;
+        qc->error_reason = "unknown packet number";
 
         return S3_ERROR;
     }
@@ -367,8 +366,9 @@ s3_quic_congestion_ack(s3_connection_t *c, s3_quic_frame_t *f)
     }
 
     if (cg->idle) {
-        s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic congestion ack idle t:%uL win:%uz if:%uz",
-                      now, cg->window, cg->in_flight);
+        s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0,
+                      "quic congestion ack idle t:%uL win:%uz if:%uz", now, cg->window,
+                      cg->in_flight);
 
         goto done;
     }
@@ -387,8 +387,8 @@ s3_quic_congestion_ack(s3_connection_t *c, s3_quic_frame_t *f)
         w_cubic = s3_quic_congestion_cubic(c);
 
         if (cg->window < cg->w_prior) {
-            cg->w_est += (uint64_t)cg->mtu * f->plen * 3 * (10 - S3_QUIC_CUBIC_BETA)
-                         / (10 + S3_QUIC_CUBIC_BETA) / cg->window;
+            cg->w_est += (uint64_t)cg->mtu * f->plen * 3 * (10 - S3_QUIC_CUBIC_BETA) /
+                         (10 + S3_QUIC_CUBIC_BETA) / cg->window;
 
         } else {
             cg->w_est += (uint64_t)cg->mtu * f->plen / cg->window;
@@ -442,7 +442,7 @@ s3_quic_congestion_cubic(s3_connection_t *c)
     s3_quic_congestion_idle(c, cg->idle);
 
     now = s3_current_msec;
-    t   = (s3_msec_int_t)(now - cg->k);
+    t = (s3_msec_int_t)(now - cg->k);
 
     if (t > 1000000) {
         w = (int64_t)S3_QUIC_MAX_SIZE_T;
@@ -461,7 +461,7 @@ s3_quic_congestion_cubic(s3_connection_t *c)
      */
 
     cc = 10000000000ll / (int64_t)cg->mtu / S3_QUIC_CUBIC_C;
-    w  = t * t * t / cc + (int64_t)cg->w_max;
+    w = t * t * t / cc + (int64_t)cg->w_max;
 
     if ((uint64_t)w > S3_QUIC_MAX_SIZE_T) {
         w = (int64_t)S3_QUIC_MAX_SIZE_T;
@@ -508,9 +508,9 @@ s3_quic_congestion_idle(s3_connection_t *c, s3_uint_t idle)
 static void
 s3_quic_drop_ack_ranges(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint64_t pn)
 {
-    uint64_t              base;
-    s3_uint_t             i, smallest, largest;
-    s3_quic_ack_range_t  *r;
+    uint64_t             base;
+    s3_uint_t            i, smallest, largest;
+    s3_quic_ack_range_t *r;
 
     s3_log_debug4(S3_LOG_DEBUG_EVENT, c->log, 0,
                   "quic drop ack ranges pn:%uL largest:%uL fr:%uL nranges:%ui", pn,
@@ -526,26 +526,26 @@ s3_quic_drop_ack_ranges(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint64_t pn
         ctx->pending_ack = S3_QUIC_UNSET_PN;
     }
 
-    largest  = base;
+    largest = base;
     smallest = largest - ctx->first_range;
 
     if (pn >= largest) {
         ctx->largest_range = S3_QUIC_UNSET_PN;
-        ctx->first_range   = 0;
-        ctx->nranges       = 0;
+        ctx->first_range = 0;
+        ctx->nranges = 0;
         return;
     }
 
     if (pn >= smallest) {
         ctx->first_range = largest - pn - 1;
-        ctx->nranges     = 0;
+        ctx->nranges = 0;
         return;
     }
 
     for (i = 0; i < ctx->nranges; i++) {
         r = &ctx->ranges[i];
 
-        largest  = smallest - r->gap - 2;
+        largest = smallest - r->gap - 2;
         smallest = largest - r->range;
 
         if (pn >= largest) {
@@ -553,7 +553,7 @@ s3_quic_drop_ack_ranges(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint64_t pn
             return;
         }
         if (pn >= smallest) {
-            r->range     = largest - pn - 1;
+            r->range = largest - pn - 1;
             ctx->nranges = i + 1;
             return;
         }
@@ -635,9 +635,8 @@ s3_quic_detect_lost(s3_connection_t *c, s3_quic_ack_stat_t *st)
      * latest ACK frame.
      */
 
-    if (st && nlost >= 2 && ((s3_msec_int_t)(st->newest - oldest) < 0
-                             || (s3_msec_int_t)(st->oldest - newest) > 0))
-    {
+    if (st && nlost >= 2 &&
+        ((s3_msec_int_t)(st->newest - oldest) < 0 || (s3_msec_int_t)(st->oldest - newest) > 0)) {
         if (newest - oldest > s3_quic_pcg_duration(c)) {
             s3_quic_persistent_congestion(c);
         }
@@ -673,9 +672,9 @@ s3_quic_persistent_congestion(s3_connection_t *c)
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
 
-    cg->mtu            = qc->path->mtu;
+    cg->mtu = qc->path->mtu;
     cg->recovery_start = s3_quic_oldest_sent_packet(c) - 1;
-    cg->window         = cg->mtu * 2;
+    cg->window = cg->mtu * 2;
 
     s3_log_debug2(S3_LOG_DEBUG_EVENT, c->log, 0, "quic congestion persistent t:%uL win:%uz",
                   s3_current_msec, cg->window);
@@ -718,10 +717,10 @@ s3_quic_resend_frames(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
     s3_quic_frame_t      *f, *start;
     s3_quic_connection_t *qc;
 
-    qc    = s3_quic_get_connection(c);
-    q     = s3_queue_head(&ctx->sent);
+    qc = s3_quic_get_connection(c);
+    q = s3_queue_head(&ctx->sent);
     start = s3_queue_data(q, s3_quic_frame_t, queue);
-    pnum  = start->pnum;
+    pnum = start->pnum;
 
     s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic resend packet pnum:%uL", start->pnum);
 
@@ -763,9 +762,8 @@ s3_quic_resend_frames(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
 
         case S3_QUIC_FT_MAX_STREAMS:
         case S3_QUIC_FT_MAX_STREAMS2:
-            f->u.max_streams.limit =
-                f->u.max_streams.bidi ? qc->streams.client_max_streams_bidi
-                                      : qc->streams.client_max_streams_uni;
+            f->u.max_streams.limit = f->u.max_streams.bidi ? qc->streams.client_max_streams_bidi
+                                                           : qc->streams.client_max_streams_uni;
             s3_quic_queue_frame(qc, f);
             break;
 
@@ -817,8 +815,9 @@ s3_quic_congestion_lost(s3_connection_t *c, s3_quic_frame_t *f)
     now = s3_current_msec;
 
     if ((s3_msec_int_t)timer <= 0) {
-        s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic congestion lost rec t:%uL win:%uz if:%uz",
-                      now, cg->window, cg->in_flight);
+        s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0,
+                      "quic congestion lost rec t:%uL win:%uz if:%uz", now, cg->window,
+                      cg->in_flight);
 
         goto done;
     }
@@ -833,16 +832,15 @@ s3_quic_congestion_lost(s3_connection_t *c, s3_quic_frame_t *f)
 
     /* RFC 9438, 4.6. Multiplicative Decrease */
 
-    cg->mtu            = qc->path->mtu;
+    cg->mtu = qc->path->mtu;
     cg->recovery_start = now;
-    cg->w_prior        = cg->window;
+    cg->w_prior = cg->window;
     /* RFC 9438, 4.7. Fast Convergence */
-    cg->w_max    = (cg->window < cg->w_max) ? cg->window * (10 + S3_QUIC_CUBIC_BETA) / 20
-                                            : cg->window;
+    cg->w_max = (cg->window < cg->w_max) ? cg->window * (10 + S3_QUIC_CUBIC_BETA) / 20 : cg->window;
     cg->ssthresh = cg->in_flight * S3_QUIC_CUBIC_BETA / 10;
-    cg->window   = s3_max(cg->ssthresh, cg->mtu * 2);
-    cg->w_est    = cg->window;
-    cg->k        = now + s3_quic_congestion_cubic_time(c);
+    cg->window = s3_max(cg->ssthresh, cg->mtu * 2);
+    cg->w_est = cg->window;
+    cg->k = now + s3_quic_congestion_cubic_time(c);
     cg->idle_start = now;
 
     s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic congestion lost t:%uL win:%uz if:%uz", now,
@@ -877,7 +875,7 @@ s3_quic_congestion_cubic_time(s3_connection_t *c)
     }
 
     cc = 10000000000ll / (int64_t)cg->mtu / S3_QUIC_CUBIC_C;
-    v  = (int64_t)(cg->w_max - cg->window) * cc;
+    v = (int64_t)(cg->w_max - cg->window) * cc;
 
     /*
      * Newton-Raphson method for x ^ 3 = v:
@@ -917,11 +915,11 @@ s3_quic_set_lost_timer(s3_connection_t *c)
     s3_quic_send_ctx_t   *ctx;
     s3_quic_connection_t *qc;
 
-    qc  = s3_quic_get_connection(c);
+    qc = s3_quic_get_connection(c);
     now = s3_current_msec;
 
     lost = -1;
-    pto  = -1;
+    pto = -1;
 
     for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
         ctx = &qc->send_ctx[i];
@@ -1033,8 +1031,8 @@ s3_quic_pto_handler(s3_event_t *ev)
 
     s3_log_debug0(S3_LOG_DEBUG_EVENT, ev->log, 0, "quic pto timer");
 
-    c   = ev->data;
-    qc  = s3_quic_get_connection(c);
+    c = ev->data;
+    qc = s3_quic_get_connection(c);
     now = s3_current_msec;
 
     for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
@@ -1067,8 +1065,8 @@ s3_quic_pto_handler(s3_event_t *ev)
                 goto failed;
             }
 
-            f->level            = ctx->level;
-            f->type             = S3_QUIC_FT_PING;
+            f->level = ctx->level;
+            f->type = S3_QUIC_FT_PING;
             f->ignore_congestion = 1;
 
             if (s3_quic_frame_sendto(c, f, 0, qc->path) == S3_ERROR) {
@@ -1129,10 +1127,10 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
     }
 
     base = ctx->largest_range;
-    pn   = pkt->pn;
+    pn = pkt->pn;
 
     if (base == S3_QUIC_UNSET_PN) {
-        ctx->largest_range    = pn;
+        ctx->largest_range = pn;
         ctx->largest_received = pkt->received;
         return S3_OK;
     }
@@ -1141,14 +1139,14 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
         return S3_OK;
     }
 
-    largest  = base;
+    largest = base;
     smallest = largest - ctx->first_range;
 
     if (pn > base) {
 
         if (pn - base == 1) {
             ctx->first_range++;
-            ctx->largest_range    = pn;
+            ctx->largest_range = pn;
             ctx->largest_received = pkt->received;
 
             return S3_OK;
@@ -1170,8 +1168,8 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
                 }
             }
 
-            gap             = pn - base - 2;
-            range           = ctx->first_range;
+            gap = pn - base - 2;
+            range = ctx->first_range;
             ctx->first_range = 0;
             ctx->largest_range = pn;
             ctx->largest_received = pkt->received;
@@ -1247,7 +1245,7 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
             } else {
                 /* current gap is split into two parts */
 
-                gap   = ge - pn - 1;
+                gap = ge - pn - 1;
                 range = 0;
 
                 if (ctx->nranges == S3_QUIC_MAX_RANGES) {
@@ -1269,14 +1267,13 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
             return S3_OK;
         }
 
-        largest  = smallest - r->gap - 2;
+        largest = smallest - r->gap - 2;
         smallest = largest - r->range;
 
         if (pn >= smallest && pn <= largest) {
             /* this packet number is already known */
             return S3_OK;
         }
-
     }
 
     if (pn == smallest - 1) {
@@ -1304,7 +1301,7 @@ s3_quic_ack_packet(s3_connection_t *c, s3_quic_header_t *pkt)
         return S3_OK;
     }
 
-    gap   = smallest - 2 - pn;
+    gap = smallest - 2 - pn;
     range = 0;
 
 insert:
@@ -1316,7 +1313,7 @@ insert:
     s3_memmove(&ctx->ranges[i + 1], &ctx->ranges[i],
                sizeof(s3_quic_ack_range_t) * (ctx->nranges - i - 1));
 
-    ctx->ranges[i].gap   = gap;
+    ctx->ranges[i].gap = gap;
     ctx->ranges[i].range = range;
 
     return S3_OK;
@@ -1335,11 +1332,10 @@ s3_quic_generate_ack(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
     if (ctx->level == S3_QUIC_ENCRYPTION_APPLICATION) {
 
         delay = s3_current_msec - ctx->ack_delay_start;
-        qc    = s3_quic_get_connection(c);
+        qc = s3_quic_get_connection(c);
 
-        if (s3_queue_empty(&ctx->frames) && ctx->send_ack < S3_QUIC_MAX_ACK_GAP
-            && delay < qc->tp.max_ack_delay)
-        {
+        if (s3_queue_empty(&ctx->frames) && ctx->send_ack < S3_QUIC_MAX_ACK_GAP &&
+            delay < qc->tp.max_ack_delay) {
             if (!qc->push.timer_set && !qc->closing) {
                 s3_event_add_timer(&qc->push, qc->tp.max_ack_delay - delay);
             }

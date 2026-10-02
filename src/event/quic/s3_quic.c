@@ -11,6 +11,7 @@
 #include <s3_quic_frames.h>
 #include <s3_quic_output.h>
 #include <s3_quic_ack.h>
+#include <s3_quic_streams.h>
 
 /*
  * the s3_errno map is not pulled by s3_quic.h
@@ -175,7 +176,9 @@ s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_
      * the reference uses s3_quic_rbtree_insert_stream() here
      * (D4, s3_quic_streams.c); the tree is empty until then
      */
-    s3_rbtree_init(&qc->streams.tree, &qc->streams.sentinel, s3_rbtree_insert_value);
+    s3_rbtree_init(&qc->streams.tree, &qc->streams.sentinel, s3_quic_rbtree_insert_stream);
+
+    s3_queue_init(&qc->streams.uninitialized);
 
     for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
         s3_queue_init(&qc->send_ctx[i].frames);
@@ -378,8 +381,12 @@ s3_quic_open_sockets(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_heade
         goto failed;
     }
 
-    /* the listener backlink was consumed by the socket registrations */
-    c->data = NULL;
+    /*
+     * the listener backlink stays for the connection lifetime: the
+     * sockets issued later (create_sockets, retire replenishment) have
+     * to land in the same listener rbtree, or the dcid lookup drops
+     * their packets with a stateless reset
+     */
 
     return S3_OK;
 
@@ -807,9 +814,16 @@ s3_quic_close_connection(s3_connection_t *c, s3_int_t rc)
     }
 
     /*
-     * the reference waits for the streams to close here
-     * (D4, s3_quic_streams.c: s3_quic_close_streams() == S3_AGAIN)
+     * RFC 9000, 10.2.1.  Closing Draining Connection State
+     *
+     * an application reset of the streams: the streams with pending
+     * data wait for their flows to drain, and the connection teardown
+     * resumes from the close event they post
      */
+
+    if (s3_quic_close_streams(c, qc) == S3_AGAIN) {
+        return;
+    }
 
     if (qc->push.timer_set) {
         s3_event_del_timer(&qc->push);
@@ -1461,6 +1475,7 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
         case S3_QUIC_FT_CONNECTION_CLOSE:
         case S3_QUIC_FT_CONNECTION_CLOSE_APP:
             do_close = 1;
+
             continue;
 
         default:
@@ -1532,16 +1547,80 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
         case S3_QUIC_FT_STREAM5:
         case S3_QUIC_FT_STREAM6:
         case S3_QUIC_FT_STREAM7:
+
+            if (s3_quic_handle_stream_frame(c, pkt, &frame) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_MAX_DATA:
+
+            if (s3_quic_handle_max_data_frame(c, &frame.u.max_data) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_MAX_STREAM_DATA:
+
+            if (s3_quic_handle_max_stream_data_frame(c, pkt, &frame.u.max_stream_data) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_MAX_STREAMS:
         case S3_QUIC_FT_MAX_STREAMS2:
+
+            if (s3_quic_handle_max_streams_frame(c, pkt, &frame.u.max_streams) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_DATA_BLOCKED:
+
+            if (s3_quic_handle_data_blocked_frame(c, pkt, &frame.u.data_blocked) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_STREAM_DATA_BLOCKED:
+
+            if (s3_quic_handle_stream_data_blocked_frame(c, pkt, &frame.u.stream_data_blocked) !=
+                S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_STREAMS_BLOCKED:
         case S3_QUIC_FT_STREAMS_BLOCKED2:
+
+            if (s3_quic_handle_streams_blocked_frame(c, pkt, &frame.u.streams_blocked) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_RESET_STREAM:
+
+            if (s3_quic_handle_reset_stream_frame(c, pkt, &frame.u.reset_stream) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_STOP_SENDING:
+
+            if (s3_quic_handle_stop_sending_frame(c, pkt, &frame.u.stop_sending) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
         case S3_QUIC_FT_PATH_CHALLENGE:
         case S3_QUIC_FT_PATH_RESPONSE:
         case S3_QUIC_FT_NEW_TOKEN:
@@ -1869,6 +1948,15 @@ s3_quic_lookup_connection(s3_udp_listen_t *ul, s3_str_t *key)
         rc = s3_quic_memn2cmp(key->data, qsock->sid.id, key->len, qsock->sid.len);
 
         if (rc == 0) {
+
+            /*
+             * c->udp is the socket of the current packet: the handlers
+             * read it to tell which connection id the peer used (the
+             * reference does the same in its udp delivery path)
+             */
+
+            c->udp = (struct s3_udp_connection_s *)qsock;
+
             return c;
         }
 
@@ -1955,7 +2043,9 @@ s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf)
     s3_queue_init(&qc->client_ids);
     s3_queue_init(&qc->free_client_ids);
 
-    s3_rbtree_init(&qc->streams.tree, &qc->streams.sentinel, s3_rbtree_insert_value);
+    s3_rbtree_init(&qc->streams.tree, &qc->streams.sentinel, s3_quic_rbtree_insert_stream);
+
+    s3_queue_init(&qc->streams.uninitialized);
 
     for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
         s3_queue_init(&qc->send_ctx[i].frames);

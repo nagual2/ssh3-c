@@ -12,6 +12,7 @@
 #include <s3_quic_transport.h>
 #include <s3_quic_protection.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_streams.h>
 #include <s3_quic_connid.h>
 #include <s3_ssl.h>
 #include <s3_quic_ssl.h>
@@ -150,6 +151,35 @@ struct s3_quic_socket_s {
     /* the datagram handed over by the listener, read through c->recv() */
     u_char *buffer;
     size_t  len;
+};
+
+/*
+ * the stream pseudo connection and its flow control state (the
+ * reference ngx_quic_stream_s); the connection of the stream lives in
+ * connection->data, like the reference sc->quic (porting map 4.3.2)
+ */
+struct s3_quic_stream_s {
+    s3_rbtree_node_t            node;
+    s3_queue_t                  queue;
+    s3_connection_t            *parent;
+    s3_connection_t            *connection;
+    uint64_t                    id;
+    uint64_t                    sent;
+    uint64_t                    acked;
+    uint64_t                    send_max_data;
+    uint64_t                    send_offset;
+    uint64_t                    send_final_size;
+    uint64_t                    recv_max_data;
+    uint64_t                    recv_offset;
+    uint64_t                    recv_window;
+    uint64_t                    recv_last;
+    uint64_t                    recv_final_size;
+    s3_quic_buffer_t            send;
+    s3_quic_buffer_t            recv;
+    s3_quic_stream_send_state_e send_state;
+    s3_quic_stream_recv_state_e recv_state;
+    unsigned                    cancelable : 1;
+    unsigned                    fin_acked : 1;
 };
 
 typedef struct {

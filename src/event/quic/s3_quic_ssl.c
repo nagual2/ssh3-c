@@ -11,6 +11,7 @@
 #include <s3_quic_frames.h>
 #include <s3_quic_output.h>
 #include <s3_quic_ssl.h>
+#include <s3_quic_streams.h>
 
 /*
  * RFC 9000, 7.5.  Cryptographic Message Buffering
@@ -508,8 +509,15 @@ s3_quic_handshake(s3_connection_t *c)
         /*
          * the reference starts 0-RTT streams here when the early data
          * keys and the client transport parameters are ready
-         * (D4, s3_quic_streams.c: s3_quic_init_streams())
+         * (ngx_quic_init_streams() in the early data branch)
          */
+
+        if (s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_EARLY_DATA, 0) &&
+            qc->client_tp_done) {
+            if (s3_quic_init_streams(c) != S3_OK) {
+                return S3_ERROR;
+            }
+        }
 
         return S3_OK;
     }
@@ -562,17 +570,6 @@ s3_quic_handshake(s3_connection_t *c)
     s3_post_event(&qc->key_update, &qc->ctx->posted_events);
 
     /*
-     * the handshake is confirmed, the handshake timeout no longer
-     * applies: the reference cancels the close timer in
-     * ngx_quic_init_streams() (D4, s3_quic_init_streams()), the
-     * connection would otherwise be torn down at handshake_timeout
-     */
-
-    if (qc->close.timer_set) {
-        s3_event_del_timer(&qc->close);
-    }
-
-    /*
      * RFC 9001, 4.9.2.  Discarding Handshake Keys
      *
      * An endpoint MUST discard its Handshake keys
@@ -603,10 +600,11 @@ s3_quic_handshake(s3_connection_t *c)
         }
     }
 
-    /*
-     * the reference opens the application here
-     * (D4, s3_quic_streams.c: s3_quic_init_streams())
-     */
+    /* the application is opened: the close (handshake) timer dies here */
+
+    if (s3_quic_init_streams(c) != S3_OK) {
+        return S3_ERROR;
+    }
 
     return S3_OK;
 }

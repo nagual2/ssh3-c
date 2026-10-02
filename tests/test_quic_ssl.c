@@ -103,6 +103,7 @@ s3_test_env_init(s3_test_env_t *env, const u_char *cert, size_t cert_len, const 
     s3_queue_init(&env->qc.free_paths);
     s3_queue_init(&env->qc.client_ids);
     s3_queue_init(&env->qc.free_client_ids);
+    s3_queue_init(&env->qc.streams.uninitialized);
 
     for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
         s3_queue_init(&env->qc.send_ctx[i].frames);
