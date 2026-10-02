@@ -49,6 +49,15 @@ struct s3_quic_keys_s {
     s3_quic_secrets_t secrets[S3_QUIC_ENCRYPTION_LAST];
     s3_quic_secrets_t next_key;
     s3_uint_t         cipher; /* TLS cipher suite id, like SSL_CIPHER_get_id() */
+
+    /*
+     * role of this connection.  The reference only ever runs a server,
+     * so it hardwires "client secret = read, server secret = write".
+     * ssh3-c ships a client too, which mirrors the mapping; every
+     * client/server selection below keys off this field.
+     */
+
+    s3_uint_t is_client;
 };
 
 typedef struct {
@@ -80,10 +89,10 @@ typedef struct {
  * layer and converts it with SSL_CIPHER_get_id(); here the TLS cipher
  * suite id (TLS1_3_CK_*) is passed directly, so D1 links libcrypto only
  */
-s3_int_t s3_quic_keys_set_initial_secret(s3_quic_keys_t *keys, s3_str_t *secret, s3_log_t *log);
-s3_int_t s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_uint_t is_write, s3_quic_keys_t *keys,
-                                            s3_uint_t level, uint32_t cipher, const uint8_t *secret,
-                                            size_t secret_len);
+s3_int_t  s3_quic_keys_set_initial_secret(s3_quic_keys_t *keys, s3_str_t *secret, s3_log_t *log);
+s3_int_t  s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_int_t is_write, s3_quic_keys_t *keys,
+                                             s3_uint_t level, uint32_t cipher, const uint8_t *secret,
+                                             size_t secret_len);
 s3_uint_t s3_quic_keys_available(s3_quic_keys_t *keys, s3_uint_t level, s3_uint_t is_write);
 void      s3_quic_keys_discard(s3_quic_keys_t *keys, s3_uint_t level);
 void      s3_quic_keys_switch(s3_quic_keys_t *keys);

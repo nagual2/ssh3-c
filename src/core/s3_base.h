@@ -70,6 +70,8 @@ typedef int s3_err_t;
 #define s3_min(val1, val2) ((val1 > val2) ? (val2) : (val1))
 #define s3_max(val1, val2) ((val1 < val2) ? (val2) : (val1))
 
+#define s3_abs(val) ((val >= 0) ? val : -(val))
+
 #define s3_align(d, a) (((d) + ((a) - 1)) & ~((a) - 1))
 
 #define s3_align_ptr(p, a)                                                                         \

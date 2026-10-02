@@ -144,8 +144,12 @@ struct s3_quic_socket_s {
     s3_quic_server_id_t     sid;
     struct sockaddr_storage sockaddr;
     socklen_t               socklen;
-    s3_udp_listen_t        *listen; /* set in D3 on the listener rbtree registration */
+    s3_udp_listen_t        *listen; /* set on the listener rbtree registration */
     s3_uint_t               used;   /* unsigned  used:1; */
+
+    /* the datagram handed over by the listener, read through c->recv() */
+    u_char *buffer;
+    size_t  len;
 };
 
 typedef struct {
@@ -279,8 +283,14 @@ struct s3_quic_connection_s {
     unsigned validated : 1;
     unsigned client_tp_done : 1;
 
+    /* RFC 9001, 4.1.2: a client confirms on HANDSHAKE_DONE */
+    unsigned handshake_confirmed : 1;
+
     /* the nginx c->reusable flag, porting map 4.3.9 */
     unsigned reusable : 1;
+
+    /* the client role created by s3_quic_connect() */
+    unsigned client : 1;
 
 #if (S3_QUIC_OPENSSL_API)
     unsigned read_level : 2;

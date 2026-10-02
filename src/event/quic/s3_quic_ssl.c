@@ -9,6 +9,7 @@
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_output.h>
 #include <s3_quic_ssl.h>
 
 /*
@@ -37,7 +38,23 @@ static int s3_quic_cbs_got_transport_params(SSL *ssl_conn, const unsigned char *
                                             size_t params_len, void *arg);
 static int s3_quic_cbs_alert(SSL *ssl_conn, unsigned char alert, void *arg);
 
-static s3_int_t s3_quic_handshake(s3_connection_t *c);
+static s3_int_t s3_quic_ssl_tls_init(s3_connection_t *c);
+
+static const OSSL_DISPATCH qtdis[] = {
+
+    {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND, (void (*)(void))s3_quic_cbs_send},
+
+    {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD, (void (*)(void))s3_quic_cbs_recv_rcd},
+
+    {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD, (void (*)(void))s3_quic_cbs_release_rcd},
+
+    {OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET, (void (*)(void))s3_quic_cbs_yield_secret},
+
+    {OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS, (void (*)(void))s3_quic_cbs_got_transport_params},
+
+    {OSSL_FUNC_SSL_QUIC_TLS_ALERT, (void (*)(void))s3_quic_cbs_alert},
+
+    {0, NULL}};
 
 static int
 s3_quic_cbs_send(SSL *ssl_conn, const unsigned char *data, size_t len, size_t *consumed, void *arg)
@@ -58,7 +75,12 @@ s3_quic_cbs_send(SSL *ssl_conn, const unsigned char *data, size_t len, size_t *c
 
     SSL_get0_alpn_selected(ssl_conn, &alpn_data, &alpn_len);
 
-    if (alpn_len == 0) {
+    /*
+     * the server sees the offered ALPN of the peer; the client learns
+     * the negotiated ALPN only with the ServerHello, so the check is
+     * deferred to the handshake completion
+     */
+    if (!qc->client && alpn_len == 0) {
         qc->error = S3_QUIC_ERR_CRYPTO(SSL_AD_NO_APPLICATION_PROTOCOL);
         qc->error_reason = "missing ALPN extension";
 
@@ -66,7 +88,12 @@ s3_quic_cbs_send(SSL *ssl_conn, const unsigned char *data, size_t len, size_t *c
         return 1;
     }
 
-    if (!qc->client_tp_done) {
+    /*
+     * the server may not send before the client transport parameters
+     * arrived (RFC 9001, 8.2); the client sends its own parameters
+     * with SSL_set_quic_tls_transport_params() and may start at once
+     */
+    if (!qc->client && !qc->client_tp_done) {
         /* RFC 9001, 8.2.  QUIC Transport Parameters Extension */
         qc->error = S3_QUIC_ERR_CRYPTO(SSL_AD_MISSING_EXTENSION);
         qc->error_reason = "missing transport parameters";
@@ -213,17 +240,37 @@ s3_quic_cbs_yield_secret(SSL *ssl_conn, uint32_t ssl_level, int direction,
      * 0x03000000 prefix, like the TLS1_3_CK_* constants used by the
      * protection layer
      */
-    if (s3_quic_keys_set_encryption_secret(c->log, direction, qc->keys, level,
+
+    /*
+     * the OpenSSL direction flag is 0 for the write (transmit)
+     * secret and 1 for the read (receive) secret; the protection
+     * layer stores the transmit secrets in the server slot and the
+     * receive secrets in the client slot
+     */
+    if (s3_quic_keys_set_encryption_secret(c->log, !direction, qc->keys, level,
                                            (uint32_t)SSL_CIPHER_get_id(cipher), secret,
                                            secret_len) != S3_OK) {
         qc->error = S3_QUIC_ERR_INTERNAL_ERROR;
         return 1;
     }
 
-    if (direction) {
+    if (!direction) {
         qc->write_level = level;
 
     } else {
+        /*
+         * TLS 1.3 derives the peer application read secret before the
+         * peer Finished is processed.  Moving read_level to APPLICATION
+         * here would hide the handshake records still queued on the
+         * handshake crypto stream from s3_quic_cbs_recv_rcd() and
+         * deadlock the handshake (RFC 9001, 4.1.2); the level is
+         * advanced once SSL_do_handshake() reports completion
+         */
+
+        if (!c->ssl->handshaked && level == S3_QUIC_ENCRYPTION_APPLICATION) {
+            return 1;
+        }
+
         qc->read_level = level;
     }
 
@@ -247,12 +294,12 @@ s3_quic_cbs_got_transport_params(SSL *ssl_conn, const unsigned char *params, siz
     qc = s3_quic_get_connection(c);
 
     /* defaults for parameters not sent by client */
-    s3_memcpy(&ctp, &qc->ctp, sizeof(s3_quic_tp_t));
+    ctp = qc->ctp;
 
     p = (u_char *)params;
     end = p + params_len;
 
-    if (s3_quic_parse_transport_params(p, end, &ctp, c->log) != S3_OK) {
+    if (s3_quic_parse_transport_params(p, end, &ctp, c->log, qc->client) != S3_OK) {
         qc->error = S3_QUIC_ERR_TRANSPORT_PARAMETER_ERROR;
         qc->error_reason = "failed to process transport parameters";
 
@@ -291,6 +338,8 @@ s3_quic_cbs_alert(SSL *ssl_conn, unsigned char alert, void *arg)
     return 1;
 }
 
+static s3_int_t s3_quic_post_handshake(s3_connection_t *c);
+
 s3_int_t
 s3_quic_handle_crypto_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_frame_t *frame)
 {
@@ -305,8 +354,15 @@ s3_quic_handle_crypto_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_f
         return S3_OK;
     }
 
-    if (c->ssl->handshaked) {
-        /* QUIC doesn't define post-handshake messages for a client */
+    if (c->ssl->handshaked && !qc->client) {
+        /*
+         * RFC 8446, 4.6.  Post-Handshake Messages
+         *
+         * a client never sends a post-handshake message, and a server
+         * has nothing to hand over at this point: anything else is a
+         * protocol violation (the reference only ever runs as a server
+         * and so never sees the other direction)
+         */
 
         qc->error = S3_QUIC_ERR_CRYPTO(SSL_AD_UNEXPECTED_MESSAGE);
         qc->error_reason = "unexpected CRYPTO frame";
@@ -347,15 +403,69 @@ s3_quic_handle_crypto_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_f
      * with SSL_provide_quic_data() on the quictls/boringssl branches
      */
 
+    if (c->ssl->handshaked) {
+        return s3_quic_post_handshake(c);
+    }
+
     return s3_quic_handshake(c);
 }
 
 static s3_int_t
+s3_quic_post_handshake(s3_connection_t *c)
+{
+    int      n, sslerr;
+    SSL     *ssl_conn;
+    s3_int_t rc;
+
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    ssl_conn = c->ssl->connection;
+
+    /*
+     * RFC 9001, 4.6.  New Session Ticket
+     *
+     * a server delivers its tickets right after the handshake, so a
+     * client keeps receiving CRYPTO frames in 1-RTT packets; the
+     * records are pulled through the read callback as usual and
+     * SSL_do_handshake() dispatches them
+     */
+
+    n = SSL_do_handshake(ssl_conn);
+
+    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "SSL_do_handshake (post): %d", n);
+
+    if (n <= 0) {
+        sslerr = SSL_get_error(ssl_conn, n);
+
+        if (sslerr != SSL_ERROR_WANT_READ && sslerr != SSL_ERROR_WANT_WRITE) {
+            s3_ssl_error(c->log, 0, "SSL_do_handshake() failed after handshake");
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    if (qc->error) {
+        return S3_ERROR;
+    }
+
+    /* a ticket may be followed by more of them in the same flight */
+
+    rc = s3_quic_output(c);
+
+    return rc;
+}
+
+s3_int_t
 s3_quic_handshake(s3_connection_t *c)
 {
     int                   n, sslerr;
     SSL                  *ssl_conn;
     s3_quic_frame_t      *frame;
+    const unsigned char  *alpn_data;
+    unsigned int          alpn_len;
     s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
@@ -406,19 +516,42 @@ s3_quic_handshake(s3_connection_t *c)
 
     c->ssl->handshaked = 1;
 
-    frame = s3_quic_alloc_frame(c);
-    if (frame == NULL) {
-        return S3_ERROR;
+    /* the handshake crypto stream is drained, read at 1-RTT from now on */
+
+    qc->read_level = S3_QUIC_ENCRYPTION_APPLICATION;
+
+    if (qc->client) {
+        /* the negotiated ALPN of the server is visible by now */
+        SSL_get0_alpn_selected(ssl_conn, &alpn_data, &alpn_len);
+
+        if (alpn_len == 0) {
+            qc->error = S3_QUIC_ERR_CRYPTO(SSL_AD_NO_APPLICATION_PROTOCOL);
+            qc->error_reason = "missing ALPN extension";
+
+            s3_log_error(S3_LOG_INFO, c->log, 0, "quic missing ALPN extension");
+            return S3_ERROR;
+        }
     }
 
-    frame->level = S3_QUIC_ENCRYPTION_APPLICATION;
-    frame->type = S3_QUIC_FT_HANDSHAKE_DONE;
-    s3_quic_queue_frame(qc, frame);
+    if (!qc->client) {
+        /* the client must not send HANDSHAKE_DONE (RFC 9000, 19.20) */
 
-    /*
-     * the reference sends a session token here when retry is enabled
-     * (D3, s3_quic_output.c: s3_quic_send_new_token())
-     */
+        frame = s3_quic_alloc_frame(c);
+        if (frame == NULL) {
+            return S3_ERROR;
+        }
+
+        frame->level = S3_QUIC_ENCRYPTION_APPLICATION;
+        frame->type = S3_QUIC_FT_HANDSHAKE_DONE;
+        s3_quic_queue_frame(qc, frame);
+
+        if (qc->conf->retry) {
+            /* the session token lets the peer skip address validation */
+            if (s3_quic_send_new_token(c, qc->path) != S3_OK) {
+                return S3_ERROR;
+            }
+        }
+    }
 
     /*
      * RFC 9001, 9.5.  Header Protection Timing Side Channels
@@ -429,11 +562,33 @@ s3_quic_handshake(s3_connection_t *c)
     s3_post_event(&qc->key_update, &qc->ctx->posted_events);
 
     /*
+     * the handshake is confirmed, the handshake timeout no longer
+     * applies: the reference cancels the close timer in
+     * ngx_quic_init_streams() (D4, s3_quic_init_streams()), the
+     * connection would otherwise be torn down at handshake_timeout
+     */
+
+    if (qc->close.timer_set) {
+        s3_event_del_timer(&qc->close);
+    }
+
+    /*
      * RFC 9001, 4.9.2.  Discarding Handshake Keys
      *
      * An endpoint MUST discard its Handshake keys
      * when the TLS handshake is confirmed.
+     *
+     * a client confirms the handshake right after handing its Finished
+     * over to the Handshake context, so the pending Handshake frames
+     * have to leave the wire before that context is dropped; the
+     * reference never has to flush here, it only runs as a server,
+     * where the whole flight is already sent and waits for an ack
      */
+
+    if (qc->client && s3_quic_output(c) != S3_OK) {
+        return S3_ERROR;
+    }
+
     s3_quic_discard_ctx(c, S3_QUIC_ENCRYPTION_HANDSHAKE);
 
     /*
@@ -441,9 +596,11 @@ s3_quic_handshake(s3_connection_t *c)
      * (D4, s3_quic_migration.c: s3_quic_discover_path_mtu())
      */
 
-    /* start accepting clients on negotiated number of server ids */
-    if (s3_quic_create_sockets(c) != S3_OK) {
-        return S3_ERROR;
+    if (!qc->client) {
+        /* start accepting clients on negotiated number of server ids */
+        if (s3_quic_create_sockets(c) != S3_OK) {
+            return S3_ERROR;
+        }
     }
 
     /*
@@ -454,59 +611,18 @@ s3_quic_handshake(s3_connection_t *c)
     return S3_OK;
 }
 
-s3_int_t
-s3_quic_init_connection(s3_connection_t *c)
+static s3_int_t
+s3_quic_ssl_tls_init(s3_connection_t *c)
 {
     u_char               *p;
     size_t                clen;
     ssize_t               len;
-    s3_str_t              dcid;
-    SSL                  *ssl_conn;
-    s3_quic_socket_t     *qsock;
     s3_quic_connection_t *qc;
-
-    static const OSSL_DISPATCH qtdis[] = {
-
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND, (void (*)(void))s3_quic_cbs_send},
-
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD, (void (*)(void))s3_quic_cbs_recv_rcd},
-
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD, (void (*)(void))s3_quic_cbs_release_rcd},
-
-        {OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET, (void (*)(void))s3_quic_cbs_yield_secret},
-
-        {OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS,
-         (void (*)(void))s3_quic_cbs_got_transport_params},
-
-        {OSSL_FUNC_SSL_QUIC_TLS_ALERT, (void (*)(void))s3_quic_cbs_alert},
-
-        {0, NULL}};
 
     qc = s3_quic_get_connection(c);
 
-    if (s3_ssl_create_connection(qc->conf->ssl, c) != S3_OK) {
-        return S3_ERROR;
-    }
-
-    c->ssl->no_wait_shutdown = 1;
-
-    ssl_conn = c->ssl->connection;
-
-    if (SSL_set_quic_tls_cbs(ssl_conn, qtdis, c) == 0) {
+    if (SSL_set_quic_tls_cbs(c->ssl->connection, qtdis, c) == 0) {
         s3_ssl_error(c->log, 0, "quic SSL_set_quic_tls_cbs() failed");
-        return S3_ERROR;
-    }
-
-    if (SSL_CTX_get_max_early_data(qc->conf->ssl->ctx)) {
-        SSL_set_quic_tls_early_data_enabled(ssl_conn, 1);
-    }
-
-    qsock = s3_quic_get_socket(c);
-
-    dcid.data = qsock->sid.id;
-    dcid.len = qsock->sid.len;
-
-    if (s3_quic_new_sr_token(c, &dcid, qc->conf->sr_token_key, qc->tp.sr_token) != S3_OK) {
         return S3_ERROR;
     }
 
@@ -527,10 +643,74 @@ s3_quic_init_connection(s3_connection_t *c)
     s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic transport params len:%uz %*xs", len, len, p);
 #endif
 
-    if (SSL_set_quic_tls_transport_params(ssl_conn, p, len) == 0) {
+    if (SSL_set_quic_tls_transport_params(c->ssl->connection, p, len) == 0) {
         s3_ssl_error(c->log, 0, "quic SSL_set_quic_tls_transport_params() failed");
         return S3_ERROR;
     }
 
     return S3_OK;
+}
+
+s3_int_t
+s3_quic_init_connection(s3_connection_t *c)
+{
+    s3_str_t              dcid;
+    s3_quic_socket_t     *qsock;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    if (s3_ssl_create_connection(qc->conf->ssl, c) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    c->ssl->no_wait_shutdown = 1;
+
+    if (SSL_CTX_get_max_early_data(qc->conf->ssl->ctx)) {
+        SSL_set_quic_tls_early_data_enabled(c->ssl->connection, 1);
+    }
+
+    qsock = s3_quic_get_socket(c);
+
+    dcid.data = qsock->sid.id;
+    dcid.len = qsock->sid.len;
+
+    if (s3_quic_new_sr_token(c, &dcid, qc->conf->sr_token_key, qc->tp.sr_token) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    return s3_quic_ssl_tls_init(c);
+}
+
+s3_int_t
+s3_quic_client_init_connection(s3_connection_t *c)
+{
+    s3_ssl_conn_t        *ssl_conn;
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    ssl_conn = s3_pcalloc(c->pool, sizeof(s3_ssl_conn_t));
+    if (ssl_conn == NULL) {
+        return S3_ERROR;
+    }
+
+    ssl_conn->connection = SSL_new(qc->conf->ssl->ctx);
+    if (ssl_conn->connection == NULL) {
+        s3_ssl_error(c->log, 0, "SSL_new() failed");
+        return S3_ERROR;
+    }
+
+    SSL_set_connect_state(ssl_conn->connection);
+
+    if (qc->conf->ssl->alpn.len > 0 &&
+        SSL_set_alpn_protos(ssl_conn->connection, qc->conf->ssl->alpn.data,
+                            (unsigned int)qc->conf->ssl->alpn.len) != 0) {
+        s3_ssl_error(c->log, 0, "SSL_set_alpn_protos() failed");
+        return S3_ERROR;
+    }
+
+    c->ssl = ssl_conn;
+
+    return s3_quic_ssl_tls_init(c);
 }

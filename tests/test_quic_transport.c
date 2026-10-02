@@ -715,7 +715,7 @@ test_transport_params(void)
 
     /* the 0-RTT prefix must parse on its own */
     s3_memzero(&parsed, sizeof(s3_quic_tp_t));
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + clen, &parsed, &s3_test_log) == S3_OK);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + clen, &parsed, &s3_test_log, 0) == S3_OK);
     S3_ASSERT(parsed.initial_max_data == tp.initial_max_data);
     S3_ASSERT(parsed.max_idle_timeout == tp.max_idle_timeout);
     S3_ASSERT(parsed.max_datagram_frame_size == 0); /* not in the 0-RTT set */
@@ -724,7 +724,7 @@ test_transport_params(void)
      * the server blob carries original_dcid and sr_token; both are
      * forbidden in client transport parameters, the parser rejects it
      */
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + n, &parsed, &s3_test_log) == S3_ERROR);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + n, &parsed, &s3_test_log, 0) == S3_ERROR);
 
     /*
      * the server-only tail of the blob: original_dcid TLV (1+1+8),
@@ -749,7 +749,7 @@ test_transport_params(void)
     S3_ASSERT(s3_memcmp(buf + n - 16, srt, 16) == 0);
 
     s3_memzero(&parsed, sizeof(s3_quic_tp_t));
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + n - 38, &parsed, &s3_test_log) == S3_OK);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + n - 38, &parsed, &s3_test_log, 0) == S3_OK);
     S3_ASSERT(parsed.initial_max_streams_bidi == 151288809941952654ULL);
     S3_ASSERT(parsed.initial_max_data == 494878333);
     S3_ASSERT(parsed.max_ack_delay == 624485);
@@ -760,29 +760,60 @@ test_transport_params(void)
     S3_ASSERT(parsed.max_datagram_frame_size == 1200);
 
     /* no datagram TP when disabled; init_transport_params() zeroes the
-       dcid/token fields, so the tail shrinks to 22 bytes (2+2+18) */
+       dcid/token fields and sr_token is only encoded when set, so the
+       last encoded parameter is max_ack_delay (TLV of 4 bytes) */
 
     qcf.max_datagram_frame_size = 0;
     S3_ASSERT(s3_quic_init_transport_params(&tp, &qcf) == S3_OK);
 
     len = s3_quic_create_transport_params(buf, buf + sizeof(buf), &tp, NULL);
 
-    S3_ASSERT(buf[len - 22] == S3_QUIC_TP_ORIGINAL_DCID);
-    S3_ASSERT(buf[len - 21] == 0);
-    S3_ASSERT(buf[len - 20] == S3_QUIC_TP_INITIAL_SCID);
-    S3_ASSERT(buf[len - 19] == 0);
-    S3_ASSERT(buf[len - 18] == S3_QUIC_TP_SR_TOKEN);
-    S3_ASSERT(buf[len - 17] == S3_QUIC_SR_TOKEN_LEN);
+    S3_ASSERT(buf[len - 3] == S3_QUIC_TP_ACK_DELAY_EXPONENT);
+    S3_ASSERT(buf[len - 2] == 1);
+    S3_ASSERT(buf[len - 1] == S3_QUIC_DEFAULT_ACK_DELAY_EXPONENT);
 
     s3_memzero(&parsed, sizeof(s3_quic_tp_t));
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + len - 22, &parsed, &s3_test_log) == S3_OK);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + len, &parsed, &s3_test_log, 0) == S3_OK);
+    S3_ASSERT(parsed.max_ack_delay == S3_QUIC_DEFAULT_MAX_ACK_DELAY);
+    S3_ASSERT(parsed.ack_delay_exponent == S3_QUIC_DEFAULT_ACK_DELAY_EXPONENT);
     S3_ASSERT(parsed.max_datagram_frame_size == 0);
+    S3_ASSERT(parsed.original_dcid.len == 0);
 
     /* forbidden client params */
 
     buf[0] = S3_QUIC_TP_ORIGINAL_DCID;
     buf[1] = 0x00;
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 2, &parsed, &s3_test_log) == S3_ERROR);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 2, &parsed, &s3_test_log, 0) == S3_ERROR);
+
+    /*
+     * the same parameters are expected from a server: the client role
+     * parses them out and the values reach s3_quic_tp_t
+     */
+
+    tp.original_dcid.len = 8;
+    tp.original_dcid.data = orig;
+    tp.initial_scid.len = 8;
+    tp.initial_scid.data = scid;
+    s3_memcpy(tp.sr_token, srt, S3_QUIC_SR_TOKEN_LEN);
+
+    len = s3_quic_create_transport_params(NULL, NULL, &tp, NULL);
+    n = s3_quic_create_transport_params(buf, buf + len, &tp, NULL);
+    S3_ASSERT(n == (size_t)len);
+
+    s3_memzero(&parsed, sizeof(s3_quic_tp_t));
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + n, &parsed, &s3_test_log, 1) == S3_OK);
+    S3_ASSERT(parsed.original_dcid.len == 8);
+    S3_ASSERT(s3_memcmp(parsed.original_dcid.data, orig, 8) == 0);
+    S3_ASSERT(parsed.initial_scid.len == 8);
+    S3_ASSERT(s3_memcmp(parsed.initial_scid.data, scid, 8) == 0);
+    S3_ASSERT(s3_memcmp(parsed.sr_token, srt, S3_QUIC_SR_TOKEN_LEN) == 0);
+
+    /* a stateless reset token of the wrong length is a parameter error */
+
+    buf[0] = S3_QUIC_TP_SR_TOKEN;
+    buf[1] = 0x0f;
+    s3_memcpy(buf + 2, srt, 15);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 17, &parsed, &s3_test_log, 1) == S3_ERROR);
 
     /* unknown and reserved params are skipped */
 
@@ -792,7 +823,7 @@ test_transport_params(void)
     buf[3] = 0x40; /* unknown id 100 */
     buf[4] = 0x64;
     buf[5] = 0x00;
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 6, &parsed, &s3_test_log) == S3_OK);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 6, &parsed, &s3_test_log, 0) == S3_OK);
 
     /* trailing garbage */
 
@@ -800,14 +831,14 @@ test_transport_params(void)
     buf[1] = 0x01;
     buf[2] = 0x05;
     buf[3] = 0xff;
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 4, &parsed, &s3_test_log) == S3_ERROR);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 4, &parsed, &s3_test_log, 0) == S3_ERROR);
 
     /* declared length longer than data */
 
     buf[0] = S3_QUIC_TP_MAX_IDLE_TIMEOUT;
     buf[1] = 0x05;
     buf[2] = 0x01;
-    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 3, &parsed, &s3_test_log) == S3_ERROR);
+    S3_ASSERT(s3_quic_parse_transport_params(buf, buf + 3, &parsed, &s3_test_log, 0) == S3_ERROR);
 
     return s3_test_failures;
 }

@@ -129,6 +129,47 @@ s3_ssl_free(s3_ssl_t *ssl)
     s3_free(ssl);
 }
 
+s3_ssl_t *
+s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
+{
+    s3_ssl_t *ssl;
+
+    ssl = s3_alloc(sizeof(s3_ssl_t), log);
+    if (ssl == NULL) {
+        return NULL;
+    }
+
+    s3_memzero(ssl, sizeof(s3_ssl_t));
+
+    ssl->log = log;
+
+    if (alpn != NULL && alpn->len > 0) {
+        ssl->alpn.data = s3_alloc(alpn->len, log);
+        if (ssl->alpn.data == NULL) {
+            s3_free(ssl);
+            return NULL;
+        }
+
+        s3_memcpy(ssl->alpn.data, alpn->data, alpn->len);
+        ssl->alpn.len = alpn->len;
+    }
+
+    ssl->ctx = SSL_CTX_new(TLS_client_method());
+    if (ssl->ctx == NULL) {
+        s3_ssl_error(log, 0, "SSL_CTX_new() failed");
+        s3_ssl_free(ssl);
+        return NULL;
+    }
+
+    SSL_CTX_set_min_proto_version(ssl->ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ssl->ctx, TLS1_3_VERSION);
+
+    /* the interop probe accepts any peer certificate for now */
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_NONE, NULL);
+
+    return ssl;
+}
+
 static int
 s3_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                       const unsigned char *in, unsigned int inlen, void *arg)

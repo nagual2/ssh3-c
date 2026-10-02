@@ -3,26 +3,27 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+#include <openssl/rand.h>
+
+#include <s3_crc32.h>
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_output.h>
+#include <s3_quic_ack.h>
 
 /*
  * the s3_errno map is not pulled by s3_quic.h
  */
 #include <s3_errno.h>
 
-/*
- * RFC 9002, 6.1.  Loss Detection Thresholds
- */
-#define S3_QUIC_TIME_GRANULARITY 1
+#include <s3_udp_recv.h>
 
 static s3_quic_connection_t *s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf,
                                                     s3_quic_header_t *pkt);
-static s3_int_t  s3_quic_handle_stateless_reset(s3_connection_t *c, s3_quic_header_t *pkt);
-static void      s3_quic_input_handler(s3_event_t *rev);
-static void      s3_quic_close_handler(s3_event_t *ev);
-static s3_msec_t s3_quic_pto(s3_connection_t *c, s3_quic_send_ctx_t *ctx);
+static s3_int_t s3_quic_handle_stateless_reset(s3_connection_t *c, s3_quic_header_t *pkt);
+static void     s3_quic_input_handler(s3_event_t *rev);
+static void     s3_quic_close_handler(s3_event_t *ev);
 
 static s3_int_t s3_quic_handle_datagram(s3_connection_t *c, s3_buf_t *b, s3_quic_conf_t *conf);
 static s3_int_t s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf,
@@ -31,16 +32,15 @@ static s3_int_t s3_quic_handle_payload(s3_connection_t *c, s3_quic_header_t *pkt
 static s3_int_t s3_quic_check_csid(s3_quic_connection_t *qc, s3_quic_header_t *pkt);
 static s3_int_t s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt);
 static s3_int_t s3_quic_handle_datagram_frame(s3_connection_t *c, s3_quic_frame_t *frame);
+static s3_int_t s3_quic_handle_hs_done(s3_connection_t *c);
 
 static void s3_quic_push_handler(s3_event_t *ev);
 static void s3_quic_key_update_handler(s3_event_t *ev);
 
-/*
- * the local counterpart of ngx_cmp_sockaddr(); the os layer version
- * arrives in D3 together with the listener lookup
- */
 static s3_int_t s3_quic_cmp_sockaddr(struct sockaddr *sa1, socklen_t len1, struct sockaddr *sa2,
                                      socklen_t len2);
+
+static s3_int_t s3_quic_memn2cmp(u_char *s1, u_char *s2, size_t n1, size_t n2);
 
 s3_int_t
 s3_quic_apply_transport_params(s3_connection_t *c, s3_quic_tp_t *ctp)
@@ -130,6 +130,12 @@ s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf)
     /* quic connection is now created */
     qc = s3_quic_get_connection(c);
 
+    /*
+     * the subsequent datagrams of the connection are delivered by the
+     * listener through the quic socket (porting map 4.3.3)
+     */
+    c->recv = s3_quic_shared_recv;
+
     s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
 
     if (!qc->streams.initialized) {
@@ -157,6 +163,11 @@ s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_
     if (qc->keys == NULL) {
         return NULL;
     }
+
+    /* the reference accepts client Initial packets only, so the role is
+     * a server one; qc->client is already 0 from s3_pcalloc() */
+
+    qc->keys->is_client = 0;
 
     qc->version = pkt->version;
 
@@ -187,12 +198,12 @@ s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_
     qc->ctx = conf->ctx;
 
     /*
-     * the pto handler lives in s3_quic_ack.c (D3); the timer is not
-     * armed until the loss detection arrives
+     * the pto event doubles as the loss detection timer
+     * (s3_quic_ack.c: s3_quic_set_lost_timer())
      */
     qc->pto.log = c->log;
     qc->pto.data = c;
-    qc->pto.handler = NULL;
+    qc->pto.handler = s3_quic_pto_handler;
 
     qc->push.log = c->log;
     qc->push.data = c;
@@ -367,14 +378,19 @@ s3_quic_open_sockets(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_heade
         goto failed;
     }
 
+    /* the listener backlink was consumed by the socket registrations */
+    c->data = NULL;
+
     return S3_OK;
 
 failed:
 
-    /*
-     * the reference removes the socket from the listener rbtree here
-     * (D3, s3_quic_socket.c)
-     */
+    /* the socket may be registered in the listener rbtree already */
+    if (qsock->listen != NULL) {
+        s3_rbtree_delete(&qsock->listen->rbtree, &qsock->node);
+    }
+
+    c->data = NULL;
     c->udp = NULL;
 
     return S3_ERROR;
@@ -423,10 +439,10 @@ s3_quic_close_socket(s3_connection_t *c, s3_quic_socket_t *qsock)
     s3_queue_remove(&qsock->queue);
     s3_queue_insert_head(&qc->free_sockets, &qsock->queue);
 
-    /*
-     * the reference removes the socket from the listener rbtree here
-     * (D3, s3_quic_socket.c)
-     */
+    if (qsock->listen != NULL) {
+        s3_rbtree_delete(&qsock->listen->rbtree, &qsock->node);
+        qsock->listen = NULL;
+    }
 
     qc->nsockets--;
 
@@ -448,11 +464,18 @@ s3_quic_listen(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_socket_t *q
     qsock->connection = c;
 
     /*
-     * D3 registers the socket in the listener rbtree here:
-     * node.key = crc32 of the id, the lookup compares the sid bytes
-     * (the reference ngx_quic_listen() + ngx_event_quic_udp.c)
+     * the quic socket is registered in the listener rbtree: the node
+     * key is the crc32 of the id, the lookup compares the sid bytes
+     * (the reference ngx_quic_listen() + ngx_event_quic_udp.c); the
+     * client role has no listener and keeps the socket unregistered
      */
-    qsock->node.key = 0;
+    qsock->listen = (s3_udp_listen_t *)c->data;
+
+    if (qsock->listen != NULL) {
+        qsock->node.key = s3_crc32_long(id.data, id.len);
+
+        s3_rbtree_insert(&qsock->listen->rbtree, &qsock->node);
+    }
 
     s3_queue_insert_tail(&qc->sockets, &qsock->queue);
 
@@ -634,7 +657,6 @@ s3_quic_input_handler(s3_event_t *rev)
     s3_int_t              rc;
     s3_buf_t              b;
     s3_connection_t      *c;
-    s3_quic_socket_t     *qsock;
     s3_quic_connection_t *qc;
 
     static u_char buffer[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
@@ -657,23 +679,19 @@ s3_quic_input_handler(s3_event_t *rev)
      */
 
     if (c->recv == NULL || qc == NULL) {
-        /* D3 wires the datagram delivery from the listener */
+        /* the first datagram of a server connection goes through c->buffer */
         return;
     }
 
-    /* the reference reads the datagram from qsock->buffer; the P1
-     * delivery model hands it over through c->recv() */
+    /*
+     * the datagram was staged by the listener into the quic socket
+     * (or read from the client socket); the per-datagram peer address
+     * is kept in qsock->sockaddr by the listener
+     */
 
     n = c->recv(c, buffer, sizeof(buffer));
     if (n <= 0) {
         return;
-    }
-
-    qsock = s3_quic_get_socket(c);
-
-    if (qsock != NULL && c->sockaddr != NULL && c->socklen <= sizeof(struct sockaddr_storage)) {
-        s3_memcpy(&qsock->sockaddr, c->sockaddr, c->socklen);
-        qsock->socklen = c->socklen;
     }
 
     s3_memzero(&b, sizeof(s3_buf_t));
@@ -772,11 +790,7 @@ s3_quic_close_connection(s3_connection_t *c, s3_int_t rc)
 
                 qc->error_level = ctx->level;
 
-                /*
-                 * the reference sends a CONNECTION_CLOSE packet here
-                 * (D3, s3_quic_output.c: s3_quic_send_cc()); until then
-                 * the peer discovers the close by its own idle timeout
-                 */
+                (void)s3_quic_send_cc(c);
 
                 if (rc == S3_OK) {
                     s3_event_add_timer(&qc->close, 3 * s3_quic_pto(c, ctx));
@@ -966,6 +980,22 @@ s3_quic_handle_datagram(s3_connection_t *c, s3_buf_t *b, s3_quic_conf_t *conf)
     qc = s3_quic_get_connection(c);
 
     if (qc) {
+        /*
+         * RFC 9000, 8.1.  Preventing Amplification Attacks:
+         *
+         * An endpoint MUST limit the number of bytes it sends to three
+         * times the number of bytes it has received; the whole datagram
+         * is accounted once, which is what the reference does in its
+         * set_path() (D4 repeats the accounting for a path discovered
+         * later, s3_quic_migration.c)
+         */
+
+        if (path) {
+            path->received += (off_t)size;
+        } else {
+            qc->path->received += (off_t)size;
+        }
+
         qc->received += (off_t)size;
 
         if ((uint64_t)(c->sent + qc->received) / 8 >
@@ -988,6 +1018,18 @@ s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t
     s3_quic_socket_t     *qsock;
     s3_quic_connection_t *qc;
 
+    qc = s3_quic_get_connection(c);
+
+    /*
+     * the local role is needed by the parser itself: the RFC 9000, 14.1
+     * minimum size of a datagram carrying an Initial packet is enforced
+     * by the endpoint which is amplification limited, that is a server;
+     * a client has to accept short datagrams, a bare Initial ACK from
+     * the server is far below the 1200 bytes
+     */
+
+    pkt->client = (qc && qc->client) ? 1 : 0;
+
     rc = s3_quic_parse_packet(pkt);
 
     if (rc == S3_ERROR) {
@@ -999,17 +1041,12 @@ s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t
     s3_log_debug2(S3_LOG_DEBUG_EVENT, c->log, 0, "quic packet rx dcid len:%uz %xV", pkt->dcid.len,
                   &pkt->dcid);
 
-    qc = s3_quic_get_connection(c);
-
     if (qc) {
 
         if (rc == S3_DECLINED) {
-            /*
-             * the reference negotiates the version here
-             * (D3, s3_quic_output.c: s3_quic_negotiate_version())
-             */
+            /* unsupported version: the packet is long-header and safe to answer */
             s3_log_error(S3_LOG_INFO, c->log, 0, "quic unsupported version: 0x%xD", pkt->version);
-            return S3_DECLINED;
+            return s3_quic_negotiate_version(c, pkt);
         }
 
         if (pkt->level != S3_QUIC_ENCRYPTION_APPLICATION) {
@@ -1019,21 +1056,43 @@ s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t
                 return S3_DECLINED;
             }
 
-            if (pkt->first) {
-                qsock = s3_quic_get_socket(c);
+            if (qc->client) {
 
-                if (qsock->socklen != 0 && qc->path->socklen != 0 &&
-                    s3_quic_cmp_sockaddr((struct sockaddr *)&qsock->sockaddr, qsock->socklen,
-                                         qc->path->sockaddr, qc->path->socklen) != S3_OK) {
-                    /* packet comes from unknown path, possibly migration */
+                /*
+                 * RFC 9000, 7.2.  Negotiating Connection IDs:
+                 * the client moves to the scid of the first Initial
+                 * packet of the server; the transport parameter check
+                 * then matches against it
+                 */
+                if (pkt->level == S3_QUIC_ENCRYPTION_INITIAL && pkt->scid.len > 0 &&
+                    pkt->scid.len <= S3_QUIC_CID_LEN_MAX &&
+                    (qc->path->cid->len != pkt->scid.len ||
+                     s3_memcmp(qc->path->cid->id, pkt->scid.data, pkt->scid.len) != 0)) {
+                    s3_memcpy(qc->path->cid->id, pkt->scid.data, pkt->scid.len);
+                    qc->path->cid->len = pkt->scid.len;
+
                     s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0,
-                                  "quic too early migration attempt");
-                    return S3_ABORT;
+                                  "quic client adopted the peer scid");
                 }
-            }
 
-            if (s3_quic_check_csid(qc, pkt) != S3_OK) {
-                return S3_DECLINED;
+            } else {
+
+                if (pkt->first) {
+                    qsock = s3_quic_get_socket(c);
+
+                    if (qsock->socklen != 0 && qc->path->socklen != 0 &&
+                        s3_quic_cmp_sockaddr((struct sockaddr *)&qsock->sockaddr, qsock->socklen,
+                                             qc->path->sockaddr, qc->path->socklen) != S3_OK) {
+                        /* packet comes from unknown path, possibly migration */
+                        s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0,
+                                      "quic too early migration attempt");
+                        return S3_ABORT;
+                    }
+                }
+
+                if (s3_quic_check_csid(qc, pkt) != S3_OK) {
+                    return S3_DECLINED;
+                }
             }
         }
 
@@ -1057,20 +1116,11 @@ s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t
     /* packet does not belong to a connection */
 
     if (rc == S3_DECLINED) {
-        /*
-         * the reference negotiates the version here
-         * (D3, s3_quic_output.c: s3_quic_negotiate_version())
-         */
-        return S3_DECLINED;
+        return s3_quic_negotiate_version(c, pkt);
     }
 
     if (pkt->level == S3_QUIC_ENCRYPTION_APPLICATION) {
-        /*
-         * the reference sends a stateless reset here
-         * (D3, s3_quic_output.c: s3_quic_send_stateless_reset())
-         */
-        s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic stateless reset not yet (D3)");
-        return S3_DECLINED;
+        return s3_quic_send_stateless_reset(c, conf, pkt);
     }
 
     if (pkt->level != S3_QUIC_ENCRYPTION_INITIAL) {
@@ -1096,33 +1146,27 @@ s3_quic_handle_packet(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t
             return S3_ERROR;
 
         } else if (rc == S3_ABORT) {
-            /* token cannot be decrypted: the reference sends an early
-             * CONNECTION_CLOSE packet (D3, s3_quic_output.c) */
-            return S3_DECLINED;
+            /* token cannot be decrypted */
+            return s3_quic_send_early_cc(c, pkt, S3_QUIC_ERR_INVALID_TOKEN, "invalid token");
 
         } else if (rc == S3_DECLINED) {
             /* token is invalid */
 
             if (pkt->retried) {
-                /* invalid address validation token (D3: send_early_cc) */
-                return S3_DECLINED;
+                return s3_quic_send_early_cc(c, pkt, S3_QUIC_ERR_INVALID_TOKEN, "stale token");
+            }
 
-            } else if (conf->retry) {
-                /* invalid NEW_TOKEN (D3: send_retry) */
-                s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic retry not yet (D3)");
-                return S3_DECLINED;
+            if (conf->retry) {
+                return s3_quic_send_retry(c, conf, pkt);
             }
         }
 
         /* S3_OK */
 
     } else if (conf->retry) {
-        /*
-         * the reference sends a retry packet here
-         * (D3, s3_quic_output.c: s3_quic_send_retry())
-         */
-        s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic retry not yet (D3), accepting packet");
-        pkt->odcid = pkt->dcid;
+        /* no address validation token yet: RFC 9000, 17.2.5.1, the
+         * client repeats the Initial with the retry token */
+        return s3_quic_send_retry(c, conf, pkt);
 
     } else {
         pkt->odcid = pkt->dcid;
@@ -1164,6 +1208,7 @@ s3_quic_handle_payload(s3_connection_t *c, s3_quic_header_t *pkt)
     pkt->keys = qc->keys;
     pkt->key_phase = qc->key_phase;
     pkt->plaintext = buf;
+    pkt->client = qc->client;
 
     ctx = s3_quic_get_send_ctx(qc, pkt->level);
 
@@ -1234,10 +1279,7 @@ s3_quic_handle_payload(s3_connection_t *c, s3_quic_header_t *pkt)
         qc->error_ftype = 0;
         qc->error_app = 0;
 
-        /*
-         * the reference answers with a CONNECTION_CLOSE packet
-         * (D3, s3_quic_output.c: s3_quic_send_cc())
-         */
+        (void)s3_quic_send_cc(c);
 
         return S3_OK;
     }
@@ -1297,10 +1339,8 @@ s3_quic_discard_ctx(s3_connection_t *c, s3_uint_t level)
 
         f = s3_queue_data(q, s3_quic_frame_t, queue);
 
-        /*
-         * the reference returns the frame to the congestion controller
-         * here (D3, s3_quic_ack.c: s3_quic_congestion_ack())
-         */
+        /* the frames were not ack'ed, give the bytes back */
+        s3_quic_congestion_ack(c, f);
 
         s3_quic_free_frame(c, f);
     }
@@ -1323,10 +1363,7 @@ s3_quic_discard_ctx(s3_connection_t *c, s3_uint_t level)
 
     ctx->send_ack = 0;
 
-    /*
-     * the reference re-arms the loss detection timer here
-     * (D3, s3_quic_ack.c: s3_quic_set_lost_timer())
-     */
+    s3_quic_set_lost_timer(c);
 }
 
 static s3_int_t
@@ -1410,13 +1447,15 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
         switch (frame.type) {
 
         case S3_QUIC_FT_ACK:
+        case S3_QUIC_FT_ACK_ECN:
+
+            if (s3_quic_handle_ack_frame(c, pkt, &frame) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            continue;
+
         case S3_QUIC_FT_PADDING:
-            /*
-             * the reference feeds the acknowledgement ranges to the
-             * loss detection here (D3, s3_quic_ack.c:
-             * s3_quic_handle_ack_frame()); padding requires no action;
-             * until D3 both are simply ignored
-             */
             continue;
 
         case S3_QUIC_FT_CONNECTION_CLOSE:
@@ -1447,6 +1486,14 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
         case S3_QUIC_FT_NEW_CONNECTION_ID:
 
             if (s3_quic_handle_new_connection_id_frame(c, &frame.u.ncid) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            break;
+
+        case S3_QUIC_FT_HANDSHAKE_DONE:
+
+            if (s3_quic_handle_hs_done(c) != S3_OK) {
                 return S3_ERROR;
             }
 
@@ -1536,9 +1583,48 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
     }
 
     /*
-     * the reference queues the packet number for acknowledgement here
-     * (D3, s3_quic_ack.c: s3_quic_ack_packet())
+     * the received packet number is queued for acknowledgement
+     * (RFC 9000, 13.2.1.  Sending Acknowledgments)
      */
+    if (s3_quic_ack_packet(c, pkt) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_quic_handle_hs_done(s3_connection_t *c)
+{
+    s3_quic_connection_t *qc;
+
+    qc = s3_quic_get_connection(c);
+
+    if (!qc->client) {
+        /* only a server may send it, s3_quic_frame_allowed() filters the rest */
+
+        qc->error = S3_QUIC_ERR_PROTOCOL_VIOLATION;
+        qc->error_reason = "HANDSHAKE_DONE from a client";
+
+        return S3_ERROR;
+    }
+
+    /*
+     * RFC 9001, 4.1.2.  Handshake Complete
+     *
+     * the handshake is confirmed at 1-RTT: the handshake keys may be
+     * discarded and the loss detection state is reset, an endpoint
+     * confirms a handshake for sending as soon as the handshake
+     * completes
+     */
+
+    if (qc->handshake_confirmed) {
+        return S3_OK;
+    }
+
+    qc->handshake_confirmed = 1;
+
+    s3_quic_discard_ctx(c, S3_QUIC_ENCRYPTION_HANDSHAKE);
 
     return S3_OK;
 }
@@ -1596,13 +1682,15 @@ s3_quic_handle_datagram_frame(s3_connection_t *c, s3_quic_frame_t *frame)
 static void
 s3_quic_push_handler(s3_event_t *ev)
 {
+    s3_connection_t *c;
+
     s3_log_debug0(S3_LOG_DEBUG_EVENT, ev->log, 0, "quic push handler");
 
-    /*
-     * the reference packs the queued frames into packets here
-     * (D3, s3_quic_output.c: s3_quic_output()); until output exists
-     * the queued frames are flushed on the first push of D3
-     */
+    c = ev->data;
+
+    if (s3_quic_output(c) != S3_OK) {
+        s3_quic_close_connection(c, S3_ERROR);
+    }
 }
 
 static void
@@ -1682,22 +1770,352 @@ s3_quic_cmp_sockaddr(struct sockaddr *sa1, socklen_t len1, struct sockaddr *sa2,
     }
 }
 
-static s3_msec_t
-s3_quic_pto(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
+static s3_int_t
+s3_quic_memn2cmp(u_char *s1, u_char *s2, size_t n1, size_t n2)
 {
-    s3_msec_t             duration;
-    s3_quic_connection_t *qc;
+    size_t   n;
+    s3_int_t rc;
 
-    qc = s3_quic_get_connection(c);
+    n = (n1 <= n2) ? n1 : n2;
 
-    /* RFC 9002, appendix A.3; D3 moves this to s3_quic_ack.c */
+    rc = (s3_int_t)s3_memcmp(s1, s2, n);
 
-    duration = qc->avg_rtt;
-    duration += s3_max(4 * qc->rttvar, (s3_msec_t)S3_QUIC_TIME_GRANULARITY);
-
-    if (ctx->level == S3_QUIC_ENCRYPTION_APPLICATION && qc->tp.max_ack_delay < duration / 10) {
-        duration += qc->tp.max_ack_delay;
+    if (rc != 0 || n1 == n2) {
+        return rc;
     }
 
-    return duration;
+    return (n1 < n2) ? -1 : 1;
+}
+
+void
+s3_quic_rbtree_insert_socket(s3_rbtree_node_t *temp, s3_rbtree_node_t *node,
+                             s3_rbtree_node_t *sentinel)
+{
+    s3_int_t           rc;
+    s3_rbtree_node_t **p;
+    s3_quic_socket_t  *qsock, *qsockt;
+
+    for (;;) {
+
+        if (node->key < temp->key) {
+
+            p = &temp->left;
+
+        } else if (node->key > temp->key) {
+
+            p = &temp->right;
+
+        } else { /* node->key == temp->key */
+
+            qsock = (s3_quic_socket_t *)node;
+            qsockt = (s3_quic_socket_t *)temp;
+
+            rc = s3_quic_memn2cmp(qsock->sid.id, qsockt->sid.id, qsock->sid.len, qsockt->sid.len);
+
+            p = (rc < 0) ? &temp->left : &temp->right;
+        }
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    s3_rbt_red(node);
+}
+
+s3_connection_t *
+s3_quic_lookup_connection(s3_udp_listen_t *ul, s3_str_t *key)
+{
+    s3_int_t          rc;
+    s3_connection_t  *c;
+    s3_rbtree_node_t *node, *sentinel;
+    s3_quic_socket_t *qsock;
+    s3_uint32_t       hash;
+
+    if (key->len == 0) {
+        return NULL;
+    }
+
+    node = ul->rbtree.root;
+    sentinel = ul->rbtree.sentinel;
+
+    hash = s3_crc32_long(key->data, key->len);
+
+    while (node != sentinel) {
+
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        /* hash == node->key */
+
+        qsock = (s3_quic_socket_t *)node;
+
+        c = qsock->connection;
+
+        rc = s3_quic_memn2cmp(key->data, qsock->sid.id, key->len, qsock->sid.len);
+
+        if (rc == 0) {
+            return c;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    return NULL;
+}
+
+ssize_t
+s3_quic_shared_recv(s3_connection_t *c, u_char *buf, size_t size)
+{
+    ssize_t           n;
+    s3_quic_socket_t *qsock;
+
+    qsock = s3_quic_get_socket(c);
+
+    if (qsock == NULL || qsock->buffer == NULL) {
+        return (ssize_t)S3_AGAIN;
+    }
+
+    n = (ssize_t)s3_min(qsock->len, size);
+
+    s3_memcpy(buf, qsock->buffer, n);
+
+    qsock->buffer = NULL;
+    qsock->len = 0;
+
+    c->read->ready = 0;
+    c->read->active = 1;
+
+    return n;
+}
+
+s3_int_t
+s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf)
+{
+    s3_uint_t             i;
+    s3_str_t              dcid;
+    s3_quic_tp_t         *ctp;
+    s3_quic_client_id_t  *cid;
+    s3_quic_socket_t     *qsock;
+    s3_quic_connection_t *qc;
+
+    /*
+     * RFC 9000, 17.2.  Constant Size of Connection IDs
+     *
+     * the short header carries no length field for the destination
+     * connection id: both peers have to agree on it beforehand, so the
+     * parser reads S3_QUIC_SERVER_CID_LEN bytes unconditionally and
+     * both sides have to emit a cid of exactly that length
+     */
+
+    u_char dcid_buf[S3_QUIC_SERVER_CID_LEN];
+    u_char scid_buf[S3_QUIC_SERVER_CID_LEN];
+
+    s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic connect");
+
+    if (c->sockaddr == NULL || conf == NULL || conf->ssl == NULL || conf->ctx == NULL) {
+        s3_log_error(S3_LOG_INFO, c->log, 0, "quic connect: invalid configuration");
+        return S3_ERROR;
+    }
+
+    qc = s3_pcalloc(c->pool, sizeof(s3_quic_connection_t));
+    if (qc == NULL) {
+        return S3_ERROR;
+    }
+
+    qc->keys = s3_pcalloc(c->pool, sizeof(s3_quic_keys_t));
+    if (qc->keys == NULL) {
+        return S3_ERROR;
+    }
+
+    qc->client = 1;
+    qc->keys->is_client = 1;
+    qc->version = S3_QUIC_VERSION;
+
+    s3_queue_init(&qc->sockets);
+    s3_queue_init(&qc->free_sockets);
+
+    s3_queue_init(&qc->paths);
+    s3_queue_init(&qc->free_paths);
+
+    s3_queue_init(&qc->client_ids);
+    s3_queue_init(&qc->free_client_ids);
+
+    s3_rbtree_init(&qc->streams.tree, &qc->streams.sentinel, s3_rbtree_insert_value);
+
+    for (i = 0; i < S3_QUIC_SEND_CTX_LAST; i++) {
+        s3_queue_init(&qc->send_ctx[i].frames);
+        s3_queue_init(&qc->send_ctx[i].sending);
+        s3_queue_init(&qc->send_ctx[i].sent);
+        qc->send_ctx[i].largest_pn = S3_QUIC_UNSET_PN;
+        qc->send_ctx[i].largest_ack = S3_QUIC_UNSET_PN;
+        qc->send_ctx[i].largest_range = S3_QUIC_UNSET_PN;
+        qc->send_ctx[i].pending_ack = S3_QUIC_UNSET_PN;
+    }
+
+    qc->send_ctx[0].level = S3_QUIC_ENCRYPTION_INITIAL;
+    qc->send_ctx[1].level = S3_QUIC_ENCRYPTION_HANDSHAKE;
+    qc->send_ctx[2].level = S3_QUIC_ENCRYPTION_APPLICATION;
+
+    s3_queue_init(&qc->free_frames);
+
+    s3_quic_init_rtt(qc);
+
+    qc->ctx = conf->ctx;
+
+    qc->pto.log = c->log;
+    qc->pto.data = c;
+    qc->pto.handler = s3_quic_pto_handler;
+
+    qc->push.log = c->log;
+    qc->push.data = c;
+    qc->push.handler = s3_quic_push_handler;
+
+    qc->close.log = c->log;
+    qc->close.data = c;
+    qc->close.handler = s3_quic_close_handler;
+
+    qc->path_validation.log = c->log;
+    qc->path_validation.data = c;
+    qc->path_validation.handler = NULL;
+
+    qc->key_update.log = c->log;
+    qc->key_update.data = c;
+    qc->key_update.handler = s3_quic_key_update_handler;
+
+    qc->conf = conf;
+
+    if (s3_quic_init_transport_params(&qc->tp, conf) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    ctp = &qc->ctp;
+
+    /* defaults to be used before actual server parameters are received */
+    ctp->max_udp_payload_size = S3_QUIC_MAX_UDP_PAYLOAD_SIZE;
+    ctp->ack_delay_exponent = S3_QUIC_DEFAULT_ACK_DELAY_EXPONENT;
+    ctp->max_ack_delay = S3_QUIC_DEFAULT_MAX_ACK_DELAY;
+    ctp->active_connection_id_limit = 2;
+
+    s3_queue_init(&qc->streams.uninitialized);
+    s3_queue_init(&qc->streams.free);
+
+    qc->streams.recv_max_data = qc->tp.initial_max_data;
+    qc->streams.recv_window = qc->streams.recv_max_data;
+
+    qc->streams.client_max_streams_uni = qc->tp.initial_max_streams_uni;
+    qc->streams.client_max_streams_bidi = qc->tp.initial_max_streams_bidi;
+
+    qc->congestion.window =
+        s3_min(10 * S3_QUIC_MIN_INITIAL_SIZE, s3_max(2 * S3_QUIC_MIN_INITIAL_SIZE, 14720));
+    qc->congestion.ssthresh = (size_t)-1;
+    qc->congestion.mtu = S3_QUIC_MIN_INITIAL_SIZE;
+    qc->congestion.recovery_start = s3_current_msec - 1;
+
+    qc->max_frames = (conf->max_concurrent_streams_uni + conf->max_concurrent_streams_bidi) *
+                     conf->stream_buffer_size / 2000;
+    qc->max_frames = s3_max(qc->max_frames, 10000);
+
+    /*
+     * RFC 9000, 7.2.  Negotiating Connection IDs:
+     * the client generates the dcid the first Initial packet is sent
+     * to and its own scid
+     */
+
+    if (RAND_bytes(dcid_buf, sizeof(dcid_buf)) != 1) {
+        goto failed;
+    }
+
+    if (RAND_bytes(scid_buf, sizeof(scid_buf)) != 1) {
+        goto failed;
+    }
+
+    dcid.data = dcid_buf;
+    dcid.len = sizeof(dcid_buf);
+
+    if (s3_quic_keys_set_initial_secret(qc->keys, &dcid, c->log) != S3_OK) {
+        goto failed;
+    }
+
+    /* the anchor socket: our side of the connection (unregistered) */
+    qsock = s3_pcalloc(c->pool, sizeof(s3_quic_socket_t));
+    if (qsock == NULL) {
+        goto failed;
+    }
+
+    qsock->sid.seqnum = qc->server_seqnum++;
+    qsock->sid.len = sizeof(scid_buf);
+    s3_memcpy(qsock->sid.id, scid_buf, sizeof(scid_buf));
+
+    if (s3_quic_listen(c, qc, qsock) != S3_OK) {
+        goto failed;
+    }
+
+    qsock->used = 1;
+
+    qc->tp.initial_scid.len = qsock->sid.len;
+    qc->tp.initial_scid.data = s3_pnalloc(c->pool, qsock->sid.len);
+    if (qc->tp.initial_scid.data == NULL) {
+        goto failed;
+    }
+
+    s3_memcpy(qc->tp.initial_scid.data, qsock->sid.id, qsock->sid.len);
+
+    c->udp = (struct s3_udp_connection_s *)qsock;
+
+    /* the peer id the path is addressed by until the server answers */
+    cid = s3_quic_create_client_id(c, &dcid, 0, NULL);
+    if (cid == NULL) {
+        goto failed;
+    }
+
+    qc->path = s3_quic_new_path(c, c->sockaddr, c->socklen, cid);
+    if (qc->path == NULL) {
+        goto failed;
+    }
+
+    qc->path->tag = S3_QUIC_PATH_ACTIVE;
+
+    /* the client is not subject to the amplification limit */
+    qc->path->validated = 1;
+
+    qc->reusable = 1;
+
+    if (s3_quic_client_init_connection(c) != S3_OK) {
+        goto failed;
+    }
+
+    c->recv = s3_udp_recv;
+
+    s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
+    s3_event_add_timer(&qc->close, qc->conf->handshake_timeout);
+
+    c->read->handler = s3_quic_input_handler;
+
+    /* the ClientHello goes out with the first output */
+    if (s3_quic_handshake(c) != S3_OK) {
+        s3_quic_close_connection(c, S3_ERROR);
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+
+failed:
+
+    s3_quic_keys_cleanup(qc->keys);
+
+    return S3_ERROR;
 }

@@ -150,6 +150,14 @@ typedef struct {
     s3_rbtree_t              rbtree;  /* the pseudo connections */
     s3_rbtree_node_t         sentinel;
     unsigned                 wildcard : 1;
+
+    /*
+     * the quic listener: the rbtree is keyed by the packet dcid
+     * (s3_quic_rbtree_insert_socket / s3_quic_lookup_connection) and
+     * holds s3_quic_socket_t nodes instead of the sockaddr-keyed P1
+     * pseudo connections (porting map 1.12.3)
+     */
+    unsigned quic : 1;
 } s3_udp_listen_t;
 
 void    s3_event_recvmsg(s3_event_t *ev);

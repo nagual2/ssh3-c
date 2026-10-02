@@ -11,6 +11,15 @@
 
 s3_int_t s3_quic_init_connection(s3_connection_t *c);
 
+/* the client role ssl setup (s3_quic_connect) */
+s3_int_t s3_quic_client_init_connection(s3_connection_t *c);
+
+/*
+ * drives SSL_do_handshake(); the CRYPTO records produced by the
+ * callbacks are queued as CRYPTO frames
+ */
+s3_int_t s3_quic_handshake(s3_connection_t *c);
+
 s3_int_t s3_quic_handle_crypto_frame(s3_connection_t *c, s3_quic_header_t *pkt,
                                      s3_quic_frame_t *frame);
 

@@ -9,13 +9,50 @@ set(CMAKE_C_EXTENSIONS OFF)
 # XSI strerror_r (int return), posix_memalign, sysconf, STDERR_FILENO.
 add_compile_definitions(_POSIX_C_SOURCE=200809L)
 
+include(CheckCSourceCompiles)
+
+# the UDP GSO (man 7 udp UDP_SEGMENT) support, like NGX_HAVE_UDP_SEGMENT
+check_c_source_compiles(
+    "
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <netinet/udp.h>
+    int main(void) {
+        struct cmsghdr *cmsg = 0;
+        (void) cmsg->cmsg_level = SOL_UDP;
+        (void) cmsg->cmsg_type = UDP_SEGMENT;
+        return 0;
+    }
+    "
+    S3_HAVE_UDP_SEGMENT)
+
+# the local address ancillary data, like NGX_HAVE_ADDRINFO_CMSG
+check_c_source_compiles(
+    "
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    int main(void) {
+        struct cmsghdr *cmsg = 0;
+        (void) cmsg->cmsg_level = SOL_IP;
+        (void) cmsg->cmsg_type = IP_PKTINFO;
+#ifdef IPV6_RECVPKTINFO
+        return 0;
+#else
+        return 1;
+#endif
+    }
+    "
+    S3_HAVE_ADDRINFO_CMSG)
+
 set(S3_CORE_SOURCES
     src/core/s3_string.c
     src/core/s3_palloc.c
     src/core/s3_buf.c
     src/core/s3_rbtree.c
     src/core/s3_log.c
+    src/core/s3_crc32.c
     src/os/unix/s3_errno.c
+    src/os/unix/s3_cmsg.c
     src/event/s3_event.c
     src/event/s3_event_posted.c
     src/event/s3_event_timer.c
@@ -32,6 +69,8 @@ set(S3_CORE_SOURCES
     src/event/quic/s3_ssl.c
     src/event/quic/s3_quic_ssl.c
     src/event/quic/s3_quic.c
+    src/event/quic/s3_quic_output.c
+    src/event/quic/s3_quic_ack.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -43,6 +82,14 @@ target_include_directories(s3core
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event/quic
         ${CMAKE_CURRENT_SOURCE_DIR}/src/os/unix
 )
+
+if(S3_HAVE_UDP_SEGMENT)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_UDP_SEGMENT=1)
+endif()
+
+if(S3_HAVE_ADDRINFO_CMSG)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_ADDRINFO_CMSG=1)
+endif()
 
 target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
 
@@ -80,6 +127,9 @@ set(S3_TESTS
     test_quic_tokens
     test_quic_ssl
     test_quic_core
+    test_quic_output
+    test_quic_ack
+    test_quic_e2e
 )
 
 enable_testing()

@@ -13,6 +13,18 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
+/*
+ * the quic listener branch keys the rbtree by the packet dcid and
+ * hands the datagrams over through the quic sockets
+ * (porting map 1.12.3)
+ */
+#include <s3_quic.h>
+#include <s3_quic_connection.h>
+
+#if (S3_HAVE_ADDRINFO_CMSG)
+#include <s3_cmsg.h>
+#endif
+
 #define S3_UDP_DGRAM_SIZE 65535
 
 /* the raw sockaddr fallback key is bounded by sockaddr_storage */
@@ -30,6 +42,12 @@ struct s3_udp_connection_s {
     u_char          *buffer;
     size_t           len;
 };
+
+static s3_int_t s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul,
+                                struct msghdr *msg, u_char *buffer, ssize_t n,
+                                struct sockaddr *sockaddr, socklen_t socklen);
+static void     s3_quic_deliver(s3_connection_t *c, u_char *buffer, ssize_t n,
+                                struct sockaddr *sockaddr, socklen_t socklen);
 
 static void             s3_close_accepted_udp_connection(s3_connection_t *c);
 static s3_int_t         s3_insert_udp_connection(s3_udp_listen_t *ul, s3_connection_t *c);
@@ -57,6 +75,15 @@ s3_event_recvmsg(s3_event_t *ev)
     s3_connection_t        *c, *lc;
     static u_char           buffer[S3_UDP_DGRAM_SIZE];
 
+#if (S3_HAVE_ADDRINFO_CMSG)
+    /* the local address ancillary data of a wildcard listener */
+    u_char msg_control[CMSG_SPACE(sizeof(struct in_pktinfo))
+#if defined(IPV6_RECVPKTINFO)
+                       + CMSG_SPACE(sizeof(struct in6_pktinfo))
+#endif
+    ];
+#endif
+
     lc = (s3_connection_t *)ev->data;
     ul = (s3_udp_listen_t *)lc->data;
     ctx = ul->ctx;
@@ -72,6 +99,14 @@ s3_event_recvmsg(s3_event_t *ev)
     msg.msg_namelen = sizeof(sa);
     msg.msg_iov = iov;
     msg.msg_iovlen = 1;
+
+#if (S3_HAVE_ADDRINFO_CMSG)
+    if (ul->wildcard && ul->quic) {
+        msg.msg_control = msg_control;
+        msg.msg_controllen = sizeof(msg_control);
+        s3_memzero(msg_control, sizeof(msg_control));
+    }
+#endif
 
     n = recvmsg(lc->fd, &msg, 0);
 
@@ -105,6 +140,11 @@ s3_event_recvmsg(s3_event_t *ev)
         socklen = sizeof(struct sockaddr);
         s3_memzero(&sa, sizeof(struct sockaddr));
         sa.ss_family = lc->sockaddr != NULL ? lc->sockaddr->sa_family : AF_INET;
+    }
+
+    if (ul->quic) {
+        (void)s3_quic_recvmsg(ev, lc, ul, &msg, buffer, n, sockaddr, socklen);
+        return;
     }
 
     c = s3_lookup_udp_connection(ul, lc, sockaddr, socklen);
@@ -213,6 +253,207 @@ s3_event_recvmsg(s3_event_t *ev)
     wev->log = log;
 
     ul->handler(c);
+}
+
+/*
+ * the quic branch of the datagram delivery: the connection is looked
+ * up by the dcid of the first packet; a known connection gets the
+ * datagram through its quic socket, a new one is passed to the
+ * listener handler with the datagram in c->buffer
+ * (the reference ngx_event_quic_udp.c)
+ */
+static s3_int_t
+s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul, struct msghdr *msg,
+                u_char *buffer, ssize_t n, struct sockaddr *sockaddr, socklen_t socklen)
+{
+    s3_log_t        *log;
+    s3_str_t         key;
+    s3_event_t      *rev, *wev;
+    s3_buf_t        *b;
+    s3_connection_t *c;
+
+#if (S3_HAVE_ADDRINFO_CMSG)
+    struct cmsghdr         *cmsg;
+    struct sockaddr_storage lsa;
+    socklen_t               local_socklen;
+    s3_uint_t               have_lsa;
+
+    have_lsa = 0;
+
+    if (ul->wildcard && msg->msg_control != NULL) {
+
+        s3_memzero(&lsa, sizeof(lsa));
+
+        if (lc->sockaddr != NULL) {
+            s3_memcpy(&lsa, lc->sockaddr, lc->socklen);
+
+        } else {
+            lsa.ss_family = sockaddr->sa_family;
+        }
+
+        for (cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+            if (s3_get_srcaddr_cmsg(cmsg, (struct sockaddr *)&lsa) != 0) {
+                have_lsa = 1;
+                break;
+            }
+        }
+    }
+
+#else
+    (void)msg;
+    (void)lc;
+#endif
+
+    if (s3_quic_get_packet_dcid(ev->log, buffer, (size_t)n, &key) != S3_OK) {
+        /* a malformed datagram cannot be routed to a connection */
+        return S3_OK;
+    }
+
+    c = s3_quic_lookup_connection(ul, &key);
+
+    if (c != NULL) {
+
+        s3_quic_deliver(c, buffer, n, sockaddr, socklen);
+
+        return S3_OK;
+    }
+
+    /* a new quic client */
+
+    c = s3_get_connection(ul->ctx, lc->fd);
+    if (c == NULL) {
+        return S3_ERROR;
+    }
+
+    c->shared = 1;
+
+    c->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, ev->log);
+    if (c->pool == NULL) {
+        s3_close_accepted_udp_connection(c);
+        return S3_ERROR;
+    }
+
+    c->sockaddr = (struct sockaddr *)s3_palloc(c->pool, socklen);
+    if (c->sockaddr == NULL) {
+        s3_close_accepted_udp_connection(c);
+        return S3_ERROR;
+    }
+
+    s3_memcpy(c->sockaddr, sockaddr, socklen);
+    c->socklen = socklen;
+
+    log = (s3_log_t *)s3_palloc(c->pool, sizeof(s3_log_t));
+    if (log == NULL) {
+        s3_close_accepted_udp_connection(c);
+        return S3_ERROR;
+    }
+
+    *log = *ev->log;
+
+    c->log = log;
+    c->pool->log = log;
+
+    c->send_chain = s3_udp_sendmsg_chain;
+    /* c->recv is installed by s3_quic_run() (s3_quic_shared_recv) */
+
+#if (S3_HAVE_ADDRINFO_CMSG)
+    if (have_lsa) {
+
+        c->local_sockaddr = (struct sockaddr *)s3_palloc(c->pool, socklen);
+        if (c->local_sockaddr == NULL) {
+            s3_close_accepted_udp_connection(c);
+            return S3_ERROR;
+        }
+
+        local_socklen =
+            (lsa.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+        s3_memcpy(c->local_sockaddr, &lsa, local_socklen);
+        c->local_socklen = local_socklen;
+
+    } else
+#endif
+    {
+        /* the local address of the listener */
+        if (lc->sockaddr != NULL) {
+            c->local_sockaddr = (struct sockaddr *)s3_palloc(c->pool, lc->socklen);
+            if (c->local_sockaddr == NULL) {
+                s3_close_accepted_udp_connection(c);
+                return S3_ERROR;
+            }
+
+            s3_memcpy(c->local_sockaddr, lc->sockaddr, lc->socklen);
+            c->local_socklen = lc->socklen;
+        }
+    }
+
+    /* the first datagram is copied into the connection pool memory */
+
+    b = s3_pcalloc(c->pool, sizeof(s3_buf_t));
+    if (b == NULL) {
+        s3_close_accepted_udp_connection(c);
+        return S3_ERROR;
+    }
+
+    b->temporary = 1;
+    b->start = s3_palloc(c->pool, n);
+    if (b->start == NULL) {
+        s3_close_accepted_udp_connection(c);
+        return S3_ERROR;
+    }
+
+    b->pos = b->start;
+    b->last = s3_cpymem(b->start, buffer, n);
+    b->end = b->last;
+
+    c->buffer = b;
+
+    /* the listener backlink consumed by s3_quic_listen() */
+    c->data = ul;
+
+    rev = c->read;
+    wev = c->write;
+
+    rev->active = 1;
+    wev->ready = 1;
+
+    rev->log = log;
+    wev->log = log;
+
+    ul->handler(c);
+
+    return S3_OK;
+}
+
+static void
+s3_quic_deliver(s3_connection_t *c, u_char *buffer, ssize_t n, struct sockaddr *sockaddr,
+                socklen_t socklen)
+{
+    s3_event_t       *rev;
+    s3_quic_socket_t *qsock;
+
+    qsock = (s3_quic_socket_t *)c->udp;
+
+    s3_memcpy(&qsock->sockaddr, sockaddr, socklen);
+    qsock->socklen = socklen;
+
+    qsock->buffer = buffer;
+    qsock->len = n;
+
+    rev = c->read;
+
+    rev->ready = 1;
+    rev->active = 0;
+
+    rev->handler(rev);
+
+    if (c->udp != NULL) {
+        qsock = (s3_quic_socket_t *)c->udp;
+        qsock->buffer = NULL;
+        qsock->len = 0;
+    }
+
+    rev->ready = 0;
+    rev->active = 1;
 }
 
 static void

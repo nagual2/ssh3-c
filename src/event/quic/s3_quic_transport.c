@@ -73,10 +73,12 @@ static size_t   s3_quic_create_max_stream_data(u_char *p, s3_quic_max_stream_dat
 static size_t   s3_quic_create_max_data(u_char *p, s3_quic_max_data_frame_t *md);
 static size_t   s3_quic_create_datagram(u_char *p, s3_quic_frame_t *f);
 static size_t   s3_quic_create_path_challenge(u_char *p, s3_quic_path_challenge_frame_t *pc);
-static size_t   s3_quic_create_path_response(u_char *p, s3_quic_path_challenge_frame_t *pc);
-static size_t   s3_quic_create_new_connection_id(u_char *p, s3_quic_new_conn_id_frame_t *rcid);
-static size_t   s3_quic_create_retire_connection_id(u_char *p, s3_quic_retire_cid_frame_t *rcid);
-static size_t   s3_quic_create_close(u_char *p, s3_quic_frame_t *f);
+
+static s3_uint_t s3_quic_tp_sr_token_set(const s3_quic_tp_t *tp);
+static size_t    s3_quic_create_path_response(u_char *p, s3_quic_path_challenge_frame_t *pc);
+static size_t    s3_quic_create_new_connection_id(u_char *p, s3_quic_new_conn_id_frame_t *rcid);
+static size_t    s3_quic_create_retire_connection_id(u_char *p, s3_quic_retire_cid_frame_t *rcid);
+static size_t    s3_quic_create_close(u_char *p, s3_quic_frame_t *f);
 
 static s3_int_t s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id,
                                               s3_quic_tp_t *dst);
@@ -369,7 +371,17 @@ s3_quic_parse_long_header_v1(s3_quic_header_t *pkt)
 
     if (s3_quic_pkt_in(pkt->flags)) {
 
-        if (pkt->len < S3_QUIC_MIN_INITIAL_SIZE) {
+        /*
+         * RFC 9000, 14.1.  Initial Packet:
+         *
+         * A server MUST discard an Initial packet that is carried in a
+         * UDP datagram with a payload that is smaller than 1200 bytes.
+         * The same is not required of a client: only the amplification
+         * limited side enforces the size, and a peer is free to answer
+         * with a bare Initial ACK well below that limit
+         */
+
+        if (!pkt->client && pkt->len < S3_QUIC_MIN_INITIAL_SIZE) {
             s3_log_error(S3_LOG_INFO, pkt->log, 0,
                          "quic UDP datagram is too small for initial packet");
             return S3_DECLINED;
@@ -1063,6 +1075,12 @@ s3_quic_parse_frame(s3_quic_header_t *pkt, u_char *start, u_char *end, s3_quic_f
 
         break;
 
+    case S3_QUIC_FT_HANDSHAKE_DONE:
+
+        /* the frame carries no payload; the reference never parses it */
+
+        break;
+
     default:
         s3_log_error(S3_LOG_INFO, pkt->log, 0, "quic unknown frame type 0x%xi", f->type);
         return S3_ERROR;
@@ -1164,6 +1182,19 @@ s3_quic_frame_allowed(s3_quic_header_t *pkt, s3_uint_t frame_type)
 
     } else {
         ptype = 1; /* application data */
+    }
+
+    /*
+     * RFC 9000, 19.20.  HANDSHAKE_DONE
+     *
+     * the table denies the frame to every packet type: it is defined
+     * for the server only and the reference never has to check the
+     * opposite direction, a client has to accept it exactly once in a
+     * 1-RTT packet to confirm the handshake (RFC 9001, 4.1.2)
+     */
+
+    if (frame_type == S3_QUIC_FT_HANDSHAKE_DONE && pkt->client && ptype == 1) {
+        return S3_OK;
     }
 
     if (ptype & s3_quic_frame_masks[frame_type]) {
@@ -1759,10 +1790,20 @@ s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id, s3_quic_tp_t 
         break;
 
     case S3_QUIC_TP_INITIAL_SCID:
+    case S3_QUIC_TP_ORIGINAL_DCID:
+    case S3_QUIC_TP_RETRY_SCID:
 
         str.len = end - p;
         str.data = p;
         break;
+
+    case S3_QUIC_TP_SR_TOKEN:
+
+        if (end - p != S3_QUIC_SR_TOKEN_LEN) {
+            return S3_ERROR;
+        }
+        s3_memcpy(dst->sr_token, p, S3_QUIC_SR_TOKEN_LEN);
+        return S3_OK;
 
     default:
         return S3_DECLINED;
@@ -1822,6 +1863,14 @@ s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id, s3_quic_tp_t 
         dst->initial_scid = str;
         break;
 
+    case S3_QUIC_TP_ORIGINAL_DCID:
+        dst->original_dcid = str;
+        break;
+
+    case S3_QUIC_TP_RETRY_SCID:
+        dst->retry_scid = str;
+        break;
+
     default:
         return S3_ERROR;
     }
@@ -1830,7 +1879,8 @@ s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id, s3_quic_tp_t 
 }
 
 s3_int_t
-s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_t *log)
+s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_t *log,
+                               s3_uint_t client)
 {
     uint64_t id, len;
     s3_int_t rc;
@@ -1842,11 +1892,22 @@ s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_
             return S3_ERROR;
         }
 
+        /*
+         * RFC 9000, 7.3.  The reference is a server and so rejects the
+         * server-only parameters in any peer; a client expects them
+         * instead and validates the values in s3_quic_apply_transport_params()
+         */
+
         switch (id) {
         case S3_QUIC_TP_ORIGINAL_DCID:
         case S3_QUIC_TP_PREFERRED_ADDRESS:
         case S3_QUIC_TP_RETRY_SCID:
         case S3_QUIC_TP_SR_TOKEN:
+
+            if (client) {
+                break;
+            }
+
             s3_log_error(S3_LOG_INFO, log, 0,
                          "quic client sent forbidden transport param"
                          " id:0x%xL",
@@ -2058,16 +2119,28 @@ s3_quic_create_transport_params(u_char *pos, u_char *end, s3_quic_tp_t *tp, size
         len += s3_quic_tp_len(S3_QUIC_TP_MAX_DATAGRAM_FRAME_SIZE, tp->max_datagram_frame_size);
     }
 
-    len += s3_quic_tp_strlen(S3_QUIC_TP_ORIGINAL_DCID, tp->original_dcid);
-    len += s3_quic_tp_strlen(S3_QUIC_TP_INITIAL_SCID, tp->initial_scid);
+    /*
+     * the original_dcid, retry_scid and sr_token parameters are only
+     * sent by servers (RFC 9000, 18.2); the client role leaves them
+     * empty and the encoder skips them
+     */
+    if (tp->original_dcid.len) {
+        len += s3_quic_tp_strlen(S3_QUIC_TP_ORIGINAL_DCID, tp->original_dcid);
+    }
+
+    if (tp->initial_scid.len) {
+        len += s3_quic_tp_strlen(S3_QUIC_TP_INITIAL_SCID, tp->initial_scid);
+    }
 
     if (tp->retry_scid.len) {
         len += s3_quic_tp_strlen(S3_QUIC_TP_RETRY_SCID, tp->retry_scid);
     }
 
-    len += s3_quic_varint_len(S3_QUIC_TP_SR_TOKEN);
-    len += s3_quic_varint_len(S3_QUIC_SR_TOKEN_LEN);
-    len += S3_QUIC_SR_TOKEN_LEN;
+    if (s3_quic_tp_sr_token_set(tp)) {
+        len += s3_quic_varint_len(S3_QUIC_TP_SR_TOKEN);
+        len += s3_quic_varint_len(S3_QUIC_SR_TOKEN_LEN);
+        len += S3_QUIC_SR_TOKEN_LEN;
+    }
 
     if (pos == NULL) {
         return len;
@@ -2108,18 +2181,39 @@ s3_quic_create_transport_params(u_char *pos, u_char *end, s3_quic_tp_t *tp, size
         s3_quic_tp_vint(S3_QUIC_TP_MAX_DATAGRAM_FRAME_SIZE, tp->max_datagram_frame_size);
     }
 
-    s3_quic_tp_str(S3_QUIC_TP_ORIGINAL_DCID, tp->original_dcid);
-    s3_quic_tp_str(S3_QUIC_TP_INITIAL_SCID, tp->initial_scid);
+    if (tp->original_dcid.len) {
+        s3_quic_tp_str(S3_QUIC_TP_ORIGINAL_DCID, tp->original_dcid);
+    }
+
+    if (tp->initial_scid.len) {
+        s3_quic_tp_str(S3_QUIC_TP_INITIAL_SCID, tp->initial_scid);
+    }
 
     if (tp->retry_scid.len) {
         s3_quic_tp_str(S3_QUIC_TP_RETRY_SCID, tp->retry_scid);
     }
 
-    s3_quic_build_int(&p, S3_QUIC_TP_SR_TOKEN);
-    s3_quic_build_int(&p, S3_QUIC_SR_TOKEN_LEN);
-    p = s3_cpymem(p, tp->sr_token, S3_QUIC_SR_TOKEN_LEN);
+    if (s3_quic_tp_sr_token_set(tp)) {
+        s3_quic_build_int(&p, S3_QUIC_TP_SR_TOKEN);
+        s3_quic_build_int(&p, S3_QUIC_SR_TOKEN_LEN);
+        p = s3_cpymem(p, tp->sr_token, S3_QUIC_SR_TOKEN_LEN);
+    }
 
     return p - pos;
+}
+
+static s3_uint_t
+s3_quic_tp_sr_token_set(const s3_quic_tp_t *tp)
+{
+    s3_uint_t i, v;
+
+    v = 0;
+
+    for (i = 0; i < S3_QUIC_SR_TOKEN_LEN; i++) {
+        v |= tp->sr_token[i];
+    }
+
+    return v;
 }
 
 static size_t
@@ -2155,7 +2249,10 @@ s3_quic_create_close(u_char *p, s3_quic_frame_t *f)
     }
 
     s3_quic_build_int(&p, cl->reason.len);
-    p = s3_cpymem(p, cl->reason.data, cl->reason.len);
+
+    if (cl->reason.len) {
+        p = s3_cpymem(p, cl->reason.data, cl->reason.len);
+    }
 
     return p - start;
 }

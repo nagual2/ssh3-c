@@ -132,6 +132,7 @@ s3_quic_keys_set_initial_secret(s3_quic_keys_t *keys, s3_str_t *secret, s3_log_t
     size_t            is_len;
     uint8_t           is[SHA256_DIGEST_LENGTH];
     s3_str_t          iss;
+    s3_int_t          client_enc;
     s3_uint_t         i;
     const EVP_MD     *digest;
     s3_quic_md_t      client_key, server_key;
@@ -197,11 +198,20 @@ s3_quic_keys_set_initial_secret(s3_quic_keys_t *keys, s3_str_t *secret, s3_log_t
         return S3_ERROR;
     }
 
-    if (s3_quic_crypto_init(ciphers.c, client, &client_key, 0, log) == S3_ERROR) {
-        return S3_ERROR;
+    /*
+     * RFC 9001, 5.1: a peer protects its outgoing packets with the key
+     * it writes and opens the ones the peer writes.  nginx runs a
+     * server only, so it hardwires client=read and server=write; a
+     * client connection (ssh3-c) mirrors the mapping.
+     */
+
+    client_enc = keys->is_client ? 1 : 0;
+
+    if (s3_quic_crypto_init(ciphers.c, client, &client_key, client_enc, log) == S3_ERROR) {
+        goto failed;
     }
 
-    if (s3_quic_crypto_init(ciphers.c, server, &server_key, 1, log) == S3_ERROR) {
+    if (s3_quic_crypto_init(ciphers.c, server, &server_key, !client_enc, log) == S3_ERROR) {
         goto failed;
     }
 
@@ -528,7 +538,7 @@ s3_quic_crypto_hp_cleanup(s3_quic_secret_t *s)
 }
 
 s3_int_t
-s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_uint_t is_write, s3_quic_keys_t *keys,
+s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_int_t is_write, s3_quic_keys_t *keys,
                                    s3_uint_t level, uint32_t cipher, const uint8_t *secret,
                                    size_t secret_len)
 {
@@ -540,7 +550,13 @@ s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_uint_t is_write, s3_quic_ke
     s3_quic_secret_t *peer_secret;
     s3_quic_ciphers_t ciphers;
 
-    peer_secret = is_write ? &keys->secrets[level].server : &keys->secrets[level].client;
+    /*
+     * is_write is the TLS direction, not the slot name: a server writes
+     * with the server secret, a client with the client one (RFC 9001, 5.1)
+     */
+
+    peer_secret = (is_write == (s3_int_t)keys->is_client) ? &keys->secrets[level].client
+                                                          : &keys->secrets[level].server;
 
     keys->cipher = cipher;
 
@@ -592,7 +608,7 @@ s3_quic_keys_set_encryption_secret(s3_log_t *log, s3_uint_t is_write, s3_quic_ke
 s3_uint_t
 s3_quic_keys_available(s3_quic_keys_t *keys, s3_uint_t level, s3_uint_t is_write)
 {
-    if (is_write == 0) {
+    if (is_write == keys->is_client) {
         return keys->secrets[level].client.ctx != NULL;
     }
 
@@ -648,6 +664,7 @@ s3_int_t
 s3_quic_keys_update(s3_quic_keys_t *keys, s3_log_t *log)
 {
     s3_int_t           key_len;
+    s3_int_t           client_enc;
     s3_uint_t          i;
     s3_quic_md_t       client_key, server_key;
     s3_quic_hkdf_t     seq[6];
@@ -658,6 +675,8 @@ s3_quic_keys_update(s3_quic_keys_t *keys, s3_log_t *log)
     next = &keys->next_key;
 
     s3_log_debug0(S3_LOG_DEBUG_EVENT, log, 0, "quic key update");
+
+    client_enc = keys->is_client ? 1 : 0;
 
     key_len = s3_quic_ciphers(keys->cipher, &ciphers);
 
@@ -691,11 +710,11 @@ s3_quic_keys_update(s3_quic_keys_t *keys, s3_log_t *log)
         }
     }
 
-    if (s3_quic_crypto_init(ciphers.c, &next->client, &client_key, 0, log) == S3_ERROR) {
+    if (s3_quic_crypto_init(ciphers.c, &next->client, &client_key, client_enc, log) == S3_ERROR) {
         goto failed;
     }
 
-    if (s3_quic_crypto_init(ciphers.c, &next->server, &server_key, 1, log) == S3_ERROR) {
+    if (s3_quic_crypto_init(ciphers.c, &next->server, &server_key, !client_enc, log) == S3_ERROR) {
         goto failed;
     }
 
@@ -756,7 +775,11 @@ s3_quic_create_packet(s3_quic_header_t *pkt, s3_str_t *res)
     out.len = pkt->payload.len + S3_QUIC_TAG_LEN;
     out.data = res->data + ad.len;
 
-    secret = &pkt->keys->secrets[pkt->level].server;
+    /* a client protects packets with the client secret, a server
+     * with the server secret (RFC 9001, 5.1) */
+
+    secret = pkt->client ? &pkt->keys->secrets[pkt->level].client
+                         : &pkt->keys->secrets[pkt->level].server;
 
     s3_memcpy(nonce, secret->iv.data, secret->iv.len);
     s3_quic_compute_nonce(nonce, sizeof(nonce), pkt->number);
@@ -938,10 +961,17 @@ s3_quic_decrypt(s3_quic_header_t *pkt, uint64_t *largest_pn)
     s3_int_t          pnl;
     s3_str_t          in, ad;
     s3_uint_t         key_phase;
-    s3_quic_secret_t *secret;
+    s3_quic_secret_t *secret, *next;
     uint8_t           nonce[S3_QUIC_IV_LEN], mask[S3_QUIC_HP_LEN];
 
-    secret = &pkt->keys->secrets[pkt->level].client;
+    /* packets of the peer are protected with the peer secret: on a
+     * server the client secret, on a client the server secret
+     * (RFC 9001, 5.1) */
+
+    next = pkt->client ? &pkt->keys->next_key.server : &pkt->keys->next_key.client;
+
+    secret = pkt->client ? &pkt->keys->secrets[pkt->level].server
+                         : &pkt->keys->secrets[pkt->level].client;
 
     p = pkt->raw->pos;
     len = pkt->data + pkt->len - p;
@@ -973,8 +1003,8 @@ s3_quic_decrypt(s3_quic_header_t *pkt, uint64_t *largest_pn)
         key_phase = (pkt->flags & S3_QUIC_PKT_KPHASE) != 0;
 
         if (key_phase != pkt->key_phase) {
-            if (pkt->keys->next_key.client.ctx != NULL) {
-                secret = &pkt->keys->next_key.client;
+            if (next->ctx != NULL) {
+                secret = next;
                 pkt->key_update = 1;
 
             } else {

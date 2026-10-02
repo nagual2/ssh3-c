@@ -309,6 +309,14 @@ typedef struct {
     unsigned first : 1;
     unsigned rebound : 1;
     unsigned path_challenged : 1;
+
+    /*
+     * the direction of the packet: 1 when it is sent (or, on receive,
+     * expected to be sent) by a QUIC client; unlike nginx, ssh3-c works
+     * on both sides, so the secret selection in encrypt/decrypt cannot
+     * be hard-wired to server/client respectively
+     */
+    unsigned client : 1;
 } s3_quic_header_t;
 
 s3_int_t s3_quic_parse_packet(s3_quic_header_t *pkt);
@@ -330,7 +338,8 @@ ssize_t s3_quic_parse_ack_range(s3_log_t *log, u_char *start, u_char *end, uint6
 size_t  s3_quic_create_ack_range(u_char *p, uint64_t gap, uint64_t range);
 
 s3_int_t s3_quic_init_transport_params(s3_quic_tp_t *tp, s3_quic_conf_t *qcf);
-s3_int_t s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_t *log);
+s3_int_t s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_t *log,
+                                        s3_uint_t client);
 ssize_t  s3_quic_create_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, size_t *clen);
 
 void s3_quic_dcid_encode_key(u_char *dcid, uint64_t key);

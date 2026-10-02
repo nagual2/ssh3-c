@@ -47,6 +47,13 @@ s3_ssl_t *s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const 
                         size_t key_len, const s3_str_t *alpn);
 void      s3_ssl_free(s3_ssl_t *ssl);
 
+/*
+ * the client role context (TLS_client_method, no certificate); the
+ * peer certificates are not verified yet (the QUIC-go interop probe
+ * uses a self-signed certificate)
+ */
+s3_ssl_t *s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn);
+
 s3_int_t s3_ssl_create_connection(s3_ssl_t *ssl, s3_connection_t *c);
 s3_int_t s3_ssl_shutdown(s3_connection_t *c);
 

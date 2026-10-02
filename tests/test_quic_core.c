@@ -67,6 +67,35 @@ s3_test_udp_socket(void)
     return fd;
 }
 
+/*
+ * the peer address of the connection: the bound loopback address of
+ * its own socket, so that the packets the quic layer sends land
+ * nowhere instead of failing with EDESTADDRREQ
+ */
+
+static s3_int_t
+s3_test_core_peer_addr(s3_test_core_env_t *env)
+{
+    struct sockaddr_in sa;
+    socklen_t          len;
+
+    len = sizeof(sa);
+
+    if (getsockname(env->conn->fd, (struct sockaddr *)&sa, &len) == -1) {
+        return S3_ERROR;
+    }
+
+    env->conn->sockaddr = s3_palloc(env->conn->pool, len);
+    if (env->conn->sockaddr == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(env->conn->sockaddr, &sa, len);
+    env->conn->socklen = len;
+
+    return S3_OK;
+}
+
 static s3_int_t
 s3_test_core_env_init(s3_test_core_env_t *env, const u_char *cert, size_t cert_len,
                       const u_char *key, size_t key_len)
@@ -126,6 +155,18 @@ s3_test_core_env_init(s3_test_core_env_t *env, const u_char *cert, size_t cert_l
     }
 
     env->conn->pool = env->conn_pool;
+
+    /*
+     * the packets are injected into c->buffer directly, so the peer
+     * address is set by hand: s3_quic_new_path() takes it from the
+     * connection, as the udp layer does before s3_quic_run().  The
+     * loopback address of the socket itself is enough, a real peer
+     * reads nothing here
+     */
+
+    if (s3_test_core_peer_addr(env) != S3_OK) {
+        return S3_ERROR;
+    }
 
     return S3_OK;
 }
@@ -312,9 +353,9 @@ test_run_and_close(void)
     S3_ASSERT(s3_quic_keys_set_initial_secret(&pkt_keys, &secret, &s3_test_tls_log) == S3_OK);
 
     /*
-     * the client seals with the client initial secret; the protection
-     * layer reads the peer secret from the server slot, so the client
-     * secret is written there
+     * a client seals its Initial with the client initial secret; the
+     * harness below seeds it as the write direction of a server-role
+     * key set, so the packet is protected from the server slot
      */
     s3_memcpy(cli_secret, pkt_keys.secrets[S3_QUIC_ENCRYPTION_INITIAL].client.secret.data,
               sizeof(cli_secret));
@@ -403,17 +444,43 @@ test_run_and_close(void)
 
     /*
      * part 2: a 1-RTT packet with a DATAGRAM frame and
-     * CONNECTION_CLOSE_APP drains the connection; the application read
-     * keys are seeded, as the ssl layer yields them on the handshake
-     * completion
+     * CONNECTION_CLOSE_APP drains the connection; the application
+     * secrets are seeded, as the ssl layer yields them on the
+     * handshake completion
+     *
+     * the connection is a server one: is_write selects the tls
+     * direction, and the keys of that direction land in the server
+     * slot (RFC 9001, 5.1).  The draining timer below is armed only
+     * while the write keys of some level are present, so is_write is 1
+     * here
      */
 
     for (n = 0; n < 32; n++) {
         app_secret[n] = (uint8_t)(0x11 * (n + 1));
     }
 
+    /*
+     * the connection is a server one and the material is synthetic:
+     * the ssl layer yields the real application secrets on the
+     * handshake completion.  Both directions get the same bytes, as
+     * the packet below is sealed by the helper from the server slot
+     * (the zeroed key set of the helper is a server-role one) while
+     * the connection opens it with the client slot (RFC 9001, 5.1).
+     * The write direction is also what arms the draining timer.
+     *
+     * the ssl layer has already installed the application read secret
+     * of the handshake, and the protection layer replaces a slot in
+     * place, so the level is discarded before the reseed
+     */
+
+    s3_quic_keys_discard(qc->keys, S3_QUIC_ENCRYPTION_APPLICATION);
+
     S3_ASSERT(s3_quic_keys_set_encryption_secret(
                   &s3_test_tls_log, 0, qc->keys, S3_QUIC_ENCRYPTION_APPLICATION,
+                  TLS1_3_CK_AES_128_GCM_SHA256, app_secret, sizeof(app_secret)) == S3_OK);
+
+    S3_ASSERT(s3_quic_keys_set_encryption_secret(
+                  &s3_test_tls_log, 1, qc->keys, S3_QUIC_ENCRYPTION_APPLICATION,
                   TLS1_3_CK_AES_128_GCM_SHA256, app_secret, sizeof(app_secret)) == S3_OK);
 
     /* the DATAGRAM frame */

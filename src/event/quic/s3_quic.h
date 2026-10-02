@@ -48,6 +48,9 @@
 #define S3_QUIC_CID_LEN_MIN 8
 #define S3_QUIC_CID_LEN_MAX 20
 
+/* RFC 9000, 15.  Versions: QUIC v1 */
+#define S3_QUIC_VERSION 1
+
 #define S3_QUIC_MAX_RANGES 10
 
 typedef s3_int_t (*s3_quic_init_pt)(s3_connection_t *c);
@@ -179,6 +182,9 @@ typedef struct {
  */
 void s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf);
 
+/* the client role: initiates the handshake towards c->sockaddr */
+s3_int_t s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf);
+
 void s3_quic_finalize_connection(s3_connection_t *c, s3_uint_t err, const char *reason);
 void s3_quic_shutdown_connection(s3_connection_t *c, s3_uint_t err, const char *reason);
 
@@ -186,5 +192,17 @@ s3_int_t s3_quic_derive_key(s3_log_t *log, const char *label, s3_str_t *secret, 
                             u_char *out, size_t len);
 
 s3_int_t s3_quic_get_packet_dcid(s3_log_t *log, u_char *data, size_t len, s3_str_t *dcid);
+
+/*
+ * the listener services for the udp layer (porting map 4.3): the
+ * rbtree of a quic listener holds s3_quic_socket_t nodes keyed by
+ * the crc32 of the connection id (the reference ngx_event_quic_udp.c)
+ */
+void             s3_quic_rbtree_insert_socket(s3_rbtree_node_t *temp, s3_rbtree_node_t *node,
+                                              s3_rbtree_node_t *sentinel);
+s3_connection_t *s3_quic_lookup_connection(s3_udp_listen_t *ul, s3_str_t *key);
+
+/* the shared-datagram recv installed as c->recv on the quic connections */
+ssize_t s3_quic_shared_recv(s3_connection_t *c, u_char *buf, size_t size);
 
 #endif /* _S3_QUIC_H_INCLUDED_ */

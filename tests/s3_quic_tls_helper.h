@@ -155,6 +155,8 @@ static const OSSL_DISPATCH s3_test_tls_dis[] = {
 /*
  * generates a self-signed EC certificate and returns the PEM strings
  */
+#ifndef S3_TEST_TLS_NO_CERT
+
 static int
 s3_test_tls_gen_cert(u_char *cert, size_t *cert_len, u_char *key, size_t *key_len)
 {
@@ -226,10 +228,12 @@ s3_test_tls_gen_cert(u_char *cert, size_t *cert_len, u_char *key, size_t *key_le
     return 0;
 }
 
+#endif /* S3_TEST_TLS_NO_CERT */
+
 static void
 s3_test_tls_log_init(void)
 {
-    s3_test_tls_log.log_level = S3_LOG_ALERT;
+    s3_test_tls_log.log_level = S3_LOG_INFO;
     s3_test_tls_log.fd = S3_INVALID_FILE;
 }
 
@@ -238,6 +242,8 @@ s3_test_tls_log_init(void)
  * wire-format protocol list; the caller owns *out_ctx and must free
  * it with SSL_CTX_free() after SSL_free()
  */
+#ifndef S3_TEST_TLS_NO_CLIENT
+
 static SSL *
 s3_test_tls_client(s3_test_tls_side_t *side, const s3_str_t *alpn, const u_char *tp, size_t tp_len,
                    SSL_CTX **out_ctx)
@@ -318,6 +324,8 @@ s3_test_client_tp(u_char *buf, const u_char *scid, size_t scid_len)
 
     return (size_t)(p - buf);
 }
+
+#endif /* S3_TEST_TLS_NO_CLIENT */
 
 #ifndef S3_TEST_TLS_NO_LOCKSTEP
 
