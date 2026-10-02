@@ -1544,6 +1544,7 @@ s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
         case S3_QUIC_FT_STOP_SENDING:
         case S3_QUIC_FT_PATH_CHALLENGE:
         case S3_QUIC_FT_PATH_RESPONSE:
+        case S3_QUIC_FT_NEW_TOKEN:
             s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic frame type:%ui ignored until D3/D4",
                           frame.type);
             break;

@@ -1,0 +1,388 @@
+/*
+ * Copyright (C) 2026 the ssh3-c authors
+ */
+
+/*
+ * the QUIC interop test client: dials a peer, completes the
+ * handshake, sends count datagrams of the requested size and verifies
+ * the echoes byte for byte.  Peers: the quic-go harness
+ * (interop/quic-go) and, at P3, the ssh3 server of the Go fork.
+ *
+ * stdout carries the machine-readable protocol of the runner:
+ *   INTEROP-HANDSHAKE-OK
+ *   INTEROP-DATAGRAM-OK sent=N recv=N
+ * the exit code is 0 only when every echo came back
+ */
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+
+#include <s3_quic.h>
+#include <s3_quic_connection.h>
+#include <s3_quic_output.h>
+#include <s3_ssl.h>
+
+static s3_log_t s3_interop_log;
+
+static u_char *s3_interop_expected;
+static u_char *s3_interop_got;
+
+static size_t s3_interop_count;
+static size_t s3_interop_size;
+static size_t s3_interop_received;
+
+static void
+s3_interop_log_init(void)
+{
+    s3_interop_log.log_level = S3_LOG_INFO;
+    s3_interop_log.fd = S3_INVALID_FILE;
+}
+
+static void
+s3_interop_le32(u_char *p, uint32_t v)
+{
+    p[0] = (u_char)(v & 0xff);
+    p[1] = (u_char)((v >> 8) & 0xff);
+    p[2] = (u_char)((v >> 16) & 0xff);
+    p[3] = (u_char)((v >> 24) & 0xff);
+}
+
+static uint32_t
+s3_interop_read_le32(const u_char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void
+s3_interop_client_datagram(s3_connection_t *c, const u_char *data, size_t len)
+{
+    uint32_t idx;
+
+    (void)c;
+
+    if (len < 4 || len != s3_interop_size) {
+        return;
+    }
+
+    idx = s3_interop_read_le32(data);
+
+    if (idx >= s3_interop_count || s3_interop_got[idx]) {
+        return;
+    }
+
+    if (s3_memcmp(data, s3_interop_expected + idx * s3_interop_size, len) != 0) {
+        return;
+    }
+
+    s3_interop_got[idx] = 1;
+    s3_interop_received++;
+}
+
+static s3_int_t
+s3_interop_parse_addr(const char *text, struct sockaddr_in *sa)
+{
+    char           host[64];
+    const char    *colon;
+    size_t         n;
+    unsigned       port;
+    struct in_addr addr;
+
+    colon = strchr(text, ':');
+    if (colon == NULL) {
+        return S3_ERROR;
+    }
+
+    n = (size_t)(colon - text);
+    if (n == 0 || n >= sizeof(host)) {
+        return S3_ERROR;
+    }
+
+    memcpy(host, text, n);
+    host[n] = '\0';
+
+    if (inet_pton(AF_INET, host, &addr) != 1) {
+        return S3_ERROR;
+    }
+
+    port = (unsigned)atoi(colon + 1);
+    if (port == 0 || port > 65535) {
+        return S3_ERROR;
+    }
+
+    s3_memzero(sa, sizeof(struct sockaddr_in));
+
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((uint16_t)port);
+    sa->sin_addr = addr;
+
+    return S3_OK;
+}
+
+static void
+s3_interop_alpn_wire(u_char *wire, const char *name)
+{
+    size_t n;
+
+    n = strlen(name);
+
+    if (n == 0 || n > 255) {
+        fprintf(stderr, "interop-client: bad alpn name\n");
+        exit(1);
+    }
+
+    wire[0] = (u_char)n;
+    memcpy(wire + 1, name, n);
+}
+
+static void
+s3_interop_usage(const char *prog)
+{
+    fprintf(stderr,
+            "usage: %s -a addr:port [-n count] [-s size] [-t ms] [-A alpn]\n"
+            "  -a  peer UDP address\n"
+            "  -n  datagrams to send, default 8\n"
+            "  -s  datagram payload size, default 512, capped at 1100\n"
+            "  -t  overall deadline in ms, default 20000\n"
+            "  -A  ALPN name, default s3interop/1\n",
+            prog);
+}
+
+int
+main(int argc, char **argv)
+{
+    char                  opt;
+    const char           *peer_text = NULL, *alpn_name = "s3interop/1";
+    unsigned              timeout = 20000, dg_size = 1200;
+    long                  n_arg = 8, s_arg = 512;
+    u_char                alpn_wire[256];
+    s3_str_t              alpn;
+    size_t                i, sent;
+    s3_uint_t             hs_reported = 0;
+    s3_msec_t             start;
+    s3_fd_t               fd;
+    struct sockaddr_in    sa;
+    s3_event_ctx_t        ctx;
+    s3_connection_t      *cli;
+    s3_quic_connection_t *qc;
+
+    s3_interop_log_init();
+
+    while ((opt = (char)getopt(argc, argv, "a:n:s:t:A:d:h")) != -1) {
+
+        switch (opt) {
+
+        case 'a':
+            peer_text = optarg;
+            break;
+
+        case 'n':
+            n_arg = atol(optarg);
+            break;
+
+        case 's':
+            s_arg = atol(optarg);
+            break;
+
+        case 't':
+            timeout = (unsigned)atol(optarg);
+            break;
+
+        case 'A':
+            alpn_name = optarg;
+            break;
+
+        case 'd':
+            dg_size = (unsigned)atoi(optarg);
+            break;
+
+        default:
+            s3_interop_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (peer_text == NULL || n_arg < 1 || n_arg > 65536 || s_arg < 8 || s_arg > 1100) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
+    if (s3_interop_parse_addr(peer_text, &sa) != S3_OK) {
+        fprintf(stderr, "interop-client: bad peer address %s\n", peer_text);
+        return 1;
+    }
+
+    if (s3_event_ctx_init(&ctx, &s3_interop_log) != S3_OK) {
+        fprintf(stderr, "interop-client: event ctx init failed\n");
+        return 1;
+    }
+
+    s3_interop_count = (size_t)n_arg;
+    s3_interop_size = (size_t)s_arg;
+
+    s3_interop_expected = malloc(s3_interop_count * s3_interop_size);
+    s3_interop_got = calloc(s3_interop_count, 1);
+
+    if (s3_interop_expected == NULL || s3_interop_got == NULL) {
+        return 1;
+    }
+
+    for (i = 0; i < s3_interop_count; i++) {
+        u_char *p = s3_interop_expected + i * s3_interop_size;
+
+        s3_interop_le32(p, (uint32_t)i);
+
+        if (RAND_bytes(p + 4, s3_interop_size - 4) != 1) {
+            fprintf(stderr, "interop-client: RAND_bytes failed\n");
+            return 1;
+        }
+    }
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+        perror("socket");
+        return 1;
+    }
+
+    cli = s3_get_connection(&ctx, fd);
+    if (cli == NULL) {
+        fprintf(stderr, "interop-client: connection alloc failed\n");
+        return 1;
+    }
+
+    cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_interop_log);
+    if (cli->pool == NULL) {
+        return 1;
+    }
+
+    cli->sockaddr = (struct sockaddr *)s3_palloc(cli->pool, sizeof(sa));
+    if (cli->sockaddr == NULL) {
+        return 1;
+    }
+
+    s3_memcpy(cli->sockaddr, &sa, sizeof(sa));
+    cli->socklen = sizeof(sa);
+
+    s3_interop_alpn_wire(alpn_wire, alpn_name);
+
+    alpn.data = alpn_wire;
+    alpn.len = 1 + strlen(alpn_name);
+
+    s3_quic_conf_t conf;
+
+    s3_memzero(&conf, sizeof(conf));
+
+    conf.ssl = s3_ssl_client_create(&s3_interop_log, &alpn);
+    if (conf.ssl == NULL) {
+        fprintf(stderr, "interop-client: ssl init failed\n");
+        return 1;
+    }
+
+    conf.ctx = &ctx;
+    conf.handshake_timeout = (s3_msec_t)timeout;
+    conf.idle_timeout = 60000;
+    conf.stream_buffer_size = 16384;
+    conf.max_concurrent_streams_bidi = 16;
+    conf.max_concurrent_streams_uni = 16;
+    conf.active_connection_id_limit = 8;
+    conf.max_datagram_frame_size = dg_size;
+    conf.datagram_handler = s3_interop_client_datagram;
+
+    for (i = 0; i < S3_QUIC_AV_KEY_LEN; i++) {
+        conf.av_token_key[i] = (u_char)(0xa0 + i);
+        conf.sr_token_key[i] = (u_char)(0xb0 + i);
+    }
+
+    if (s3_event_actions.add_event(cli->read, S3_READ_EVENT, 0) != S3_OK) {
+        return 1;
+    }
+
+    if (s3_quic_connect(cli, &conf) != S3_OK) {
+        fprintf(stderr, "interop-client: connect failed\n");
+        return 1;
+    }
+
+    qc = s3_quic_get_connection(cli);
+    if (qc == NULL) {
+        return 1;
+    }
+
+    start = s3_current_msec;
+    sent = 0;
+
+    for (;;) {
+        s3_event_process_posted(&ctx, &ctx.posted_events);
+
+        s3_process_events_and_timers(&ctx);
+
+        qc = s3_quic_get_connection(cli);
+
+        if (qc == NULL) {
+            fprintf(stderr, "interop-client: connection is gone\n");
+            return 1;
+        }
+
+        if (!hs_reported && cli->ssl != NULL && cli->ssl->handshaked) {
+            printf("INTEROP-HANDSHAKE-OK\n");
+            fflush(stdout);
+
+            hs_reported = 1;
+
+            if (qc->client_tp_done && qc->ctp.max_datagram_frame_size == 0) {
+                fprintf(stderr, "interop-client: peer does not support datagrams\n");
+                return 1;
+            }
+        }
+
+        if (hs_reported && sent < s3_interop_count) {
+            u_char *p = s3_interop_expected + sent * s3_interop_size;
+
+            if (s3_quic_send_datagram(cli, p, s3_interop_size) == S3_OK) {
+                sent++;
+
+            } else {
+                fprintf(stderr, "interop-client: send_datagram failed\n");
+                return 1;
+            }
+        }
+
+        if (s3_interop_received == s3_interop_count) {
+            break;
+        }
+
+        if (s3_current_msec - start > (s3_msec_t)timeout) {
+            fprintf(stderr, "interop-client: timeout sent=%zu received=%zu\n", sent,
+                    s3_interop_received);
+            return 1;
+        }
+    }
+
+    printf("INTEROP-DATAGRAM-OK sent=%zu recv=%zu\n", sent, s3_interop_received);
+    fflush(stdout);
+
+    /*
+     * the silent abort runs the full teardown: the ssl shutdown frees
+     * the openssl object, the keys are cleansed and the connection
+     * pool dies with the quic connection in it
+     */
+    (void)s3_quic_close_connection(cli, S3_ABORT);
+
+    s3_event_process_posted(&ctx, &ctx.posted_events);
+
+    s3_ssl_free(conf.ssl);
+
+    free(s3_interop_expected);
+    free(s3_interop_got);
+
+    (void)close(fd);
+    s3_destroy_pool(ctx.pool);
+
+    return 0;
+}

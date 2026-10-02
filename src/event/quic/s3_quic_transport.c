@@ -1081,6 +1081,32 @@ s3_quic_parse_frame(s3_quic_header_t *pkt, u_char *start, u_char *end, s3_quic_f
 
         break;
 
+    case S3_QUIC_FT_NEW_TOKEN: {
+
+        /*
+         * the token is accepted and dropped: it would be used for
+         * address validation of a subsequent connection (D4)
+         */
+
+        u_char *token_data;
+
+        p = s3_quic_parse_int(p, end, &varint);
+        if (p == NULL) {
+            pkt->error = S3_QUIC_ERR_FRAME_ENCODING_ERROR;
+            s3_log_error(S3_LOG_INFO, pkt->log, 0, "quic failed to parse token length");
+            return S3_ERROR;
+        }
+
+        p = s3_quic_read_bytes(p, end, varint, &token_data);
+        if (p == NULL) {
+            pkt->error = S3_QUIC_ERR_FRAME_ENCODING_ERROR;
+            s3_log_error(S3_LOG_INFO, pkt->log, 0, "quic failed to parse token data");
+            return S3_ERROR;
+        }
+
+        break;
+    }
+
     default:
         s3_log_error(S3_LOG_INFO, pkt->log, 0, "quic unknown frame type 0x%xi", f->type);
         return S3_ERROR;
@@ -1194,6 +1220,18 @@ s3_quic_frame_allowed(s3_quic_header_t *pkt, s3_uint_t frame_type)
      */
 
     if (frame_type == S3_QUIC_FT_HANDSHAKE_DONE && pkt->client && ptype == 1) {
+        return S3_OK;
+    }
+
+    /*
+     * RFC 9000, 19.7.  NEW_TOKEN
+     *
+     * the same server-only situation: a client accepts NEW_TOKEN in a
+     * 1-RTT packet; the token itself is not used until the client
+     * needs address validation for a new connection
+     */
+
+    if (frame_type == S3_QUIC_FT_NEW_TOKEN && pkt->client && ptype == 1) {
         return S3_OK;
     }
 

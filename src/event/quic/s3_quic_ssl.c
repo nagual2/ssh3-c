@@ -242,19 +242,19 @@ s3_quic_cbs_yield_secret(SSL *ssl_conn, uint32_t ssl_level, int direction,
      */
 
     /*
-     * the OpenSSL direction flag is 0 for the write (transmit)
-     * secret and 1 for the read (receive) secret; the protection
-     * layer stores the transmit secrets in the server slot and the
-     * receive secrets in the client slot
+     * the OpenSSL direction flag follows nginx: 1 for the write
+     * (transmit) secret and 0 for the read (receive) secret; the
+     * protection layer slots the secrets by the tls direction against
+     * the connection role (RFC 9001, 5.1)
      */
-    if (s3_quic_keys_set_encryption_secret(c->log, !direction, qc->keys, level,
+    if (s3_quic_keys_set_encryption_secret(c->log, direction, qc->keys, level,
                                            (uint32_t)SSL_CIPHER_get_id(cipher), secret,
                                            secret_len) != S3_OK) {
         qc->error = S3_QUIC_ERR_INTERNAL_ERROR;
         return 1;
     }
 
-    if (!direction) {
+    if (direction) {
         qc->write_level = level;
 
     } else {

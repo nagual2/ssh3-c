@@ -9,12 +9,34 @@
 #include <openssl/x509.h>
 
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <s3_ssl.h>
 #include <s3_string.h>
 
 static int s3_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                                  const unsigned char *in, unsigned int inlen, void *arg);
+
+/*
+ * the interop probe: TLS secrets on stderr in the NSS keylog format,
+ * enabled by the S3_KEYLOG environment variable
+ */
+static void
+s3_ssl_keylog_cb(const SSL *ssl, const char *line)
+{
+    static int enabled = -1;
+
+    (void)ssl;
+
+    if (enabled < 0) {
+        enabled = (getenv("S3_KEYLOG") != NULL);
+    }
+
+    if (enabled) {
+        fprintf(stderr, "KEYLOG %s\n", line);
+    }
+}
 
 s3_ssl_t *
 s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key, size_t key_len,
@@ -166,6 +188,8 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
 
     /* the interop probe accepts any peer certificate for now */
     SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_NONE, NULL);
+
+    SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
 
     return ssl;
 }

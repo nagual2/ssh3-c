@@ -112,6 +112,13 @@ add_executable(s3gso_bench bench/gso_bench.c)
 target_compile_options(s3gso_bench PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(s3gso_bench PRIVATE Threads::Threads)
 
+# the interop runners over real UDP (the quic-go harness, later the Go fork)
+foreach(S3_INTEROP interop_server interop_client)
+    add_executable(s3${S3_INTEROP} interop/${S3_INTEROP}.c)
+    target_compile_options(s3${S3_INTEROP} PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(s3${S3_INTEROP} PRIVATE s3core Threads::Threads)
+endforeach()
+
 set(S3_TESTS
     test_pool
     test_buf

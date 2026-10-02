@@ -369,8 +369,21 @@ nginx — только сервер, поэтому четыре места в �
 | 2 | `s3_quic_keys_set_initial_secret()` / `s3_quic_keys_update()` | клиентский слот всегда на чтение, серверный на запись | направление `enc` выводится из `keys->is_client` |
 | 3 | `HANDSHAKE_DONE` (0x1e) | таблица разрешённых фреймов запрещает фрейм всем типам пакетов: сервер его не получает | клиент принимает ровно один раз в 1-RTT, подтверждает handshake и сбрасывает handshake-ключи (`handshake_confirmed`) |
 | 4 | `CRYPTO` после handshake | отвергается всегда | отвергается только сервером; клиент принимает `NewSessionTicket` и прогоняет `SSL_do_handshake()` в `s3_quic_post_handshake()` |
+| 5 | флаг `direction` в `s3_quic_cbs_yield_secret()` | nginx передаёт `direction` в kdf как есть: **1 = write, 0 = read** | в D3 инверсия `!direction` дала согласованный, но зеркальный C↔C — интероп с quic-go вскрыл; исправлено на nginx-семантику, C↔C остался зелёным |
+| 6 | `NEW_TOKEN` (0x07) | маска 0x0: сервер его не получает | клиент принимает в 1-RTT, токен парсится и дропается (адресная валидация — D4) |
 
 Отдельно: короткий заголовок не несёт длину DCID, поэтому парсер читает ровно `S3_QUIC_SERVER_CID_LEN` байт, а клиент обязан генерировать CID той же длины (иначе расходится смещение выборки для header protection — симптом: TX-смещение 21 против RX 25).
+
+## 5. Интероп-стенд (quic-go)
+
+| № | Компонент | Где |
+|---|-----------|-----|
+| 1 | Go-harness (server/client, DATAGRAM echo) | `interop/quic-go` (quic-go v0.63.0 — как в Go-форке) |
+| 2 | C-раннеры: `s3interop_server`, `s3interop_client` | `interop/interop_server.c`, `interop/interop_client.c` |
+| 3 | Матрица PASS/FAIL | `interop/run-quic-go.sh` (loopback, серты в `build/interop/`) |
+| 4 | TLS-секреты обеих сторон для отладки | `S3_KEYLOG=1` (C, NSS keylog на stderr), `-keylog файл` (harness) |
+
+Результат 2026-10-02: оба направления PASS (handshake + 8/8 DATAGRAM). Под `tc netem loss 5%` handshake доживает; DATAGRAM-фазы теряют часть датаграмм — это семантика RFC 9221 (ненадёжны, без ретрансмиссии), приёмка по потерям должна считать «N из M прошли + соединение живо», а не «все до одного».
 
 ---
 
