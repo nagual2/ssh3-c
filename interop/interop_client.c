@@ -52,11 +52,24 @@ static unsigned         s3_interop_sfin;
 static int              s3_interop_streams_mode;
 static s3_connection_t *s3_interop_stream;
 
-/* the deterministic pattern byte at an absolute offset */
-static u_char
-s3_interop_pattern_at(size_t i)
+/*
+ * the deterministic pattern: a constant 64-byte template with the
+ * block offset in the first eight bytes; the writer fills whole
+ * blocks with memcpy, the verifier compares them the same way, so
+ * neither side pays per-byte arithmetic (the first profile showed
+ * the per-byte generator eating 99% of the client cpu)
+ */
+
+static u_char s3_interop_ptemplate[64];
+
+static void
+s3_interop_pattern_init(void)
 {
-    return (u_char)(i * 31 + (i >> 8));
+    size_t i;
+
+    for (i = 0; i < sizeof(s3_interop_ptemplate); i++) {
+        s3_interop_ptemplate[i] = (u_char)(i * 31 + 7);
+    }
 }
 
 static void
@@ -155,13 +168,35 @@ s3_interop_stream_echo_read(s3_event_t *ev)
             exit(1);
         }
 
-        for (n = 0; n < (size_t)m; n++) {
+        for (n = 0; n < (size_t)m;) {
+            size_t pos = s3_interop_srecv + n;
+            size_t bstart = pos & ~(size_t)(sizeof(s3_interop_ptemplate) - 1);
+            size_t r = pos - bstart;
+            size_t k = sizeof(s3_interop_ptemplate) - r;
+            u_char exp[sizeof(s3_interop_ptemplate)];
 
-            if (s3_interop_sbuf[n] != s3_interop_pattern_at(s3_interop_srecv + n)) {
-                fprintf(stderr, "interop-client: stream mismatch at offset %zu\n",
-                        s3_interop_srecv + n);
+            if (k > (size_t)m - n) {
+                k = (size_t)m - n;
+            }
+
+            /*
+             * the expected block is the template with the first eight
+             * bytes replaced by the little-endian block offset
+             */
+
+            s3_memcpy(exp, s3_interop_ptemplate, sizeof(exp));
+            s3_memcpy(exp, &bstart, sizeof(bstart));
+
+            if (s3_memcmp(s3_interop_sbuf + n, exp + r, k) != 0) {
+                fprintf(stderr,
+                        "DBG r=%zu k=%zu got %02x %02x %02x %02x want %02x %02x %02x %02x\n", r, k,
+                        s3_interop_sbuf[n], s3_interop_sbuf[n + 1], s3_interop_sbuf[n + 2],
+                        s3_interop_sbuf[n + 3], exp[r], exp[r + 1], exp[r + 2], exp[r + 3]);
+                fprintf(stderr, "interop-client: stream mismatch at offset %zu\n", pos);
                 exit(1);
             }
+
+            n += k;
         }
 
         s3_interop_srecv += (size_t)m;
@@ -258,6 +293,7 @@ main(int argc, char **argv)
     s3_quic_connection_t *qc;
 
     s3_interop_log_init();
+    s3_interop_pattern_init();
 
     while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:Sh")) != -1) {
 
@@ -316,7 +352,8 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (s3_interop_streams_mode && s_arg > 1048576) {
+    if (s3_interop_streams_mode && (s_arg > 1048576 || s_arg % 64 != 0)) {
+        /* the block pattern requires 64-byte aligned chunk sizes */
         s3_interop_usage(argv[0]);
         return 1;
     }
@@ -485,18 +522,51 @@ main(int argc, char **argv)
         if (s3_interop_streams_mode) {
 
             if (hs_reported) {
-                /* the writer: flow control may throttle, retried each pass */
+                /*
+                 * the writer: flow control may throttle, retried each
+                 * pass.  The pattern blocks live at absolute stream
+                 * offsets (a partial send leaves s3_interop_ssent
+                 * unaligned), so the fill is driven by the absolute
+                 * position: the offset field lands only on real block
+                 * boundaries
+                 */
                 while (s3_interop_ssent < s3_interop_stotal) {
                     size_t  chunk = sizeof(s3_interop_sbuf);
                     ssize_t m;
-                    size_t  k;
+                    size_t  j, r, k, pos, bstart;
 
                     if (s3_interop_ssent + chunk > s3_interop_stotal) {
                         chunk = s3_interop_stotal - s3_interop_ssent;
                     }
 
-                    for (k = 0; k < chunk; k++) {
-                        s3_interop_sbuf[k] = s3_interop_pattern_at(s3_interop_ssent + k);
+                    for (j = 0; j < chunk;) {
+                        pos = s3_interop_ssent + j;
+                        r = pos % sizeof(s3_interop_ptemplate);
+                        k = chunk - j;
+
+                        if (r < 8) {
+                            /*
+                             * the first eight bytes of a block carry
+                             * the little-endian block offset; a chunk
+                             * boundary may split the field
+                             */
+
+                            bstart = pos - r;
+
+                            if (k > 8 - r) {
+                                k = 8 - r;
+                            }
+
+                            s3_memcpy(s3_interop_sbuf + j, (u_char *)&bstart + r, k);
+                            j += k;
+
+                            continue;
+                        }
+
+                        k = s3_min(k, sizeof(s3_interop_ptemplate) - r);
+
+                        s3_memcpy(s3_interop_sbuf + j, s3_interop_ptemplate + r, k);
+                        j += k;
                     }
 
                     m = s3_quic_stream_send(s3_interop_stream, s3_interop_sbuf, chunk);
@@ -556,6 +626,30 @@ main(int argc, char **argv)
             if (s3_interop_streams_mode) {
                 fprintf(stderr, "interop-client: timeout sent=%zu recv=%zu\n", s3_interop_ssent,
                         s3_interop_srecv);
+
+                if (qc != NULL) {
+                    s3_quic_stream_t *qs;
+
+                    fprintf(stderr,
+                            "DBG conn send_max_data=%llu send_offset=%llu recv_max_data=%llu\n",
+                            (unsigned long long)qc->streams.send_max_data,
+                            (unsigned long long)qc->streams.send_offset,
+                            (unsigned long long)qc->streams.recv_max_data);
+
+                    qs = s3_quic_find_stream(
+                        &qc->streams.tree,
+                        s3_interop_stream ? ((s3_quic_stream_t *)s3_interop_stream->data)->id : 0);
+
+                    if (qs != NULL) {
+                        fprintf(stderr,
+                                "DBG stream sent=%llu acked=%llu send_max_data=%llu "
+                                "recv_last=%llu recv_max_data=%llu\n",
+                                (unsigned long long)qs->sent, (unsigned long long)qs->acked,
+                                (unsigned long long)qs->send_max_data,
+                                (unsigned long long)qs->recv_last,
+                                (unsigned long long)qs->recv_max_data);
+                    }
+                }
 
             } else {
                 fprintf(stderr, "interop-client: timeout sent=%zu received=%zu required=%zu\n",
