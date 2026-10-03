@@ -715,6 +715,7 @@ s3_quic_resend_frames(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
     uint64_t              pnum;
     s3_queue_t           *q;
     s3_quic_frame_t      *f, *start;
+    s3_quic_stream_t     *qs;
     s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
@@ -767,11 +768,27 @@ s3_quic_resend_frames(s3_connection_t *c, s3_quic_send_ctx_t *ctx)
             s3_quic_queue_frame(qc, f);
             break;
 
-            /*
-             * the reference re-queues MAX_STREAM_DATA and STREAM frames
-             * with the current stream state here (D4, s3_quic_streams.c);
-             * until then they are re-queued as is
-             */
+        case S3_QUIC_FT_MAX_STREAM_DATA:
+            qs = s3_quic_find_stream(&qc->streams.tree, f->u.max_stream_data.id);
+            if (qs == NULL) {
+                s3_quic_free_frame(c, f);
+                break;
+            }
+
+            f->u.max_stream_data.limit = qs->recv_max_data;
+            s3_quic_queue_frame(qc, f);
+            break;
+
+        case S3_QUIC_FT_STREAM:
+            qs = s3_quic_find_stream(&qc->streams.tree, f->u.stream.stream_id);
+
+            if (qs == NULL || qs->send_state == S3_QUIC_STREAM_SEND_RESET_SENT ||
+                qs->send_state == S3_QUIC_STREAM_SEND_RESET_RECVD) {
+                s3_quic_free_frame(c, f);
+                break;
+            }
+
+            /* fall through */
 
         default:
             s3_queue_insert_tail(&ctx->frames, &f->queue);

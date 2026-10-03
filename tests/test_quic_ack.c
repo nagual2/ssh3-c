@@ -20,6 +20,7 @@
 #include <s3_quic_output.h>
 #include <s3_quic_ack.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_streams.h>
 
 #define S3_TEST_TLS_NO_LOCKSTEP
 #define S3_TEST_TLS_NO_CLIENT
@@ -209,10 +210,9 @@ s3_test_seed_app(s3_test_ack_env_t *env)
         secret[i] = (uint8_t)(0x11 * (i + 1));
     }
 
-    S3_ASSERT(s3_quic_keys_set_encryption_secret(&s3_test_tls_log, 1, env->qc->keys,
-                                                 S3_QUIC_ENCRYPTION_APPLICATION,
-                                                 TLS1_3_CK_AES_128_GCM_SHA256, secret,
-                                                 sizeof(secret)) == S3_OK);
+    S3_ASSERT(s3_quic_keys_set_encryption_secret(
+                  &s3_test_tls_log, 1, env->qc->keys, S3_QUIC_ENCRYPTION_APPLICATION,
+                  TLS1_3_CK_AES_128_GCM_SHA256, secret, sizeof(secret)) == S3_OK);
 }
 
 /*
@@ -239,13 +239,13 @@ s3_test_ack_frame(uint64_t largest, uint64_t first_range, uint64_t delay, s3_qui
 static int
 test_ack_ranges(void)
 {
-    s3_test_ack_env_t    env;
-    s3_quic_frame_t     *f, ack;
-    s3_quic_header_t     pkt;
-    s3_quic_send_ctx_t  *ctx;
-    uint64_t             pnums[5];
-    size_t               in_flight;
-    s3_uint_t            i;
+    s3_test_ack_env_t   env;
+    s3_quic_frame_t    *f, ack;
+    s3_quic_header_t    pkt;
+    s3_quic_send_ctx_t *ctx;
+    uint64_t            pnums[5];
+    size_t              in_flight;
+    s3_uint_t           i;
 
     S3_ASSERT(s3_test_env_init(&env) == S3_OK);
     S3_ASSERT(s3_quic_connect(env.conn, &env.conf) == S3_OK);
@@ -436,11 +436,162 @@ test_loss_retransmit(void)
     return s3_test_failures;
 }
 
+/*
+ * a lost MAX_STREAM_DATA frame must be rebuilt from the current
+ * stream state, not requeued as it was (the nginx reference,
+ * ngx_event_quic_ack.c "case NGX_QUIC_FT_MAX_STREAM_DATA").
+ *
+ * requeueing the stale limit deadlocks the peer: the window we
+ * advertise stops growing while recv_offset passes it, and the peer
+ * blocks forever with data still in flight
+ */
+
+static int
+test_max_stream_data_retransmit(void)
+{
+    s3_test_ack_env_t   env;
+    s3_connection_t    *sc;
+    s3_quic_stream_t   *qs;
+    s3_quic_frame_t    *f;
+    s3_quic_send_ctx_t *ctx;
+    uint64_t            stale, fresh;
+
+    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env.conn, &env.conf) == S3_OK);
+
+    env.qc = s3_quic_get_connection(env.conn);
+    ctx = &env.qc->send_ctx[2];
+
+    /* flush the handshake flight, then seed the application keys */
+    S3_ASSERT(s3_quic_output(env.conn) == S3_OK);
+
+    s3_test_seed_app(&env);
+
+    /* a client-initiated bidi stream, id 0 */
+    sc = s3_quic_open_stream(env.conn, 1);
+    S3_ASSERT(sc != NULL);
+    S3_ASSERT(sc->data != NULL);
+
+    qs = (s3_quic_stream_t *)sc->data;
+
+    /*
+     * the window is advertised as stale; after the frame is on the
+     * wire the application consumes data and the window moves forward
+     * to fresh.  the retransmission must carry fresh, not stale
+     */
+
+    stale = qs->recv_max_data;
+    S3_ASSERT(stale > 0);
+
+    /*
+     * queue the frame the way the loss path would find it: a
+     * MAX_STREAM_DATA carrying the stale limit, already sent and
+     * sitting in the sent queue
+     */
+
+    f = s3_quic_alloc_frame(env.conn);
+    S3_ASSERT(f != NULL);
+
+    f->level = S3_QUIC_ENCRYPTION_APPLICATION;
+    f->type = S3_QUIC_FT_MAX_STREAM_DATA;
+    f->u.max_stream_data.id = qs->id;
+    f->u.max_stream_data.limit = stale;
+
+    S3_ASSERT(s3_quic_frame_sendto(env.conn, f, 0, env.qc->path) == S3_OK);
+
+    /* the window has moved on since the frame was queued */
+    qs->recv_max_data = stale + qs->recv_window;
+    fresh = qs->recv_max_data;
+
+    /* drop everything the peer socket received */
+    {
+        u_char  buf[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+        ssize_t n;
+
+        do {
+            n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        } while (n > 0);
+    }
+
+    /* rewind the send time so the loss detection fires on it */
+    {
+        s3_queue_t      *q;
+        s3_quic_frame_t *qf;
+
+        for (q = s3_queue_head(&ctx->sent); q != s3_queue_sentinel(&ctx->sent);
+             q = s3_queue_next(q)) {
+            qf = s3_queue_data(q, s3_quic_frame_t, queue);
+            qf->send_time -= 60000;
+        }
+    }
+
+    /* a loss detection runs after an ACK of the peer */
+    ctx->largest_ack = ctx->pnum - 1;
+    env.qc->first_rtt = s3_current_msec - 1000;
+
+    s3_quic_set_lost_timer(env.conn);
+    S3_ASSERT(env.qc->pto.timer_set == 1);
+    S3_ASSERT(env.qc->pto.handler != NULL);
+
+    env.qc->pto.handler(&env.qc->pto);
+
+    /*
+     * the rebuilt frame carries the current window, not the stale
+     * limit it was sent with
+     */
+
+    {
+        s3_queue_t      *q;
+        s3_quic_frame_t *qf;
+        int              found;
+
+        found = 0;
+
+        for (q = s3_queue_head(&ctx->frames); q != s3_queue_sentinel(&ctx->frames);
+             q = s3_queue_next(q)) {
+            qf = s3_queue_data(q, s3_quic_frame_t, queue);
+
+            if (qf->type != S3_QUIC_FT_MAX_STREAM_DATA) {
+                continue;
+            }
+
+            found = 1;
+
+            S3_ASSERT(qf->u.max_stream_data.id == qs->id);
+            S3_ASSERT(qf->u.max_stream_data.limit == qs->recv_max_data);
+
+            /* and the rebuilt limit is the extended one, not the stale */
+            S3_ASSERT(qf->u.max_stream_data.limit != stale);
+            S3_ASSERT(qf->u.max_stream_data.limit >= fresh);
+        }
+
+        S3_ASSERT(found == 1);
+    }
+
+    /*
+     * tear the stream down explicitly: its pool is owned by the
+     * stream, not by the connection pool the fixture destroys, and
+     * the read handler is a stub so the stream is never closed
+     */
+
+    if (sc->read->posted) {
+        s3_delete_posted_event(sc->read);
+    }
+
+    s3_rbtree_delete(&env.qc->streams.tree, &qs->node);
+    s3_close_connection(sc);
+
+    s3_test_env_done(&env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_ack(void)
 {
     test_ack_ranges();
     test_loss_retransmit();
+    test_max_stream_data_retransmit();
 
     OPENSSL_cleanup();
 
