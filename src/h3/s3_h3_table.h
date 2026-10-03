@@ -12,6 +12,9 @@
 
 #include <s3_core.h>
 #include <s3_connection.h>
+#include <s3_event.h>
+
+typedef struct s3_h3_session_s s3_h3_session_t;
 
 
 typedef struct {

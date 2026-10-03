@@ -74,6 +74,8 @@
  */
 #define s3_h3_get_session(c) ((s3_h3_session_t *) (c)->data)
 
+typedef struct s3_h3_session_s s3_h3_session_t;
+
 struct s3_h3_session_s {
     s3_h3_dynamic_table_t table;
 
