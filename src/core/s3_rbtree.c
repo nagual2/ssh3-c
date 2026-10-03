@@ -129,7 +129,7 @@ s3_rbtree_insert_timer_value(s3_rbtree_node_t *temp, s3_rbtree_node_t *node,
 
         /*  node->key < temp->key */
 
-        p = ((int32_t)(node->key - temp->key) < 0) ? &temp->left : &temp->right;
+        p = ((s3_rbtree_key_int_t)(node->key - temp->key) < 0) ? &temp->left : &temp->right;
 
         if (*p == sentinel) {
             break;

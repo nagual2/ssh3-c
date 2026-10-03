@@ -8,8 +8,13 @@
 
 #include <s3_base.h>
 
-typedef uint32_t s3_rbtree_key_t;
-typedef int64_t  s3_rbtree_key_int_t;
+/*
+ * the reference stores 64-bit msec timer keys in the key field
+ * (ngx_rbtree_key_t = ngx_uint_t); a narrower key truncates the event
+ * timer values and find_timer() misreads every key after 2^32 ms
+ */
+typedef uintptr_t s3_rbtree_key_t;
+typedef intptr_t  s3_rbtree_key_int_t;
 
 typedef struct s3_rbtree_node_s s3_rbtree_node_t;
 

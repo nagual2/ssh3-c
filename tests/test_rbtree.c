@@ -157,6 +157,28 @@ s3_test_rbtree(void)
         S3_ASSERT(tree.root == sentinel);
     }
 
+    /* timer insert: keys more than 2^31 ms apart (24.8 days of uptime)
+     * must keep their order; a signed-32 delta comparison misplaces the
+     * far node as the tree minimum */
+
+    s3_rbtree_init(&tree, sentinel, s3_rbtree_insert_timer_value);
+
+    {
+        s3_test_tree_item_t t1, t2;
+
+        t1.node.key = 1000;
+        t2.node.key = 1000 + 0x80001000ULL; /* over 2^31 ms later */
+
+        s3_rbtree_insert(&tree, &t1.node);
+        s3_rbtree_insert(&tree, &t2.node);
+
+        S3_ASSERT(s3_rbtree_min(tree.root, sentinel) == &t1.node);
+
+        s3_rbtree_delete(&tree, &t2.node);
+        s3_rbtree_delete(&tree, &t1.node);
+        S3_ASSERT(tree.root == sentinel);
+    }
+
     s3_destroy_pool(pool);
 
     return s3_test_failures;
