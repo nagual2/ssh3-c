@@ -20,15 +20,34 @@ static const u_char s3_test_dcid[16] = "s3-dcid-1234567"; /* 16 bytes, no NUL */
 static const u_char s3_test_scid[8] = {0x9a, 0x5b, 0x1c, 0xf0, 0x33, 0x44, 0x55, 0x66};
 static const u_char s3_test_dg_payload[4] = {0xde, 0xad, 0xbe, 0xef};
 
-static u_char s3_test_dg_data[64];
-static size_t s3_test_dg_len;
+static u_char        s3_test_dg_data[64];
+static size_t        s3_test_dg_len;
+static const u_char *s3_test_dg_ptr;
+static size_t        s3_test_dg_links;
+static size_t        s3_test_dg_link_size;
 
 static void
-s3_test_datagram_handler(s3_connection_t *c, const u_char *data, size_t len)
+s3_test_datagram_handler(s3_connection_t *c, s3_chain_t *data)
 {
+    s3_chain_t *cl;
+    size_t      len;
+
     (void)c;
 
-    s3_memcpy(s3_test_dg_data, data, len);
+    /* record the chain geometry the library handed over */
+
+    s3_test_dg_ptr = data->buf->pos;
+    s3_test_dg_link_size = s3_buf_size(data->buf);
+
+    s3_test_dg_links = 0;
+    len = 0;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        s3_memcpy(s3_test_dg_data + len, cl->buf->pos, s3_buf_size(cl->buf));
+        len += s3_buf_size(cl->buf);
+        s3_test_dg_links++;
+    }
+
     s3_test_dg_len = len;
 }
 
@@ -545,6 +564,20 @@ test_run_and_close(void)
 
     S3_ASSERT(s3_test_dg_len == 4);
     S3_ASSERT(s3_memcmp(s3_test_dg_data, s3_test_dg_payload, 4) == 0);
+
+    /*
+     * zero copy: the handler gets the chain the parser built, a view
+     * over the decrypted packet, not a block assembled for it.  a
+     * flattened handler would see a single anonymous block instead
+     */
+
+    S3_ASSERT(s3_test_dg_links == 1);
+    S3_ASSERT(s3_test_dg_link_size == 4);
+
+    /* the view is writable by nobody but carries the payload verbatim */
+
+    S3_ASSERT(s3_test_dg_ptr != NULL);
+    S3_ASSERT(s3_memcmp(s3_test_dg_ptr, s3_test_dg_payload, 4) == 0);
 
     /* the CONNECTION_CLOSE frame drains the connection */
 

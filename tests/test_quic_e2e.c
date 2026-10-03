@@ -36,49 +36,67 @@ static u_char s3_test_srv_received[64];
 static size_t s3_test_srv_received_len;
 
 typedef struct {
-    s3_pool_t         *pool;
-    s3_event_ctx_t     ctx;
+    s3_pool_t     *pool;
+    s3_event_ctx_t ctx;
 
-    s3_fd_t            listen_fd;
-    s3_connection_t   *listener;
-    s3_udp_listen_t    ul;
-    s3_quic_conf_t     srv_conf;
+    s3_fd_t          listen_fd;
+    s3_connection_t *listener;
+    s3_udp_listen_t  ul;
+    s3_quic_conf_t   srv_conf;
 
-    s3_fd_t            cli_fd;
-    s3_connection_t   *cli;
-    s3_quic_conf_t     cli_conf;
+    s3_fd_t          cli_fd;
+    s3_connection_t *cli;
+    s3_quic_conf_t   cli_conf;
 
     struct sockaddr_in sa;
     socklen_t          sa_len;
 
-    s3_connection_t   *server;
-    int                accepts;
+    s3_connection_t *server;
+    int              accepts;
 } s3_test_e2e_env_t;
 
 static s3_test_e2e_env_t s3_test_e2e;
 
 static void
-s3_test_client_datagram(s3_connection_t *c, const u_char *data, size_t len)
+s3_test_client_datagram(s3_connection_t *c, s3_chain_t *data)
 {
+    s3_chain_t *cl;
+    size_t      len;
+
     (void)c;
 
-    s3_memcpy(s3_test_cli_received, data, len);
+    len = 0;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        s3_memcpy(s3_test_cli_received + len, cl->buf->pos, s3_buf_size(cl->buf));
+        len += s3_buf_size(cl->buf);
+    }
+
     s3_test_cli_received_len = len;
 }
 
 static void
-s3_test_server_datagram(s3_connection_t *c, const u_char *data, size_t len)
+s3_test_server_datagram(s3_connection_t *c, s3_chain_t *data)
 {
+    s3_chain_t           *cl;
+    size_t                len;
     s3_quic_connection_t *qc;
 
-    s3_memcpy(s3_test_srv_received, data, len);
+    /* the chain is valid for the call only: copy what we echo back */
+
+    len = 0;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        s3_memcpy(s3_test_srv_received + len, cl->buf->pos, s3_buf_size(cl->buf));
+        len += s3_buf_size(cl->buf);
+    }
+
     s3_test_srv_received_len = len;
 
-    /* echo the datagram back to the client */
     qc = s3_quic_get_connection(c);
 
     if (qc != NULL && !qc->closing) {
-        (void)s3_quic_send_datagram(c, data, len);
+        (void)s3_quic_send_datagram(c, s3_test_srv_received, len);
     }
 }
 
@@ -155,7 +173,7 @@ s3_test_env_init(s3_test_e2e_env_t *env)
 
     {
         u_char cert[4096] = {0}, key[4096] = {0};
-        size_t  cert_len = 0, key_len = 0;
+        size_t cert_len = 0, key_len = 0;
 
         if (s3_test_tls_gen_cert(cert, &cert_len, key, &key_len) != 0) {
             return S3_ERROR;
@@ -333,9 +351,8 @@ s3_test_quic_e2e_run(void)
             dg_sent = 1;
         }
 
-        if (dg_sent && s3_test_cli_received_len == sizeof(payload)
-            && s3_memcmp(s3_test_cli_received, payload, sizeof(payload)) == 0)
-        {
+        if (dg_sent && s3_test_cli_received_len == sizeof(payload) &&
+            s3_memcmp(s3_test_cli_received, payload, sizeof(payload)) == 0) {
             break;
         }
 

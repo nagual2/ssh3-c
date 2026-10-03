@@ -1642,7 +1642,6 @@ s3_quic_handle_hs_done(s3_connection_t *c)
 static s3_int_t
 s3_quic_handle_datagram_frame(s3_connection_t *c, s3_quic_frame_t *frame)
 {
-    u_char               *buf, *p;
     size_t                len;
     s3_chain_t           *cl;
     s3_quic_connection_t *qc;
@@ -1651,6 +1650,10 @@ s3_quic_handle_datagram_frame(s3_connection_t *c, s3_quic_frame_t *frame)
 
     if (qc->conf->datagram_handler == NULL) {
         s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic datagram dropped: no handler");
+        return S3_OK;
+    }
+
+    if (frame->data == NULL) {
         return S3_OK;
     }
 
@@ -1664,27 +1667,16 @@ s3_quic_handle_datagram_frame(s3_connection_t *c, s3_quic_frame_t *frame)
         return S3_OK;
     }
 
-    /* the frame data is a chain; the handler takes one contiguous block */
-
-    buf = s3_palloc(c->pool, len);
-    if (buf == NULL) {
-        return S3_ERROR;
-    }
-
-    p = buf;
-
-    for (cl = frame->data; cl != NULL; cl = cl->next) {
-        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
-    }
-
     /*
+     * the chain goes to the handler as it stands: it views the
+     * decryption buffer, so no block is allocated and no byte is copied
+     *
      * D5 adds the receive accounting of RFC 9221 here: the per
      * connection queue limit, the drop policy and the
      * datagrams_in_flight bookkeeping on the send side
      */
-    qc->conf->datagram_handler(c, buf, len);
 
-    (void)s3_pfree(c->pool, buf);
+    qc->conf->datagram_handler(c, frame->data);
 
     return S3_OK;
 }

@@ -95,24 +95,49 @@ s3_interop_read_le32(const u_char *p)
 }
 
 static void
-s3_interop_client_datagram(s3_connection_t *c, const u_char *data, size_t len)
+s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
 {
-    uint32_t idx;
+    u_char     *exp;
+    uint32_t    idx;
+    size_t      len, n;
+    s3_chain_t *cl;
 
     (void)c;
+
+    len = 0;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
 
     if (len < 4 || len != s3_interop_size) {
         return;
     }
 
-    idx = s3_interop_read_le32(data);
+    /* the index is the first four payload bytes, they open the chain */
+
+    if (s3_buf_size(data->buf) < 4) {
+        return;
+    }
+
+    idx = s3_interop_read_le32(data->buf->pos);
 
     if (idx >= s3_interop_count || s3_interop_got[idx]) {
         return;
     }
 
-    if (s3_memcmp(data, s3_interop_expected + idx * s3_interop_size, len) != 0) {
-        return;
+    /* compare link by link: no flattened copy of the payload needed */
+
+    exp = s3_interop_expected + idx * s3_interop_size;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        n = s3_buf_size(cl->buf);
+
+        if (s3_memcmp(cl->buf->pos, exp, n) != 0) {
+            return;
+        }
+
+        exp += n;
     }
 
     s3_interop_got[idx] = 1;

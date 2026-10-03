@@ -153,9 +153,46 @@ s3_interop_alpn_wire(u_char *wire, const char *name)
 }
 
 static void
-s3_interop_datagram_echo(s3_connection_t *c, const u_char *data, size_t len)
+s3_interop_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 {
-    (void)s3_quic_send_datagram(c, data, len);
+    u_char     *buf;
+    size_t      len;
+    s3_chain_t *cl;
+
+    /*
+     * a datagram almost always lands in a single link of the receive
+     * buffer: echo it straight from there, no intermediate block
+     */
+
+    if (data->next == NULL) {
+        (void)s3_quic_send_datagram(c, data->buf->pos, s3_buf_size(data->buf));
+        return;
+    }
+
+    /* a fragmented datagram: flatten it once, into the connection pool */
+
+    len = 0;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    buf = s3_palloc(c->pool, len);
+    if (buf == NULL) {
+        return;
+    }
+
+    {
+        u_char *p = buf;
+
+        for (cl = data; cl != NULL; cl = cl->next) {
+            p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+        }
+    }
+
+    (void)s3_quic_send_datagram(c, buf, len);
+
+    (void)s3_pfree(c->pool, buf);
 }
 
 /*

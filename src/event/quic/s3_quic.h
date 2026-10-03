@@ -59,8 +59,16 @@ typedef void (*s3_quic_shutdown_pt)(s3_connection_t *c);
 
 typedef struct s3_quic_stream_s s3_quic_stream_t;
 
-/* RFC 9221, 5.  Datagram Handlers */
-typedef void (*s3_quic_datagram_pt)(s3_connection_t *c, const u_char *data, size_t len);
+/*
+ * RFC 9221, 5.  Datagram Handlers
+ *
+ * the payload arrives as the chain the parser produced: the handler
+ * walks it and copies only what it must retain.  the chain views the
+ * decryption buffer (as in the reference) and is valid for the
+ * duration of the call
+ */
+
+typedef void (*s3_quic_datagram_pt)(s3_connection_t *c, s3_chain_t *data);
 
 /*
  * the new stream handler: the ssh3-c replacement of the nginx

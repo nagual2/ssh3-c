@@ -246,7 +246,7 @@ nginx QUIC не имеет DATAGRAM. Все точки врезки опреде
 
 | № | Направление | Точка входа | Реализация |
 |---|-------------|-------------|------------|
-| 1 | приём | `ngx_quic_handle_datagram_frame` (новый, вызов из ngx_event_quic.c:1176) | payload (`frame.data` chain, `u.datagram.length`) → callback `conf->datagram_handler(c, data, len)` — новое поле `s3_quic_conf_t`. Без `ngx_quic_buffer_t`: DATAGRAM не упорядочивается и не собирается заново (кадр ≤ MTU). Образец результата — streams.c:1295-1329, но без буфера и `set_event` |
+| 1 | приём | `ngx_quic_handle_datagram_frame` (новый, вызов из ngx_event_quic.c:1176) | payload (`frame.data` chain, `u.datagram.length`) → callback `conf->datagram_handler(c, data)` — новое поле `s3_quic_conf_t`. **Zero-copy (2026-10-03)**: цепочка парсера передаётся как есть, без сплющивания — обработчик сам решает, копировать ли. Цепочка указывает на статический буфер дешифрования (`pkt->plaintext`, как в nginx) и валидна только на время вызова. Без `ngx_quic_buffer_t`: DATAGRAM не упорядочивается и не собирается заново (кадр ≤ MTU). Образец результата — streams.c:1295-1329, но без буфера и `set_event` |
 | 2 | отправка | новый public API `s3_quic_send_datagram(c, data, len)` (аналог `ngx_quic_reset_stream` в quic.h:137) | `ngx_quic_alloc_frame` (frames.c:197) + `u.datagram` + `frame->data` = `ngx_quic_copy_buffer` (frames.c:393) + `ngx_quic_queue_frame` (frames.c:299) → уйдёт через обычный `ngx_quic_output`; размер ограничен `min(TP_peer.max_datagram_frame_size, path->mtu - header)` — проверка в момент постановки |
 | 3 | отмена/закрытие | `ngx_quic_close_connection`/`discard_ctx` (ngx_event_quic.c:470/1096) | ничего: не-ack-кадры освобождаются как остальные |
 
