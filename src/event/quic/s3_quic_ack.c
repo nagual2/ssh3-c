@@ -8,6 +8,7 @@
 #include <s3_quic_output.h>
 #include <s3_quic_ack.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_migration.h>
 #include <s3_quic_streams.h>
 
 #define S3_QUIC_MAX_ACK_GAP 2
@@ -243,10 +244,9 @@ s3_quic_handle_ack_frame_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint
     qc = s3_quic_get_connection(c);
 
     if (ctx->level == S3_QUIC_ENCRYPTION_APPLICATION) {
-        /*
-         * the reference updates the MTU discovery state here
-         * (D4, s3_quic_migration.c: s3_quic_handle_path_mtu())
-         */
+        if (s3_quic_handle_path_mtu(c, qc->path, min, max) != S3_OK) {
+            return S3_ERROR;
+        }
     }
 
     st->max_pn = S3_TIMER_INFINITE;

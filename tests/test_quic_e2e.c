@@ -390,6 +390,23 @@ s3_test_quic_e2e_run(void)
     S3_ASSERT(qc->client_tp_done == 1);
     S3_ASSERT(qc->ctp.max_datagram_frame_size == 1200);
 
+    /*
+     * DPLPMTUD: probe PING packets ride the application-level ACK path;
+     * the doubling schedule starts PATH_MTU_DELAY after path validation,
+     * so a short pump either confirms the first probe or the discovery
+     * confirmation is dead
+     */
+    {
+        s3_msec_t deadline = s3_current_msec + 1500;
+
+        while (qc->path->mtu <= S3_QUIC_MIN_INITIAL_SIZE && s3_current_msec < deadline) {
+            s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+            s3_process_events_and_timers(&env->ctx);
+        }
+
+        S3_ASSERT(qc->path->mtu > S3_QUIC_MIN_INITIAL_SIZE);
+    }
+
     s3_test_env_done(env);
 
     return s3_test_failures;
