@@ -86,6 +86,9 @@ set(S3_CORE_SOURCES
     src/event/quic/s3_quic_output.c
     src/event/quic/s3_quic_ack.c
     src/event/quic/s3_quic_streams.c
+    src/h3/s3_h3_encode.c
+    src/h3/s3_h3_table.c
+    src/h3/s3_h3_parse.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -94,6 +97,7 @@ target_include_directories(s3core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/h3
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event/quic
         ${CMAKE_CURRENT_SOURCE_DIR}/src/os/unix
 )
@@ -152,6 +156,8 @@ set(S3_TESTS
     test_quic_output
     test_quic_ack
     test_quic_e2e
+    test_h3_qpack
+    test_h3_parse
 )
 
 enable_testing()
