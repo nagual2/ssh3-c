@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-// The quic-go interop harness for ssh3-c (D3/D4 acceptance).
+// The quic-go interop harness for ssh3-c (D3/D4/P3 acceptance).
 //
-// One binary, two modes:
+// One binary, several modes:
 //
 //	harness -server -addr 127.0.0.1:0 -cert cert.pem -key key.pem
 //	harness -client -addr 127.0.0.1:4433 -count 8 -size 512
 //	harness -client -streams -addr 127.0.0.1:4433 -count 8 -size 65536
+//	harness -h3-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
+//	harness -h3-client -a 127.0.0.1:4433
 //
 // The server accepts QUIC connections and echoes every received
 // DATAGRAM back; in addition it echoes every accepted stream.  The
@@ -15,12 +17,21 @@
 // pumps count*size bytes through a stream against a deterministic
 // pattern (no memory bound, for the bulk runs).
 //
+// The -h3-* modes exercise RFC 9220 extended CONNECT over HTTP/3:
+// the server accepts only CONNECT with :protocol=ssh3, :path=/ssh3-term
+// and a non-empty Authorization header (401 otherwise), answers 200
+// and holds the request stream open until the peer closes it; the
+// client opens the extended CONNECT with Authorization: test-token
+// and reports the response status.
+//
 // Machine-readable lines on stdout (the runner greps them):
 //
 //	INTEROP-LISTEN port=N
 //	INTEROP-HANDSHAKE-OK
 //	INTEROP-DATAGRAM-OK sent=N recv=N
 //	INTEROP-STREAM-OK sent=N recv=N
+//	INTEROP-H3-CONNECT-OK authlen=<len>
+//	INTEROP-H3-STATUS <code>
 package main
 
 import (
@@ -33,10 +44,12 @@ import (
 	"io"
 	mrand "math/rand"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 func fatalf(format string, args ...any) {
@@ -58,6 +71,9 @@ func main() {
 	streams := flag.Bool("streams", false, "client test: pump a stream instead of datagrams")
 	hold := flag.Duration("hold", 0, "after the handshake, hold the connection idle this long")
 	min := flag.Int("min", -1, "require at least this many echoed datagrams (-1: all)")
+	h3Server := flag.Bool("h3-server", false, "run as an HTTP/3 server accepting RFC 9220 extended CONNECT (ssh3)")
+	h3Client := flag.Bool("h3-client", false, "run as an HTTP/3 extended CONNECT client (ssh3)")
+	addrShort := flag.String("a", "", "dial target host:port for -h3-client (alias for -addr)")
 	flag.Parse()
 
 	if !*streams && *size > 1100 {
@@ -66,12 +82,32 @@ func main() {
 		*size = 1100
 	}
 
-	if *server && *client {
-		fatalf("-server and -client are mutually exclusive")
+	modes := 0
+	for _, m := range []*bool{server, client, h3Server, h3Client} {
+		if *m {
+			modes++
+		}
+	}
+	if modes > 1 {
+		fatalf("-server, -client, -h3-server and -h3-client are mutually exclusive")
 	}
 
 	if *server {
 		runServer(*addr, *certFile, *keyFile, *alpn, *keylog)
+		return
+	}
+
+	if *h3Server {
+		runH3Server(*addr, *certFile, *keyFile)
+		return
+	}
+
+	if *h3Client {
+		target := *addr
+		if *addrShort != "" {
+			target = *addrShort
+		}
+		runH3Client(target, *timeout)
 		return
 	}
 
@@ -471,5 +507,156 @@ func verifyPattern(r io.Reader, p *mrand.Rand, n int64) (int64, error) {
 func fillPattern(b []byte, r *mrand.Rand) {
 	for i := range b {
 		b[i] = byte(r.Intn(256))
+	}
+}
+
+// h3ConnectHandler accepts only RFC 9220 extended CONNECT requests
+// announcing the ssh3 protocol; a valid request is answered with 200
+// and its stream is kept open until the peer goes away
+func h3ConnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect || r.Proto != "ssh3" {
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+
+	if r.URL.Path != "/ssh3-term" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	authlen := len(r.Header.Get("Authorization"))
+	if authlen == 0 {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	fmt.Printf("INTEROP-H3-CONNECT-OK authlen=%d\n", authlen)
+
+	// no Content-Length: a CONNECT response is just a status and the
+	// stream carries the tunneled protocol from here on
+	w.WriteHeader(http.StatusOK)
+
+	// take over the stream so it stays open until the client closes
+	// it; HTTPStream flushes the headers and marks the response as
+	// hijacked, so quic-go does not terminate it on handler return
+	streamer, ok := w.(http3.HTTPStreamer)
+	if !ok {
+		return
+	}
+
+	str := streamer.HTTPStream()
+
+	_, _ = io.Copy(io.Discard, str) // wait for the client to close
+
+	str.Close()
+}
+
+// runH3Server serves HTTP/3 (h3 ALPN is set up automatically by
+// quic-go) on the given UDP address
+func runH3Server(addr, certFile, keyFile string) {
+	if certFile == "" || keyFile == "" {
+		fatalf("h3-server mode needs -cert and -key")
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		fatalf("load key pair: %v", err)
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr(addr))
+	if err != nil {
+		fatalf("listen udp: %v", err)
+	}
+
+	fmt.Printf("INTEROP-LISTEN port=%d\n", udpConn.LocalAddr().(*net.UDPAddr).Port)
+
+	server := &http3.Server{
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{http3.NextProtoH3},
+		},
+		QUICConfig: &quic.Config{
+			MaxIdleTimeout: 60 * time.Second,
+		},
+		Handler: http.HandlerFunc(h3ConnectHandler),
+	}
+
+	if err := server.Serve(udpConn); err != nil {
+		fatalf("h3 serve: %v", err)
+	}
+}
+
+// runH3Client dials, sends the extended CONNECT announcing ssh3 and
+// reports the response status.  The request stream's send side stays
+// open until the response has been read: Transport.RoundTrip would
+// half-close the stream right after the headers (no request body),
+// which is not how a real ssh3 client tunnels over the CONNECT.
+func runH3Client(target string, timeout time.Duration) {
+	if target == "" {
+		fatalf("h3-client mode needs -a host:port")
+	}
+
+	tlsCfg := &tls.Config{
+		NextProtos:         []string{http3.NextProtoH3},
+		InsecureSkipVerify: true, // the harness runs against self-signed certs
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		fatalf("local udp: %v", err)
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := tr.Dial(ctx, udpAddr(target), tlsCfg, &quic.Config{
+		MaxIdleTimeout: 60 * time.Second,
+	})
+	if err != nil {
+		fatalf("dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	// extended CONNECT needs the low-level API: NewClientConn is the
+	// quic-go-sanctioned entry point for it (RFC 9220)
+	cc := (&http3.Transport{}).NewClientConn(conn)
+
+	str, err := cc.OpenRequestStream(ctx)
+	if err != nil {
+		fatalf("open request stream: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodConnect, "https://"+target+"/ssh3-term", nil)
+	if err != nil {
+		fatalf("build connect request: %v", err)
+	}
+
+	// quic-go encodes req.Proto as the :protocol pseudo-header
+	req.Proto = "ssh3"
+	req.Header.Set("Authorization", "test-token")
+
+	if err := str.SendRequestHeader(req); err != nil {
+		fatalf("send connect: %v", err)
+	}
+
+	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set stream deadline: %v", err)
+	}
+
+	resp, err := str.ReadResponse()
+	if err != nil {
+		fatalf("read response: %v", err)
+	}
+
+	fmt.Printf("INTEROP-H3-STATUS %d\n", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+
+	if err := str.Close(); err != nil {
+		fatalf("close stream: %v", err)
 	}
 }
