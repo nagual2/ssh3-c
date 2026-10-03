@@ -113,7 +113,7 @@ s3_event_recvmsg(s3_event_t *ev)
     if (n == -1) {
         err = s3_socket_errno;
 
-        if (err == S3_EAGAIN) {
+        if (err == S3_EAGAIN || err == S3_EINTR) {
             s3_log_debug0(S3_LOG_DEBUG_EVENT, ev->log, err, "recvmsg() not ready");
             return;
         }

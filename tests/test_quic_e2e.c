@@ -18,6 +18,7 @@
 
 #include <openssl/ssl.h>
 
+#include <s3_nonblocking.h>
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
@@ -143,6 +144,10 @@ s3_test_env_init(s3_test_e2e_env_t *env)
         return S3_ERROR;
     }
 
+    if (s3_nonblocking(env->listen_fd) != S3_OK) {
+        return S3_ERROR;
+    }
+
     s3_memzero(&env->sa, sizeof(env->sa));
     env->sa.sin_family = AF_INET;
     env->sa.sin_port = 0;
@@ -222,6 +227,10 @@ s3_test_env_init(s3_test_e2e_env_t *env)
 
     env->cli_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (env->cli_fd == -1) {
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(env->cli_fd) != S3_OK) {
         return S3_ERROR;
     }
 

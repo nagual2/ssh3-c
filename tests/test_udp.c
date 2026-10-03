@@ -9,6 +9,7 @@
 
 #include <s3_core.h>
 
+#include <s3_nonblocking.h>
 #include <s3_udp_sendmsg_chain.h>
 
 #include <netinet/in.h>
@@ -64,6 +65,7 @@ s3_test_udp(void)
 
     lsd = socket(AF_INET, SOCK_DGRAM, 0);
     S3_ASSERT(lsd != -1);
+    S3_ASSERT(s3_nonblocking(lsd) == S3_OK);
 
     s3_memzero(&sa, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -89,6 +91,7 @@ s3_test_udp(void)
 
     csd = socket(AF_INET, SOCK_DGRAM, 0);
     S3_ASSERT(csd != -1);
+    S3_ASSERT(s3_nonblocking(csd) == S3_OK);
 
     s3_memzero(&ul, sizeof(ul));
     ul.connection = lc;

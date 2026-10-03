@@ -23,6 +23,7 @@
 
 #include <openssl/rand.h>
 
+#include <s3_nonblocking.h>
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
@@ -467,6 +468,11 @@ main(int argc, char **argv)
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == -1) {
         perror("socket");
+        return 1;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
+        perror("fcntl(O_NONBLOCK)");
         return 1;
     }
 

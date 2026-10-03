@@ -72,6 +72,7 @@ set(S3_CORE_SOURCES
     src/event/modules/s3_epoll_module.c
     src/os/unix/s3_udp_sendmsg_chain.c
     src/os/unix/s3_udp_recv.c
+    src/os/unix/s3_nonblocking.c
     src/os/unix/s3_sock_ntop.c
     src/event/quic/s3_quic_transport.c
     src/event/quic/s3_quic_frames.c

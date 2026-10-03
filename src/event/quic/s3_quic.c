@@ -618,34 +618,46 @@ s3_quic_input_handler(s3_event_t *rev)
      * the datagram was staged by the listener into the quic socket
      * (or read from the client socket); the per-datagram peer address
      * is kept in qsock->sockaddr by the listener
+     *
+     * ngx_quic_recvmsg() drains the socket in a loop instead of handing
+     * one datagram back to the event loop, and it is worth the same
+     * here: one epoll wakeup then costs one recv() per datagram rather
+     * than a whole epoll_wait()/recv() pair per datagram, which on a
+     * busy socket is where the bulk transfer spends its system time.
+     * S3_AGAIN marks the drained socket and returns to the loop; as in
+     * the reference, ev->available does not bound the drain on epoll
      */
 
-    n = c->recv(c, buffer, sizeof(buffer));
-    if (n <= 0) {
-        return;
+    for ( ;; ) {
+
+        n = c->recv(c, buffer, sizeof(buffer));
+
+        if (n <= 0) {
+            return;
+        }
+
+        s3_memzero(&b, sizeof(s3_buf_t));
+
+        b.temporary = 1;
+        b.pos = buffer;
+        b.last = buffer + n;
+
+        rc = s3_quic_handle_datagram(c, &b, qc->conf);
+
+        if (rc == S3_ERROR) {
+            s3_quic_close_connection(c, S3_ERROR);
+            return;
+        }
+
+        if (rc == S3_ABORT) {
+            return;
+        }
+
+        /* rc == S3_OK */
+
+        qc->send_timer_set = 0;
+        s3_event_add_timer(rev, qc->tp.max_idle_timeout);
     }
-
-    s3_memzero(&b, sizeof(s3_buf_t));
-
-    b.temporary = 1;
-    b.pos = buffer;
-    b.last = buffer + n;
-
-    rc = s3_quic_handle_datagram(c, &b, qc->conf);
-
-    if (rc == S3_ERROR) {
-        s3_quic_close_connection(c, S3_ERROR);
-        return;
-    }
-
-    if (rc == S3_ABORT) {
-        return;
-    }
-
-    /* rc == S3_OK */
-
-    qc->send_timer_set = 0;
-    s3_event_add_timer(rev, qc->tp.max_idle_timeout);
 }
 
 void

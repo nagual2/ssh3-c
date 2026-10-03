@@ -15,6 +15,7 @@
 
 #include <openssl/ssl.h>
 
+#include <s3_nonblocking.h>
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
@@ -44,6 +45,10 @@ s3_test_udp_socket(struct sockaddr_in *sa)
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == -1) {
+        return -1;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
         return -1;
     }
 

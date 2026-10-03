@@ -9,6 +9,8 @@
 #define S3_TEST_TLS_NO_LOCKSTEP
 #include "s3_quic_tls_helper.h"
 
+#include <s3_nonblocking.h>
+
 /*
  * D2 unit tests of the quic core: s3_quic_run() on a crafted, valid
  * Initial packet carrying a real ClientHello, the DATAGRAM frame
@@ -70,6 +72,10 @@ s3_test_udp_socket(void)
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == -1) {
+        return -1;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
         return -1;
     }
 
@@ -596,10 +602,152 @@ test_run_and_close(void)
     return s3_test_failures;
 }
 
+/*
+ * the input handler must drain the socket, the way ngx_quic_recvmsg()
+ * loops on recvmsg() until the socket reports EAGAIN: one epoll wakeup
+ * has to cost one recv per datagram, not one epoll_wait per datagram
+ */
+
+#define S3_TEST_DRAIN_DATAGRAMS 3
+
+static s3_uint_t s3_test_drain_calls;
+static u_char    s3_test_drain_pkt[S3_TEST_TLS_BUF];
+static size_t    s3_test_drain_pkt_len;
+
+static ssize_t
+s3_test_drain_recv(s3_connection_t *c, u_char *buf, size_t size)
+{
+    size_t len;
+
+    (void)c;
+
+    if (s3_test_drain_calls == S3_TEST_DRAIN_DATAGRAMS) {
+        return (ssize_t)S3_AGAIN;
+    }
+
+    s3_test_drain_calls++;
+
+    len = s3_min(s3_test_drain_pkt_len, size);
+
+    s3_memcpy(buf, s3_test_drain_pkt, len);
+
+    return (ssize_t)len;
+}
+
+static int
+test_input_handler_drains_socket(void)
+{
+    u_char                cert[4096] = {0}, key[4096] = {0}, tp[64], res[2048], sealed[2048];
+    u_char                cli_secret[32];
+    size_t                cert_len = 0, key_len = 0, tp_len, frame_len, pkt_len;
+    s3_str_t              alpn, secret;
+    int                   n;
+    s3_quic_keys_t        pkt_keys;
+    s3_quic_header_t      pkt;
+    s3_quic_frame_t       frame;
+    s3_chain_t            chain;
+    s3_buf_t             *b;
+    s3_quic_connection_t *qc;
+
+    static s3_test_core_env_t env;
+
+    s3_test_tls_log_init();
+
+    S3_ASSERT(s3_test_tls_gen_cert(cert, &cert_len, key, &key_len) == 0);
+    S3_ASSERT(s3_test_core_env_init(&env, cert, cert_len, key, key_len) == S3_OK);
+
+    /* drive one Initial through, so that the quic connection exists */
+
+    tp_len = s3_test_client_tp(tp, s3_test_scid, sizeof(s3_test_scid));
+
+    alpn.data = (u_char *)"\x04ssh3";
+    alpn.len = 5;
+
+    env.client = s3_test_tls_client(&env.cli, &alpn, tp, tp_len, &env.client_ctx);
+    S3_ASSERT(env.client != NULL);
+
+    n = SSL_do_handshake(env.client);
+    S3_ASSERT(n <= 0 && SSL_get_error(env.client, n) == SSL_ERROR_WANT_READ);
+
+    s3_memzero(&frame, sizeof(s3_quic_frame_t));
+    s3_memzero(&chain, sizeof(s3_chain_t));
+
+    chain.buf = &(s3_buf_t){
+        .temporary = 1, .pos = env.cli.out[0], .last = env.cli.out[0] + env.cli.out_len[0]};
+    frame.type = S3_QUIC_FT_CRYPTO;
+    frame.data = &chain;
+    frame.u.crypto.offset = 0;
+    frame.u.crypto.length = env.cli.out_len[0];
+
+    frame_len = s3_quic_create_frame(res, &frame);
+    S3_ASSERT(frame_len > 0);
+
+    s3_memzero(&pkt_keys, sizeof(s3_quic_keys_t));
+
+    secret.data = (u_char *)s3_test_dcid;
+    secret.len = sizeof(s3_test_dcid);
+
+    S3_ASSERT(s3_quic_keys_set_initial_secret(&pkt_keys, &secret, &s3_test_tls_log) == S3_OK);
+
+    s3_memcpy(cli_secret, pkt_keys.secrets[S3_QUIC_ENCRYPTION_INITIAL].client.secret.data,
+              sizeof(cli_secret));
+
+    s3_quic_keys_cleanup(&pkt_keys);
+
+    s3_memzero(&pkt, sizeof(s3_quic_header_t));
+    pkt.log = &s3_test_tls_log;
+    pkt.flags = 0xc0;
+    pkt.version = 1;
+    pkt.level = S3_QUIC_ENCRYPTION_INITIAL;
+    pkt.number = 0;
+    pkt.num_len = 1;
+    pkt.trunc = 0;
+    pkt.dcid.data = (u_char *)s3_test_dcid;
+    pkt.dcid.len = sizeof(s3_test_dcid);
+    pkt.scid.data = (u_char *)s3_test_scid;
+    pkt.scid.len = sizeof(s3_test_scid);
+    pkt.payload.data = res;
+    pkt.payload.len = frame_len;
+
+    S3_ASSERT(s3_test_seal_packet(&pkt, &pkt_keys, S3_QUIC_ENCRYPTION_INITIAL, cli_secret,
+                                  sizeof(cli_secret), sealed, sizeof(sealed), &pkt_len) == S3_OK);
+
+    b = s3_test_datagram_buf(env.conn->pool, sealed, pkt_len);
+    S3_ASSERT(b != NULL);
+
+    env.conn->buffer = b;
+
+    s3_quic_run(env.conn, &env.conf);
+
+    qc = s3_quic_get_connection(env.conn);
+    S3_ASSERT(qc != NULL);
+
+    /*
+     * the packets below replay the Initial the connection has already
+     * processed: a duplicate frame is dropped by the quic layer, which
+     * is what keeps the connection alive while the socket is drained
+     */
+
+    s3_memcpy(s3_test_drain_pkt, sealed, pkt_len);
+    s3_test_drain_pkt_len = pkt_len;
+    s3_test_drain_calls = 0;
+
+    env.conn->recv = s3_test_drain_recv;
+
+    env.conn->read->handler(env.conn->read);
+
+    S3_ASSERT(s3_test_drain_calls == S3_TEST_DRAIN_DATAGRAMS);
+
+    s3_test_core_env_done(&env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_core(void)
 {
     test_run_and_close();
+    test_input_handler_drains_socket();
 
     /* release the one-time openssl allocations for the leak check */
     OPENSSL_cleanup();
