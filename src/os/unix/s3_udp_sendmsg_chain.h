@@ -10,6 +10,14 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
+#if (S3_HAVE_UDP_SEGMENT)
+/*
+ * UDP_SEGMENT, the UDP_SEGMENT cmsg the GSO send path sets; the reference
+ * pulls the same header in from its platform config (NGX_LINUX)
+ */
+#include <netinet/udp.h>
+#endif
+
 #include <s3_base.h>
 #include <s3_connection.h>
 #include <s3_palloc.h>

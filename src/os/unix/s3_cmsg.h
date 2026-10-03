@@ -7,6 +7,7 @@
 #define _S3_CMSG_H_INCLUDED_
 
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #include <s3_base.h>
 

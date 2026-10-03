@@ -7,42 +7,53 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # XSI strerror_r (int return), posix_memalign, sysconf, STDERR_FILENO.
-add_compile_definitions(_POSIX_C_SOURCE=200809L)
+#
+# the feature checks below must compile under the same feature macros as the
+# build, otherwise they answer a question nobody asked: CMake runs
+# check_c_source_compiles in a separate project that does not inherit
+# add_compile_definitions
+set(S3_FEATURE_DEFINITIONS -D_POSIX_C_SOURCE=200809L)
+
+add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 
 include(CheckCSourceCompiles)
+
+set(CMAKE_REQUIRED_DEFINITIONS ${S3_FEATURE_DEFINITIONS})
 
 # the UDP GSO (man 7 udp UDP_SEGMENT) support, like NGX_HAVE_UDP_SEGMENT
 check_c_source_compiles(
     "
     #include <sys/socket.h>
-    #include <netinet/in.h>
     #include <netinet/udp.h>
     int main(void) {
-        struct cmsghdr *cmsg = 0;
-        (void) cmsg->cmsg_level = SOL_UDP;
-        (void) cmsg->cmsg_type = UDP_SEGMENT;
+        struct cmsghdr cmsg;
+        cmsg.cmsg_level = SOL_UDP;
+        cmsg.cmsg_type = UDP_SEGMENT;
         return 0;
     }
     "
     S3_HAVE_UDP_SEGMENT)
 
-# the local address ancillary data, like NGX_HAVE_ADDRINFO_CMSG
+# the local address ancillary data, like NGX_HAVE_ADDRINFO_CMSG.
+#
+# the code sizes cmsghdr payload with the two packet info structs, so the
+# check must complete them -- IP_PKTINFO and IPV6_RECVPKTINFO are plain
+# constants that survive on hosts where the structs are not declared.
+# struct in6_pktinfo is behind __USE_GNU, in_pktinfo behind __USE_MISC
 check_c_source_compiles(
     "
     #include <sys/socket.h>
     #include <netinet/in.h>
     int main(void) {
-        struct cmsghdr *cmsg = 0;
-        (void) cmsg->cmsg_level = SOL_IP;
-        (void) cmsg->cmsg_type = IP_PKTINFO;
-#ifdef IPV6_RECVPKTINFO
-        return 0;
-#else
-        return 1;
-#endif
+        struct cmsghdr cmsg;
+        cmsg.cmsg_level = SOL_IP;
+        cmsg.cmsg_type = IP_PKTINFO;
+        return (int) (sizeof(struct in_pktinfo) + sizeof(struct in6_pktinfo)) & 0;
     }
     "
     S3_HAVE_ADDRINFO_CMSG)
+
+unset(CMAKE_REQUIRED_DEFINITIONS)
 
 set(S3_CORE_SOURCES
     src/core/s3_string.c
