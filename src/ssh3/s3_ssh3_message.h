@@ -95,4 +95,14 @@ s3_int_t s3_ssh3_msg_parse_extended_data(const u_char **pos, const u_char *end,
 
 s3_int_t s3_ssh3_msg_parse_request(const u_char **pos, const u_char *end, s3_ssh3_msg_request_t *m);
 
+/*
+ * the envelope only (the type SSHString plus the want_reply byte):
+ * fills request_type and want_reply, leaves the body unparsed - *pos
+ * lands on the first body byte for the s3_ssh3_request body parser;
+ * the whole-buffer variant above stays for a trailing 98 message
+ */
+
+s3_int_t s3_ssh3_msg_parse_request_envelope(const u_char **pos, const u_char *end,
+                                            s3_ssh3_msg_request_t *m);
+
 #endif /* _S3_SSH3_MESSAGE_H_INCLUDED_ */

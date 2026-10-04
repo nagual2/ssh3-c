@@ -199,3 +199,31 @@ s3_ssh3_msg_parse_request(const u_char **pos, const u_char *end, s3_ssh3_msg_req
 
     return S3_OK;
 }
+
+s3_int_t
+s3_ssh3_msg_parse_request_envelope(const u_char **pos, const u_char *end,
+                                   s3_ssh3_msg_request_t *m)
+{
+    const u_char *p = *pos;
+    s3_str_t      request_type;
+
+    if (s3_ssh3_parse_sshstring(&p, end, &request_type) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (end - p < 1) {
+        return S3_ERROR;
+    }
+
+    m->request_type = request_type;
+    m->want_reply = *p++;
+
+    /* the body stays where it starts: the caller parses it against
+     * end with the request module, *pos lands on the first body byte */
+
+    s3_memzero(&m->body, sizeof(s3_str_t));
+
+    *pos = p;
+
+    return S3_OK;
+}

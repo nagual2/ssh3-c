@@ -97,6 +97,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_channel.c
     src/ssh3/s3_ssh3_conversation.c
     src/ssh3/s3_ssh3_dgram.c
+    src/ssh3/s3_ssh3_session_srv.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -175,6 +176,7 @@ set(S3_TESTS
     test_ssh3_channel
     test_ssh3_conversation
     test_ssh3_dgram
+    test_ssh3_session_srv
 )
 
 enable_testing()
