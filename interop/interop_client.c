@@ -17,12 +17,21 @@
  * (the header, the shell request and the ping probe in one send), the
  * verdict is the echoed ping.
  *
+ * with -C -S exec|pty the session scenarios run instead of the ping:
+ * exec sends "printf s3-exec-ok" with the fin right behind it and
+ * reads the output plus the 98 exit-status; pty opens a pty at 80x24,
+ * starts the shell, resizes to 100x40, probes the size with stty,
+ * signals KILL once the resized geometry came back and waits for the
+ * exit-status 137 (128 + SIGKILL).
+ *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
  *   INTEROP-DATAGRAM-OK sent=N recv=N
  *   INTEROP-STREAM-OK sent=N recv=N
  *   INTEROP-H3-STATUS <code>
  *   INTEROP-CHANNEL-OK len=<payload length>
+ *   INTEROP-EXEC-OK exit=0 / INTEROP-EXEC-FAIL exit=<code>
+ *   INTEROP-PTY-SIGNAL-OK exit=137 / INTEROP-PTY-SIGNAL-FAIL exit=<code>
  * the exit code is 0 only when the mode's success line came back
  */
 
@@ -100,6 +109,20 @@ static s3_connection_t *s3_interop_h3_channel;
 static unsigned         s3_interop_h3_ch_sent;
 static unsigned         s3_interop_h3_ch_confirmed;
 static unsigned         s3_interop_h3_ch_ok;
+
+/*
+ * the session scenarios (-3 -C -S exec|pty): the channel carries the
+ * request/response runs instead of the ping echo, no shell request or
+ * ping goes out; the verdict comes with the 98 exit-status
+ */
+enum { S3_INTEROP_SESSION_NONE = 0, S3_INTEROP_SESSION_EXEC, S3_INTEROP_SESSION_PTY };
+
+static unsigned s3_interop_h3_session_mode;
+static u_char  *s3_interop_h3_sess_out; /* the stdout accumulator */
+static size_t   s3_interop_h3_sess_out_cap;
+static size_t   s3_interop_h3_sess_out_len;
+static unsigned s3_interop_h3_sess_signal_pending; /* the resized geometry came back */
+static unsigned s3_interop_h3_sess_signal_sent;
 
 static s3_h3_parse_headers_t s3_interop_h3_parse;
 static u_char               *s3_interop_h3_buf;
@@ -787,6 +810,322 @@ s3_interop_h3_channel_read(s3_event_t *ev)
     }
 }
 
+/* the needle search over the accumulated stdout (no NUL terminator) */
+
+static unsigned
+s3_interop_h3_sess_has(const char *text, size_t n)
+{
+    size_t i;
+
+    if (s3_interop_h3_sess_out_len < n) {
+        return 0;
+    }
+
+    for (i = 0; i + n <= s3_interop_h3_sess_out_len; i++) {
+
+        if (s3_memcmp(s3_interop_h3_sess_out + i, text, n) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void
+s3_interop_h3_sess_append(const u_char *data, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+
+    if (s3_interop_h3_sess_out_len + len > s3_interop_h3_sess_out_cap) {
+        size_t  cap = s3_interop_h3_sess_out_cap + 262144;
+        u_char *grown;
+
+        while (cap < s3_interop_h3_sess_out_len + len) {
+            cap += 262144;
+        }
+
+        grown = realloc(s3_interop_h3_sess_out, cap);
+
+        if (grown == NULL) {
+            fprintf(stderr, "interop-client: session output growth failed\n");
+            exit(1);
+        }
+
+        s3_interop_h3_sess_out = grown;
+        s3_interop_h3_sess_out_cap = cap;
+    }
+
+    s3_memcpy(s3_interop_h3_sess_out + s3_interop_h3_sess_out_len, data, len);
+    s3_interop_h3_sess_out_len += len;
+}
+
+/* the verdict of both session scenarios, the 98 exit-status carries it */
+
+static void
+s3_interop_h3_session_verdict(uint64_t code)
+{
+    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
+
+        if (code == 0 && s3_interop_h3_sess_has("s3-exec-ok", 10)) {
+            printf("INTEROP-EXEC-OK exit=0\n");
+            fflush(stdout);
+
+            s3_interop_h3_ch_ok = 1;
+
+            return;
+        }
+
+        printf("INTEROP-EXEC-FAIL exit=%llu\n", (unsigned long long)code);
+        fflush(stdout);
+
+        exit(1);
+    }
+
+    /*
+     * the pty run: KILL is the only signal an interactive shell may
+     * not ignore (POSIX job control), the verdict is 137 = 128 + 9;
+     * the exit-signal body is unused, the server sends exit-status
+     */
+
+    if (code == 137) {
+        printf("INTEROP-PTY-SIGNAL-OK exit=137\n");
+        fflush(stdout);
+
+        s3_interop_h3_ch_ok = 1;
+
+        return;
+    }
+
+    printf("INTEROP-PTY-SIGNAL-FAIL exit=%llu\n", (unsigned long long)code);
+    fflush(stdout);
+
+    exit(1);
+}
+
+/*
+ * the 98 builder: the message type varint, the envelope and the
+ * encoded body of the request, appended at p; returns the past-the-end
+ * pointer
+ */
+static u_char *
+s3_interop_h3_session_request(u_char *p, s3_ssh3_request_kind_t kind, unsigned want_reply,
+                              const s3_ssh3_request_t *body)
+{
+    s3_ssh3_msg_request_t env;
+    u_char                enc[128];
+    size_t                n;
+    const char           *type;
+
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_REQUEST);
+
+    type = s3_ssh3_request_type_str(kind);
+
+    n = (size_t)s3_ssh3_request_encode_body(NULL, body);
+
+    if (n > sizeof(enc)) {
+        fprintf(stderr, "interop-client: session request body too large\n");
+        exit(1);
+    }
+
+    (void)s3_ssh3_request_encode_body(enc, body);
+
+    s3_memzero(&env, sizeof(env));
+
+    env.request_type.data = (u_char *)type;
+    env.request_type.len = strlen(type);
+    env.want_reply = want_reply;
+    env.body.data = enc;
+    env.body.len = n;
+
+    return (u_char *)s3_ssh3_msg_encode_request(p, &env);
+}
+
+/*
+ * the session reader (-3 -C -S exec|pty): the first message must be
+ * the 91 confirmation, then the 94 payloads accumulate into the stdout
+ * buffer and the 98 envelopes dispatch by the request kind; the
+ * verdict is the 98 exit-status (the exec wants zero with the marker
+ * printed, the pty wants 137 = 128 + SIGKILL).  A request body has no
+ * length prefix on the wire, it runs to the end of the received data,
+ * so a truncated tail waits for the next recv
+ */
+static void
+s3_interop_h3_session_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_interop_h3_ch_ok) {
+        /* after the verdict the queued teardown read events may arrive */
+        return;
+    }
+
+    sc = ev->data;
+
+    for (;;) {
+
+        if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
+            size_t  cap = s3_interop_h3_ch_cap + 262144;
+            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-client: channel buffer growth failed\n");
+                exit(1);
+            }
+
+            s3_interop_h3_ch_buf = grown;
+            s3_interop_h3_ch_cap = cap;
+        }
+
+        n = sc->recv(sc, s3_interop_h3_ch_buf + s3_interop_h3_ch_len,
+                     s3_interop_h3_ch_cap - s3_interop_h3_ch_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin before the exit-status: no verdict */
+            fprintf(stderr, "interop-client: channel closed before the session verdict\n");
+            exit(1);
+        }
+
+        if (n < 0) {
+            fprintf(stderr, "interop-client: channel recv error\n");
+            exit(1);
+        }
+
+        s3_interop_h3_ch_len += (size_t)n;
+
+        pos = s3_interop_h3_ch_buf;
+        end = s3_interop_h3_ch_buf + s3_interop_h3_ch_len;
+
+        while (pos < end) {
+
+            uint64_t type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                /* a partial type varint, the next recv completes it */
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: duplicate channel confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    break;
+                }
+
+                s3_interop_h3_ch_confirmed = 1;
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t msg;
+
+                if (!s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: channel data before confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
+                    break;
+                }
+
+                /* the stdout accumulates for the verdict */
+
+                s3_interop_h3_sess_append(msg.data.data, msg.data.len);
+
+                /*
+                 * the pty run signals when the resized geometry came
+                 * back ("40 100" = rows columns after window-change)
+                 */
+
+                if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_PTY &&
+                    !s3_interop_h3_sess_signal_pending && s3_interop_h3_sess_has("40 100", 6)) {
+                    s3_interop_h3_sess_signal_pending = 1;
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) {
+
+                s3_ssh3_msg_extended_data_t xmsg;
+
+                if (s3_ssh3_msg_parse_extended_data(&pos, end, &xmsg) != S3_OK) {
+                    break;
+                }
+
+                /* the stderr side is drained, nothing verdicts on it */
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
+
+                s3_ssh3_msg_request_t env;
+                s3_ssh3_request_t     body;
+                const u_char         *bpos;
+                s3_int_t              rc;
+
+                if (s3_ssh3_msg_parse_request_envelope(&pos, end, &env) != S3_OK) {
+                    /* a partial envelope, the parse left pos untouched */
+                    break;
+                }
+
+                bpos = pos;
+
+                rc = s3_ssh3_request_parse_body(&bpos, end, &env.request_type, &body);
+
+                if (rc == S3_OK) {
+
+                    if (body.kind == S3_SSH3_REQ_EXIT_STATUS) {
+                        s3_interop_h3_session_verdict(body.u.exit_status.status);
+
+                        return;
+                    }
+
+                    /* the replies without the verdict power are drained */
+                    continue;
+                }
+
+                if (rc == S3_DECLINED) {
+
+                    /*
+                     * an unknown request type: its body has no length
+                     * prefix on the wire, the buffer tail drains
+                     */
+                    pos = end;
+
+                    continue;
+                }
+
+                /* S3_ERROR: a partial body, the next recv completes it */
+                break;
+            }
+
+            fprintf(stderr, "interop-client: unexpected channel message %llu\n",
+                    (unsigned long long)type);
+            exit(1);
+        }
+
+        /* the consumed bytes compact to the front of the receive buffer */
+        s3_interop_h3_ch_len = (size_t)(end - pos);
+        s3_memmove(s3_interop_h3_ch_buf, pos, s3_interop_h3_ch_len);
+    }
+}
+
 static void
 s3_interop_h3_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
 {
@@ -886,7 +1225,8 @@ s3_interop_usage(const char *prog)
         "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
         "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
         "      shell request and a ping, the verdict is the echoed ping\n"
-        "  -S  stream echo mode: pump count*size pattern bytes through a stream\n"
+        "  -S  stream echo mode: pump count*size pattern bytes through a stream;\n"
+        "      with -3 -C: the session scenario, exec or pty\n"
         "  -n  datagrams to send (stream: count chunks), default 8\n"
         "  -s  datagram payload size (stream: chunk size), default 512\n"
         "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
@@ -917,12 +1257,32 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3CTSCh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3CTS:h")) != -1) {
 
         switch (opt) {
 
         case 'S':
+
+            if (optarg != NULL && strcmp(optarg, "exec") == 0) {
+                s3_interop_h3_session_mode = S3_INTEROP_SESSION_EXEC;
+                break;
+            }
+
+            if (optarg != NULL && strcmp(optarg, "pty") == 0) {
+                s3_interop_h3_session_mode = S3_INTEROP_SESSION_PTY;
+                break;
+            }
+
+            /*
+             * the bare -S of the stream runs: the taken token, if any,
+             * is the next option, it goes back for the parse
+             */
             s3_interop_streams_mode = 1;
+
+            if (optarg != NULL) {
+                optind--;
+            }
+
             break;
 
         case '3':
@@ -983,6 +1343,12 @@ main(int argc, char **argv)
 
     /* the channel phase rides on the h3 mode */
     if (s3_interop_h3_channel_mode && !s3_interop_h3_mode) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
+    /* the session scenarios ride on the channel phase */
+    if (s3_interop_h3_session_mode && (!s3_interop_h3_channel_mode || !s3_interop_h3_mode)) {
         s3_interop_usage(argv[0]);
         return 1;
     }
@@ -1269,7 +1635,9 @@ main(int argc, char **argv)
                         return 1;
                     }
 
-                    s3_interop_h3_channel->read->handler = s3_interop_h3_channel_read;
+                    s3_interop_h3_channel->read->handler = s3_interop_h3_session_mode
+                                                               ? s3_interop_h3_session_read
+                                                               : s3_interop_h3_channel_read;
                     s3_interop_h3_channel->read->data = s3_interop_h3_channel;
 
                     /*
@@ -1281,14 +1649,11 @@ main(int argc, char **argv)
                 }
 
                 if (!s3_interop_h3_ch_sent) {
-                    u_char                frame[512];
-                    u_char               *p;
-                    s3_ssh3_channel_t     hdr;
-                    s3_ssh3_msg_request_t req;
-                    s3_ssh3_msg_data_t    data;
-                    s3_ssh3_request_t     body;
-                    size_t                total;
-                    ssize_t               m;
+                    u_char            frame[512];
+                    u_char           *p;
+                    s3_ssh3_channel_t hdr;
+                    size_t            total;
+                    ssize_t           m;
 
                     /* the header: the conversation is the CONNECT stream */
                     s3_memzero(&hdr, sizeof(hdr));
@@ -1299,24 +1664,98 @@ main(int argc, char **argv)
                     hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
                     hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
 
-                    /* the shell request: the body is empty by design */
-                    s3_memzero(&body, sizeof(body));
-                    body.kind = S3_SSH3_REQ_SHELL;
-
-                    s3_memzero(&req, sizeof(req));
-                    req.request_type.data = (u_char *)s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL);
-                    req.request_type.len = strlen(s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL));
-                    req.want_reply = 1;
-
-                    data.data.data = (u_char *)"ping";
-                    data.data.len = 4;
-
                     p = frame;
                     p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
-                    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_REQUEST);
-                    p = (u_char *)s3_ssh3_msg_encode_request(p, &req);
-                    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-                    p = (u_char *)s3_ssh3_msg_encode_data(p, &data);
+
+                    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
+
+                        /* the exec: the marker command with the reply wanted */
+                        s3_ssh3_request_t exec;
+
+                        s3_memzero(&exec, sizeof(exec));
+
+                        exec.kind = S3_SSH3_REQ_EXEC;
+                        exec.u.exec.command.data = (u_char *)"printf s3-exec-ok";
+                        exec.u.exec.command.len = strlen("printf s3-exec-ok");
+
+                        p = s3_interop_h3_session_request(p, S3_SSH3_REQ_EXEC, 1, &exec);
+                    }
+
+                    else if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_PTY) {
+
+                        /*
+                         * the pty at 80x24, then the shell, then the
+                         * resize to 100x40 with the size probe behind
+                         * it, one send for all four
+                         */
+                        s3_ssh3_request_t  pty, shell, wc;
+                        s3_ssh3_msg_data_t data;
+
+                        s3_memzero(&pty, sizeof(pty));
+
+                        pty.kind = S3_SSH3_REQ_PTY;
+                        pty.u.pty.term.data = (u_char *)"xterm";
+                        pty.u.pty.term.len = strlen("xterm");
+                        pty.u.pty.width = 80;
+                        pty.u.pty.height = 24;
+                        pty.u.pty.pixel_width = 0;
+                        pty.u.pty.pixel_height = 0;
+                        pty.u.pty.modes.data = NULL;
+                        pty.u.pty.modes.len = 0;
+
+                        p = s3_interop_h3_session_request(p, S3_SSH3_REQ_PTY, 1, &pty);
+
+                        /* the shell request: the body is empty by design */
+                        s3_memzero(&shell, sizeof(shell));
+
+                        shell.kind = S3_SSH3_REQ_SHELL;
+
+                        p = s3_interop_h3_session_request(p, S3_SSH3_REQ_SHELL, 1, &shell);
+
+                        s3_memzero(&wc, sizeof(wc));
+
+                        wc.kind = S3_SSH3_REQ_WINDOW_CHANGE;
+                        wc.u.window_change.width = 100;
+                        wc.u.window_change.height = 40;
+                        wc.u.window_change.pixel_width = 0;
+                        wc.u.window_change.pixel_height = 0;
+
+                        p = s3_interop_h3_session_request(p, S3_SSH3_REQ_WINDOW_CHANGE, 0, &wc);
+
+                        /* the probe the resized pty answers with "40 100" */
+                        s3_memzero(&data, sizeof(data));
+
+                        data.data.data = (u_char *)"stty size\n";
+                        data.data.len = strlen("stty size\n");
+
+                        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                        p = (u_char *)s3_ssh3_msg_encode_data(p, &data);
+                    }
+
+                    else {
+
+                        /* the shell request: the body is empty by design */
+                        s3_ssh3_request_t     body;
+                        s3_ssh3_msg_data_t    data;
+                        s3_ssh3_msg_request_t req;
+
+                        s3_memzero(&body, sizeof(body));
+                        body.kind = S3_SSH3_REQ_SHELL;
+
+                        s3_memzero(&req, sizeof(req));
+                        req.request_type.data =
+                            (u_char *)s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL);
+                        req.request_type.len = strlen(s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL));
+                        req.want_reply = 1;
+
+                        data.data.data = (u_char *)"ping";
+                        data.data.len = 4;
+
+                        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_REQUEST);
+                        p = (u_char *)s3_ssh3_msg_encode_request(p, &req);
+                        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                        p = (u_char *)s3_ssh3_msg_encode_data(p, &data);
+                    }
 
                     total = (size_t)(p - frame);
 
@@ -1334,6 +1773,52 @@ main(int argc, char **argv)
 
                     else {
                         s3_interop_h3_ch_sent = 1;
+
+                        if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
+                            /* the exec carries no stdin: the fin goes out at once */
+                            if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) !=
+                                S3_OK) {
+                                fprintf(stderr, "interop-client: channel shutdown failed\n");
+                                return 1;
+                            }
+                        }
+                    }
+                }
+
+                if (s3_interop_h3_sess_signal_pending && !s3_interop_h3_sess_signal_sent) {
+
+                    /* the resized geometry came back, the KILL goes out */
+                    u_char            frame[128];
+                    u_char           *p;
+                    s3_ssh3_request_t sig;
+                    size_t            total;
+                    ssize_t           m;
+
+                    s3_memzero(&sig, sizeof(sig));
+
+                    sig.kind = S3_SSH3_REQ_SIGNAL;
+                    sig.u.signal.name.data = (u_char *)"KILL";
+                    sig.u.signal.name.len = strlen("KILL");
+
+                    p = frame;
+                    p = s3_interop_h3_session_request(p, S3_SSH3_REQ_SIGNAL, 0, &sig);
+
+                    total = (size_t)(p - frame);
+
+                    m = s3_quic_stream_send(s3_interop_h3_channel, frame, total);
+
+                    if (m == (ssize_t)S3_AGAIN) {
+                        /* the window opens on the write event, retried next pass */
+                        ;
+                    }
+
+                    else if (m != (ssize_t)total) {
+                        fprintf(stderr, "interop-client: signal send failed\n");
+                        return 1;
+                    }
+
+                    else {
+                        s3_interop_h3_sess_signal_sent = 1;
                     }
                 }
             }
@@ -1456,6 +1941,15 @@ main(int argc, char **argv)
                         "ch_confirmed=%u ch_ok=%u\n",
                         s3_interop_h3_req_sent, s3_interop_h3_status_seen, s3_interop_h3_ch_sent,
                         s3_interop_h3_ch_confirmed, s3_interop_h3_ch_ok);
+
+                if (s3_interop_h3_session_mode) {
+                    fprintf(stderr,
+                            "interop-client: session state mode=%u signal_pending=%u "
+                            "signal_sent=%u out_len=%zu\n",
+                            s3_interop_h3_session_mode, s3_interop_h3_sess_signal_pending,
+                            s3_interop_h3_sess_signal_sent, s3_interop_h3_sess_out_len);
+                }
+
                 return 1;
             }
 

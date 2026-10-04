@@ -26,11 +26,11 @@ typedef struct s3_ssh3_session_srv_s s3_ssh3_session_srv_t;
 struct s3_ssh3_session_srv_s {
     s3_pool_t *pool;
 
-    int  pid;          /* the child, 0 before spawn */
-    int  stdin_fd;     /* the write side the caller feeds */
-    int  stdout_fd;    /* the read side of the process output */
-    int  stderr_fd;    /* -1 when a pty (stderr merges into the pty) */
-    int  pty_master;   /* the pty master, S3_SSH3_SESSION_INVALID_FD when pipes */
+    int pid;        /* the child, 0 before spawn */
+    int stdin_fd;   /* the write side the caller feeds */
+    int stdout_fd;  /* the read side of the process output */
+    int stderr_fd;  /* -1 when a pty (stderr merges into the pty) */
+    int pty_master; /* the pty master, S3_SSH3_SESSION_INVALID_FD when pipes */
 
     unsigned pty : 1;
     unsigned open : 1; /* LARVAL : OPEN */

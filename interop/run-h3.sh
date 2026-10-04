@@ -9,12 +9,22 @@
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
+#   6. our client (-3 -C -S exec) -> our server (-3): the exec
+#      session, the command output and the 98 exit-status 0
+#   7. our client (-3 -C -S pty) -> our server (-3): the pty session,
+#      the resize to 100x40 and the size probe, then the KILL
+#      signal (an interactive shell ignores TERM), the
+#      98 exit-status 137
 #
 # the verdicts come from the stdout protocol of the runners:
 #   INTEROP-H3-STATUS 200    (the client side)
 #   INTEROP-H3-CONNECT-OK    (the C server side)
 #   INTEROP-CHANNEL-OK       (the C client side, the echoed ping)
 #   INTEROP-CHANNEL-ACCEPT   (the C server side, the channel accepted)
+#   INTEROP-EXEC-OK          (the C client side, the exec verdict)
+#   INTEROP-SESSION-EXEC     (the C server side, the exec accepted)
+#   INTEROP-SESSION-EXIT     (the C server side, the session exit code)
+#   INTEROP-PTY-SIGNAL-OK    (the C client side, the pty verdict)
 #
 # usage: interop/run-h3.sh
 # requires: the C runners (cmake --build build/linux-release), a Go
@@ -189,6 +199,60 @@ if wait_listen "$WORK/ch-srv.log"; then
         echo "   FAIL"
         tail -5 "$WORK/ch-cli.log" | sed 's/^/   /'
         tail -5 "$WORK/ch-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 6: C client (-3 -C -S exec) -> C server (-3), exec session"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/exec-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/exec-srv.log"; then
+    PORT=$(port_of "$WORK/exec-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/exec-cli.log" 2>&1 \
+        && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/exec-cli.log" \
+        && grep -q "INTEROP-SESSION-EXIT code=0" "$WORK/exec-srv.log"; then
+        echo "   PASS (exec session: command output and exit 0)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/exec-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/exec-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 7: C client (-3 -C -S pty) -> C server (-3), pty + signal session"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/pty-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/pty-srv.log"; then
+    PORT=$(port_of "$WORK/pty-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -S pty -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/pty-cli.log" 2>&1 \
+        && grep -q "INTEROP-PTY-SIGNAL-OK exit=137" "$WORK/pty-cli.log" \
+        && grep -q "INTEROP-SESSION-EXIT code=137" "$WORK/pty-srv.log"; then
+        echo "   PASS (pty session: resize, size probe, KILL, exit 137)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/pty-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/pty-srv.log" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
     fi
 

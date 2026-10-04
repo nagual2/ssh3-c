@@ -201,8 +201,7 @@ s3_ssh3_msg_parse_request(const u_char **pos, const u_char *end, s3_ssh3_msg_req
 }
 
 s3_int_t
-s3_ssh3_msg_parse_request_envelope(const u_char **pos, const u_char *end,
-                                   s3_ssh3_msg_request_t *m)
+s3_ssh3_msg_parse_request_envelope(const u_char **pos, const u_char *end, s3_ssh3_msg_request_t *m)
 {
     const u_char *p = *pos;
     s3_str_t      request_type;

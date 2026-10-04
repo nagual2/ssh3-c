@@ -16,19 +16,29 @@
  * the ssh3 route): the uni streams are handed to the session port
  * (s3_h3_init_stream()), the first bidi stream runs the extended
  * CONNECT validator below and every later bidi stream is an ssh3
- * channel: the header is checked, 91 goes back and every 94 data
- * message is echoed.  In this mode stdout additionally carries:
+ * channel: the header is checked, 91 goes back and the channel
+ * carries either the 94 echo or the server session (docs/P4-WIRE.md
+ * 6) - the requests spawn a process through s3_ssh3_session_srv, the
+ * process output rides back as 94/95 and the verdict is the 98
+ * exit-status.  In this mode stdout additionally carries:
  *   INTEROP-H3-CONNECT-OK authlen=<len>
  *   INTEROP-H3-REJECT code=<400|401|403|425>
  *   INTEROP-CHANNEL-ACCEPT id=<stream id> type=<channel type>
+ *   INTEROP-SESSION-PTY
+ *   INTEROP-SESSION-SHELL
+ *   INTEROP-SESSION-EXEC
+ *   INTEROP-SESSION-EXIT code=<code>
  */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <openssl/rand.h>
@@ -43,6 +53,7 @@
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
+#include <s3_ssh3_session_srv.h>
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
@@ -389,7 +400,8 @@ static size_t s3_interop_h3_out_len;
  * the ssh3 session channels (-3): every bidi stream after the CONNECT
  * is a channel.  The pre-confirmation phase keeps a small per-channel
  * accumulator (the header and the first messages may arrive in
- * several recvs), the echo after the 91 is stateless
+ * several recvs); after the 91 the channel runs either the echo or
+ * the server session of docs/P4-WIRE.md 6
  */
 typedef struct {
     s3_connection_t *sc;
@@ -397,7 +409,24 @@ typedef struct {
     size_t           cap;
     size_t           len;
     unsigned         confirmed;
+
+    /*
+     * the session side: the pool owns the session struct and its
+     * command copy, the 50 ms timer pumps the process fds between
+     * the channel events (a channel that never speaks would stall
+     * the output otherwise - the event ctx has no per-fd watches
+     * outside the quic sockets)
+     */
+    s3_pool_t             *sess_pool;
+    s3_ssh3_session_srv_t *sess;
+    unsigned               sess_intent; /* a pty-req or an exec announced the session */
+    unsigned               sess_exit_sent;
+    unsigned               sess_peer_fin;
+    s3_event_t             sess_timer;
 } s3_interop_h3_channel_t;
+
+/* the teardown of the session side, the channel free calls it first */
+static void s3_interop_session_teardown(s3_interop_h3_channel_t *ch);
 
 static s3_interop_h3_channel_t s3_interop_h3_channels[S3_INTEROP_TRACKED];
 
@@ -755,6 +784,14 @@ s3_interop_h3_stream_write(s3_event_t *ev)
 static void
 s3_interop_h3_channel_free(s3_interop_h3_channel_t *ch)
 {
+    /* the pump timer must leave the rbtree before the memory goes */
+
+    if (ch->sess_timer.timer_set) {
+        s3_event_del_timer(&ch->sess_timer);
+    }
+
+    s3_interop_session_teardown(ch);
+
     free(ch->buf);
 
     s3_memzero(ch, sizeof(*ch));
@@ -820,6 +857,363 @@ s3_interop_h3_channel_echo(s3_connection_t *sc, const u_char *data, size_t len)
     }
 
     return S3_OK;
+}
+
+/* the 95 frame of the stderr pipe (docs/P4-WIRE.md 3.1, dataType 1) */
+
+static s3_int_t
+s3_interop_h3_channel_send_extended(s3_connection_t *sc, const u_char *data, size_t len)
+{
+    u_char *p;
+    size_t  total;
+    ssize_t m;
+
+    total = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) +
+            s3_ssh3_varint_size(S3_SSH3_EXTENDED_DATA_STDERR) + s3_ssh3_sshstring_size(len);
+
+    if (total > sizeof(s3_interop_h3_ch_out)) {
+        return S3_ERROR;
+    }
+
+    p = s3_interop_h3_ch_out;
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_EXTENDED_DATA);
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_EXTENDED_DATA_STDERR);
+    p = (u_char *)s3_ssh3_encode_sshstring(p, data, len);
+
+    m = s3_quic_stream_send(sc, s3_interop_h3_ch_out, total);
+
+    /* the same small-volume assumption as the 94 echo above */
+
+    if (m != (ssize_t)total) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+/*
+ * the server session (docs/P4-WIRE.md 6): the channel requests drive
+ * s3_ssh3_session_srv, the process fds are pumped by the channel read
+ * handler and the 50 ms timer - the simple harness scheme, a general
+ * server wants the fds watched in the event context
+ */
+
+/* the reference runs $SHELL (newCommand of the server flow) */
+
+static const char *
+s3_interop_session_shell(void)
+{
+    const char *shell = getenv("SHELL");
+
+    return (shell != NULL && *shell != '\0') ? shell : "/bin/sh";
+}
+
+static s3_int_t
+s3_interop_session_start(s3_interop_h3_channel_t *ch)
+{
+    if (ch->sess != NULL) {
+        return S3_OK;
+    }
+
+    ch->sess_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_interop_log);
+
+    if (ch->sess_pool == NULL) {
+        return S3_ERROR;
+    }
+
+    ch->sess = s3_pcalloc(ch->sess_pool, sizeof(s3_ssh3_session_srv_t));
+
+    if (ch->sess == NULL || s3_ssh3_session_srv_init(ch->sess, ch->sess_pool) != S3_OK) {
+        s3_destroy_pool(ch->sess_pool);
+        ch->sess_pool = NULL;
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static void
+s3_interop_session_teardown(s3_interop_h3_channel_t *ch)
+{
+    s3_ssh3_session_srv_t *s = ch->sess;
+    int                    in, out, err, master;
+
+    if (s == NULL) {
+        return;
+    }
+
+    /* the client may vanish mid-session: the process dies here */
+
+    if (s->pid > 0) {
+        (void)kill((pid_t)s->pid, SIGKILL);
+        (void)waitpid((pid_t)s->pid, NULL, 0);
+    }
+
+    /* the reap usually closed the fds already, the leftovers die too */
+
+    in = s->stdin_fd;
+    out = s->stdout_fd;
+    err = s->stderr_fd;
+    master = s->pty_master;
+
+    if (in != S3_SSH3_SESSION_INVALID_FD) {
+        (void)close(in);
+    }
+
+    if (out != S3_SSH3_SESSION_INVALID_FD && out != in) {
+        (void)close(out);
+    }
+
+    if (err != S3_SSH3_SESSION_INVALID_FD && err != in && err != out) {
+        (void)close(err);
+    }
+
+    if (master != S3_SSH3_SESSION_INVALID_FD && master != in && master != out && master != err) {
+        (void)close(master);
+    }
+
+    /* the pool owns the session struct, everything goes with it */
+
+    s3_destroy_pool(ch->sess_pool);
+
+    ch->sess = NULL;
+    ch->sess_pool = NULL;
+}
+
+/*
+ * the request bodies carry no length prefix (docs/P4-WIRE.md 6) and
+ * the contract parser wants the body to end exactly at `end`; the
+ * peers pipeline several requests in one stream write, so the body
+ * boundary is walked here first and the exact span is validated
+ * afterwards by s3_ssh3_request_parse_body()
+ */
+static const u_char *
+s3_interop_request_body_end(s3_ssh3_request_kind_t kind, const u_char *pos, const u_char *end)
+{
+    s3_str_t str;
+    uint64_t num;
+
+    switch (kind) {
+
+    case S3_SSH3_REQ_SHELL:
+        return pos;
+
+    case S3_SSH3_REQ_PTY:
+        if (s3_ssh3_parse_sshstring(&pos, end, &str) != S3_OK ||
+            s3_ssh3_parse_varint(&pos, end, &num) != S3_OK       /* width */
+            || s3_ssh3_parse_varint(&pos, end, &num) != S3_OK    /* height */
+            || s3_ssh3_parse_varint(&pos, end, &num) != S3_OK    /* pixel width */
+            || s3_ssh3_parse_varint(&pos, end, &num) != S3_OK    /* pixel height */
+            || s3_ssh3_parse_sshstring(&pos, end, &str) != S3_OK /* modes */
+        ) {
+            return NULL;
+        }
+
+        return pos;
+
+    case S3_SSH3_REQ_EXEC:
+    case S3_SSH3_REQ_SUBSYSTEM:
+    case S3_SSH3_REQ_SIGNAL:
+        return s3_ssh3_parse_sshstring(&pos, end, &str) == S3_OK ? pos : NULL;
+
+    case S3_SSH3_REQ_WINDOW_CHANGE:
+        return (s3_ssh3_parse_varint(&pos, end, &num) == S3_OK &&
+                s3_ssh3_parse_varint(&pos, end, &num) == S3_OK &&
+                s3_ssh3_parse_varint(&pos, end, &num) == S3_OK &&
+                s3_ssh3_parse_varint(&pos, end, &num) == S3_OK)
+                   ? pos
+                   : NULL;
+
+    case S3_SSH3_REQ_EXIT_STATUS:
+        return s3_ssh3_parse_varint(&pos, end, &num) == S3_OK ? pos : NULL;
+
+    case S3_SSH3_REQ_EXIT_SIGNAL:
+
+        if (s3_ssh3_parse_sshstring(&pos, end, &str) != S3_OK || end - pos < 1) {
+            return NULL;
+        }
+
+        pos++;
+
+        return (s3_ssh3_parse_sshstring(&pos, end, &str) == S3_OK &&
+                s3_ssh3_parse_sshstring(&pos, end, &str) == S3_OK)
+                   ? pos
+                   : NULL;
+
+    case S3_SSH3_REQ_X11:
+
+        if (end - pos < 1) {
+            return NULL;
+        }
+
+        pos++;
+
+        return (s3_ssh3_parse_sshstring(&pos, end, &str) == S3_OK &&
+                s3_ssh3_parse_sshstring(&pos, end, &str) == S3_OK &&
+                s3_ssh3_parse_varint(&pos, end, &num) == S3_OK)
+                   ? pos
+                   : NULL;
+    }
+
+    return NULL;
+}
+
+/* the 98 exit-status, the terminal message of the session flow */
+
+static s3_int_t
+s3_interop_session_send_exit(s3_connection_t *sc, uint64_t code)
+{
+    u_char                frame[64];
+    u_char                body[16];
+    u_char               *p;
+    s3_ssh3_request_t     req;
+    s3_ssh3_msg_request_t env;
+    size_t                body_len, total;
+    ssize_t               m;
+
+    s3_memzero(&req, sizeof(req));
+
+    req.kind = S3_SSH3_REQ_EXIT_STATUS;
+    req.u.exit_status.status = code;
+
+    body_len = s3_ssh3_request_encode_body(NULL, &req);
+    (void)s3_ssh3_request_encode_body(body, &req);
+
+    s3_memzero(&env, sizeof(env));
+
+    env.request_type.data = (u_char *)s3_ssh3_request_type_str(S3_SSH3_REQ_EXIT_STATUS);
+    env.request_type.len = s3_strlen(env.request_type.data);
+    env.want_reply = 0;
+    env.body.data = body;
+    env.body.len = body_len;
+
+    p = frame;
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_REQUEST);
+    p = (u_char *)s3_ssh3_msg_encode_request(p, &env);
+
+    total = (size_t)(p - frame);
+
+    m = s3_quic_stream_send(sc, frame, total);
+
+    if (m != (ssize_t)total) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static void
+s3_interop_session_pump(s3_interop_h3_channel_t *ch)
+{
+    static u_char out[16384];
+
+    s3_connection_t *sc;
+    ssize_t          n;
+    s3_int_t         rc;
+    uint64_t         code;
+    s3_str_t         name;
+    unsigned         core;
+
+    if (ch->sess == NULL) {
+        return;
+    }
+
+    sc = ch->sc;
+
+    /* the stdout rides as 94, the pty merges everything into it */
+
+    for (;;) {
+
+        n = s3_ssh3_session_srv_read_output(ch->sess, out, sizeof(out));
+
+        if (n <= 0) {
+            break;
+        }
+
+        if (s3_interop_h3_channel_echo(sc, out, (size_t)n) != S3_OK) {
+            fprintf(stderr, "interop-server: session output send stalled\n");
+            return;
+        }
+    }
+
+    /* the stderr pipe of the pipe sessions, 95 with dataType 1 */
+
+    if (ch->sess->stderr_fd != S3_SSH3_SESSION_INVALID_FD) {
+
+        for (;;) {
+
+            n = s3_ssh3_session_srv_read_stderr(ch->sess, out, sizeof(out));
+
+            if (n <= 0) {
+                break;
+            }
+
+            if (s3_interop_h3_channel_send_extended(sc, out, (size_t)n) != S3_OK) {
+                fprintf(stderr, "interop-server: session stderr send stalled\n");
+                return;
+            }
+        }
+    }
+
+    if (ch->sess_exit_sent) {
+        return;
+    }
+
+    s3_str_null(&name);
+
+    rc = s3_ssh3_session_srv_reap(ch->sess, &code, &name, &core);
+
+    if (rc != S3_OK) {
+        /* S3_AGAIN: the process still runs, the pump comes back */
+        return;
+    }
+
+    if (s3_interop_session_send_exit(sc, code) != S3_OK) {
+        fprintf(stderr, "interop-server: exit-status send failed\n");
+        return;
+    }
+
+    /* the reference shuts the channel send side after the verdict */
+
+    (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+
+    ch->sess_exit_sent = 1;
+
+    printf("INTEROP-SESSION-EXIT code=%u\n", (unsigned)code);
+    fflush(stdout);
+}
+
+static void
+s3_interop_session_timer(s3_event_t *ev)
+{
+    s3_interop_h3_channel_t *ch = ev->data;
+
+    ev->timedout = 0;
+
+    s3_interop_session_pump(ch);
+
+    /* the timer disarms once the verdict is out, the flow ends by
+     * the peer fin on the already drained stream */
+
+    if (ch->sess != NULL && !ch->sess_exit_sent) {
+        s3_event_add_timer(ev, 50);
+    }
+}
+
+/* the timer arms at the spawn, the pump rides it until the verdict */
+
+static void
+s3_interop_session_arm(s3_interop_h3_channel_t *ch)
+{
+    if (ch->sess_timer.timer_set) {
+        return;
+    }
+
+    ch->sess_timer.data = ch;
+    ch->sess_timer.log = &s3_interop_log;
+    ch->sess_timer.handler = s3_interop_session_timer;
+
+    s3_event_add_timer(&ch->sess_timer, 50);
 }
 
 static s3_int_t
@@ -928,7 +1322,34 @@ s3_interop_h3_channel_read(s3_event_t *ev)
         }
 
         if (n == 0) {
-            /* the peer fin: the echo side shuts down with it */
+
+            if (ch->sess != NULL && !ch->sess_exit_sent) {
+
+                /*
+                 * the FIN of the peer is the EOF of the process
+                 * stdin: the module closes its input side and the
+                 * pump drains the tail - the verdict goes out from
+                 * the pump once the process is over, the channel
+                 * lives until then
+                 */
+                ch->sess_peer_fin = 1;
+
+                if (s3_ssh3_session_srv_close_input(ch->sess) != S3_OK) {
+                    fprintf(stderr, "interop-server: session close_input declined\n");
+                }
+
+                s3_interop_session_pump(ch);
+
+                return;
+            }
+
+            if (ch->sess != NULL) {
+                /* the verdict is out and the peer closed its side */
+                s3_interop_h3_channel_free(ch);
+                return;
+            }
+
+            /* the echo mode: the peer fin shuts the stream down */
             (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
             s3_interop_h3_channel_free(ch);
             return;
@@ -965,6 +1386,30 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                     break;
                 }
 
+                if (ch->sess_intent) {
+
+                    if (ch->sess != NULL && ch->sess->open) {
+
+                        if (s3_ssh3_session_srv_input(ch->sess, msg.data.data, msg.data.len) !=
+                            S3_OK) {
+                            fprintf(stderr, "interop-server: session input failed\n");
+                        }
+
+                    } else {
+
+                        /*
+                         * the LARVAL data of a session channel drops
+                         * (the forward-agent marker of the reference
+                         * is out of the harness scope)
+                         */
+                        fprintf(stderr, "interop-server: session data before the spawn dropped\n");
+                    }
+
+                    continue;
+                }
+
+                /* the echo mode: the data goes back unchanged */
+
                 if (s3_interop_h3_channel_echo(sc, msg.data.data, msg.data.len) != S3_OK) {
                     s3_interop_h3_channel_cancel(ch, "echo send stalled");
                     return;
@@ -987,40 +1432,147 @@ s3_interop_h3_channel_read(s3_event_t *ev)
             if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
 
                 /*
-                 * the envelope is parsed by hand: s3_ssh3_msg_parse_request()
-                 * treats the rest of the buffer as the raw request body, so a
-                 * message following the request would be eaten by it.  The
-                 * shell body is empty (docs/P4-WIRE.md 6), the other request
-                 * bodies carry no length prefix and are out of the interop
-                 * scope
+                 * the envelope parses by the message module, the body
+                 * boundary walks first (no length prefix on the wire,
+                 * the peers pipeline requests in one write) and the
+                 * exact span validates through the request module
                  */
-                const u_char *body;
-                s3_str_t      rtype;
+                s3_ssh3_msg_request_t  env;
+                s3_ssh3_request_t      req;
+                const u_char          *bpos, *bend;
+                s3_ssh3_request_kind_t kind;
 
-                body = pos;
-
-                if (s3_ssh3_parse_sshstring(&pos, end, &rtype) != S3_OK) {
-                    /* a partial string, the parse left pos untouched */
+                if (s3_ssh3_msg_parse_request_envelope(&pos, end, &env) != S3_OK) {
+                    /* a partial envelope, the parse left pos untouched */
                     break;
                 }
 
-                if (pos == end) {
-                    /* the want_reply byte has not arrived yet */
-                    pos = body;
-                    break;
-                }
+                if (s3_ssh3_request_kind_of(&env.request_type, &kind) != S3_OK) {
 
-                /* want_reply, ignored like the reference does: no
-                 * 99/100 exists on the wire (docs/P4-WIRE.md 6) */
-                pos++;
-
-                if (rtype.len == 5 && s3_memcmp(rtype.data, "shell", 5) == 0) {
-                    /* the empty shell body, nothing to skip */
+                    /*
+                     * an unknown request type: its body has no
+                     * boundary on the wire, the buffer tail drains
+                     * (the known peers send none)
+                     */
+                    fprintf(stderr, "interop-server: unknown request type %.*s\n",
+                            (int)env.request_type.len, (const char *)env.request_type.data);
+                    pos = end;
                     continue;
                 }
 
-                s3_interop_h3_channel_cancel(ch, "unsupported channel request");
-                return;
+                bend = s3_interop_request_body_end(kind, pos, end);
+
+                if (bend == NULL) {
+                    /* a partial body, the next recv completes it */
+                    break;
+                }
+
+                bpos = pos;
+
+                if (s3_ssh3_request_parse_body(&bpos, bend, &env.request_type, &req) != S3_OK) {
+                    /* the walked span must parse, else the stream desynced */
+                    s3_interop_h3_channel_cancel(ch, "bad request body");
+                    return;
+                }
+
+                pos = bend;
+
+                switch (kind) {
+
+                case S3_SSH3_REQ_PTY:
+
+                    if (s3_interop_session_start(ch) != S3_OK ||
+                        s3_ssh3_session_srv_pty_req(ch->sess, &req.u.pty.term, req.u.pty.width,
+                                                    req.u.pty.height, req.u.pty.pixel_width,
+                                                    req.u.pty.pixel_height,
+                                                    &req.u.pty.modes) != S3_OK) {
+                        fprintf(stderr, "interop-server: pty-req failed\n");
+                        break;
+                    }
+
+                    ch->sess_intent = 1;
+
+                    printf("INTEROP-SESSION-PTY\n");
+                    fflush(stdout);
+
+                    break;
+
+                case S3_SSH3_REQ_EXEC:
+
+                    if (s3_interop_session_start(ch) != S3_OK ||
+                        s3_ssh3_session_srv_exec(ch->sess, s3_interop_session_shell(),
+                                                 &req.u.exec.command) != S3_OK) {
+                        fprintf(stderr, "interop-server: exec failed\n");
+                        break;
+                    }
+
+                    ch->sess_intent = 1;
+
+                    printf("INTEROP-SESSION-EXEC\n");
+                    fflush(stdout);
+
+                    s3_interop_session_arm(ch);
+                    s3_interop_session_pump(ch);
+
+                    break;
+
+                case S3_SSH3_REQ_SHELL:
+
+                    /*
+                     * the harness gate: a bare shell request stays in
+                     * the echo mode (the ping channel of the runner
+                     * lives on it), the session spawns once a pty-req
+                     * or an exec announced the intent - the module
+                     * itself spawns on any shell per the contract
+                     */
+                    if (!ch->sess_intent) {
+                        fprintf(stderr, "interop-server: shell without the session intent\n");
+                        break;
+                    }
+
+                    if (s3_interop_session_start(ch) != S3_OK ||
+                        s3_ssh3_session_srv_shell(ch->sess, s3_interop_session_shell()) != S3_OK) {
+                        fprintf(stderr, "interop-server: shell failed\n");
+                        break;
+                    }
+
+                    printf("INTEROP-SESSION-SHELL\n");
+                    fflush(stdout);
+
+                    s3_interop_session_arm(ch);
+                    s3_interop_session_pump(ch);
+
+                    break;
+
+                case S3_SSH3_REQ_WINDOW_CHANGE:
+
+                    if (ch->sess == NULL ||
+                        s3_ssh3_session_srv_window_change(
+                            ch->sess, req.u.window_change.width, req.u.window_change.height,
+                            req.u.window_change.pixel_width,
+                            req.u.window_change.pixel_height) != S3_OK) {
+                        fprintf(stderr, "interop-server: window-change declined\n");
+                    }
+
+                    break;
+
+                case S3_SSH3_REQ_SIGNAL:
+
+                    if (ch->sess == NULL ||
+                        s3_ssh3_session_srv_signal(ch->sess, &req.u.signal.name) != S3_OK) {
+                        fprintf(stderr, "interop-server: signal declined\n");
+                    }
+
+                    break;
+
+                default:
+                    /* subsystem/x11/exit-*: the server never runs them */
+                    fprintf(stderr, "interop-server: request %.*s ignored\n",
+                            (int)env.request_type.len, (const char *)env.request_type.data);
+                    break;
+                }
+
+                continue;
             }
 
             s3_interop_h3_channel_cancel(ch, "unknown channel message");
@@ -1030,6 +1582,13 @@ s3_interop_h3_channel_read(s3_event_t *ev)
         /* the consumed bytes compact to the front of the buffer */
         ch->len = (size_t)(end - pos);
         s3_memmove(ch->buf, pos, ch->len);
+
+        /*
+         * the session output rides along: the input just fed may have
+         * woken the process, the pump answers with the fresh bytes
+         * (the second trigger is the 50 ms timer armed at the spawn)
+         */
+        s3_interop_session_pump(ch);
     }
 }
 
@@ -1347,6 +1906,17 @@ main(int argc, char **argv)
 
     if (s3_nonblocking(fd) != S3_OK) {
         perror("fcntl(O_NONBLOCK)");
+        return 1;
+    }
+
+    /*
+     * the session children fork this socket: the exec closes it so
+     * the shell commands of the scenarios never hold the listener
+     * (the epoll fd of the ctx leaks into the children the same way,
+     * harmless for the short-lived harness commands)
+     */
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+        perror("fcntl(FD_CLOEXEC)");
         return 1;
     }
 
