@@ -21,6 +21,10 @@
 
 #define S3_SSH3_SESSION_INVALID_FD -1
 
+/* the envp frame cap of spawn: the inherited environment plus extras */
+
+#define S3_SSH3_SESSION_ENVP_MAX 128
+
 typedef struct s3_ssh3_session_srv_s s3_ssh3_session_srv_t;
 
 struct s3_ssh3_session_srv_s {
@@ -31,6 +35,12 @@ struct s3_ssh3_session_srv_s {
     int stdout_fd;  /* the read side of the process output */
     int stderr_fd;  /* -1 when a pty (stderr merges into the pty) */
     int pty_master; /* the pty master, S3_SSH3_SESSION_INVALID_FD when pipes */
+
+    /* the extra environment entries, "NAME=VALUE", the pool owns them */
+
+    char  **env;
+    size_t  env_len;
+    size_t  env_cap;
 
     unsigned pty : 1;
     unsigned open : 1; /* LARVAL : OPEN */
@@ -43,6 +53,17 @@ struct s3_ssh3_session_srv_s {
  */
 
 s3_int_t s3_ssh3_session_srv_init(s3_ssh3_session_srv_t *s, s3_pool_t *pool);
+
+/*
+ * quotes one extra environment entry to the child (the reference
+ * setupEnv: the agent forwarding path adds SSH_AUTH_SOCK, the
+ * session harness adds HOME/SHELL); the entries ride on top of the
+ * inherited environment, a repeated name keeps the last one;
+ * S3_DECLINED once the process spawned, S3_ERROR when the pool is
+ * exhausted
+ */
+
+s3_int_t s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *value);
 
 /*
  * the channel requests (the 98 bodies, s3_ssh3_request_t); shell and

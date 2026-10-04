@@ -101,6 +101,10 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_auth_srv.c
     src/ssh3/s3_ssh3_session_cli.c
     src/ssh3/s3_ssh3_forward.c
+    src/ssh3/s3_ssh3_agent.c
+    src/ssh3/s3_ssh3_sftp_codec.c
+    src/ssh3/s3_ssh3_sftp_srv.c
+    src/ssh3/s3_ssh3_sftp_cli.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -183,6 +187,10 @@ set(S3_TESTS
     test_ssh3_auth_srv
     test_ssh3_session_cli
     test_ssh3_forward
+    test_ssh3_agent
+    test_ssh3_sftp_codec
+    test_ssh3_sftp_srv
+    test_ssh3_sftp_cli
 )
 
 enable_testing()

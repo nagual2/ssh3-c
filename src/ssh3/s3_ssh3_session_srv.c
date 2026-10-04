@@ -66,6 +66,8 @@ s3_ssh3_session_signal_name(int number)
     return NULL;
 }
 
+extern char **environ;
+
 s3_int_t
 s3_ssh3_session_srv_init(s3_ssh3_session_srv_t *s, s3_pool_t *pool)
 {
@@ -98,6 +100,87 @@ s3_ssh3_session_nonblock(int fd)
     }
 
     return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *value)
+{
+    size_t n, vn;
+    char  *entry, **grown;
+
+    if (s == NULL || s->pid != 0 || name == NULL || value == NULL) {
+        return S3_DECLINED;
+    }
+
+    n = s3_strlen(name);
+    vn = s3_strlen(value);
+
+    if (s->env_len == s->env_cap) {
+
+        size_t cap = s->env_cap ? s->env_cap * 2 : 4;
+
+        grown = s3_palloc(s->pool, cap * sizeof(char *));
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        if (s->env != NULL) {
+            s3_memcpy(grown, s->env, s->env_len * sizeof(char *));
+        }
+
+        s->env = grown;
+        s->env_cap = cap;
+    }
+
+    entry = s3_palloc(s->pool, n + 1 + vn + 1);
+
+    if (entry == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(entry, name, n);
+    entry[n] = '=';
+    s3_memcpy(entry + n + 1, value, vn);
+    entry[n + 1 + vn] = '\0';
+
+    s->env[s->env_len++] = entry;
+
+    return S3_OK;
+}
+
+/*
+ * the envp of the child: the inherited environment plus the quoted
+ * extras; the array lives in the caller frame, the child execs
+ * before the frame dies
+ */
+
+static char **
+s3_ssh3_session_envp(s3_ssh3_session_srv_t *s, char **envp, size_t cap)
+{
+    size_t i, n = 0;
+
+    for (i = 0; environ[i] != NULL; i++) {
+
+        if (n == cap - 1) {
+            return NULL;
+        }
+
+        envp[n++] = environ[i];
+    }
+
+    for (i = 0; i < s->env_len; i++) {
+
+        if (n == cap - 1) {
+            return NULL;
+        }
+
+        envp[n++] = s->env[i];
+    }
+
+    envp[n] = NULL;
+
+    return envp;
 }
 
 /* closes every parent-side fd once, the pty fds may alias each other */
@@ -135,9 +218,17 @@ s3_ssh3_session_close_fds(s3_ssh3_session_srv_t *s)
 static s3_int_t
 s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
 {
-    int   in_pipe[2], out_pipe[2], err_pipe[2];
-    int   master;
-    pid_t pid;
+    int     in_pipe[2], out_pipe[2], err_pipe[2];
+    int     master;
+    pid_t   pid;
+    char   *envp[S3_SSH3_SESSION_ENVP_MAX];
+    char  **env;
+
+    env = s->env_len ? s3_ssh3_session_envp(s, envp, S3_SSH3_SESSION_ENVP_MAX) : NULL;
+
+    if (s->env_len && env == NULL) {
+        return S3_ERROR;
+    }
 
     master = s->pty_master;
 
@@ -261,7 +352,11 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
             }
         }
 
-        execv(argv[0], argv);
+        if (env != NULL) {
+            execve(argv[0], argv, env);
+        } else {
+            execv(argv[0], argv);
+        }
 
         _exit(127);
     }
