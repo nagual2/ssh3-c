@@ -12,14 +12,17 @@
  *
  * the -3 switch switches to the h3 mode: after the handshake the h3
  * session comes up (SETTINGS on the control stream) and one bidi
- * stream carries the RFC 9220 extended CONNECT announcing ssh3; the
- * verdict is the response :status.
+ * stream carries the RFC 9220 extended CONNECT announcing ssh3; after
+ * the 200 the next client bidi stream opens the ssh3 session channel
+ * (the header, the shell request and the ping probe in one send), the
+ * verdict is the echoed ping.
  *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
  *   INTEROP-DATAGRAM-OK sent=N recv=N
  *   INTEROP-STREAM-OK sent=N recv=N
  *   INTEROP-H3-STATUS <code>
+ *   INTEROP-CHANNEL-OK len=<payload length>
  * the exit code is 0 only when the mode's success line came back
  */
 
@@ -42,8 +45,18 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_channel.h>
+#include <s3_ssh3_message.h>
+#include <s3_ssh3_request.h>
 #include <s3_ssh3_version.h>
+#include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
+
+/*
+ * the channel maxPacketSize of the reference, 30000 on both sides
+ * (docs/P4-WIRE.md 5)
+ */
+#define S3_INTEROP_CHANNEL_MAX_PACKET 30000
 
 static s3_log_t s3_interop_log;
 
@@ -74,10 +87,29 @@ static unsigned         s3_interop_h3_req_sent;
 static unsigned         s3_interop_h3_status_seen;
 static unsigned         s3_interop_h3_status;
 
+/*
+ * the ssh3 session channel (-3 -C): opened right after the 200 on the
+ * next client bidi stream (ChannelID == its StreamID), one send
+ * carries the channel header, the shell request and the ping probe;
+ * the verdict is the echoed ping.  The phase is opt-in: the quic-go
+ * h3-server harness tears the connection down on any extra bidi
+ * stream, so the plain -3 runs stay untouched
+ */
+static int              s3_interop_h3_channel_mode;
+static s3_connection_t *s3_interop_h3_channel;
+static unsigned         s3_interop_h3_ch_sent;
+static unsigned         s3_interop_h3_ch_confirmed;
+static unsigned         s3_interop_h3_ch_ok;
+
 static s3_h3_parse_headers_t s3_interop_h3_parse;
 static u_char               *s3_interop_h3_buf;
 static size_t                s3_interop_h3_cap;
 static size_t                s3_interop_h3_len;
+
+/* the receive accumulator of the session channel */
+static u_char *s3_interop_h3_ch_buf;
+static size_t  s3_interop_h3_ch_cap;
+static size_t  s3_interop_h3_ch_len;
 
 /*
  * the offline selftest (-T, TEMPORARY for the wave-B bridge, removed
@@ -634,6 +666,127 @@ s3_interop_h3_response_read(s3_event_t *ev)
     }
 }
 
+/*
+ * the session channel reader: the first message must be the 91
+ * confirmation, then the run completes on the 94 carrying the ping
+ * back; anything else on the channel is a hard protocol error
+ */
+static void
+s3_interop_h3_channel_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_interop_h3_ch_ok) {
+        /* after the verdict the queued teardown read events may arrive */
+        return;
+    }
+
+    sc = ev->data;
+
+    for (;;) {
+
+        if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
+            size_t  cap = s3_interop_h3_ch_cap + 262144;
+            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-client: channel buffer growth failed\n");
+                exit(1);
+            }
+
+            s3_interop_h3_ch_buf = grown;
+            s3_interop_h3_ch_cap = cap;
+        }
+
+        n = sc->recv(sc, s3_interop_h3_ch_buf + s3_interop_h3_ch_len,
+                     s3_interop_h3_ch_cap - s3_interop_h3_ch_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin before the ping came back: no verdict */
+            fprintf(stderr, "interop-client: channel closed before the ping echo\n");
+            exit(1);
+        }
+
+        if (n < 0) {
+            fprintf(stderr, "interop-client: channel recv error\n");
+            exit(1);
+        }
+
+        s3_interop_h3_ch_len += (size_t)n;
+
+        pos = s3_interop_h3_ch_buf;
+        end = s3_interop_h3_ch_buf + s3_interop_h3_ch_len;
+
+        while (pos < end) {
+
+            uint64_t type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                /* a partial type varint, the next recv completes it */
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: duplicate channel confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    break;
+                }
+
+                s3_interop_h3_ch_confirmed = 1;
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t msg;
+
+                if (!s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: channel data before confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
+                    break;
+                }
+
+                if (msg.data.len == 4 && s3_memcmp(msg.data.data, "ping", 4) == 0) {
+
+                    printf("INTEROP-CHANNEL-OK len=%zu\n", msg.data.len);
+                    fflush(stdout);
+
+                    s3_interop_h3_ch_ok = 1;
+
+                    return;
+                }
+
+                /* the other payloads are not expected, drained */
+                continue;
+            }
+
+            fprintf(stderr, "interop-client: unexpected channel message %llu\n",
+                    (unsigned long long)type);
+            exit(1);
+        }
+
+        /* the consumed bytes compact to the front of the receive buffer */
+        s3_interop_h3_ch_len = (size_t)(end - pos);
+        s3_memmove(s3_interop_h3_ch_buf, pos, s3_interop_h3_ch_len);
+    }
+}
+
 static void
 s3_interop_h3_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
 {
@@ -726,18 +879,21 @@ s3_interop_alpn_wire(u_char *wire, const char *name)
 static void
 s3_interop_usage(const char *prog)
 {
-    fprintf(stderr,
-            "usage: %s -a addr:port [-3] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]\n"
-            "  -a  peer UDP address\n"
-            "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
-            "  -S  stream echo mode: pump count*size pattern bytes through a stream\n"
-            "  -n  datagrams to send (stream: count chunks), default 8\n"
-            "  -s  datagram payload size (stream: chunk size), default 512\n"
-            "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
-            "  -t  overall deadline in ms, default 20000\n"
-            "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
-            "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
-            prog);
+    fprintf(
+        stderr,
+        "usage: %s -a addr:port [-3] [-C] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]\n"
+        "  -a  peer UDP address\n"
+        "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
+        "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
+        "      shell request and a ping, the verdict is the echoed ping\n"
+        "  -S  stream echo mode: pump count*size pattern bytes through a stream\n"
+        "  -n  datagrams to send (stream: count chunks), default 8\n"
+        "  -s  datagram payload size (stream: chunk size), default 512\n"
+        "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
+        "  -t  overall deadline in ms, default 20000\n"
+        "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
+        "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
+        prog);
 }
 
 int
@@ -761,7 +917,7 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3TSh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3CTSCh")) != -1) {
 
         switch (opt) {
 
@@ -771,6 +927,10 @@ main(int argc, char **argv)
 
         case '3':
             s3_interop_h3_mode = 1;
+            break;
+
+        case 'C':
+            s3_interop_h3_channel_mode = 1;
             break;
 
         case 'T':
@@ -817,6 +977,12 @@ main(int argc, char **argv)
     }
 
     if (s3_interop_h3_mode && s3_interop_streams_mode) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
+    /* the channel phase rides on the h3 mode */
+    if (s3_interop_h3_channel_mode && !s3_interop_h3_mode) {
         s3_interop_usage(argv[0]);
         return 1;
     }
@@ -1086,8 +1252,97 @@ main(int argc, char **argv)
                 }
             }
 
-            /* the verdict is printed by the response reader */
-            if (s3_interop_h3_status_seen) {
+            if (s3_interop_h3_status_seen && s3_interop_h3_channel_mode) {
+
+                /*
+                 * the session channel comes up right after the 200:
+                 * the next client bidi stream (ChannelID == its
+                 * StreamID) carries the channel header, the shell
+                 * request and the ping probe, one send for all three
+                 */
+                if (s3_interop_h3_channel == NULL) {
+
+                    s3_interop_h3_channel = s3_quic_open_stream(cli, 1);
+
+                    if (s3_interop_h3_channel == NULL) {
+                        fprintf(stderr, "interop-client: channel open_stream failed\n");
+                        return 1;
+                    }
+
+                    s3_interop_h3_channel->read->handler = s3_interop_h3_channel_read;
+                    s3_interop_h3_channel->read->data = s3_interop_h3_channel;
+
+                    /*
+                     * the app-level read arming, the same the CONNECT
+                     * stream got: without it the quic layer raises
+                     * ready but never posts the stream events
+                     */
+                    s3_interop_h3_channel->read->active = 1;
+                }
+
+                if (!s3_interop_h3_ch_sent) {
+                    u_char                frame[512];
+                    u_char               *p;
+                    s3_ssh3_channel_t     hdr;
+                    s3_ssh3_msg_request_t req;
+                    s3_ssh3_msg_data_t    data;
+                    s3_ssh3_request_t     body;
+                    size_t                total;
+                    ssize_t               m;
+
+                    /* the header: the conversation is the CONNECT stream */
+                    s3_memzero(&hdr, sizeof(hdr));
+
+                    hdr.conversation_stream_id =
+                        ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
+                    hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
+                    hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+                    hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+
+                    /* the shell request: the body is empty by design */
+                    s3_memzero(&body, sizeof(body));
+                    body.kind = S3_SSH3_REQ_SHELL;
+
+                    s3_memzero(&req, sizeof(req));
+                    req.request_type.data = (u_char *)s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL);
+                    req.request_type.len = strlen(s3_ssh3_request_type_str(S3_SSH3_REQ_SHELL));
+                    req.want_reply = 1;
+
+                    data.data.data = (u_char *)"ping";
+                    data.data.len = 4;
+
+                    p = frame;
+                    p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+                    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_REQUEST);
+                    p = (u_char *)s3_ssh3_msg_encode_request(p, &req);
+                    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                    p = (u_char *)s3_ssh3_msg_encode_data(p, &data);
+
+                    total = (size_t)(p - frame);
+
+                    m = s3_quic_stream_send(s3_interop_h3_channel, frame, total);
+
+                    if (m == (ssize_t)S3_AGAIN) {
+                        /* the window opens on the write event, retried next pass */
+                        ;
+                    }
+
+                    else if (m != (ssize_t)total) {
+                        fprintf(stderr, "interop-client: channel send failed\n");
+                        return 1;
+                    }
+
+                    else {
+                        s3_interop_h3_ch_sent = 1;
+                    }
+                }
+            }
+
+            /*
+             * the plain -3 run completes on the 200; the -C run goes
+             * on until the ping came back echoed
+             */
+            if (s3_interop_h3_status_seen && (!s3_interop_h3_channel_mode || s3_interop_h3_ch_ok)) {
                 break;
             }
 
@@ -1196,8 +1451,11 @@ main(int argc, char **argv)
 
         if (s3_current_msec - start > (s3_msec_t)timeout) {
             if (s3_interop_h3_mode) {
-                fprintf(stderr, "interop-client: h3 timeout sent=%u status_seen=%u\n",
-                        s3_interop_h3_req_sent, s3_interop_h3_status_seen);
+                fprintf(stderr,
+                        "interop-client: h3 timeout sent=%u status_seen=%u ch_sent=%u "
+                        "ch_confirmed=%u ch_ok=%u\n",
+                        s3_interop_h3_req_sent, s3_interop_h3_status_seen, s3_interop_h3_ch_sent,
+                        s3_interop_h3_ch_confirmed, s3_interop_h3_ch_ok);
                 return 1;
             }
 

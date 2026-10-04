@@ -6,10 +6,15 @@
 #   3. our client (-3) -> our server (-3) (sanity)
 #   4. the harness h3-client with an unsupported version -> our server
 #      (-3): the request is rejected with 403 (version negotiation)
+#   5. our client (-3) -> our server (-3): after the 200 the client
+#      opens a session channel (header + shell request + ping in one
+#      send), the server confirms (91) and echoes the data (94)
 #
 # the verdicts come from the stdout protocol of the runners:
 #   INTEROP-H3-STATUS 200    (the client side)
 #   INTEROP-H3-CONNECT-OK    (the C server side)
+#   INTEROP-CHANNEL-OK       (the C client side, the echoed ping)
+#   INTEROP-CHANNEL-ACCEPT   (the C server side, the channel accepted)
 #
 # usage: interop/run-h3.sh
 # requires: the C runners (cmake --build build/linux-release), a Go
@@ -157,6 +162,33 @@ if wait_listen "$WORK/cc-rej-srv.log"; then
         echo "   FAIL"
         tail -5 "$WORK/go-rej-cli.log" | sed 's/^/   /'
         tail -5 "$WORK/cc-rej-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 5: C client (-3) -> C server (-3), session channel echo"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/ch-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/ch-srv.log"; then
+    PORT=$(port_of "$WORK/ch-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/ch-cli.log" 2>&1 \
+        && grep -q "INTEROP-CHANNEL-OK" "$WORK/ch-cli.log" \
+        && grep -q "INTEROP-CHANNEL-ACCEPT" "$WORK/ch-srv.log"; then
+        echo "   PASS (session channel confirmed and echoed)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/ch-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/ch-srv.log" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
     fi
 

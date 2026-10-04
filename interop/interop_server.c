@@ -14,10 +14,13 @@
  *
  * the -3 switch switches to the h3 mode (RFC 9220 extended CONNECT,
  * the ssh3 route): the uni streams are handed to the session port
- * (s3_h3_init_stream()), the bidi streams run the extended CONNECT
- * validator below.  In this mode stdout additionally carries:
+ * (s3_h3_init_stream()), the first bidi stream runs the extended
+ * CONNECT validator below and every later bidi stream is an ssh3
+ * channel: the header is checked, 91 goes back and every 94 data
+ * message is echoed.  In this mode stdout additionally carries:
  *   INTEROP-H3-CONNECT-OK authlen=<len>
  *   INTEROP-H3-REJECT code=<400|401|403|425>
+ *   INTEROP-CHANNEL-ACCEPT id=<stream id> type=<channel type>
  */
 
 #include <arpa/inet.h>
@@ -37,10 +40,20 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_channel.h>
+#include <s3_ssh3_message.h>
+#include <s3_ssh3_request.h>
 #include <s3_ssh3_version.h>
+#include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
 
 #define S3_INTEROP_TRACKED 64
+
+/*
+ * the channel maxPacketSize of the reference, 30000 on both sides
+ * (docs/P4-WIRE.md 5); it caps what a peer may put into one 94
+ */
+#define S3_INTEROP_CHANNEL_MAX_PACKET 30000
 
 static s3_log_t s3_interop_log;
 
@@ -371,6 +384,28 @@ static size_t s3_interop_h3_scheme_len;
 /* the response tail pending on the send window */
 static u_char s3_interop_h3_out[512];
 static size_t s3_interop_h3_out_len;
+
+/*
+ * the ssh3 session channels (-3): every bidi stream after the CONNECT
+ * is a channel.  The pre-confirmation phase keeps a small per-channel
+ * accumulator (the header and the first messages may arrive in
+ * several recvs), the echo after the 91 is stateless
+ */
+typedef struct {
+    s3_connection_t *sc;
+    u_char          *buf;
+    size_t           cap;
+    size_t           len;
+    unsigned         confirmed;
+} s3_interop_h3_channel_t;
+
+static s3_interop_h3_channel_t s3_interop_h3_channels[S3_INTEROP_TRACKED];
+
+/* the StreamID of the CONNECT stream, the channels must quote it */
+static uint64_t s3_interop_h3_conv_id;
+
+/* one echo frame: varint 94 + SSHString, capped by the maxPacketSize */
+static u_char s3_interop_h3_ch_out[32768];
 
 static void
 s3_interop_h3_store(u_char *dst, size_t size, size_t *len, s3_str_t *value)
@@ -712,6 +747,347 @@ s3_interop_h3_stream_write(s3_event_t *ev)
     s3_interop_h3_flush();
 }
 
+/*
+ * the ssh3 session channels (-3): accept, the 91 confirmation and the
+ * stateless 94 echo, the wire shape of docs/P4-WIRE.md 2 and 3.1
+ */
+
+static void
+s3_interop_h3_channel_free(s3_interop_h3_channel_t *ch)
+{
+    free(ch->buf);
+
+    s3_memzero(ch, sizeof(*ch));
+}
+
+static s3_interop_h3_channel_t *
+s3_interop_h3_channel_of(s3_connection_t *sc)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_INTEROP_TRACKED; i++) {
+
+        if (s3_interop_h3_channels[i].sc == sc) {
+            return &s3_interop_h3_channels[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void
+s3_interop_h3_channel_cancel(s3_interop_h3_channel_t *ch, const char *why)
+{
+    s3_quic_stream_t *qs = ch->sc->data;
+
+    /* the reference answer to a bad channel is cancel(0) */
+
+    fprintf(stderr, "interop-server: channel id=%llu %s\n", (unsigned long long)qs->id, why);
+
+    (void)s3_quic_cancelable_stream(ch->sc);
+    (void)s3_quic_shutdown_stream(ch->sc, S3_RDWR_SHUTDOWN);
+
+    s3_interop_h3_channel_free(ch);
+}
+
+static s3_int_t
+s3_interop_h3_channel_echo(s3_connection_t *sc, const u_char *data, size_t len)
+{
+    u_char *p;
+    size_t  total;
+    ssize_t m;
+
+    total = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) + s3_ssh3_sshstring_size(len);
+
+    if (total > sizeof(s3_interop_h3_ch_out)) {
+        return S3_ERROR;
+    }
+
+    p = s3_interop_h3_ch_out;
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+    p = (u_char *)s3_ssh3_encode_sshstring(p, data, len);
+
+    m = s3_quic_stream_send(sc, s3_interop_h3_ch_out, total);
+
+    /*
+     * the scenario moves tens of bytes against a 16 KiB send window, a
+     * stall cannot happen; a partial send would desync the message
+     * stream, so any short write is a hard error here (the simpler
+     * choice over the write-event retry)
+     */
+    if (m != (ssize_t)total) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
+{
+    s3_connection_t                *sc = ch->sc;
+    s3_quic_stream_t               *qs = sc->data;
+    s3_ssh3_channel_t               hdr;
+    s3_ssh3_msg_open_confirmation_t conf;
+    const u_char                   *pos, *end;
+    u_char                          out[32];
+    u_char                         *p;
+    size_t                          total;
+    ssize_t                         m;
+
+    s3_memzero(&hdr, sizeof(hdr));
+
+    pos = ch->buf;
+    end = ch->buf + ch->len;
+
+    /*
+     * the header is expected in the first block (the reference writes
+     * it together with the first data); a truncated block is
+     * indistinguishable from a wrong frame type at this API, both are
+     * S3_ERROR and both cancel the stream
+     */
+    if (s3_ssh3_channel_parse_header(&pos, end, &hdr) != S3_OK) {
+        s3_interop_h3_channel_cancel(ch, "bad channel header");
+        return S3_ERROR;
+    }
+
+    /* the receiver must verify the conversation of the channel */
+
+    if (hdr.conversation_stream_id != s3_interop_h3_conv_id) {
+        s3_interop_h3_channel_cancel(ch, "conversation mismatch");
+        return S3_ERROR;
+    }
+
+    /* the 91 with our own maxPacketSize, like confirmChannel() does */
+
+    s3_memzero(&conf, sizeof(conf));
+    conf.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+
+    p = out;
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    p = (u_char *)s3_ssh3_msg_encode_open_confirmation(p, &conf);
+    total = (size_t)(p - out);
+
+    m = s3_quic_stream_send(sc, out, total);
+
+    /* the same small-volume assumption as the echo above */
+    if (m != (ssize_t)total) {
+        s3_interop_h3_channel_cancel(ch, "confirmation send stalled");
+        return S3_ERROR;
+    }
+
+    ch->confirmed = 1;
+
+    printf("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s\n", (unsigned long long)qs->id,
+           (int)hdr.type.len, (const char *)hdr.type.data);
+    fflush(stdout);
+
+    /* the header bytes are consumed, the type view dies here */
+    ch->len = (size_t)(end - pos);
+    s3_memmove(ch->buf, pos, ch->len);
+
+    return S3_OK;
+}
+
+static void
+s3_interop_h3_channel_read(s3_event_t *ev)
+{
+    s3_connection_t         *sc;
+    s3_interop_h3_channel_t *ch;
+    const u_char            *pos, *end;
+    ssize_t                  n;
+
+    sc = ev->data;
+
+    ch = s3_interop_h3_channel_of(sc);
+
+    if (ch == NULL) {
+        /* the slot was freed by a cancel, the tail events are noise */
+        return;
+    }
+
+    for (;;) {
+
+        if (ch->len == ch->cap) {
+            size_t  cap = ch->cap + 262144;
+            u_char *grown = realloc(ch->buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-server: channel buffer growth failed\n");
+                exit(1);
+            }
+
+            ch->buf = grown;
+            ch->cap = cap;
+        }
+
+        n = sc->recv(sc, ch->buf + ch->len, ch->cap - ch->len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the peer fin: the echo side shuts down with it */
+            (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+            s3_interop_h3_channel_free(ch);
+            return;
+        }
+
+        if (n < 0) {
+            s3_interop_h3_channel_cancel(ch, "recv error");
+            return;
+        }
+
+        ch->len += (size_t)n;
+
+        if (!ch->confirmed && s3_interop_h3_channel_confirm(ch) != S3_OK) {
+            /* cancelled inside */
+            return;
+        }
+
+        pos = ch->buf;
+        end = ch->buf + ch->len;
+
+        while (pos < end) {
+
+            uint64_t type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                /* a partial type varint, the next recv completes it */
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+                s3_ssh3_msg_data_t msg;
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
+                    break;
+                }
+
+                if (s3_interop_h3_channel_echo(sc, msg.data.data, msg.data.len) != S3_OK) {
+                    s3_interop_h3_channel_cancel(ch, "echo send stalled");
+                    return;
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) {
+                s3_ssh3_msg_extended_data_t xmsg;
+
+                if (s3_ssh3_msg_parse_extended_data(&pos, end, &xmsg) != S3_OK) {
+                    break;
+                }
+
+                /* the stderr side is drained, nothing echoes back */
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
+
+                /*
+                 * the envelope is parsed by hand: s3_ssh3_msg_parse_request()
+                 * treats the rest of the buffer as the raw request body, so a
+                 * message following the request would be eaten by it.  The
+                 * shell body is empty (docs/P4-WIRE.md 6), the other request
+                 * bodies carry no length prefix and are out of the interop
+                 * scope
+                 */
+                const u_char *body;
+                s3_str_t      rtype;
+
+                body = pos;
+
+                if (s3_ssh3_parse_sshstring(&pos, end, &rtype) != S3_OK) {
+                    /* a partial string, the parse left pos untouched */
+                    break;
+                }
+
+                if (pos == end) {
+                    /* the want_reply byte has not arrived yet */
+                    pos = body;
+                    break;
+                }
+
+                /* want_reply, ignored like the reference does: no
+                 * 99/100 exists on the wire (docs/P4-WIRE.md 6) */
+                pos++;
+
+                if (rtype.len == 5 && s3_memcmp(rtype.data, "shell", 5) == 0) {
+                    /* the empty shell body, nothing to skip */
+                    continue;
+                }
+
+                s3_interop_h3_channel_cancel(ch, "unsupported channel request");
+                return;
+            }
+
+            s3_interop_h3_channel_cancel(ch, "unknown channel message");
+            return;
+        }
+
+        /* the consumed bytes compact to the front of the buffer */
+        ch->len = (size_t)(end - pos);
+        s3_memmove(ch->buf, pos, ch->len);
+    }
+}
+
+static void
+s3_interop_h3_channel_accept(s3_connection_t *sc)
+{
+    s3_interop_h3_channel_t *ch;
+    s3_event_t              *rev;
+    unsigned                 i;
+
+    ch = NULL;
+
+    for (i = 0; i < S3_INTEROP_TRACKED; i++) {
+
+        if (s3_interop_h3_channels[i].sc == NULL) {
+            ch = &s3_interop_h3_channels[i];
+            break;
+        }
+    }
+
+    if (ch == NULL) {
+        fprintf(stderr, "interop-server: channel table is full\n");
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return;
+    }
+
+    s3_memzero(ch, sizeof(*ch));
+    ch->sc = sc;
+
+    rev = sc->read;
+
+    rev->handler = s3_interop_h3_channel_read;
+    rev->data = sc;
+
+    /*
+     * the app-level read arming, the s3 analog of the reference
+     * ngx_handle_read_event(): without it s3_quic_set_event() only
+     * raises ready and never posts the data events
+     */
+    rev->active = 1;
+
+    /*
+     * the write side stays unarmed: the echo treats a send stall as a
+     * hard error, no tail flushes on the write events
+     */
+
+    /*
+     * the first STREAM frame ran before this handler: its data sits
+     * in the receive buffer with ready raised, and the event was lost
+     * on the not yet armed active flag; the reference app reads right
+     * in the accept path (ngx_http_v3_wait_request_handler())
+     */
+    if (rev->ready) {
+        rev->handler(rev);
+    }
+}
+
 static void
 s3_interop_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 {
@@ -753,12 +1129,17 @@ s3_interop_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
     }
 
     if (s3_interop_h3_sc != NULL) {
-        /* one request stream at a time in the harness */
-        fprintf(stderr, "interop-server: extra h3 request stream ignored\n");
+
+        /*
+         * every bidi stream after the CONNECT is an ssh3 channel
+         * (docs/P4-WIRE.md 1, the server dispatch rule)
+         */
+        s3_interop_h3_channel_accept(sc);
         return;
     }
 
     s3_interop_h3_sc = sc;
+    s3_interop_h3_conv_id = qs->id;
     s3_interop_h3_responded = 0;
     s3_interop_h3_len = 0;
     s3_interop_h3_out_len = 0;
