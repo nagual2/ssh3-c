@@ -11,6 +11,8 @@
 //	harness -h3-client -a 127.0.0.1:4433
 //	harness -h3-session-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
 //	harness -h3-session-client -a 127.0.0.1:4433 [-cmd 'printf s3-exec-ok'] [-kill]
+//	harness -h3-forward-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
+//	harness -h3-forward-client -a 127.0.0.1:4433 -fwd-tcp 13456/127.0.0.1@19999
 //
 // The server accepts QUIC connections and echoes every received
 // DATAGRAM back; in addition it echoes every accepted stream.  The
@@ -35,6 +37,16 @@
 // one channel, execs -cmd and expects the exit-status (0 with the
 // s3-exec-ok marker, or 137 when -kill signaled KILL).
 //
+// The -h3-forward-* modes run the direct-tcp/direct-udp forwarding
+// channels (docs/P4-WIRE.md 2.1 with the address extension, 3.2 for
+// the datagrams) over the same raw server dispatch: the server dials
+// the target carried in the channel header and pipes the socket (94
+// frames for TCP, the one QUIC datagram receiver of the connection
+// for UDP); the client (-fwd-tcp localport/remoteip@remoteport)
+// forwards every accepted connection of its local listener through
+// one direct-tcp channel each.  The UDP client side is not
+// implemented: only the server side of direct-udp exists here.
+//
 // Machine-readable lines on stdout (the runner greps them):
 //
 //	INTEROP-LISTEN port=N
@@ -47,6 +59,9 @@
 //	INTEROP-GO-SESSION-EXIT code=<code>
 //	INTEROP-GO-EXEC-OK exit=0 / INTEROP-GO-EXEC-FAIL exit=<code>
 //	INTEROP-GO-KILL-OK exit=137 / INTEROP-GO-KILL-FAIL exit=<code>
+//	INTEROP-GO-FWD-TCP-OPEN target=<host:port>
+//	INTEROP-GO-FWD-UDP-OPEN target=<host:port>
+//	INTEROP-GO-FWD-LISTEN port=<port>
 package main
 
 import (
@@ -65,6 +80,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -106,6 +123,12 @@ func main() {
 	command := flag.String("cmd", "printf s3-exec-ok", "h3-session-client: the command to exec")
 	kill := flag.Bool("kill", false,
 		"h3-session-client: signal KILL after the confirmation, expect exit 137")
+	h3ForwardServer := flag.Bool("h3-forward-server", false,
+		"HTTP/3 server accepting direct-tcp/direct-udp forwarding channels")
+	h3ForwardClient := flag.Bool("h3-forward-client", false,
+		"HTTP/3 client forwarding a local TCP listener through a direct-tcp channel")
+	fwdTCP := flag.String("fwd-tcp", "",
+		"h3-forward-client: localport/remoteip@remoteport, e.g. 13456/127.0.0.1@19999")
 	flag.Parse()
 
 	if !*streams && *size > 1100 {
@@ -115,14 +138,16 @@ func main() {
 	}
 
 	modes := 0
-	for _, m := range []*bool{server, client, h3Server, h3Client, h3SessionServer, h3SessionClient} {
+	for _, m := range []*bool{server, client, h3Server, h3Client, h3SessionServer,
+		h3SessionClient, h3ForwardServer, h3ForwardClient} {
 		if *m {
 			modes++
 		}
 	}
 	if modes > 1 {
-		fatalf("-server, -client, -h3-server, -h3-client, -h3-session-server " +
-			"and -h3-session-client are mutually exclusive")
+		fatalf("-server, -client, -h3-server, -h3-client, -h3-session-server, " +
+			"-h3-session-client, -h3-forward-server and -h3-forward-client " +
+			"are mutually exclusive")
 	}
 
 	if *server {
@@ -137,6 +162,20 @@ func main() {
 
 	if *h3SessionServer {
 		runH3SessionServer(*addr, *certFile, *keyFile)
+		return
+	}
+
+	if *h3ForwardServer {
+		runH3ForwardServer(*addr, *certFile, *keyFile)
+		return
+	}
+
+	if *h3ForwardClient {
+		target := *addr
+		if *addrShort != "" {
+			target = *addrShort
+		}
+		runH3ForwardClient(target, *fwdTCP, *timeout)
 		return
 	}
 
@@ -1444,3 +1483,654 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 		}
 	}
 }
+
+// s3ForwardServer holds the forwarding state of one accepted QUIC
+// connection: the conversation id (the datagram prefix and the
+// channel header check) and the direct-udp channels.  One UDP channel
+// per connection is the exercised scenario, the map supports several
+// anyway.
+type s3ForwardServer struct {
+	conn   *quic.Conn
+	convID uint64
+
+	sendMu sync.Mutex // serializes SendDatagram across the UDP pumps
+
+	mu  sync.Mutex
+	udp map[quic.StreamID]*net.UDPConn
+}
+
+func (fs *s3ForwardServer) addUDPChannel(id quic.StreamID, sock *net.UDPConn) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	fs.udp[id] = sock
+}
+
+func (fs *s3ForwardServer) removeUDPChannel(id quic.StreamID) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	delete(fs.udp, id)
+}
+
+func (fs *s3ForwardServer) udpChannel(id quic.StreamID) *net.UDPConn {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	return fs.udp[id]
+}
+
+func (fs *s3ForwardServer) sendDatagram(data []byte) error {
+	fs.sendMu.Lock()
+	defer fs.sendMu.Unlock()
+
+	return fs.conn.SendDatagram(data)
+}
+
+// runH3ForwardServer serves the forwarding scenarios: the RFC 9220
+// extended CONNECT rides the same raw server conn as the session
+// server (the first bidi stream is the CONNECT, every later bidi is a
+// direct-tcp or direct-udp channel), plus the single QUIC datagram
+// receiver per connection routes the UDP payloads of the direct-udp
+// channels to their dialed targets (docs/P4-WIRE.md 1, 3.2)
+func runH3ForwardServer(addr, certFile, keyFile string) {
+	if certFile == "" || keyFile == "" {
+		fatalf("h3-forward-server mode needs -cert and -key")
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		fatalf("load key pair: %v", err)
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr(addr))
+	if err != nil {
+		fatalf("listen udp: %v", err)
+	}
+
+	fmt.Printf("INTEROP-LISTEN port=%d\n", udpConn.LocalAddr().(*net.UDPAddr).Port)
+
+	server := &http3.Server{
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{http3.NextProtoH3},
+		},
+		QUICConfig: &quic.Config{
+			MaxIdleTimeout:  60 * time.Second,
+			EnableDatagrams: true, // the direct-udp path
+		},
+		Handler: http.HandlerFunc(h3ConnectHandler),
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	listener, err := tr.Listen(server.TLSConfig, server.QUICConfig)
+	if err != nil {
+		fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			fatalf("accept: %v", err)
+		}
+
+		go serveForwardConn(server, conn)
+	}
+}
+
+// serveForwardConn runs one accepted QUIC connection of the forward
+// server: the h3 layer is fed through the raw server conn, the first
+// bidi is the CONNECT (its StreamID is the conversation) and every
+// later bidi is a forwarding channel; the datagram loop starts once
+// the conversation id is known
+func serveForwardConn(server *http3.Server, conn *quic.Conn) {
+	raw, err := server.NewRawServerConn(conn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: raw server conn: %v\n", err)
+		_ = conn.CloseWithError(0, "")
+		return
+	}
+
+	go func() {
+		for {
+			str, err := conn.AcceptUniStream(context.Background())
+			if err != nil {
+				return
+			}
+			go raw.HandleUnidirectionalStream(str)
+		}
+	}()
+
+	fs := &s3ForwardServer{conn: conn, udp: make(map[quic.StreamID]*net.UDPConn)}
+
+	var haveConv bool
+
+	for {
+		str, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+
+		if !haveConv {
+			// the first bidi stream is the extended CONNECT, its
+			// StreamID is the conversationStreamID the channels and
+			// the datagrams must quote
+			fs.convID = uint64(str.StreamID())
+			haveConv = true
+
+			go raw.HandleRequestStream(str)
+			go fs.datagramLoop()
+			continue
+		}
+
+		go s3HandleForwardChannel(str, fs)
+	}
+}
+
+// datagramLoop is the single QUIC datagram receiver of the connection
+// (docs/P4-WIRE.md 3.2): the prefix is varint controlStreamID, varint
+// channelID, the rest is the raw UDP payload; foreign conversations
+// and unknown channels are dropped without any error on the wire,
+// like the reference receive loop does
+func (fs *s3ForwardServer) datagramLoop() {
+	for {
+		data, err := fs.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+
+		rd := bytes.NewReader(data)
+
+		conv, err := s3ReadVarint(rd)
+		if err != nil || conv != fs.convID {
+			continue
+		}
+
+		channel, err := s3ReadVarint(rd)
+		if err != nil {
+			continue
+		}
+
+		sock := fs.udpChannel(quic.StreamID(channel))
+		if sock == nil {
+			continue
+		}
+
+		// what is left of the datagram is the raw UDP payload; the
+		// socket is connected (DialUDP), so a plain Write goes to the
+		// one target of the channel
+		if _, err := sock.Write(data[len(data)-rd.Len():]); err != nil {
+			continue // the datagram path is lossy by definition
+		}
+	}
+}
+
+// s3HandleForwardChannel runs one accepted forwarding channel: the
+// header is the session one plus the address extension
+// (docs/P4-WIRE.md 2.1, the reference
+// buildForwardingChannelAdditionalBytes).  direct-tcp dials the
+// target and pipes the socket through 94 frames, direct-udp dials it
+// and registers the socket for the datagram loop; a refused channel
+// is cancelled with code 0 like the reference accept loop (the 92
+// failure message is never sent)
+func s3HandleForwardChannel(str *quic.Stream, fs *s3ForwardServer) {
+	br := bufio.NewReader(str)
+
+	ftype, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	convid, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	ctype, err := s3ReadSSHString(br)
+	if err != nil {
+		return
+	}
+
+	if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+		return
+	}
+
+	if ftype != s3SSHFrameType || convid != fs.convID {
+		// the reference answer to a bad channel is cancel(0)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	target, err := s3ReadForwardTarget(br)
+	if err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	switch string(ctype) {
+	case "direct-tcp":
+		sock, err := net.DialTimeout("tcp", target, 5*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "harness: dial tcp %s: %v\n", target, err)
+			str.CancelRead(0)
+			str.CancelWrite(0)
+			return
+		}
+
+		// the 91 confirmation with our maxPacketSize, like
+		// confirmChannel()
+		if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+			sock.Close()
+			return
+		}
+
+		fmt.Printf("INTEROP-GO-FWD-TCP-OPEN target=%s\n", target)
+
+		s3PipeTCPThroughChannel(str, br, sock)
+
+	case "direct-udp":
+		fs.handleUDPChannel(str, target)
+
+	default:
+		str.CancelRead(0)
+		str.CancelWrite(0)
+	}
+}
+
+// handleUDPChannel dials the direct-udp target, confirms the channel
+// and registers the socket: inbound datagrams of the channel go to
+// the target through the datagram loop, the replies ride back as
+// controlStreamID/channelID-prefixed datagrams.  The channel stream
+// carries no payload, its FIN tears the registration and the socket
+// down.
+func (fs *s3ForwardServer) handleUDPChannel(str *quic.Stream, target string) {
+	raddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	sock, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: dial udp %s: %v\n", target, err)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+		sock.Close()
+		return
+	}
+
+	fmt.Printf("INTEROP-GO-FWD-UDP-OPEN target=%s\n", target)
+
+	id := str.StreamID()
+
+	fs.addUDPChannel(id, sock)
+
+	// the replies of the target ride back as datagrams; one too large
+	// for the current path MTU is dropped, it is UDP
+	go func() {
+		buf := make([]byte, 65535)
+
+		for {
+			n, err := sock.Read(buf)
+			if err != nil {
+				return
+			}
+
+			frame := s3AppendVarint(nil, fs.convID)
+			frame = s3AppendVarint(frame, uint64(id))
+			frame = append(frame, buf[:n]...)
+
+			if err := fs.sendDatagram(frame); err != nil {
+				var tooLarge *quic.DatagramTooLargeError
+				if errors.As(err, &tooLarge) {
+					continue
+				}
+
+				return
+			}
+		}
+	}()
+
+	// the peer FIN on the channel stream is the channel close
+	_, _ = io.Copy(io.Discard, str)
+
+	fs.removeUDPChannel(id)
+	sock.Close()
+}
+
+// s3ReadForwardTarget parses the address extension that follows the
+// maxPacketSize of the direct and forwarded channel types
+// (docs/P4-WIRE.md 2.1): varint addressFamily (4 or 6), the raw IP of
+// 4 or 16 bytes, the uint16 big-endian port; it comes back in the
+// host:port dial form
+func s3ReadForwardTarget(br *bufio.Reader) (string, error) {
+	family, err := s3ReadVarint(br)
+	if err != nil {
+		return "", err
+	}
+
+	ipLen := 0
+
+	switch family {
+	case 4:
+		ipLen = 4
+	case 6:
+		ipLen = 16
+	default:
+		return "", fmt.Errorf("bad address family %d", family)
+	}
+
+	raw := make([]byte, ipLen)
+
+	if _, err := io.ReadFull(br, raw); err != nil {
+		return "", err
+	}
+
+	var port [2]byte
+
+	if _, err := io.ReadFull(br, port[:]); err != nil {
+		return "", err
+	}
+
+	return net.JoinHostPort(net.IP(raw).String(),
+		strconv.Itoa(int(binary.BigEndian.Uint16(port[:])))), nil
+}
+
+// s3PipeTCPThroughChannel pumps one TCP connection through the
+// channel stream in both directions: the socket reads ride as 94
+// frames (one per 16 KiB chunk, far below the 30000 maxPacketSize),
+// the stream 94 frames go back into the socket.  The socket EOF is
+// the stream FIN (the half close), the stream FIN closes the socket;
+// anything else than 94 from the peer resets the channel.
+func s3PipeTCPThroughChannel(str *quic.Stream, br *bufio.Reader, sock net.Conn) {
+	go func() { // socket -> 94 frames
+		buf := make([]byte, 16384)
+
+		for {
+			n, err := sock.Read(buf)
+
+			if n > 0 {
+				frame := s3AppendVarint(nil, 94)
+				frame = s3AppendSSHString(frame, buf[:n])
+
+				if _, werr := str.Write(frame); werr != nil {
+					sock.Close()
+					return
+				}
+			}
+
+			if err != nil {
+				_ = str.Close() // the socket EOF: the stream FIN
+				return
+			}
+		}
+	}()
+
+	for { // 94 frames -> socket
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			// the stream FIN of the client: shutdown the target write
+			// side and let the socket goroutine drain the echo tail; a
+			// hard close here would RST the connection and lose it
+
+			if tc, ok := sock.(*net.TCPConn); ok {
+				_ = tc.CloseWrite()
+			} else {
+				sock.Close()
+			}
+
+			return
+		}
+
+		if typ != 94 {
+			str.CancelRead(0)
+			str.CancelWrite(0)
+			sock.Close()
+			return
+		}
+
+		data, err := s3ReadSSHString(br)
+		if err != nil {
+			sock.Close()
+			return
+		}
+
+		if _, err := sock.Write(data); err != nil {
+			str.CancelRead(0)
+			str.CancelWrite(0)
+			return
+		}
+	}
+}
+
+// runH3ForwardClient dials, opens the extended CONNECT and then
+// forwards a local TCP listener through direct-tcp channels
+// (-fwd-tcp localport/remoteip@remoteport): every accepted local
+// connection opens one channel (the header quotes the CONNECT stream
+// id and carries the raw-IP target), the 91 confirmation arms the
+// two-way 94 pipe.  The run lives until SIGINT or the -timeout.  The
+// UDP client side does not exist in this harness.
+func runH3ForwardClient(target, fwd string, timeout time.Duration) {
+	if target == "" {
+		fatalf("h3-forward-client mode needs -a host:port")
+	}
+
+	if fwd == "" {
+		fatalf("h3-forward-client mode needs -fwd-tcp localport/remoteip@remoteport")
+	}
+
+	localPort, remotePort, remoteHost, err := s3ParseFwdTCP(fwd)
+	if err != nil {
+		fatalf("bad -fwd-tcp %q: %v", fwd, err)
+	}
+
+	tlsCfg := &tls.Config{
+		NextProtos:         []string{http3.NextProtoH3},
+		InsecureSkipVerify: true, // the harness runs against self-signed certs
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		fatalf("local udp: %v", err)
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := tr.Dial(ctx, udpAddr(target), tlsCfg, &quic.Config{
+		MaxIdleTimeout: 60 * time.Second,
+	})
+	if err != nil {
+		fatalf("dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	// the extended CONNECT opens the conversation control stream, the
+	// low-level API like in runH3Client (RFC 9220)
+	cc := (&http3.Transport{}).NewClientConn(conn)
+
+	str, err := cc.OpenRequestStream(ctx)
+	if err != nil {
+		fatalf("open request stream: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodConnect, "https://"+target+"/ssh3-term", nil)
+	if err != nil {
+		fatalf("build connect request: %v", err)
+	}
+
+	req.Proto = "ssh3"
+	req.Header.Set("User-Agent", s3VersionString)
+	req.Header.Set("Authorization", "test-token")
+
+	if err := str.SendRequestHeader(req); err != nil {
+		fatalf("send connect: %v", err)
+	}
+
+	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set stream deadline: %v", err)
+	}
+
+	resp, err := str.ReadResponse()
+	if err != nil {
+		fatalf("read response: %v", err)
+	}
+
+	fmt.Printf("INTEROP-H3-STATUS %d\n", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)))
+	if err != nil {
+		fatalf("listen: %v", err)
+	}
+
+	fmt.Printf("INTEROP-GO-FWD-LISTEN port=%d\n", listener.Addr().(*net.TCPAddr).Port)
+
+	// the run ends on SIGINT or the -timeout: both close the
+	// listener, the accept loop unwinds and the connection goes with
+	// the deferred Close
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+
+	go func() {
+		<-sig
+		listener.Close()
+	}()
+
+	convID := uint64(str.StreamID())
+
+	for {
+		local, err := listener.Accept()
+		if err != nil {
+			return // the listener is closed: the run is over
+		}
+
+		go s3OpenDirectTCPChannel(conn, convID, remoteHost, remotePort, timeout, local)
+	}
+}
+
+// s3ParseFwdTCP parses the -fwd-tcp value in the
+// localport/remoteip@remoteport form (e.g. 13456/127.0.0.1@19999);
+// the remote target must be an IP: the channel header carries the
+// raw address bytes, there are no names on the wire
+func s3ParseFwdTCP(fwd string) (localPort, remotePort int, remoteHost string, err error) {
+	slash := strings.SplitN(fwd, "/", 2)
+	if len(slash) != 2 {
+		return 0, 0, "", fmt.Errorf("want localport/remoteip@remoteport")
+	}
+
+	if localPort, err = strconv.Atoi(slash[0]); err != nil || localPort < 0 || localPort > 65535 {
+		return 0, 0, "", fmt.Errorf("bad local port %q", slash[0])
+	}
+
+	at := strings.SplitN(slash[1], "@", 2)
+	if len(at) != 2 || at[0] == "" {
+		return 0, 0, "", fmt.Errorf("want localport/remoteip@remoteport")
+	}
+
+	if net.ParseIP(at[0]) == nil {
+		return 0, 0, "", fmt.Errorf("the remote target must be an IP, got %q", at[0])
+	}
+
+	if remotePort, err = strconv.Atoi(at[1]); err != nil || remotePort < 1 || remotePort > 65535 {
+		return 0, 0, "", fmt.Errorf("bad remote port %q", at[1])
+	}
+
+	return localPort, remotePort, at[0], nil
+}
+
+// s3OpenDirectTCPChannel opens one direct-tcp channel for an accepted
+// local connection: the header quotes the conversation (the CONNECT
+// stream id) and carries the target (docs/P4-WIRE.md 2.1), the 91
+// confirmation arms the pipe
+func s3OpenDirectTCPChannel(conn *quic.Conn, convID uint64, host string, port int,
+	timeout time.Duration, local net.Conn,
+) {
+	str, err := conn.OpenStream()
+	if err != nil {
+		local.Close()
+		return
+	}
+
+	ip := net.ParseIP(host)
+
+	family := uint64(4)
+	rawIP := ip.To4()
+
+	if rawIP == nil {
+		family = 6
+		rawIP = ip.To16()
+	}
+
+	header := s3AppendVarint(nil, s3SSHFrameType)
+	header = s3AppendVarint(header, convID)
+	header = s3AppendSSHString(header, []byte("direct-tcp"))
+	header = s3AppendVarint(header, s3ChannelMaxPacket)
+	header = s3AppendVarint(header, family)
+	header = append(header, rawIP...)
+	header = append(header, byte(port>>8), byte(port))
+
+	// the deadline guards the handshake only: an established pipe may
+	// idle as long as the peers keep it
+	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		local.Close()
+		return
+	}
+
+	if _, err := str.Write(header); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		local.Close()
+		return
+	}
+
+	br := bufio.NewReader(str)
+
+	typ, err := s3ReadVarint(br)
+	if err != nil || typ != 91 {
+		// a refusal (the server cancels instead of 91) or a timeout
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		local.Close()
+		return
+	}
+
+	if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		local.Close()
+		return
+	}
+
+	if err := str.SetDeadline(time.Time{}); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		local.Close()
+		return
+	}
+
+	s3PipeTCPThroughChannel(str, br, local)
+}
+
+// MARKER-TEST

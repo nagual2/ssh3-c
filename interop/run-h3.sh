@@ -10,6 +10,10 @@
 #   9. our client (-3 -C -S exec) -> the harness session-server
 #  10. our client (-3 -C -S kill) -> the harness session-server
 #  11. our client (-U user:pass, Basic) -> our server (-P passfile)
+#  12. our client (-F tcp=@port) -> our server: direct-tcp forward
+#  13. our client (-F udp=@port) -> our server: direct-udp forward
+#  14. our client (-F tcp) -> the harness forward-server
+#  15. the harness forward-client -> our server: direct-tcp forward
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -26,11 +30,21 @@
 #  10. our client (-3 -C -S kill) -> the quic-go session-server:
 #      the KILL signal right after the confirmation, the
 #      98 exit-status 137
+#  12. our client (-3 -C -F tcp=@19999) -> our server (-3): the
+#      direct-tcp channel to the loopback tcp echo service, the
+#      "s3-fwd-hello" marker plus 64 KiB round trip byte for byte
+#  13. our client (-3 -C -F udp=@19998) -> our server (-3): the
+#      direct-udp channel to the loopback udp echo service, 20
+#      numbered datagrams of 1024 bytes round trip
 #
 # the verdicts come from the stdout protocol of the runners:
 #   INTEROP-H3-STATUS 200    (the client side)
 #   INTEROP-H3-CONNECT-OK    (the C server side)
 #   INTEROP-AUTH-OK          (the C server side, the Basic credentials)
+#   INTEROP-FWD-TCP-OK       (the C client side, the TCP forward verdict)
+#   INTEROP-FWD-UDP-OK       (the C client side, the UDP forward verdict)
+#   INTEROP-FWD-TCP-OPEN     (the C server side, the target connected)
+#   INTEROP-GO-FWD-TCP-OPEN  (the harness side, the target connected)
 #   INTEROP-CHANNEL-OK       (the C client side, the echoed ping)
 #   INTEROP-CHANNEL-ACCEPT   (the C server side, the channel accepted)
 #   INTEROP-EXEC-OK          (the C client side, the exec verdict)
@@ -41,6 +55,10 @@
 #   INTEROP-GO-SESSION-EXEC  (the go session-server side, the exec accepted)
 #   INTEROP-GO-SESSION-EXIT  (the go session-server side, the session exit code)
 #   INTEROP-PTY-SIGNAL-OK    (the C client side, the pty verdict)
+#   INTEROP-FWD-TCP-OK       (the C client side, the tcp forward echo)
+#   INTEROP-FWD-UDP-OK       (the C client side, the udp forward echo)
+#   INTEROP-FWD-TCP-OPEN     (the C server side, the tcp target connected)
+#   INTEROP-FWD-UDP-OPEN     (the C server side, the udp target socket up)
 #
 # usage: interop/run-h3.sh
 # requires: the C runners (cmake --build build/linux-release), a Go
@@ -90,6 +108,79 @@ wait_listen() {
 
 port_of() {
     grep -oE 'port=[0-9]+' "$1" | cut -d= -f2
+}
+
+# the loopback echo services of the forward scenarios (12, 13): one
+# python script, the mode argument picks tcp:19999 or udp:19998; the
+# readiness line greps like the INTEROP-LISTEN one above
+
+cat > "$WORK/echo_srv.py" <<'PYEOF'
+import socket
+import sys
+import threading
+
+
+def tcp_srv():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 19999))
+    s.listen(8)
+    print("ECHO-READY tcp", flush=True)
+
+    def handle(c):
+        try:
+            while 1:
+                d = c.recv(65536)
+                if not d:
+                    break
+                c.sendall(d)
+        finally:
+            c.close()
+
+    while 1:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+def udp_srv():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 19998))
+    print("ECHO-READY udp", flush=True)
+    while 1:
+        d, a = s.recvfrom(65536)
+        s.sendto(d, a)
+
+
+{"tcp": tcp_srv, "udp": udp_srv}[sys.argv[1]]()
+PYEOF
+
+start_echo() {
+    setsid nohup python3 "$WORK/echo_srv.py" "$1" > "$WORK/echo-$1.log" 2>&1 < /dev/null &
+    echo "$!" > "$WORK/echo-$1.pid"
+}
+
+wait_echo() {
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if grep -q ECHO-READY "$WORK/echo-$1.log" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
+stop_echo() {
+    if [ -f "$WORK/echo-tcp.pid" ]; then
+        kill "$(cat "$WORK/echo-tcp.pid")" 2>/dev/null
+    fi
+
+    if [ -f "$WORK/echo-udp.pid" ]; then
+        kill "$(cat "$WORK/echo-udp.pid")" 2>/dev/null
+    fi
 }
 
 echo "== scenario 1: C client (-3) -> quic-go h3-server"
@@ -390,6 +481,168 @@ else
 fi
 
 pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 12: C client (-3 -C -F tcp=@19999) -> C server (-3), direct-tcp forward"
+
+start_echo tcp
+
+if wait_echo tcp; then
+
+    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+        > "$WORK/fwd-tcp-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/fwd-tcp-srv.log"; then
+        PORT=$(port_of "$WORK/fwd-tcp-srv.log")
+
+        if timeout 30 "$BUILD/s3interop_client" -3 -C -F tcp=@19999 -a "127.0.0.1:$PORT" -t 20000 \
+            > "$WORK/fwd-tcp-cli.log" 2>&1 \
+            && grep -q "INTEROP-FWD-TCP-OK bytes=65548" "$WORK/fwd-tcp-cli.log" \
+            && grep -q "INTEROP-FWD-TCP-OPEN target=127.0.0.1:19999" "$WORK/fwd-tcp-srv.log"; then
+            echo "   PASS (direct-tcp: hello + 64 KiB echoed through the tunnel)"
+        else
+            echo "   FAIL"
+            tail -5 "$WORK/fwd-tcp-cli.log" | sed 's/^/   /'
+            tail -5 "$WORK/fwd-tcp-srv.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+    else
+        echo "   FAIL: the C server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "s3interop_server -3" 2>/dev/null
+
+else
+    echo "   FAIL: the tcp echo service did not start"
+    cat "$WORK/echo-tcp.log" | sed 's/^/   /'
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo "== scenario 13: C client (-3 -C -F udp=@19998) -> C server (-3), direct-udp forward"
+
+start_echo udp
+
+if wait_echo udp; then
+
+    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+        > "$WORK/fwd-udp-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/fwd-udp-srv.log"; then
+        PORT=$(port_of "$WORK/fwd-udp-srv.log")
+
+        if timeout 30 "$BUILD/s3interop_client" -3 -C -F udp=@19998 -a "127.0.0.1:$PORT" -t 20000 \
+            > "$WORK/fwd-udp-cli.log" 2>&1 \
+            && grep -q "INTEROP-FWD-UDP-OK count=20" "$WORK/fwd-udp-cli.log" \
+            && grep -q "INTEROP-FWD-UDP-OPEN target=127.0.0.1:19998" "$WORK/fwd-udp-srv.log"; then
+            echo "   PASS (direct-udp: 20 datagrams echoed through the tunnel)"
+        else
+            echo "   FAIL"
+            tail -5 "$WORK/fwd-udp-cli.log" | sed 's/^/   /'
+            tail -5 "$WORK/fwd-udp-srv.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+    else
+        echo "   FAIL: the C server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "s3interop_server -3" 2>/dev/null
+
+else
+    echo "   FAIL: the udp echo service did not start"
+    cat "$WORK/echo-udp.log" | sed 's/^/   /'
+    FAILURES=$((FAILURES + 1))
+fi
+
+stop_echo
+
+echo "== scenario 14: C client (-3 -C -F tcp=@19999) -> quic-go forward-server"
+
+start_echo tcp
+
+if wait_echo tcp; then
+
+    setsid nohup "$HARNESS" -h3-forward-server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+        > "$WORK/gfwd-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/gfwd-srv.log"; then
+        PORT=$(port_of "$WORK/gfwd-srv.log")
+
+        if timeout 30 "$BUILD/s3interop_client" -3 -C -F tcp=@19999 -a "127.0.0.1:$PORT" -t 20000 \
+            > "$WORK/gfwd-cli.log" 2>&1 \
+            && grep -q "INTEROP-FWD-TCP-OK bytes=65548" "$WORK/gfwd-cli.log" \
+            && grep -q "INTEROP-GO-FWD-TCP-OPEN target=127.0.0.1:19999" "$WORK/gfwd-srv.log"; then
+            echo "   PASS (direct-tcp: the C client through the go server)"
+        else
+            echo "   FAIL"
+            tail -5 "$WORK/gfwd-cli.log" | sed 's/^/   /'
+            tail -5 "$WORK/gfwd-srv.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+    else
+        echo "   FAIL: the harness forward-server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "h3-forward-server" 2>/dev/null
+
+else
+    echo "   FAIL: the tcp echo service did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+stop_echo
+
+echo "== scenario 15: quic-go forward-client -> C server (-3), direct-tcp forward"
+
+start_echo tcp
+
+if wait_echo tcp; then
+
+    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+        > "$WORK/gfwd2-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/gfwd2-srv.log"; then
+        PORT=$(port_of "$WORK/gfwd2-srv.log")
+
+        setsid nohup "$HARNESS" -h3-forward-client -fwd-tcp "13456/127.0.0.1@19999" \
+            -a "127.0.0.1:$PORT" -timeout 15s > "$WORK/gfwd2-cli.log" 2>&1 < /dev/null &
+
+        sleep 2
+
+        # the greeting rides the go listener through the tunnel to the echo
+
+        if printf 's3-gofwd-hello\n' | timeout 10 nc -q 1 127.0.0.1 13456 \
+            > "$WORK/gfwd2-pipe.out" 2>/dev/null \
+            && grep -q "s3-gofwd-hello" "$WORK/gfwd2-pipe.out" \
+            && grep -q "INTEROP-FWD-TCP-OPEN target=127.0.0.1:19999" "$WORK/gfwd2-srv.log"; then
+            echo "   PASS (direct-tcp: the go client through the C server)"
+        else
+            echo "   FAIL"
+            tail -5 "$WORK/gfwd2-pipe.out" 2>/dev/null | sed 's/^/   /'
+            tail -5 "$WORK/gfwd2-cli.log" | sed 's/^/   /'
+            tail -5 "$WORK/gfwd2-srv.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        pkill -f "h3-forward-client" 2>/dev/null
+
+    else
+        echo "   FAIL: the C server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "s3interop_server -3" 2>/dev/null
+
+else
+    echo "   FAIL: the tcp echo service did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+stop_echo
 
 rm -rf "$WORK"
 

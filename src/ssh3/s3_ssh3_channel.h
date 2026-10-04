@@ -21,7 +21,7 @@
 
 #define S3_SSH3_FRAME_TYPE 0xaf3627e6ULL
 
-#define S3_SSH3_CHANNEL_TYPE_SESSION "session"
+#define S3_SSH3_CHANNEL_TYPE_SESSION    "session"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_TCP "direct-tcp"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_UDP "direct-udp"
 

@@ -29,9 +29,15 @@
  *   INTEROP-SESSION-SHELL
  *   INTEROP-SESSION-EXEC
  *   INTEROP-SESSION-EXIT code=<code>
+ * the direct-tcp / direct-udp channels (docs/P4-WIRE.md 2.1, the
+ * target extension rides the header) relay the traffic to the target
+ * on the server side:
+ *   INTEROP-FWD-TCP-OPEN target=IP:PORT
+ *   INTEROP-FWD-UDP-OPEN target=IP:PORT
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -53,6 +59,8 @@
 #include <s3_quic_streams.h>
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_dgram.h>
+#include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_srv.h>
@@ -198,12 +206,61 @@ s3_interop_alpn_wire(u_char *wire, const char *name)
     memcpy(wire + 1, name, n);
 }
 
+/*
+ * the h3 channel, see the table below; the forward declaration lets
+ * the datagram handler hold the direct-udp singleton
+ */
+
+typedef struct s3_interop_h3_channel_s s3_interop_h3_channel_t;
+
+/*
+ * the open direct-udp forward channel: the harness simplification,
+ * one channel at a time, the datagram handler routes by its ids; NULL
+ * when no direct-udp channel is open
+ */
+static s3_interop_h3_channel_t *s3_interop_h3_udp_fwd;
+
+/* the forward branch lives below the channel table */
+
+static void s3_interop_udp_fwd_datagram(s3_connection_t *c, const u_char *buf, size_t len);
+
 static void
 s3_interop_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 {
     u_char     *buf;
     size_t      len;
     s3_chain_t *cl;
+
+    if (s3_interop_h3_udp_fwd != NULL) {
+
+        /*
+         * the direct-udp channel owns the datagrams prefixed with its
+         * ids (docs/P4-WIRE.md 3.2), the rest falls through to the
+         * plain echo; the flatten below is the rare fragmented path
+         */
+        len = 0;
+
+        for (cl = data; cl != NULL; cl = cl->next) {
+            len += s3_buf_size(cl->buf);
+        }
+
+        buf = s3_palloc(c->pool, len);
+
+        if (buf != NULL) {
+
+            u_char *p = buf;
+
+            for (cl = data; cl != NULL; cl = cl->next) {
+                p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+            }
+
+            s3_interop_udp_fwd_datagram(c, buf, len);
+
+            (void)s3_pfree(c->pool, buf);
+        }
+
+        return;
+    }
 
     /*
      * a datagram almost always lands in a single link of the receive
@@ -411,7 +468,7 @@ static size_t s3_interop_h3_out_len;
  * several recvs); after the 91 the channel runs either the echo or
  * the server session of docs/P4-WIRE.md 6
  */
-typedef struct {
+struct s3_interop_h3_channel_s {
     s3_connection_t *sc;
     u_char          *buf;
     size_t           cap;
@@ -431,7 +488,41 @@ typedef struct {
     unsigned               sess_exit_sent;
     unsigned               sess_peer_fin;
     s3_event_t             sess_timer;
-} s3_interop_h3_channel_t;
+
+    /*
+     * the forward side (direct-tcp / direct-udp): fwd_fd is the
+     * target socket (-1 when the channel is not a forward), the
+     * pending buffers decouple the quic stream from the socket and
+     * the 50 ms timer pumps the remaining directions - the same
+     * harness scheme as the session pump above
+     */
+    unsigned           fwd_kind; /* S3_INTEROP_FWD_NONE/TCP/UDP */
+    unsigned           fwd_eof;  /* the target socket saw the eof */
+    int                fwd_fd;
+    struct sockaddr_in fwd_sa;
+    u_char            *fwd_in; /* the 94 payloads awaiting the socket send */
+    size_t             fwd_in_cap;
+    size_t             fwd_in_len;
+    u_char            *fwd_out; /* the socket bytes awaiting the 94 send */
+    size_t             fwd_out_cap;
+    size_t             fwd_out_len;
+    size_t             fwd_frame_sent; /* the partial 94 frame in flight */
+    size_t             fwd_frame_total;
+    s3_event_t         fwd_timer;
+};
+
+/* the kinds of the forward channels */
+
+#define S3_INTEROP_FWD_NONE 0
+#define S3_INTEROP_FWD_TCP  1
+#define S3_INTEROP_FWD_UDP  2
+
+/*
+ * the frame buffer of the socket->channel direction: one 94 frame
+ * carries up to the maxPacketSize chunk, the type and length varints
+ * ride on top
+ */
+#define S3_INTEROP_FWD_FRAME 33000
 
 /* the teardown of the session side, the channel free calls it first */
 static void s3_interop_session_teardown(s3_interop_h3_channel_t *ch);
@@ -850,15 +941,29 @@ s3_interop_h3_stream_write(s3_event_t *ev)
 static void
 s3_interop_h3_channel_free(s3_interop_h3_channel_t *ch)
 {
-    /* the pump timer must leave the rbtree before the memory goes */
+    /* the pump timers must leave the rbtree before the memory goes */
 
     if (ch->sess_timer.timer_set) {
         s3_event_del_timer(&ch->sess_timer);
     }
 
+    if (ch->fwd_timer.timer_set) {
+        s3_event_del_timer(&ch->fwd_timer);
+    }
+
     s3_interop_session_teardown(ch);
 
+    if (ch->fwd_fd >= 0) {
+        (void)close(ch->fwd_fd);
+    }
+
+    if (ch == s3_interop_h3_udp_fwd) {
+        s3_interop_h3_udp_fwd = NULL;
+    }
+
     free(ch->buf);
+    free(ch->fwd_in);
+    free(ch->fwd_out);
 
     s3_memzero(ch, sizeof(*ch));
 }
@@ -1282,6 +1387,427 @@ s3_interop_session_arm(s3_interop_h3_channel_t *ch)
     s3_event_add_timer(&ch->sess_timer, 50);
 }
 
+/*
+ * the direct-tcp / direct-udp relay (docs/P4-WIRE.md 2.1, 3.1, 3.2):
+ * the tcp channel pipes the 94 payloads into the target socket and
+ * the socket bytes back as 94; the udp channel maps one QUIC datagram
+ * (the controlStreamID + channelID prefix) onto one sendto() and the
+ * replies back.  The pump rides the 50 ms timer like the session one
+ * - the harness scheme, a general server wants the sockets watched in
+ * the event context
+ */
+
+static unsigned
+s3_interop_h3_type_is(const s3_str_t *type, const char *name)
+{
+    size_t n = strlen(name);
+
+    return type->len == n && s3_memcmp(type->data, name, n) == 0;
+}
+
+static s3_int_t
+s3_interop_fwd_append(u_char **buf, size_t *cap, size_t *len, const u_char *data, size_t n)
+{
+    if (*len + n > *cap) {
+
+        size_t  grown_cap = *cap ? *cap : 16384;
+        u_char *grown;
+
+        while (grown_cap < *len + n) {
+            grown_cap += 65536;
+        }
+
+        grown = realloc(*buf, grown_cap);
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        *buf = grown;
+        *cap = grown_cap;
+    }
+
+    s3_memcpy(*buf + *len, data, n);
+    *len += n;
+
+    return S3_OK;
+}
+
+/* the pending channel bytes ride the target socket */
+
+static void
+s3_interop_fwd_socket_flush(s3_interop_h3_channel_t *ch)
+{
+    while (ch->fwd_in_len > 0) {
+
+        ssize_t m;
+
+        if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+            m = send(ch->fwd_fd, ch->fwd_in, ch->fwd_in_len, 0);
+
+        } else {
+            m = sendto(ch->fwd_fd, ch->fwd_in, ch->fwd_in_len, 0,
+                       (const struct sockaddr *)&ch->fwd_sa, sizeof(ch->fwd_sa));
+        }
+
+        if (m > 0) {
+            s3_memmove(ch->fwd_in, ch->fwd_in + m, ch->fwd_in_len - (size_t)m);
+            ch->fwd_in_len -= (size_t)m;
+            continue;
+        }
+
+        if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+
+        /*
+         * a broken tcp socket reports itself on the next recv, a udp
+         * datagram loss stays a loss (RFC 768); the pump retries
+         */
+        return;
+    }
+}
+
+/*
+ * the pending socket bytes go out as 94 frames; a partial send parks
+ * the frame tail (the stream is a byte stream, the offset tracking
+ * rides the static frame buffer), the pump retries it
+ */
+static void
+s3_interop_fwd_flush(s3_interop_h3_channel_t *ch)
+{
+    static u_char frame[S3_INTEROP_FWD_FRAME];
+    size_t        chunk;
+    ssize_t       m;
+
+    for (;;) {
+
+        if (ch->fwd_frame_sent == ch->fwd_frame_total) {
+
+            if (ch->fwd_out_len == 0) {
+                return;
+            }
+
+            /* a new frame: the payload copy rides the static buffer,
+             * the pending bytes drop at once */
+
+            chunk = s3_ssh3_channel_chunk_size(S3_INTEROP_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > ch->fwd_out_len) {
+                chunk = ch->fwd_out_len;
+            }
+
+            {
+                u_char *p = frame;
+
+                p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+                s3_memcpy(p, ch->fwd_out, chunk);
+
+                ch->fwd_frame_total = (size_t)(p - frame) + chunk;
+            }
+
+            ch->fwd_frame_sent = 0;
+
+            s3_memmove(ch->fwd_out, ch->fwd_out + chunk, ch->fwd_out_len - chunk);
+            ch->fwd_out_len -= chunk;
+        }
+
+        m = s3_quic_stream_send(ch->sc, frame + ch->fwd_frame_sent,
+                                ch->fwd_frame_total - ch->fwd_frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            /* the window reopens on the next pump tick */
+            return;
+        }
+
+        if (m <= 0) {
+            fprintf(stderr, "interop-server: forward send failed\n");
+            s3_interop_h3_channel_free(ch);
+            return;
+        }
+
+        ch->fwd_frame_sent += (size_t)m;
+    }
+}
+
+/* the target reply rides the datagram prefix back to the client */
+
+static void
+s3_interop_fwd_udp_reply(s3_interop_h3_channel_t *ch, const u_char *data, size_t len)
+{
+    s3_quic_stream_t *qs = ch->sc->data;
+    u_char            dg[2048];
+    u_char           *p;
+
+    /* the harness payloads fit one datagram, the bigger ones drop */
+
+    if (len + 8 > sizeof(dg)) {
+        return;
+    }
+
+    p = s3_ssh3_dgram_encode(dg, s3_interop_h3_conv_id, qs->id, data, len);
+
+    (void)s3_quic_send_datagram(qs->parent, dg, (size_t)(p - dg));
+}
+
+static void
+s3_interop_fwd_pump(s3_interop_h3_channel_t *ch)
+{
+    static u_char buf[16384];
+    ssize_t       n;
+
+    /* the pending channel bytes ride the socket first */
+    s3_interop_fwd_socket_flush(ch);
+
+    if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+
+        if (!ch->fwd_eof) {
+
+            for (;;) {
+
+                n = recv(ch->fwd_fd, buf, sizeof(buf), 0);
+
+                if (n > 0) {
+
+                    if (s3_interop_fwd_append(&ch->fwd_out, &ch->fwd_out_cap, &ch->fwd_out_len, buf,
+                                              (size_t)n) != S3_OK) {
+                        fprintf(stderr, "interop-server: forward buffer growth failed\n");
+                        s3_interop_h3_channel_free(ch);
+                        return;
+                    }
+
+                    continue;
+                }
+
+                if (n == 0) {
+                    /* the target closed: the tail drains, the channel
+                     * shuts down once the last byte is out */
+                    ch->fwd_eof = 1;
+                    break;
+                }
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+
+                fprintf(stderr, "interop-server: forward target read error\n");
+                s3_interop_h3_channel_free(ch);
+                return;
+            }
+        }
+
+    } else {
+
+        /* the udp replies: one datagram per recvfrom */
+
+        for (;;) {
+
+            n = recvfrom(ch->fwd_fd, buf, sizeof(buf), 0, NULL, NULL);
+
+            if (n <= 0) {
+
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    fprintf(stderr, "interop-server: forward target read error\n");
+                }
+
+                break;
+            }
+
+            s3_interop_fwd_udp_reply(ch, buf, (size_t)n);
+        }
+    }
+
+    s3_interop_fwd_flush(ch);
+
+    if (ch->fwd_eof && ch->fwd_out_len == 0 && ch->fwd_frame_sent == ch->fwd_frame_total) {
+
+        /* the relay is over: the fin goes out, the channel ends */
+
+        (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+        s3_interop_h3_channel_free(ch);
+    }
+}
+
+static void
+s3_interop_fwd_timer(s3_event_t *ev)
+{
+    s3_interop_h3_channel_t *ch = ev->data;
+
+    ev->timedout = 0;
+
+    s3_interop_fwd_pump(ch);
+
+    /* the pump stops once the channel is gone (the free zeroes the
+     * struct), a live forward keeps ticking */
+
+    if (ch->sc != NULL && ch->fwd_kind != S3_INTEROP_FWD_NONE) {
+        s3_event_add_timer(ev, 50);
+    }
+}
+
+static void
+s3_interop_fwd_arm(s3_interop_h3_channel_t *ch)
+{
+    if (ch->fwd_timer.timer_set) {
+        return;
+    }
+
+    ch->fwd_timer.data = ch;
+    ch->fwd_timer.log = &s3_interop_log;
+    ch->fwd_timer.handler = s3_interop_fwd_timer;
+
+    s3_event_add_timer(&ch->fwd_timer, 50);
+}
+
+/* the runner marker on the open target */
+
+static void
+s3_interop_fwd_report(const s3_ssh3_forward_target_t *t, const char *kind)
+{
+    char        ip[64];
+    const char *text;
+
+    text = inet_ntop(t->family == 6 ? AF_INET6 : AF_INET, t->ip, ip, sizeof(ip));
+
+    if (text == NULL) {
+        text = "?";
+    }
+
+    printf("INTEROP-FWD-%s-OPEN target=%s:%u\n", kind, text, (unsigned)t->port);
+    fflush(stdout);
+}
+
+/*
+ * the target connect of the direct-tcp channel: the harness runs
+ * against the loopback echo services, the plain blocking connect
+ * (a refusal on loopback is immediate) is enough and keeps the pump
+ * simple, a general server wants a non-blocking connect
+ */
+static s3_int_t
+s3_interop_fwd_tcp_open(s3_interop_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
+{
+    struct sockaddr_in sa;
+    int                fd;
+
+    if (t->family != 4) {
+        fprintf(stderr, "interop-server: direct-tcp: only the ipv4 targets are supported\n");
+        return S3_ERROR;
+    }
+
+    s3_memzero(&sa, sizeof(sa));
+
+    sa.sin_family = AF_INET;
+    s3_memcpy(&sa.sin_addr, t->ip, 4);
+    sa.sin_port = htons(t->port);
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (fd == -1) {
+        return S3_ERROR;
+    }
+
+    if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        (void)close(fd);
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
+        (void)close(fd);
+        return S3_ERROR;
+    }
+
+    ch->fwd_fd = fd;
+    ch->fwd_kind = S3_INTEROP_FWD_TCP;
+    ch->fwd_sa = sa;
+
+    s3_interop_fwd_report(t, "TCP");
+
+    return S3_OK;
+}
+
+/*
+ * the target socket of the direct-udp channel; one channel at a time
+ * (the harness simplification, the datagram routing holds a single
+ * target)
+ */
+static s3_int_t
+s3_interop_fwd_udp_open(s3_interop_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
+{
+    struct sockaddr_in sa;
+    int                fd;
+
+    if (t->family != 4) {
+        fprintf(stderr, "interop-server: direct-udp: only the ipv4 targets are supported\n");
+        return S3_ERROR;
+    }
+
+    if (s3_interop_h3_udp_fwd != NULL) {
+        fprintf(stderr, "interop-server: a direct-udp channel is already forwarded\n");
+        return S3_ERROR;
+    }
+
+    s3_memzero(&sa, sizeof(sa));
+
+    sa.sin_family = AF_INET;
+    s3_memcpy(&sa.sin_addr, t->ip, 4);
+    sa.sin_port = htons(t->port);
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd == -1) {
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
+        (void)close(fd);
+        return S3_ERROR;
+    }
+
+    ch->fwd_fd = fd;
+    ch->fwd_kind = S3_INTEROP_FWD_UDP;
+    ch->fwd_sa = sa;
+
+    s3_interop_h3_udp_fwd = ch;
+
+    s3_interop_fwd_report(t, "UDP");
+
+    return S3_OK;
+}
+
+/*
+ * the datagram of the direct-udp channel (docs/P4-WIRE.md 3.2): the
+ * prefix carries the control stream and the channel ids, a datagram
+ * that does not belong to the forwarded channel (the plain echo runs)
+ * echoes back unchanged
+ */
+static void
+s3_interop_udp_fwd_datagram(s3_connection_t *c, const u_char *buf, size_t len)
+{
+    const u_char     *pos = buf, *end = buf + len;
+    uint64_t          csid, chid;
+    s3_str_t          payload;
+    s3_quic_stream_t *qs;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        (void)s3_quic_send_datagram(c, buf, len);
+        return;
+    }
+
+    qs = s3_interop_h3_udp_fwd->sc->data;
+
+    if (csid != s3_interop_h3_conv_id || chid != qs->id) {
+        (void)s3_quic_send_datagram(c, buf, len);
+        return;
+    }
+
+    if (payload.len > 0) {
+        (void)sendto(s3_interop_h3_udp_fwd->fwd_fd, payload.data, payload.len, 0,
+                     (const struct sockaddr *)&s3_interop_h3_udp_fwd->fwd_sa,
+                     sizeof(s3_interop_h3_udp_fwd->fwd_sa));
+    }
+}
+
 static s3_int_t
 s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
 {
@@ -1289,11 +1815,13 @@ s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
     s3_quic_stream_t               *qs = sc->data;
     s3_ssh3_channel_t               hdr;
     s3_ssh3_msg_open_confirmation_t conf;
+    s3_ssh3_forward_target_t        target;
     const u_char                   *pos, *end;
     u_char                          out[32];
     u_char                         *p;
     size_t                          total;
     ssize_t                         m;
+    unsigned                        fwd;
 
     s3_memzero(&hdr, sizeof(hdr));
 
@@ -1318,6 +1846,24 @@ s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
         return S3_ERROR;
     }
 
+    /*
+     * the direct-* channels carry the target extension right after
+     * the header (docs/P4-WIRE.md 2.1), the other types end there
+     */
+    if (s3_interop_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_TCP) ||
+        s3_interop_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_UDP)) {
+
+        fwd = 1;
+
+        if (s3_ssh3_forward_parse_target(&pos, end, &target) != S3_OK) {
+            s3_interop_h3_channel_cancel(ch, "bad channel target");
+            return S3_ERROR;
+        }
+
+    } else {
+        fwd = 0;
+    }
+
     /* the 91 with our own maxPacketSize, like confirmChannel() does */
 
     s3_memzero(&conf, sizeof(conf));
@@ -1337,6 +1883,27 @@ s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
     }
 
     ch->confirmed = 1;
+
+    if (fwd) {
+
+        s3_int_t rc;
+
+        /*
+         * the 91 is out: the target opens here, a refusal cancels the
+         * channel (the opener sees the reset and fails)
+         */
+
+        rc = s3_interop_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_TCP)
+                 ? s3_interop_fwd_tcp_open(ch, &target)
+                 : s3_interop_fwd_udp_open(ch, &target);
+
+        if (rc != S3_OK) {
+            s3_interop_h3_channel_cancel(ch, "the target is unreachable");
+            return S3_ERROR;
+        }
+
+        s3_interop_fwd_arm(ch);
+    }
 
     printf("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s\n", (unsigned long long)qs->id,
            (int)hdr.type.len, (const char *)hdr.type.data);
@@ -1389,6 +1956,24 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
         if (n == 0) {
 
+            if (ch->fwd_kind != S3_INTEROP_FWD_NONE) {
+
+                /*
+                 * the fin of the opener: the tcp relay shuts the write
+                 * side of the target socket (the echo service answers
+                 * with its own eof and the pump ends the channel), the
+                 * udp channel has no eof and just ends
+                 */
+                if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+                    (void)shutdown(ch->fwd_fd, SHUT_WR);
+                    s3_interop_fwd_pump(ch);
+                    return;
+                }
+
+                s3_interop_h3_channel_free(ch);
+                return;
+            }
+
             if (ch->sess != NULL && !ch->sess_exit_sent) {
 
                 /*
@@ -1438,26 +2023,58 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
         while (pos < end) {
 
+            /*
+             * the message start: a message may arrive split over the
+             * recvs, a failed (partial) parse rewinds here so the
+             * compaction below keeps the whole frame for the next recv
+             */
+            const u_char *msg = pos;
+
             uint64_t type;
 
             if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
                 /* a partial type varint, the next recv completes it */
+                pos = msg;
                 break;
             }
 
             if (type == S3_SSH3_MSG_CHANNEL_DATA) {
-                s3_ssh3_msg_data_t msg;
+                s3_ssh3_msg_data_t msg_data;
 
-                if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
+                if (s3_ssh3_msg_parse_data(&pos, end, &msg_data) != S3_OK) {
+                    pos = msg;
                     break;
+                }
+
+                if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+
+                    /* the relay: the payload rides the target socket */
+
+                    if (s3_interop_fwd_append(&ch->fwd_in, &ch->fwd_in_cap, &ch->fwd_in_len,
+                                              msg_data.data.data, msg_data.data.len) != S3_OK) {
+                        fprintf(stderr, "interop-server: forward buffer growth failed\n");
+                        s3_interop_h3_channel_free(ch);
+                        return;
+                    }
+
+                    s3_interop_fwd_socket_flush(ch);
+
+                    continue;
+                }
+
+                if (ch->fwd_kind == S3_INTEROP_FWD_UDP) {
+
+                    /* the udp channels carry the datagram path only */
+                    s3_interop_h3_channel_cancel(ch, "data on a direct-udp channel");
+                    return;
                 }
 
                 if (ch->sess_intent) {
 
                     if (ch->sess != NULL && ch->sess->open) {
 
-                        if (s3_ssh3_session_srv_input(ch->sess, msg.data.data, msg.data.len) !=
-                            S3_OK) {
+                        if (s3_ssh3_session_srv_input(ch->sess, msg_data.data.data,
+                                                      msg_data.data.len) != S3_OK) {
                             fprintf(stderr, "interop-server: session input failed\n");
                         }
 
@@ -1476,7 +2093,8 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
                 /* the echo mode: the data goes back unchanged */
 
-                if (s3_interop_h3_channel_echo(sc, msg.data.data, msg.data.len) != S3_OK) {
+                if (s3_interop_h3_channel_echo(sc, msg_data.data.data, msg_data.data.len) !=
+                    S3_OK) {
                     s3_interop_h3_channel_cancel(ch, "echo send stalled");
                     return;
                 }
@@ -1488,6 +2106,7 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                 s3_ssh3_msg_extended_data_t xmsg;
 
                 if (s3_ssh3_msg_parse_extended_data(&pos, end, &xmsg) != S3_OK) {
+                    pos = msg;
                     break;
                 }
 
@@ -1496,6 +2115,13 @@ s3_interop_h3_channel_read(s3_event_t *ev)
             }
 
             if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
+
+                if (ch->fwd_kind != S3_INTEROP_FWD_NONE) {
+
+                    /* the forward channels carry no requests */
+                    s3_interop_h3_channel_cancel(ch, "request on a forward channel");
+                    return;
+                }
 
                 /*
                  * the envelope parses by the message module, the body
@@ -1509,7 +2135,8 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                 s3_ssh3_request_kind_t kind;
 
                 if (s3_ssh3_msg_parse_request_envelope(&pos, end, &env) != S3_OK) {
-                    /* a partial envelope, the parse left pos untouched */
+                    /* a partial envelope, the next recv completes it */
+                    pos = msg;
                     break;
                 }
 
@@ -1530,6 +2157,7 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
                 if (bend == NULL) {
                     /* a partial body, the next recv completes it */
+                    pos = msg;
                     break;
                 }
 
@@ -1684,6 +2312,7 @@ s3_interop_h3_channel_accept(s3_connection_t *sc)
 
     s3_memzero(ch, sizeof(*ch));
     ch->sc = sc;
+    ch->fwd_fd = -1;
 
     rev = sc->read;
 

@@ -29,6 +29,14 @@
  * -U user:pass switches the Authorization header to the Basic scheme
  * (RFC 7617, base64 of "user:pass" verbatim) instead of test-token.
  *
+ * -F tcp=@port|udp=@port (with -3 -C) opens the direct-tcp or
+ * direct-udp channel instead of the session one: the header carries
+ * the target extension, the target is always 127.0.0.1@port on the
+ * server side (the loopback echo services of the runner).  The tcp
+ * run sends the "s3-fwd-hello" marker plus 64 KiB of the LCG pattern
+ * as 94 and verifies the echo byte for byte; the udp run sends 20
+ * numbered datagrams of 1024 bytes and verifies the echoes.
+ *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
  *   INTEROP-DATAGRAM-OK sent=N recv=N
@@ -38,6 +46,8 @@
  *   INTEROP-EXEC-OK exit=0 / INTEROP-EXEC-FAIL exit=<code>
  *   INTEROP-KILL-OK exit=137 / INTEROP-KILL-FAIL exit=<code>
  *   INTEROP-PTY-SIGNAL-OK exit=137 / INTEROP-PTY-SIGNAL-FAIL exit=<code>
+ *   INTEROP-FWD-TCP-OK bytes=<n> / INTEROP-FWD-TCP-FAIL
+ *   INTEROP-FWD-UDP-OK count=20 / INTEROP-FWD-UDP-FAIL got=<n>
  * the exit code is 0 only when the mode's success line came back
  */
 
@@ -61,6 +71,8 @@
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_dgram.h>
+#include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_version.h>
@@ -134,6 +146,51 @@ static size_t   s3_interop_h3_sess_out_cap;
 static size_t   s3_interop_h3_sess_out_len;
 static unsigned s3_interop_h3_sess_signal_pending; /* the resized geometry came back */
 static unsigned s3_interop_h3_sess_signal_sent;
+
+/*
+ * the forward modes (-3 -C -F tcp=@port|udp=@port): the channel is a
+ * direct-tcp or direct-udp one, the target is always 127.0.0.1 on the
+ * server side.  The tcp verdict is the byte-exact echo of the hello
+ * plus the 64 KiB LCG pattern, the udp verdict is the echo of the 20
+ * numbered datagrams
+ */
+#define S3_INTEROP_FWD_NONE 0
+#define S3_INTEROP_FWD_TCP  1
+#define S3_INTEROP_FWD_UDP  2
+
+#define S3_INTEROP_FWD_UDP_COUNT 20
+#define S3_INTEROP_FWD_UDP_SIZE  1024
+
+/*
+ * the frame buffer of the tcp run: one 94 frame carries up to the
+ * maxPacketSize chunk, the type and length varints ride on top
+ */
+#define S3_INTEROP_FWD_FRAME 33000
+
+static int      s3_interop_fwd_mode;
+static unsigned s3_interop_fwd_port;
+
+/* the ids of the opened forward channel and its conversation */
+static uint64_t s3_interop_fwd_conv_id;
+static uint64_t s3_interop_fwd_channel_id;
+
+/* the tcp payload: the hello marker plus the pattern, compared byte
+ * for byte as the echo comes back; the frame buffer holds the 94
+ * frame in flight (a partial send parks its tail) */
+static u_char  *s3_interop_fwd_payload;
+static size_t   s3_interop_fwd_payload_len;
+static size_t   s3_interop_fwd_sent;
+static size_t   s3_interop_fwd_recv;
+static u_char   s3_interop_fwd_frame[S3_INTEROP_FWD_FRAME];
+static size_t   s3_interop_fwd_frame_sent;
+static size_t   s3_interop_fwd_frame_total;
+static unsigned s3_interop_fwd_fin_sent;
+
+/* the udp round: the expected datagrams with the index in the head */
+static u_char   s3_interop_fwd_udp_expected[S3_INTEROP_FWD_UDP_COUNT][S3_INTEROP_FWD_UDP_SIZE];
+static unsigned s3_interop_fwd_udp_got[S3_INTEROP_FWD_UDP_COUNT];
+static size_t   s3_interop_fwd_udp_recv;
+static unsigned s3_interop_fwd_udp_sent;
 
 /*
  * the Authorization field: test-token by default, "Basic <b64>" with
@@ -211,6 +268,129 @@ s3_interop_read_le32(const u_char *p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/*
+ * the deterministic payload of the forward runs: a 64-bit LCG with a
+ * fixed seed, the verifier holds its own copy (the echo services
+ * return everything unchanged, no shared state is needed)
+ */
+static uint64_t s3_interop_lcg_state = 0x853c49e6748fea9bULL;
+
+static u_char
+s3_interop_lcg_byte(void)
+{
+    s3_interop_lcg_state = s3_interop_lcg_state * 6364136223846793005ULL + 1442695040888963407ULL;
+
+    return (u_char)(s3_interop_lcg_state >> 33);
+}
+
+static void
+s3_interop_fwd_payload_init(void)
+{
+    static const char hello[] = "s3-fwd-hello";
+    size_t            i, hello_len = sizeof(hello) - 1;
+
+    s3_interop_fwd_payload_len = hello_len + 65536;
+    s3_interop_fwd_payload = malloc(s3_interop_fwd_payload_len);
+
+    if (s3_interop_fwd_payload == NULL) {
+        fprintf(stderr, "interop-client: forward payload alloc failed\n");
+        exit(1);
+    }
+
+    s3_memcpy(s3_interop_fwd_payload, hello, hello_len);
+
+    for (i = hello_len; i < s3_interop_fwd_payload_len; i++) {
+        s3_interop_fwd_payload[i] = s3_interop_lcg_byte();
+    }
+}
+
+static void
+s3_interop_fwd_udp_init(void)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_INTEROP_FWD_UDP_COUNT; i++) {
+
+        size_t j;
+
+        s3_interop_le32(s3_interop_fwd_udp_expected[i], i);
+
+        for (j = 4; j < S3_INTEROP_FWD_UDP_SIZE; j++) {
+            s3_interop_fwd_udp_expected[i][j] = s3_interop_lcg_byte();
+        }
+    }
+}
+
+/*
+ * the udp forward verifier (-F udp=@port): the echo datagrams carry
+ * the same prefix (docs/P4-WIRE.md 3.2), the index opens the payload,
+ * the verdict is the count of the byte-exact echoes
+ */
+static void
+s3_interop_fwd_udp_datagram(s3_chain_t *data)
+{
+    u_char        flat[S3_INTEROP_FWD_UDP_SIZE + 16];
+    u_char       *p;
+    size_t        len = 0;
+    s3_chain_t   *cl;
+    const u_char *pos, *end;
+    uint64_t      csid, chid;
+    s3_str_t      payload;
+    uint32_t      idx;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    if (len > sizeof(flat)) {
+        return;
+    }
+
+    p = flat;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+    }
+
+    pos = flat;
+    end = flat + len;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return;
+    }
+
+    if (csid != s3_interop_fwd_conv_id || chid != s3_interop_fwd_channel_id) {
+        return;
+    }
+
+    if (payload.len != S3_INTEROP_FWD_UDP_SIZE) {
+        return;
+    }
+
+    idx = s3_interop_read_le32(payload.data);
+
+    if (idx >= S3_INTEROP_FWD_UDP_COUNT || s3_interop_fwd_udp_got[idx]) {
+        return;
+    }
+
+    if (s3_memcmp(payload.data, s3_interop_fwd_udp_expected[idx], S3_INTEROP_FWD_UDP_SIZE) != 0) {
+        fprintf(stderr, "interop-client: forward udp mismatch at %u\n", idx);
+        printf("INTEROP-FWD-UDP-FAIL got=%zu\n", s3_interop_fwd_udp_recv);
+        fflush(stdout);
+        exit(1);
+    }
+
+    s3_interop_fwd_udp_got[idx] = 1;
+
+    if (++s3_interop_fwd_udp_recv == S3_INTEROP_FWD_UDP_COUNT) {
+
+        printf("INTEROP-FWD-UDP-OK count=%u\n", (unsigned)S3_INTEROP_FWD_UDP_COUNT);
+        fflush(stdout);
+
+        s3_interop_h3_ch_ok = 1;
+    }
+}
+
 static void
 s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
 {
@@ -218,6 +398,11 @@ s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
     uint32_t    idx;
     size_t      len, n;
     s3_chain_t *cl;
+
+    if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
+        s3_interop_fwd_udp_datagram(data);
+        return;
+    }
 
     (void)c;
 
@@ -876,6 +1061,246 @@ s3_interop_h3_channel_read(s3_event_t *ev)
     }
 }
 
+/*
+ * the direct-tcp writer (-F tcp=@port): the hello plus the pattern go
+ * out as 94 frames once the 91 came back; a partial send parks the
+ * frame tail (the stream is a byte stream, the offset tracking rides
+ * the static frame buffer), the main loop retries each pass
+ */
+static void
+s3_interop_fwd_tcp_write(void)
+{
+    while (s3_interop_fwd_sent < s3_interop_fwd_payload_len ||
+           s3_interop_fwd_frame_sent < s3_interop_fwd_frame_total) {
+
+        ssize_t m;
+
+        if (s3_interop_fwd_frame_sent == s3_interop_fwd_frame_total) {
+
+            size_t  chunk, overhead;
+            u_char *p;
+
+            chunk = s3_ssh3_channel_chunk_size(S3_INTEROP_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > s3_interop_fwd_payload_len - s3_interop_fwd_sent) {
+                chunk = s3_interop_fwd_payload_len - s3_interop_fwd_sent;
+            }
+
+            p = s3_interop_fwd_frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+            s3_memcpy(p, s3_interop_fwd_payload + s3_interop_fwd_sent, chunk);
+
+            overhead = (size_t)(p - s3_interop_fwd_frame);
+
+            s3_interop_fwd_frame_total = overhead + chunk;
+            s3_interop_fwd_frame_sent = 0;
+            s3_interop_fwd_sent += chunk;
+        }
+
+        m = s3_quic_stream_send(s3_interop_h3_channel,
+                                s3_interop_fwd_frame + s3_interop_fwd_frame_sent,
+                                s3_interop_fwd_frame_total - s3_interop_fwd_frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            /* the window reopens, retried on the next pass */
+            return;
+        }
+
+        if (m <= 0) {
+            fprintf(stderr, "interop-client: forward channel send failed\n");
+            exit(1);
+        }
+
+        s3_interop_fwd_frame_sent += (size_t)m;
+    }
+
+    /*
+     * everything is out: the fin lets the server shut the write side
+     * of the target socket, the echo keeps coming back
+     */
+    if (!s3_interop_fwd_fin_sent) {
+
+        if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) != S3_OK) {
+            fprintf(stderr, "interop-client: forward channel shutdown failed\n");
+            exit(1);
+        }
+
+        s3_interop_fwd_fin_sent = 1;
+    }
+}
+
+/*
+ * the forward channel reader (-F tcp=@port|udp=@port): the first
+ * message must be the 91 confirmation ("91 waits before anything
+ * else"), then the 94 payloads of the tcp run verify against the
+ * expected bytes; the udp run expects no stream data at all
+ */
+static void
+s3_interop_h3_fwd_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_interop_h3_ch_ok) {
+        /* after the verdict the queued teardown read events may arrive */
+        return;
+    }
+
+    sc = ev->data;
+
+    for (;;) {
+
+        if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
+            size_t  cap = s3_interop_h3_ch_cap + 262144;
+            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-client: channel buffer growth failed\n");
+                exit(1);
+            }
+
+            s3_interop_h3_ch_buf = grown;
+            s3_interop_h3_ch_cap = cap;
+        }
+
+        n = sc->recv(sc, s3_interop_h3_ch_buf + s3_interop_h3_ch_len,
+                     s3_interop_h3_ch_cap - s3_interop_h3_ch_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin before the echo came back: no verdict */
+            fprintf(stderr, "interop-client: forward channel closed before the echo\n");
+            printf("INTEROP-FWD-TCP-FAIL\n");
+            fflush(stdout);
+            exit(1);
+        }
+
+        if (n < 0) {
+            fprintf(stderr, "interop-client: forward channel recv error\n");
+            printf("INTEROP-FWD-TCP-FAIL\n");
+            fflush(stdout);
+            exit(1);
+        }
+
+        s3_interop_h3_ch_len += (size_t)n;
+
+        pos = s3_interop_h3_ch_buf;
+        end = s3_interop_h3_ch_buf + s3_interop_h3_ch_len;
+
+        while (pos < end) {
+
+            /*
+             * the message start: a message may arrive split over the
+             * recvs, a failed (partial) parse rewinds here so the
+             * compaction below keeps the whole frame for the next recv
+             */
+            const u_char *msg = pos;
+
+            uint64_t type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                /* a partial type varint, the next recv completes it */
+                pos = msg;
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: duplicate channel confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                s3_interop_h3_ch_confirmed = 1;
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t data;
+
+                if (!s3_interop_h3_ch_confirmed) {
+                    fprintf(stderr, "interop-client: channel data before confirmation\n");
+                    exit(1);
+                }
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
+                    fprintf(stderr, "interop-client: stream data on the udp channel\n");
+                    exit(1);
+                }
+
+                if (s3_interop_fwd_recv + data.data.len > s3_interop_fwd_payload_len) {
+                    fprintf(stderr, "interop-client: forward echo overflow\n");
+                    printf("INTEROP-FWD-TCP-FAIL\n");
+                    fflush(stdout);
+                    exit(1);
+                }
+
+                if (s3_memcmp(s3_interop_fwd_payload + s3_interop_fwd_recv, data.data.data,
+                              data.data.len) != 0) {
+                    fprintf(stderr, "interop-client: forward echo mismatch at %zu\n",
+                            s3_interop_fwd_recv);
+                    printf("INTEROP-FWD-TCP-FAIL\n");
+                    fflush(stdout);
+                    exit(1);
+                }
+
+                s3_interop_fwd_recv += data.data.len;
+
+                if (s3_interop_fwd_recv == s3_interop_fwd_payload_len) {
+
+                    printf("INTEROP-FWD-TCP-OK bytes=%zu\n", s3_interop_fwd_payload_len);
+                    fflush(stdout);
+
+                    s3_interop_h3_ch_ok = 1;
+
+                    return;
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) {
+
+                s3_ssh3_msg_extended_data_t xmsg;
+
+                if (s3_ssh3_msg_parse_extended_data(&pos, end, &xmsg) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                /* the stderr side is drained, nothing verifies on it */
+                continue;
+            }
+
+            fprintf(stderr, "interop-client: unexpected channel message %llu\n",
+                    (unsigned long long)type);
+            exit(1);
+        }
+
+        /* the consumed bytes compact to the front of the receive buffer */
+        s3_interop_h3_ch_len = (size_t)(end - pos);
+        s3_memmove(s3_interop_h3_ch_buf, pos, s3_interop_h3_ch_len);
+    }
+}
+
 /* the needle search over the accumulated stdout (no NUL terminator) */
 
 static unsigned
@@ -1307,14 +1732,17 @@ static void
 s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s -a addr:port [-3] [-C] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]"
-            " [-U user:pass]\n"
+            "usage: %s -a addr:port [-3] [-C] [-S] [-F tcp=@port|udp=@port] [-n count] [-s size]"
+            " [-m min] [-t ms] [-A alpn] [-U user:pass]\n"
             "  -a  peer UDP address\n"
             "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
             "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
             "      shell request and a ping, the verdict is the echoed ping\n"
             "  -S  stream echo mode: pump count*size pattern bytes through a stream;\n"
             "      with -3 -C: the session scenario, exec, pty or kill\n"
+            "  -F  with -3 -C: the direct-tcp or direct-udp channel to the target\n"
+            "      127.0.0.1@port on the server side; tcp verifies the echo of the\n"
+            "      hello plus 64 KiB, udp the echo of 20 datagrams\n"
             "  -U  the Basic auth of the CONNECT (RFC 7617), user:pass;\n"
             "      without it the Authorization is test-token\n"
             "  -n  datagrams to send (stream: count chunks), default 8\n"
@@ -1347,9 +1775,35 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:U:3CTS:h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:U:F:3CTS:h")) != -1) {
 
         switch (opt) {
+
+        case 'F':
+
+            /*
+             * tcp=@port / udp=@port: the target is always 127.0.0.1 on
+             * the server side (the harness shape of the direct-* run)
+             */
+            if (strncmp(optarg, "tcp=@", 5) == 0) {
+                s3_interop_fwd_mode = S3_INTEROP_FWD_TCP;
+                s3_interop_fwd_port = (unsigned)atoi(optarg + 5);
+
+            } else if (strncmp(optarg, "udp=@", 5) == 0) {
+                s3_interop_fwd_mode = S3_INTEROP_FWD_UDP;
+                s3_interop_fwd_port = (unsigned)atoi(optarg + 5);
+
+            } else {
+                s3_interop_usage(argv[0]);
+                return 1;
+            }
+
+            if (s3_interop_fwd_port == 0 || s3_interop_fwd_port > 65535) {
+                s3_interop_usage(argv[0]);
+                return 1;
+            }
+
+            break;
 
         case 'S':
 
@@ -1497,6 +1951,20 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* the forward modes ride on the channel phase and exclude the session ones */
+    if (s3_interop_fwd_mode &&
+        (!s3_interop_h3_channel_mode || !s3_interop_h3_mode || s3_interop_h3_session_mode)) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
+    if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
+        s3_interop_fwd_payload_init();
+
+    } else if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
+        s3_interop_fwd_udp_init();
+    }
+
     if (peer_text == NULL || n_arg < 1 || n_arg > 65536 || s_arg < 8) {
         s3_interop_usage(argv[0]);
         return 1;
@@ -1551,7 +2019,8 @@ main(int argc, char **argv)
     if (s3_interop_streams_mode) {
         s3_interop_stotal = s3_interop_count * s3_interop_size;
 
-    } else {
+    } else if (!s3_interop_fwd_mode) {
+
         s3_interop_expected = malloc(s3_interop_count * s3_interop_size);
         s3_interop_got = calloc(s3_interop_count, 1);
 
@@ -1762,13 +2231,13 @@ main(int argc, char **argv)
                 }
             }
 
-            if (s3_interop_h3_status_seen && s3_interop_h3_channel_mode) {
+            if (s3_interop_h3_status_seen && (s3_interop_h3_channel_mode || s3_interop_fwd_mode)) {
 
                 /*
-                 * the session channel comes up right after the 200:
-                 * the next client bidi stream (ChannelID == its
-                 * StreamID) carries the channel header, the shell
-                 * request and the ping probe, one send for all three
+                 * the channel comes up right after the 200: the next
+                 * client bidi stream (ChannelID == its StreamID)
+                 * carries the channel header and, for the forward
+                 * modes, the target extension - one send
                  */
                 if (s3_interop_h3_channel == NULL) {
 
@@ -1779,9 +2248,14 @@ main(int argc, char **argv)
                         return 1;
                     }
 
-                    s3_interop_h3_channel->read->handler = s3_interop_h3_session_mode
-                                                               ? s3_interop_h3_session_read
-                                                               : s3_interop_h3_channel_read;
+                    s3_interop_fwd_conv_id = ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
+                    s3_interop_fwd_channel_id =
+                        ((s3_quic_stream_t *)s3_interop_h3_channel->data)->id;
+
+                    s3_interop_h3_channel->read->handler =
+                        s3_interop_fwd_mode          ? s3_interop_h3_fwd_read
+                        : s3_interop_h3_session_mode ? s3_interop_h3_session_read
+                                                     : s3_interop_h3_channel_read;
                     s3_interop_h3_channel->read->data = s3_interop_h3_channel;
 
                     /*
@@ -1793,26 +2267,58 @@ main(int argc, char **argv)
                 }
 
                 if (!s3_interop_h3_ch_sent) {
-                    u_char            frame[512];
-                    u_char           *p;
-                    s3_ssh3_channel_t hdr;
-                    size_t            total;
-                    ssize_t           m;
+                    u_char                   frame[512];
+                    u_char                  *p;
+                    s3_ssh3_channel_t        hdr;
+                    s3_ssh3_forward_target_t target;
+                    size_t                   total;
+                    ssize_t                  m;
 
                     /* the header: the conversation is the CONNECT stream */
                     s3_memzero(&hdr, sizeof(hdr));
 
-                    hdr.conversation_stream_id =
-                        ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
-                    hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
-                    hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+                    hdr.conversation_stream_id = s3_interop_fwd_conv_id;
                     hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+
+                    if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
+                        hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
+                        hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
+
+                    } else if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
+                        hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
+                        hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
+
+                    } else {
+                        hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
+                        hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+                    }
 
                     p = frame;
                     p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
 
-                    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC ||
-                        s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL) {
+                    if (s3_interop_fwd_mode != S3_INTEROP_FWD_NONE) {
+
+                        /*
+                         * the target extension of the direct-* types
+                         * (docs/P4-WIRE.md 2.1): family, the raw ip,
+                         * the uint16be port - the harness target is
+                         * the loopback service on the server side
+                         */
+                        target.family = 4;
+                        target.ip_len = 4;
+
+                        if (inet_pton(AF_INET, "127.0.0.1", target.ip) != 1) {
+                            fprintf(stderr, "interop-client: inet_pton failed\n");
+                            return 1;
+                        }
+
+                        target.port = (uint16_t)s3_interop_fwd_port;
+
+                        p = s3_ssh3_forward_build_target(p, &target);
+                    }
+
+                    else if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC ||
+                             s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL) {
 
                         /*
                          * the exec: the marker command with the reply
@@ -1945,6 +2451,36 @@ main(int argc, char **argv)
                     }
                 }
 
+                if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP && s3_interop_h3_ch_confirmed) {
+
+                    /* the hello plus the pattern ride the 94 frames */
+                    s3_interop_fwd_tcp_write();
+                }
+
+                if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP && s3_interop_h3_ch_confirmed &&
+                    s3_interop_fwd_udp_sent < S3_INTEROP_FWD_UDP_COUNT) {
+
+                    /*
+                     * the numbered datagrams (docs/P4-WIRE.md 3.2):
+                     * one per pass, the echoes verify in the datagram
+                     * handler
+                     */
+                    u_char  dg[S3_INTEROP_FWD_UDP_SIZE + 16];
+                    u_char *p;
+
+                    p = s3_ssh3_dgram_encode(dg, s3_interop_fwd_conv_id, s3_interop_fwd_channel_id,
+                                             s3_interop_fwd_udp_expected[s3_interop_fwd_udp_sent],
+                                             S3_INTEROP_FWD_UDP_SIZE);
+
+                    if (s3_quic_send_datagram(cli, dg, (size_t)(p - dg)) == S3_OK) {
+                        s3_interop_fwd_udp_sent++;
+
+                    } else {
+                        fprintf(stderr, "interop-client: forward datagram send failed\n");
+                        return 1;
+                    }
+                }
+
                 if (!s3_interop_h3_sess_signal_sent &&
                     ((s3_interop_h3_session_mode == S3_INTEROP_SESSION_PTY &&
                       s3_interop_h3_sess_signal_pending) ||
@@ -1991,10 +2527,11 @@ main(int argc, char **argv)
             }
 
             /*
-             * the plain -3 run completes on the 200; the -C run goes
-             * on until the ping came back echoed
+             * the plain -3 run completes on the 200; the -C and the
+             * forward runs go on until their verdict came back
              */
-            if (s3_interop_h3_status_seen && (!s3_interop_h3_channel_mode || s3_interop_h3_ch_ok)) {
+            if (s3_interop_h3_status_seen &&
+                (!(s3_interop_h3_channel_mode || s3_interop_fwd_mode) || s3_interop_h3_ch_ok)) {
                 break;
             }
 
@@ -2117,6 +2654,19 @@ main(int argc, char **argv)
                             s3_interop_h3_sess_signal_sent, s3_interop_h3_sess_out_len);
                 }
 
+                if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
+                    fprintf(stderr, "interop-client: fwd state sent=%zu recv=%zu\n",
+                            s3_interop_fwd_sent, s3_interop_fwd_recv);
+                    printf("INTEROP-FWD-TCP-FAIL\n");
+                    fflush(stdout);
+
+                } else if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
+                    fprintf(stderr, "interop-client: fwd state sent=%u recv=%zu\n",
+                            s3_interop_fwd_udp_sent, s3_interop_fwd_udp_recv);
+                    printf("INTEROP-FWD-UDP-FAIL got=%zu\n", s3_interop_fwd_udp_recv);
+                    fflush(stdout);
+                }
+
                 return 1;
             }
 
@@ -2170,6 +2720,7 @@ main(int argc, char **argv)
 
     free(s3_interop_expected);
     free(s3_interop_got);
+    free(s3_interop_fwd_payload);
 
     (void)close(fd);
     s3_destroy_pool(ctx.pool);
