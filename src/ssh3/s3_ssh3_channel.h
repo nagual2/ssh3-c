@@ -26,14 +26,14 @@
 typedef struct s3_ssh3_channel_s s3_ssh3_channel_t;
 
 struct s3_ssh3_channel_s {
-    s3_queue_t          queue;   /* the accept queue linkage */
-    s3_rbtree_node_t    node;    /* the conversation registry, key = channel_id */
-    uint64_t            channel_id;
-    uint64_t            conversation_stream_id;
-    s3_str_t            type;
-    uint64_t            max_packet_size;
-    unsigned            header_sent : 1; /* the lazy header of the opener */
-    unsigned            confirmed : 1;   /* the 91 seen on the opener side */
+    s3_queue_t       queue; /* the accept queue linkage */
+    s3_rbtree_node_t node;  /* the conversation registry, key = channel_id */
+    uint64_t         channel_id;
+    uint64_t         conversation_stream_id;
+    s3_str_t         type;
+    uint64_t         max_packet_size;
+    unsigned         header_sent : 1; /* the lazy header of the opener */
+    unsigned         confirmed : 1;   /* the 91 seen on the opener side */
 };
 
 /*
@@ -49,12 +49,12 @@ u_char *s3_ssh3_channel_build_header(u_char *p, const s3_ssh3_channel_t *ch);
 
 /*
  * parses the header at *pos; on S3_OK the type view points into the
- * receive buffer and the conversation_stream_id, max_packet_size and
- * channel_id fields are filled; a wrong frame type or a truncated
- * buffer leaves *pos untouched and returns S3_ERROR
+ * receive buffer and the conversation_stream_id and max_packet_size
+ * fields are filled (the channel_id is the stream id, the transport
+ * knows it, the header does not carry it); a wrong frame type or a
+ * truncated buffer leaves *pos untouched and returns S3_ERROR
  */
-s3_int_t s3_ssh3_channel_parse_header(const u_char **pos, const u_char *end,
-                                      s3_ssh3_channel_t *ch);
+s3_int_t s3_ssh3_channel_parse_header(const u_char **pos, const u_char *end, s3_ssh3_channel_t *ch);
 
 /*
  * the payload bytes one 94/95 frame may carry under the channel

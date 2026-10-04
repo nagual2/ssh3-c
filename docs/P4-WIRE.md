@@ -78,7 +78,7 @@ Control stream идентифицирует conversation: `ConversationID` — 3
 | 2 | 95 `SSH_MSG_CHANNEL_EXTENDED_DATA` | `varint 95, varint dataType, SSHString data` | stderr: `dataType=1` (`SSH_EXTENDED_DATA_STDERR`); `dataType=0` запрещён на сервере (cmd/ssh3-server.go:750-755) |
 | 3 | 98 `SSH_MSG_CHANNEL_REQUEST` | `varint 98, SSHString requestType, u8 wantReply, тело запроса` | pty-req/shell/exec/subsystem/window-change/signal/exit-status/exit-signal; `wantReply` — ровно 1 байт (binary.Read bool, message/channel_request.go:75); тела — §6 |
 
-Чанкование отправки: `WriteData` (channel.go:311-342) режет буфер на `min(maxPacketSize - emptyMsgLen, len)`, где `emptyMsgLen` — длина кадра с пустой строкой (2 байта для 94, 3 для 95); заголовок кадра и payload пишутся двумя `write` без копирования payload.
+Чанкование отправки: `WriteData` (channel.go:311-342) режет буфер на `min(maxPacketSize - emptyMsgLen, len)`, где `emptyMsgLen` — длина кадра с пустой строкой (3 байта для 94 — varint 94 двухбайтный, 4 для 95); заголовок кадра и payload пишутся двумя `write` без копирования payload.
 
 Датаграммный путь выбирается **по типу канала**: только `direct-udp` и `forwarded-udp` (`Client.ForwardUDP` client.go:462-510, серверный `forwardUDPInBackground` cmd/ssh3-server.go:154-198). Всё остальное — stream-путь, даже если `SendDatagram` вызвать (см. ниже).
 
