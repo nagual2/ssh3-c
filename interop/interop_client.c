@@ -17,12 +17,17 @@
  * (the header, the shell request and the ping probe in one send), the
  * verdict is the echoed ping.
  *
- * with -C -S exec|pty the session scenarios run instead of the ping:
- * exec sends "printf s3-exec-ok" with the fin right behind it and
+ * with -C -S exec|pty|kill the session scenarios run instead of the
+ * ping: exec sends "printf s3-exec-ok" with the fin right behind it and
  * reads the output plus the 98 exit-status; pty opens a pty at 80x24,
  * starts the shell, resizes to 100x40, probes the size with stty,
  * signals KILL once the resized geometry came back and waits for the
- * exit-status 137 (128 + SIGKILL).
+ * exit-status 137 (128 + SIGKILL); kill execs "sleep 30", keeps the
+ * stream writable and signals KILL right after the 91 confirmation,
+ * waiting for the same 137.
+ *
+ * -U user:pass switches the Authorization header to the Basic scheme
+ * (RFC 7617, base64 of "user:pass" verbatim) instead of test-token.
  *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
@@ -31,6 +36,7 @@
  *   INTEROP-H3-STATUS <code>
  *   INTEROP-CHANNEL-OK len=<payload length>
  *   INTEROP-EXEC-OK exit=0 / INTEROP-EXEC-FAIL exit=<code>
+ *   INTEROP-KILL-OK exit=137 / INTEROP-KILL-FAIL exit=<code>
  *   INTEROP-PTY-SIGNAL-OK exit=137 / INTEROP-PTY-SIGNAL-FAIL exit=<code>
  * the exit code is 0 only when the mode's success line came back
  */
@@ -111,11 +117,16 @@ static unsigned         s3_interop_h3_ch_confirmed;
 static unsigned         s3_interop_h3_ch_ok;
 
 /*
- * the session scenarios (-3 -C -S exec|pty): the channel carries the
- * request/response runs instead of the ping echo, no shell request or
- * ping goes out; the verdict comes with the 98 exit-status
+ * the session scenarios (-3 -C -S exec|pty|kill): the channel carries
+ * the request/response runs instead of the ping echo, no shell request
+ * or ping goes out; the verdict comes with the 98 exit-status
  */
-enum { S3_INTEROP_SESSION_NONE = 0, S3_INTEROP_SESSION_EXEC, S3_INTEROP_SESSION_PTY };
+enum {
+    S3_INTEROP_SESSION_NONE = 0,
+    S3_INTEROP_SESSION_EXEC,
+    S3_INTEROP_SESSION_PTY,
+    S3_INTEROP_SESSION_KILL
+};
 
 static unsigned s3_interop_h3_session_mode;
 static u_char  *s3_interop_h3_sess_out; /* the stdout accumulator */
@@ -123,6 +134,21 @@ static size_t   s3_interop_h3_sess_out_cap;
 static size_t   s3_interop_h3_sess_out_len;
 static unsigned s3_interop_h3_sess_signal_pending; /* the resized geometry came back */
 static unsigned s3_interop_h3_sess_signal_sent;
+
+/*
+ * the Authorization field: test-token by default, "Basic <b64>" with
+ * -U (the static buffer is filled once at the option parse)
+ */
+static const char *s3_interop_h3_auth_value = "test-token";
+static char        s3_interop_h3_basic[512];
+
+/*
+ * the CONNECT target: "/ssh3-term" by default, the -U user rides in
+ * the query (the reference auth chain takes the username from there,
+ * docs/P4-WIRE.md 7 step 3)
+ */
+static const char *s3_interop_h3_path_value = "/ssh3-term";
+static char        s3_interop_h3_path_buf[512];
 
 static s3_h3_parse_headers_t s3_interop_h3_parse;
 static u_char               *s3_interop_h3_buf;
@@ -320,6 +346,46 @@ s3_interop_stream_echo_read(s3_event_t *ev)
 }
 
 /*
+ * the standard base64 of RFC 4648 with padding; the Basic scheme of
+ * RFC 7617 encodes "user:pass" verbatim (the colon included)
+ */
+static void
+s3_interop_base64(const u_char *src, size_t len, char *dst)
+{
+    static const char tab[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                "abcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t            i, o = 0;
+
+    for (i = 0; i + 3 <= len; i += 3) {
+        unsigned v = ((unsigned)src[i] << 16) | ((unsigned)src[i + 1] << 8) | src[i + 2];
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+        dst[o++] = tab[(v >> 6) & 0x3f];
+        dst[o++] = tab[v & 0x3f];
+    }
+
+    if (len - i == 1) {
+        unsigned v = (unsigned)src[i] << 16;
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+        dst[o++] = '=';
+        dst[o++] = '=';
+
+    } else if (len - i == 2) {
+        unsigned v = ((unsigned)src[i] << 16) | ((unsigned)src[i + 1] << 8);
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+        dst[o++] = tab[(v >> 6) & 0x3f];
+        dst[o++] = '=';
+    }
+
+    dst[o] = '\0';
+}
+
+/*
  * the h3 side (-3): the extended CONNECT request section is a zero
  * prefix plus six literal field lines, so it decodes against any
  * peer QPACK state and never references the dynamic table.  RFC 9114
@@ -352,9 +418,9 @@ s3_interop_h3_request_section(u_char *p)
         n += (size_t)s3_interop_h3_field_l(NULL, ":protocol", "ssh3");
         n += (size_t)s3_interop_h3_field_l(NULL, ":scheme", "https");
         n += (size_t)s3_interop_h3_field_l(NULL, ":authority", "example.lan");
-        n += (size_t)s3_interop_h3_field_l(NULL, ":path", "/ssh3-term");
+        n += (size_t)s3_interop_h3_field_l(NULL, ":path", s3_interop_h3_path_value);
         n += (size_t)s3_interop_h3_field_l(NULL, "user-agent", S3_SSH3_VERSION_STRING);
-        n += (size_t)s3_interop_h3_field_l(NULL, "authorization", "test-token");
+        n += (size_t)s3_interop_h3_field_l(NULL, "authorization", s3_interop_h3_auth_value);
         return n;
     }
 
@@ -363,9 +429,9 @@ s3_interop_h3_request_section(u_char *p)
     p = (u_char *)s3_interop_h3_field_l(p, ":protocol", "ssh3");
     p = (u_char *)s3_interop_h3_field_l(p, ":scheme", "https");
     p = (u_char *)s3_interop_h3_field_l(p, ":authority", "example.lan");
-    p = (u_char *)s3_interop_h3_field_l(p, ":path", "/ssh3-term");
+    p = (u_char *)s3_interop_h3_field_l(p, ":path", s3_interop_h3_path_value);
     p = (u_char *)s3_interop_h3_field_l(p, "user-agent", S3_SSH3_VERSION_STRING);
-    p = (u_char *)s3_interop_h3_field_l(p, "authorization", "test-token");
+    p = (u_char *)s3_interop_h3_field_l(p, "authorization", s3_interop_h3_auth_value);
 
     return (size_t)(p - start);
 }
@@ -861,7 +927,7 @@ s3_interop_h3_sess_append(const u_char *data, size_t len)
     s3_interop_h3_sess_out_len += len;
 }
 
-/* the verdict of both session scenarios, the 98 exit-status carries it */
+/* the verdict of the session scenarios, the 98 exit-status carries it */
 
 static void
 s3_interop_h3_session_verdict(uint64_t code)
@@ -878,6 +944,28 @@ s3_interop_h3_session_verdict(uint64_t code)
         }
 
         printf("INTEROP-EXEC-FAIL exit=%llu\n", (unsigned long long)code);
+        fflush(stdout);
+
+        exit(1);
+    }
+
+    /*
+     * the kill run: the exec-ed sleep 30 is shot with the KILL right
+     * after the confirmation, the verdict is 137 = 128 + 9
+     */
+
+    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL) {
+
+        if (code == 137) {
+            printf("INTEROP-KILL-OK exit=137\n");
+            fflush(stdout);
+
+            s3_interop_h3_ch_ok = 1;
+
+            return;
+        }
+
+        printf("INTEROP-KILL-FAIL exit=%llu\n", (unsigned long long)code);
         fflush(stdout);
 
         exit(1);
@@ -943,13 +1031,13 @@ s3_interop_h3_session_request(u_char *p, s3_ssh3_request_kind_t kind, unsigned w
 }
 
 /*
- * the session reader (-3 -C -S exec|pty): the first message must be
+ * the session reader (-3 -C -S exec|pty|kill): the first message must be
  * the 91 confirmation, then the 94 payloads accumulate into the stdout
  * buffer and the 98 envelopes dispatch by the request kind; the
  * verdict is the 98 exit-status (the exec wants zero with the marker
- * printed, the pty wants 137 = 128 + SIGKILL).  A request body has no
- * length prefix on the wire, it runs to the end of the received data,
- * so a truncated tail waits for the next recv
+ * printed, the pty and the kill want 137 = 128 + SIGKILL).  A request
+ * body has no length prefix on the wire, it runs to the end of the
+ * received data, so a truncated tail waits for the next recv
  */
 static void
 s3_interop_h3_session_read(s3_event_t *ev)
@@ -1218,22 +1306,24 @@ s3_interop_alpn_wire(u_char *wire, const char *name)
 static void
 s3_interop_usage(const char *prog)
 {
-    fprintf(
-        stderr,
-        "usage: %s -a addr:port [-3] [-C] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]\n"
-        "  -a  peer UDP address\n"
-        "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
-        "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
-        "      shell request and a ping, the verdict is the echoed ping\n"
-        "  -S  stream echo mode: pump count*size pattern bytes through a stream;\n"
-        "      with -3 -C: the session scenario, exec or pty\n"
-        "  -n  datagrams to send (stream: count chunks), default 8\n"
-        "  -s  datagram payload size (stream: chunk size), default 512\n"
-        "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
-        "  -t  overall deadline in ms, default 20000\n"
-        "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
-        "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
-        prog);
+    fprintf(stderr,
+            "usage: %s -a addr:port [-3] [-C] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]"
+            " [-U user:pass]\n"
+            "  -a  peer UDP address\n"
+            "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
+            "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
+            "      shell request and a ping, the verdict is the echoed ping\n"
+            "  -S  stream echo mode: pump count*size pattern bytes through a stream;\n"
+            "      with -3 -C: the session scenario, exec, pty or kill\n"
+            "  -U  the Basic auth of the CONNECT (RFC 7617), user:pass;\n"
+            "      without it the Authorization is test-token\n"
+            "  -n  datagrams to send (stream: count chunks), default 8\n"
+            "  -s  datagram payload size (stream: chunk size), default 512\n"
+            "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
+            "  -t  overall deadline in ms, default 20000\n"
+            "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
+            "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
+            prog);
 }
 
 int
@@ -1257,7 +1347,7 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3CTS:h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:U:3CTS:h")) != -1) {
 
         switch (opt) {
 
@@ -1273,6 +1363,11 @@ main(int argc, char **argv)
                 break;
             }
 
+            if (optarg != NULL && strcmp(optarg, "kill") == 0) {
+                s3_interop_h3_session_mode = S3_INTEROP_SESSION_KILL;
+                break;
+            }
+
             /*
              * the bare -S of the stream runs: the taken token, if any,
              * is the next option, it goes back for the parse
@@ -1281,6 +1376,55 @@ main(int argc, char **argv)
 
             if (optarg != NULL) {
                 optind--;
+            }
+
+            break;
+
+        case 'U':
+
+            /*
+             * the Basic auth (RFC 7617): the base64 input is the
+             * "user:pass" text verbatim, the colon included; the
+             * split below only rejects a missing password
+             */
+            {
+                const char *colon = strchr(optarg, ':');
+                size_t      ulen = strlen(optarg);
+
+                if (colon == NULL) {
+                    fprintf(stderr, "interop-client: -U wants user:pass\n");
+                    return 1;
+                }
+
+                if (ulen > 300) {
+                    fprintf(stderr, "interop-client: -U credentials too long\n");
+                    return 1;
+                }
+
+                memcpy(s3_interop_h3_basic, "Basic ", sizeof("Basic ") - 1);
+
+                s3_interop_base64((const u_char *)optarg, ulen,
+                                  s3_interop_h3_basic + sizeof("Basic ") - 1);
+
+                s3_interop_h3_auth_value = s3_interop_h3_basic;
+
+                /* the username goes into the query for the auth chain */
+
+                {
+                    size_t ul = (size_t)(colon - optarg);
+
+                    if (ul > sizeof(s3_interop_h3_path_buf) - sizeof("/ssh3-term?user=")) {
+                        fprintf(stderr, "interop-client: -U user too long\n");
+                        return 1;
+                    }
+
+                    memcpy(s3_interop_h3_path_buf,
+                           "/ssh3-term?user=", sizeof("/ssh3-term?user=") - 1);
+                    memcpy(s3_interop_h3_path_buf + sizeof("/ssh3-term?user=") - 1, optarg, ul);
+                    s3_interop_h3_path_buf[sizeof("/ssh3-term?user=") - 1 + ul] = '\0';
+
+                    s3_interop_h3_path_value = s3_interop_h3_path_buf;
+                }
             }
 
             break;
@@ -1667,16 +1811,27 @@ main(int argc, char **argv)
                     p = frame;
                     p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
 
-                    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
+                    if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC ||
+                        s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL) {
 
-                        /* the exec: the marker command with the reply wanted */
+                        /*
+                         * the exec: the marker command with the reply
+                         * wanted; the kill run execs sleep 30 instead
+                         * and signals KILL once the confirmation came
+                         * back
+                         */
                         s3_ssh3_request_t exec;
+                        const char       *command;
+
+                        command = (s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL)
+                                      ? "sleep 30"
+                                      : "printf s3-exec-ok";
 
                         s3_memzero(&exec, sizeof(exec));
 
                         exec.kind = S3_SSH3_REQ_EXEC;
-                        exec.u.exec.command.data = (u_char *)"printf s3-exec-ok";
-                        exec.u.exec.command.len = strlen("printf s3-exec-ok");
+                        exec.u.exec.command.data = (u_char *)command;
+                        exec.u.exec.command.len = strlen(command);
 
                         p = s3_interop_h3_session_request(p, S3_SSH3_REQ_EXEC, 1, &exec);
                     }
@@ -1775,7 +1930,12 @@ main(int argc, char **argv)
                         s3_interop_h3_ch_sent = 1;
 
                         if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
-                            /* the exec carries no stdin: the fin goes out at once */
+                            /*
+                             * the exec carries no stdin: the fin goes
+                             * out at once.  The kill run keeps the
+                             * stream writable, the KILL rides it
+                             * right after the confirmation
+                             */
                             if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) !=
                                 S3_OK) {
                                 fprintf(stderr, "interop-client: channel shutdown failed\n");
@@ -1785,9 +1945,16 @@ main(int argc, char **argv)
                     }
                 }
 
-                if (s3_interop_h3_sess_signal_pending && !s3_interop_h3_sess_signal_sent) {
+                if (!s3_interop_h3_sess_signal_sent &&
+                    ((s3_interop_h3_session_mode == S3_INTEROP_SESSION_PTY &&
+                      s3_interop_h3_sess_signal_pending) ||
+                     (s3_interop_h3_session_mode == S3_INTEROP_SESSION_KILL &&
+                      s3_interop_h3_ch_confirmed))) {
 
-                    /* the resized geometry came back, the KILL goes out */
+                    /*
+                     * the KILL goes out: the pty run waits for the
+                     * resized geometry, the kill run only for the 91
+                     */
                     u_char            frame[128];
                     u_char           *p;
                     s3_ssh3_request_t sig;

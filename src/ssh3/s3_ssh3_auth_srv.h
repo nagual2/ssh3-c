@@ -51,7 +51,7 @@ s3_int_t s3_ssh3_auth_password_file_check(const char *path, const s3_str_t *user
  * and *pos advances past the line; S3_DONE at the end of the block
  */
 
-s3_int_t s3_ssh3_auth_authorized_keys_next(const u_char **pos, const u_char *end,
-                                           s3_str_t *keytype, s3_str_t *b64);
+s3_int_t s3_ssh3_auth_authorized_keys_next(const u_char **pos, const u_char *end, s3_str_t *keytype,
+                                           s3_str_t *b64);
 
 #endif /* _S3_SSH3_AUTH_SRV_H_INCLUDED_ */

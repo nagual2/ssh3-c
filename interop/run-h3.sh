@@ -6,6 +6,10 @@
 #   3. our client (-3) -> our server (-3) (sanity)
 #   4. the harness h3-client with an unsupported version -> our server
 #      (-3): the request is rejected with 403 (version negotiation)
+#   8. the harness session-client -> our server (-3): exec session
+#   9. our client (-3 -C -S exec) -> the harness session-server
+#  10. our client (-3 -C -S kill) -> the harness session-server
+#  11. our client (-U user:pass, Basic) -> our server (-P passfile)
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -15,15 +19,27 @@
 #      the resize to 100x40 and the size probe, then the KILL
 #      signal (an interactive shell ignores TERM), the
 #      98 exit-status 137
+#   8. the quic-go session-client -> our server (-3): the exec
+#      session driven by the go side, the 98 exit-status 0
+#   9. our client (-3 -C -S exec) -> the quic-go session-server:
+#      the exec session on the go side, the 98 exit-status 0
+#  10. our client (-3 -C -S kill) -> the quic-go session-server:
+#      the KILL signal right after the confirmation, the
+#      98 exit-status 137
 #
 # the verdicts come from the stdout protocol of the runners:
 #   INTEROP-H3-STATUS 200    (the client side)
 #   INTEROP-H3-CONNECT-OK    (the C server side)
+#   INTEROP-AUTH-OK          (the C server side, the Basic credentials)
 #   INTEROP-CHANNEL-OK       (the C client side, the echoed ping)
 #   INTEROP-CHANNEL-ACCEPT   (the C server side, the channel accepted)
 #   INTEROP-EXEC-OK          (the C client side, the exec verdict)
+#   INTEROP-KILL-OK          (the C client side, the kill verdict)
 #   INTEROP-SESSION-EXEC     (the C server side, the exec accepted)
 #   INTEROP-SESSION-EXIT     (the C server side, the session exit code)
+#   INTEROP-GO-EXEC-OK       (the go session-client side, the exec verdict)
+#   INTEROP-GO-SESSION-EXEC  (the go session-server side, the exec accepted)
+#   INTEROP-GO-SESSION-EXIT  (the go session-server side, the session exit code)
 #   INTEROP-PTY-SIGNAL-OK    (the C client side, the pty verdict)
 #
 # usage: interop/run-h3.sh
@@ -253,6 +269,118 @@ if wait_listen "$WORK/pty-srv.log"; then
         echo "   FAIL"
         tail -5 "$WORK/pty-cli.log" | sed 's/^/   /'
         tail -5 "$WORK/pty-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 8: quic-go session-client -> C server (-3), exec session"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/gc-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gc-srv.log"; then
+    PORT=$(port_of "$WORK/gc-srv.log")
+
+    if timeout 30 "$HARNESS" -h3-session-client -cmd "printf s3-exec-ok" \
+        -a "127.0.0.1:$PORT" -timeout 10s \
+        > "$WORK/gc-cli.log" 2>&1 \
+        && grep -q "INTEROP-GO-EXEC-OK exit=0" "$WORK/gc-cli.log" \
+        && grep -q "INTEROP-SESSION-EXIT code=0" "$WORK/gc-srv.log"; then
+        echo "   PASS (exec session: the go client against the C server)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/gc-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/gc-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 9: C client (-3 -C -S exec) -> quic-go session-server, exec session"
+
+setsid nohup "$HARNESS" -h3-session-server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+    > "$WORK/gs-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gs-srv.log"; then
+    PORT=$(port_of "$WORK/gs-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/cexec-cli.log" 2>&1 \
+        && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/cexec-cli.log" \
+        && grep -q "INTEROP-GO-SESSION-EXIT code=0" "$WORK/gs-srv.log"; then
+        echo "   PASS (exec session: the C client against the go server)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/cexec-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/gs-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the harness h3-session-server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "h3-session-server" 2>/dev/null
+
+echo "== scenario 10: C client (-3 -C -S kill) -> quic-go session-server, kill session"
+
+setsid nohup "$HARNESS" -h3-session-server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+    > "$WORK/gkill-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gkill-srv.log"; then
+    PORT=$(port_of "$WORK/gkill-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -S kill -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/ckill-cli.log" 2>&1 \
+        && grep -q "INTEROP-KILL-OK exit=137" "$WORK/ckill-cli.log" \
+        && grep -q "INTEROP-GO-SESSION-EXIT code=137" "$WORK/gkill-srv.log"; then
+        echo "   PASS (kill session: KILL after the confirmation, exit 137)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/ckill-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/gkill-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the harness h3-session-server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "h3-session-server" 2>/dev/null
+
+echo "== scenario 11: C client (Basic auth) -> C server (-P passfile), exec session"
+
+printf 'tester:secret123\n' > "$WORK/pwfile"
+
+setsid nohup "$BUILD/s3interop_server" -3 -P "$WORK/pwfile" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/auth-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/auth-srv.log"; then
+    PORT=$(port_of "$WORK/auth-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -U tester:secret123 \
+        -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/auth-cli.log" 2>&1 \
+        && grep -q "INTEROP-AUTH-OK user=tester" "$WORK/auth-srv.log" \
+        && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/auth-cli.log"; then
+        echo "   PASS (Basic credentials accepted, exec session ran)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/auth-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/auth-srv.log" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
     fi
 

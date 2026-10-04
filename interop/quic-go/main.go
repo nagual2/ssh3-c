@@ -9,6 +9,8 @@
 //	harness -client -streams -addr 127.0.0.1:4433 -count 8 -size 65536
 //	harness -h3-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
 //	harness -h3-client -a 127.0.0.1:4433
+//	harness -h3-session-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
+//	harness -h3-session-client -a 127.0.0.1:4433 [-cmd 'printf s3-exec-ok'] [-kill]
 //
 // The server accepts QUIC connections and echoes every received
 // DATAGRAM back; in addition it echoes every accepted stream.  The
@@ -24,6 +26,15 @@
 // client opens the extended CONNECT with Authorization: test-token
 // and reports the response status.
 //
+// The -h3-session-* modes run the ssh3 session channel on top
+// (docs/P4-WIRE.md 2, 3.1, 6): every bidi stream after the CONNECT is
+// a channel (header quoting the control stream id, then the 91
+// confirmation); the server executes exec requests through sh -c,
+// forwards the process output as 94/95 frames and reports the 98
+// exit-status; KILL/TERM signals reach the process.  The client opens
+// one channel, execs -cmd and expects the exit-status (0 with the
+// s3-exec-ok marker, or 137 when -kill signaled KILL).
+//
 // Machine-readable lines on stdout (the runner greps them):
 //
 //	INTEROP-LISTEN port=N
@@ -32,13 +43,20 @@
 //	INTEROP-STREAM-OK sent=N recv=N
 //	INTEROP-H3-CONNECT-OK authlen=<len>
 //	INTEROP-H3-STATUS <code>
+//	INTEROP-GO-SESSION-EXEC
+//	INTEROP-GO-SESSION-EXIT code=<code>
+//	INTEROP-GO-EXEC-OK exit=0 / INTEROP-GO-EXEC-FAIL exit=<code>
+//	INTEROP-GO-KILL-OK exit=137 / INTEROP-GO-KILL-FAIL exit=<code>
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -46,7 +64,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go/qlog"
@@ -78,6 +99,13 @@ func main() {
 	h3Client := flag.Bool("h3-client", false, "run as an HTTP/3 extended CONNECT client (ssh3)")
 	badUA := flag.Bool("bad-ua", false, "h3-client: announce an unsupported version, expect 403")
 	addrShort := flag.String("a", "", "dial target host:port for -h3-client (alias for -addr)")
+	h3SessionServer := flag.Bool("h3-session-server", false,
+		"HTTP/3 server with ssh3 session channels: exec/signals per docs/P4-WIRE.md 6")
+	h3SessionClient := flag.Bool("h3-session-client", false,
+		"HTTP/3 client opening an ssh3 session channel: exec + exit-status")
+	command := flag.String("cmd", "printf s3-exec-ok", "h3-session-client: the command to exec")
+	kill := flag.Bool("kill", false,
+		"h3-session-client: signal KILL after the confirmation, expect exit 137")
 	flag.Parse()
 
 	if !*streams && *size > 1100 {
@@ -87,13 +115,14 @@ func main() {
 	}
 
 	modes := 0
-	for _, m := range []*bool{server, client, h3Server, h3Client} {
+	for _, m := range []*bool{server, client, h3Server, h3Client, h3SessionServer, h3SessionClient} {
 		if *m {
 			modes++
 		}
 	}
 	if modes > 1 {
-		fatalf("-server, -client, -h3-server and -h3-client are mutually exclusive")
+		fatalf("-server, -client, -h3-server, -h3-client, -h3-session-server " +
+			"and -h3-session-client are mutually exclusive")
 	}
 
 	if *server {
@@ -106,12 +135,26 @@ func main() {
 		return
 	}
 
+	if *h3SessionServer {
+		runH3SessionServer(*addr, *certFile, *keyFile)
+		return
+	}
+
 	if *h3Client {
 		target := *addr
 		if *addrShort != "" {
 			target = *addrShort
 		}
 		runH3Client(target, *timeout, *badUA)
+		return
+	}
+
+	if *h3SessionClient {
+		target := *addr
+		if *addrShort != "" {
+			target = *addrShort
+		}
+		runH3SessionClient(target, *timeout, *command, *kill)
 		return
 	}
 
@@ -729,5 +772,675 @@ func runH3Client(target string, timeout time.Duration, badUA bool) {
 
 	if err := str.Close(); err != nil {
 		fatalf("close stream: %v", err)
+	}
+}
+
+// the ssh3 wire primitives (docs/P4-WIRE.md): every integer is a QUIC
+// varint (RFC 9000 section 16, the two high bits of the first byte
+// encode the length) and an SSHString is a varint length followed by
+// the raw bytes
+
+const (
+	s3SSHFrameType     = 0xaf3627e6 // SSH_FRAME_TYPE, the channel header marker
+	s3ChannelMaxPacket = 30000      // the reference maxPacketSize on both sides
+)
+
+func s3AppendVarint(b []byte, v uint64) []byte {
+	switch {
+	case v <= 63:
+		return append(b, byte(v))
+	case v <= 16383:
+		return append(b, byte(v>>8)|0x40, byte(v))
+	case v <= 1<<30-1:
+		return append(b, byte(v>>24)|0x80, byte(v>>16), byte(v>>8), byte(v))
+	default:
+		return append(b, byte(v>>56)|0xc0, byte(v>>48), byte(v>>40), byte(v>>32),
+			byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	}
+}
+
+func s3AppendSSHString(b []byte, data []byte) []byte {
+	b = s3AppendVarint(b, uint64(len(data)))
+	return append(b, data...)
+}
+
+func s3ReadVarint(r io.Reader) (uint64, error) {
+	var first [1]byte
+
+	if _, err := io.ReadFull(r, first[:]); err != nil {
+		return 0, err
+	}
+
+	length := 1 << (first[0] >> 6)
+
+	rest := make([]byte, length-1)
+
+	if _, err := io.ReadFull(r, rest); err != nil {
+		return 0, err
+	}
+
+	v := uint64(first[0] & 0x3f)
+
+	for _, b := range rest {
+		v = v<<8 | uint64(b)
+	}
+
+	return v, nil
+}
+
+// s3ReadSSHString reads one SSHString; the length is capped so a
+// corrupted varint cannot trigger a wild allocation
+func s3ReadSSHString(r io.Reader) ([]byte, error) {
+	n, err := s3ReadVarint(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if n > 1<<20 {
+		return nil, fmt.Errorf("ssh string too long: %d", n)
+	}
+
+	data := make([]byte, n)
+
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// runH3SessionServer serves the ssh3 session scenarios: the RFC 9220
+// extended CONNECT is answered through the http3 stack (the same
+// h3ConnectHandler as the -h3-server mode), but the raw server API
+// (http3.Server.NewRawServerConn) keeps the bidi dispatch here: the
+// first bidi stream of a connection is the CONNECT (the conversation
+// control stream), every later bidi is an ssh3 session channel
+// (docs/P4-WIRE.md 1, the reference server dispatch rule).  The plain
+// http3.Server accept loop parses every bidi as an HTTP request, so it
+// cannot be used for the channels.
+//
+// Each channel runs on its own goroutine with per-channel exec state;
+// the harness peers use one channel per connection in practice.  Only
+// exec, signal and exit-status requests exist on this server (the PIN:
+// wantReply is ignored, the 92/93/96/97/99/100 messages do not exist).
+func runH3SessionServer(addr, certFile, keyFile string) {
+	if certFile == "" || keyFile == "" {
+		fatalf("h3-session-server mode needs -cert and -key")
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		fatalf("load key pair: %v", err)
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr(addr))
+	if err != nil {
+		fatalf("listen udp: %v", err)
+	}
+
+	fmt.Printf("INTEROP-LISTEN port=%d\n", udpConn.LocalAddr().(*net.UDPAddr).Port)
+
+	server := &http3.Server{
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{http3.NextProtoH3},
+		},
+		QUICConfig: &quic.Config{
+			MaxIdleTimeout: 60 * time.Second,
+		},
+		Handler: http.HandlerFunc(h3ConnectHandler),
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	listener, err := tr.Listen(server.TLSConfig, server.QUICConfig)
+	if err != nil {
+		fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			fatalf("accept: %v", err)
+		}
+
+		go serveSessionConn(server, conn)
+	}
+}
+
+// serveSessionConn runs one accepted QUIC connection: the h3 layer
+// (the peer's control/QPACK uni streams and the CONNECT request) is
+// fed through the raw server conn, every bidi stream after the first
+// is handled as an ssh3 session channel
+func serveSessionConn(server *http3.Server, conn *quic.Conn) {
+	raw, err := server.NewRawServerConn(conn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: raw server conn: %v\n", err)
+		_ = conn.CloseWithError(0, "")
+		return
+	}
+
+	go func() {
+		for {
+			str, err := conn.AcceptUniStream(context.Background())
+			if err != nil {
+				return
+			}
+			go raw.HandleUnidirectionalStream(str)
+		}
+	}()
+
+	var (
+		convID   uint64
+		haveConv bool
+	)
+
+	for {
+		str, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+
+		if !haveConv {
+			// the first bidi stream is the RFC 9220 extended CONNECT,
+			// its StreamID is the conversationStreamID the channels
+			// must quote in their headers
+			convID = uint64(str.StreamID())
+			haveConv = true
+
+			go raw.HandleRequestStream(str)
+			continue
+		}
+
+		go s3HandleSessionChannel(str, convID)
+	}
+}
+
+// s3HandleSessionChannel runs one accepted ssh3 session channel: the
+// header is checked against the conversation, the 91 confirmation goes
+// back and the message loop drives the exec/signals of
+// docs/P4-WIRE.md 6 (sh -c for exec, the output rides as 94/95, the
+// 98 exit-status closes the channel like the reference channel.Close)
+func s3HandleSessionChannel(str *quic.Stream, convID uint64) {
+	br := bufio.NewReader(str)
+
+	// the channel header (docs/P4-WIRE.md 2.1): varint frame type,
+	// varint conversationStreamID, SSHString type, varint maxPacketSize
+	ftype, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	convid, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	ctype, err := s3ReadSSHString(br)
+	if err != nil {
+		return
+	}
+
+	if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+		return
+	}
+
+	if ftype != s3SSHFrameType || convid != convID || string(ctype) != "session" {
+		// the reference answer to a bad channel is cancel(0)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	// the 91 confirmation with our maxPacketSize, like confirmChannel()
+	if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+		return
+	}
+
+	fmt.Printf("INTEROP-CHANNEL-ACCEPT id=%d type=session\n", str.StreamID())
+
+	var (
+		wmu   sync.Mutex // serializes every write to the channel stream
+		cmd   *exec.Cmd
+		stdin io.WriteCloser
+	)
+
+	for {
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			// the stream is over: a client FIN is the process stdin
+			// EOF, the exit goroutine finishes the verdict on its own
+			wmu.Lock()
+
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+
+			wmu.Unlock()
+
+			return
+		}
+
+		switch typ {
+		case 94: // SSH_MSG_CHANNEL_DATA: stdin of the process
+			data, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			wmu.Lock()
+			w := stdin
+			wmu.Unlock()
+
+			if w != nil {
+				// a dead process: the write fails, the data is drained
+				_, _ = w.Write(data)
+			}
+
+		case 95: // SSH_MSG_CHANNEL_EXTENDED_DATA: drained
+			if _, err := s3ReadVarint(br); err != nil { // data type
+				return
+			}
+
+			if _, err := s3ReadSSHString(br); err != nil {
+				return
+			}
+
+		case 98: // SSH_MSG_CHANNEL_REQUEST
+			rtype, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			var wantReply [1]byte
+
+			if _, err := io.ReadFull(br, wantReply[:]); err != nil {
+				return
+			}
+
+			_ = wantReply // parsed and ignored, the PIN of the reference
+
+			switch string(rtype) {
+			case "exec":
+				command, err := s3ReadSSHString(br)
+				if err != nil {
+					return
+				}
+
+				c := exec.Command("sh", "-c", string(command))
+
+				cin, err := c.StdinPipe()
+				if err != nil {
+					return
+				}
+
+				cout, err := c.StdoutPipe()
+				if err != nil {
+					return
+				}
+
+				cerr, err := c.StderrPipe()
+				if err != nil {
+					return
+				}
+
+				if err := c.Start(); err != nil {
+					fmt.Fprintf(os.Stderr, "harness: exec start: %v\n", err)
+					continue
+				}
+
+				wmu.Lock()
+				cmd = c
+				stdin = cin
+				wmu.Unlock()
+
+				fmt.Println("INTEROP-GO-SESSION-EXEC")
+
+				// the stdout rides as 94, the stderr as 95 with
+				// dataType 1 (docs/P4-WIRE.md 3.1); both pumps must
+				// drain before the exit-status goes out, otherwise the
+				// client stops reading at the verdict and loses the
+				// command output tail
+				var pumps sync.WaitGroup
+
+				pumps.Add(2)
+
+				go func() {
+					defer pumps.Done()
+					s3PumpToChannel(str, &wmu, cout, false)
+				}()
+
+				go func() {
+					defer pumps.Done()
+					s3PumpToChannel(str, &wmu, cerr, true)
+				}()
+
+				go func() {
+					pumps.Wait() // the pipes hit EOF, Wait() is safe now
+
+					code := s3ExitCode(c)
+
+					frame := s3AppendVarint(nil, 98)
+					frame = s3AppendSSHString(frame, []byte("exit-status"))
+					frame = append(frame, 0) // want_reply = 0
+					frame = s3AppendVarint(frame, code)
+
+					wmu.Lock()
+					_, _ = str.Write(frame)
+					wmu.Unlock()
+
+					fmt.Printf("INTEROP-GO-SESSION-EXIT code=%d\n", code)
+
+					_ = str.Close() // the channel FIN, like channel.Close()
+				}()
+
+			case "signal":
+				name, err := s3ReadSSHString(br)
+				if err != nil {
+					return
+				}
+
+				wmu.Lock()
+				c := cmd
+				wmu.Unlock()
+
+				if c == nil || c.Process == nil {
+					continue // no process: the request is ignored
+				}
+
+				switch string(name) {
+				case "KILL":
+					_ = c.Process.Kill()
+				case "TERM":
+					_ = c.Process.Signal(syscall.SIGTERM)
+				default:
+					// unknown names are ignored, like the reference
+				}
+			case "exit-status":
+				// the server never receives one; the body is one varint
+				if _, err := s3ReadVarint(br); err != nil {
+					return
+				}
+			default:
+				// an unknown request type: its body has no length
+				// prefix on the wire, the message flow is unsynced
+				// from here (the reference cancels such a channel)
+				str.CancelRead(42)
+				str.CancelWrite(42)
+				return
+			}
+
+		default:
+			str.CancelRead(42)
+			str.CancelWrite(42)
+			return
+		}
+	}
+}
+
+// s3PumpToChannel forwards one process output pipe to the channel as
+// 94 (stdout) or 95 with dataType 1 (stderr) frames; one frame per
+// read chunk, 16 KiB is far below the 30000 maxPacketSize
+func s3PumpToChannel(str *quic.Stream, mu *sync.Mutex, r io.Reader, extended bool) {
+	buf := make([]byte, 16384)
+
+	for {
+		n, err := r.Read(buf)
+
+		if n > 0 {
+			var frame []byte
+
+			if extended {
+				frame = s3AppendVarint(nil, 95)
+				frame = s3AppendVarint(frame, 1)
+			} else {
+				frame = s3AppendVarint(nil, 94)
+			}
+
+			frame = s3AppendSSHString(frame, buf[:n])
+
+			mu.Lock()
+			_, werr := str.Write(frame)
+			mu.Unlock()
+
+			if werr != nil {
+				return
+			}
+		}
+
+		if err != nil {
+			return
+		}
+	}
+}
+
+// s3ExitCode maps the command result to the exit-status code: a
+// process killed by a signal reports 128+signum (137 for SIGKILL,
+// 143 for SIGTERM), like the ssh3-c session server reaps it
+func s3ExitCode(c *exec.Cmd) uint64 {
+	err := c.Wait()
+
+	if err == nil {
+		return 0
+	}
+
+	var ee *exec.ExitError
+
+	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + uint64(ws.Signal())
+		}
+
+		return uint64(ee.ExitCode())
+	}
+
+	return 1
+}
+
+// runH3SessionClient dials, opens the extended CONNECT and then one
+// ssh3 session channel: the exec request runs -cmd with the fin right
+// behind it and the verdict is the 98 exit-status (zero plus the
+// s3-exec-ok marker in the output).  With -kill the client keeps the
+// stream writable, signals KILL right after the 91 confirmation and
+// expects the exit-status 137 (128 + SIGKILL)
+func runH3SessionClient(target string, timeout time.Duration, command string, kill bool) {
+	if target == "" {
+		fatalf("h3-session-client mode needs -a host:port")
+	}
+
+	tlsCfg := &tls.Config{
+		NextProtos:         []string{http3.NextProtoH3},
+		InsecureSkipVerify: true, // the harness runs against self-signed certs
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		fatalf("local udp: %v", err)
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := tr.Dial(ctx, udpAddr(target), tlsCfg, &quic.Config{
+		MaxIdleTimeout: 60 * time.Second,
+	})
+	if err != nil {
+		fatalf("dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	// the extended CONNECT opens the conversation control stream, the
+	// low-level API like in runH3Client (RFC 9220)
+	cc := (&http3.Transport{}).NewClientConn(conn)
+
+	str, err := cc.OpenRequestStream(ctx)
+	if err != nil {
+		fatalf("open request stream: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodConnect, "https://"+target+"/ssh3-term", nil)
+	if err != nil {
+		fatalf("build connect request: %v", err)
+	}
+
+	req.Proto = "ssh3"
+	req.Header.Set("User-Agent", s3VersionString)
+	req.Header.Set("Authorization", "test-token")
+
+	if err := str.SendRequestHeader(req); err != nil {
+		fatalf("send connect: %v", err)
+	}
+
+	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set stream deadline: %v", err)
+	}
+
+	resp, err := str.ReadResponse()
+	if err != nil {
+		fatalf("read response: %v", err)
+	}
+
+	fmt.Printf("INTEROP-H3-STATUS %d\n", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+
+	// the channel: a fresh bidi stream, the header quotes the control
+	// stream id (ChannelID == StreamID, docs/P4-WIRE.md 2)
+	ch, err := conn.OpenStream()
+	if err != nil {
+		fatalf("open channel stream: %v", err)
+	}
+
+	if err := ch.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set channel deadline: %v", err)
+	}
+
+	header := s3AppendVarint(nil, s3SSHFrameType)
+	header = s3AppendVarint(header, uint64(str.StreamID()))
+	header = s3AppendSSHString(header, []byte("session"))
+	header = s3AppendVarint(header, s3ChannelMaxPacket)
+
+	execReq := s3AppendVarint(nil, 98)
+	execReq = s3AppendSSHString(execReq, []byte("exec"))
+	execReq = append(execReq, 1) // want_reply = 1
+	execReq = s3AppendSSHString(execReq, []byte(command))
+
+	if _, err := ch.Write(append(header, execReq...)); err != nil {
+		fatalf("write channel: %v", err)
+	}
+
+	if !kill {
+		// the exec carries no stdin: the fin goes out at once (Close
+		// is the half-close of quic-go, the receive side stays
+		// open); the kill run keeps the stream writable for the
+		// signal request
+		if err := ch.Close(); err != nil {
+			fatalf("close channel: %v", err)
+		}
+	}
+
+	br := bufio.NewReader(ch)
+
+	var out []byte
+
+	first := true
+
+	for {
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			fatalf("channel read: %v", err)
+		}
+
+		if first {
+			// the 91 confirmation must be the first channel message
+			if typ != 91 {
+				fatalf("expected the 91 confirmation, got %d", typ)
+			}
+
+			if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+				fatalf("read confirmation: %v", err)
+			}
+
+			first = false
+
+			if kill {
+				sig := s3AppendVarint(nil, 98)
+				sig = s3AppendSSHString(sig, []byte("signal"))
+				sig = append(sig, 0) // want_reply = 0
+				sig = s3AppendSSHString(sig, []byte("KILL"))
+
+				if _, err := ch.Write(sig); err != nil {
+					fatalf("send signal: %v", err)
+				}
+			}
+
+			continue
+		}
+
+		switch typ {
+		case 94: // SSH_MSG_CHANNEL_DATA: the stdout accumulates
+			data, err := s3ReadSSHString(br)
+			if err != nil {
+				fatalf("read data: %v", err)
+			}
+
+			out = append(out, data...)
+
+		case 95: // SSH_MSG_CHANNEL_EXTENDED_DATA: drained
+			if _, err := s3ReadVarint(br); err != nil { // data type
+				fatalf("read extended data: %v", err)
+			}
+
+			if _, err := s3ReadSSHString(br); err != nil {
+				fatalf("read extended data: %v", err)
+			}
+
+		case 98: // SSH_MSG_CHANNEL_REQUEST: the verdict carrier
+			rtype, err := s3ReadSSHString(br)
+			if err != nil {
+				fatalf("read request: %v", err)
+			}
+
+			var wantReply [1]byte
+
+			if _, err := io.ReadFull(br, wantReply[:]); err != nil {
+				fatalf("read request: %v", err)
+			}
+
+			if string(rtype) != "exit-status" {
+				fatalf("unexpected request %q", rtype)
+			}
+
+			code, err := s3ReadVarint(br)
+			if err != nil {
+				fatalf("read exit status: %v", err)
+			}
+
+			if kill {
+				if code == 137 {
+					fmt.Println("INTEROP-GO-KILL-OK exit=137")
+					return
+				}
+
+				fmt.Printf("INTEROP-GO-KILL-FAIL exit=%d\n", code)
+				os.Exit(1)
+			}
+
+			if code == 0 && bytes.Contains(out, []byte("s3-exec-ok")) {
+				fmt.Println("INTEROP-GO-EXEC-OK exit=0")
+				return
+			}
+
+			fmt.Printf("INTEROP-GO-EXEC-FAIL exit=%d\n", code)
+			os.Exit(1)
+
+		default:
+			fatalf("unexpected channel message %d", typ)
+		}
 	}
 }

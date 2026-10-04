@@ -37,6 +37,7 @@ struct s3_ssh3_session_cli_s {
 
     unsigned confirmed; /* the 91 seen */
     unsigned exited;    /* the first exit-status won, the rest drop */
+    uint64_t exit_code; /* the verdict of the winning exit-status */
 
     s3_ssh3_session_cli_sink_pt out;
     void                       *out_arg;

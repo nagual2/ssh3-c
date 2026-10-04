@@ -22,6 +22,7 @@
  * process output rides back as 94/95 and the verdict is the 98
  * exit-status.  In this mode stdout additionally carries:
  *   INTEROP-H3-CONNECT-OK authlen=<len>
+ *   INTEROP-AUTH-OK user=<name>  (the -P password file mode)
  *   INTEROP-H3-REJECT code=<400|401|403|425>
  *   INTEROP-CHANNEL-ACCEPT id=<stream id> type=<channel type>
  *   INTEROP-SESSION-PTY
@@ -50,6 +51,7 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
@@ -78,6 +80,12 @@ static s3_uint_t        s3_interop_nconns;
 
 /* the h3 mode (-3): RFC 9220 extended CONNECT instead of the echo */
 static unsigned s3_interop_h3_mode;
+
+/*
+ * the password file (-P): the CONNECT passes only with the correct
+ * Basic credentials against its user:secret lines
+ */
+static const char *s3_interop_passfile;
 
 static void
 s3_interop_log_init(void)
@@ -591,6 +599,56 @@ s3_interop_h3_send_status(unsigned code)
     }
 }
 
+/*
+ * the Basic verdict against the -P password file (docs/P4-WIRE.md 7,
+ * the Basic step of the reference chain): the credentials decode from
+ * the authorization header, the username comes from the CONNECT
+ * target (?user=), the harness file answers the match
+ */
+static unsigned
+s3_interop_h3_basic_verdict(void)
+{
+    s3_str_t header, path, basic_user, basic_pass, user;
+    s3_int_t rc;
+
+    header.data = s3_interop_h3_auth;
+    header.len = s3_interop_h3_auth_len;
+
+    s3_str_null(&basic_user);
+    s3_str_null(&basic_pass);
+    s3_str_null(&user);
+
+    rc = s3_ssh3_auth_basic_decode(&header, &basic_user, &basic_pass);
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: basic auth: bad credentials rc=%d\n", (int)rc);
+        return 401;
+    }
+
+    path.data = s3_interop_h3_path;
+    path.len = s3_interop_h3_path_len;
+
+    rc = s3_ssh3_auth_user_from_path(&path, &user);
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: basic auth: no user in the path\n");
+        return 401;
+    }
+
+    rc = s3_ssh3_auth_password_file_check(s3_interop_passfile, &user, &basic_pass);
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: basic auth: user=%.*s rejected rc=%d\n", (int)user.len,
+                (const char *)user.data, (int)rc);
+        return 401;
+    }
+
+    printf("INTEROP-AUTH-OK user=%.*s\n", (int)user.len, (const char *)user.data);
+    fflush(stdout);
+
+    return 200;
+}
+
 static void
 s3_interop_h3_respond(s3_connection_t *pc)
 {
@@ -601,10 +659,14 @@ s3_interop_h3_respond(s3_connection_t *pc)
         return;
     }
 
-    /* RFC 9220: :protocol marks an extended CONNECT, ssh3 is our route */
+    /* RFC 9220: :protocol marks an extended CONNECT, ssh3 is our
+     * route; the query part of the path carries the auth username
+     * (docs/P4-WIRE.md 7 step 3) and does not affect the route */
+
     if (s3_interop_h3_method_len == 7 && s3_memcmp(s3_interop_h3_method, "CONNECT", 7) == 0 &&
         s3_interop_h3_protocol_len == 4 && s3_memcmp(s3_interop_h3_protocol, "ssh3", 4) == 0 &&
-        s3_interop_h3_path_len == 10 && s3_memcmp(s3_interop_h3_path, "/ssh3-term", 10) == 0) {
+        s3_interop_h3_path_len >= 10 && s3_memcmp(s3_interop_h3_path, "/ssh3-term", 10) == 0 &&
+        (s3_interop_h3_path_len == 10 || s3_interop_h3_path[10] == '?')) {
 
         /* RFC 9114, 4.4: the extended CONNECT carries :scheme and
          * :authority next to :method, :protocol and :path */
@@ -629,8 +691,12 @@ s3_interop_h3_respond(s3_connection_t *pc)
 
             code = 425;
 
-        } else {
+        } else if (s3_interop_passfile == NULL) {
             code = s3_interop_h3_auth_len ? 200 : 401;
+
+        } else {
+            /* the password file mode: the Basic credentials decide */
+            code = s3_interop_h3_basic_verdict();
         }
 
     } else {
@@ -1799,13 +1865,16 @@ static void
 s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s -l addr:port -c cert.pem -k key.pem [-3] [-A alpn] [-d dg_size]\n"
+            "usage: %s -l addr:port -c cert.pem -k key.pem [-3] [-A alpn] [-d dg_size]"
+            " [-P pwfile]\n"
             "  -l  UDP listen address, port 0 picks an ephemeral one\n"
             "  -c  certificate PEM file\n"
             "  -k  private key PEM file\n"
             "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3) instead of the echo\n"
             "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
-            "  -d  max_datagram_frame_size transport parameter, default 1200\n",
+            "  -d  max_datagram_frame_size transport parameter, default 1200\n"
+            "  -P  password file: the CONNECT passes only with the Basic"
+            " user:secret (h3 mode)\n",
             prog);
 }
 
@@ -1830,7 +1899,7 @@ main(int argc, char **argv)
 
     s3_interop_log_init();
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:3h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:P:3h")) != -1) {
 
         switch (opt) {
 
@@ -1856,6 +1925,10 @@ main(int argc, char **argv)
 
         case 'i':
             idle_ms = (unsigned)atoi(optarg);
+            break;
+
+        case 'P':
+            s3_interop_passfile = optarg;
             break;
 
         case '3':
