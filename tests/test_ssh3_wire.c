@@ -31,11 +31,11 @@ s3_test_varint_roundtrip(void)
         {4611686018427387903ULL, (const u_char *)"\xff\xff\xff\xff\xff\xff\xff\xff", 8},
     };
 
-    u_char       buf[8];
-    u_char      *p;
+    u_char        buf[8];
+    u_char       *p;
     const u_char *pos, *end;
-    uint64_t     value;
-    size_t       i;
+    uint64_t      value;
+    size_t        i;
 
     for (i = 0; i < sizeof(vec) / sizeof(vec[0]); i++) {
 
@@ -65,6 +65,12 @@ s3_test_varint_truncated(void)
     u_char        buf[8];
     const u_char *pos, *end;
     uint64_t      value;
+
+    /* the whole buffer is zeroed first: gcc cannot prove the opaque
+     * parse reads only the live prefix and warns on the untouched tail
+     * otherwise (-Wmaybe-uninitialized, gcc 13.3 false positive) */
+
+    s3_memzero(buf, sizeof(buf));
 
     /* the length prefix promises more bytes than the buffer holds */
 
@@ -173,6 +179,8 @@ s3_test_sshstring_truncated(void)
     const u_char *pos, *end;
     s3_str_t      out;
 
+    s3_memzero(buf, sizeof(buf)); /* the -Wmaybe-uninitialized calm-down */
+
     /* the length prefix promises more bytes than the buffer holds */
 
     s3_memcpy(buf, "\xc8", 1); /* 200 promised, nothing follows */
@@ -200,10 +208,10 @@ s3_test_sshstring_truncated(void)
 static int
 s3_test_ssh3_wire(void)
 {
-    (void) s3_test_varint_roundtrip();
-    (void) s3_test_varint_truncated();
-    (void) s3_test_sshstring();
-    (void) s3_test_sshstring_truncated();
+    (void)s3_test_varint_roundtrip();
+    (void)s3_test_varint_truncated();
+    (void)s3_test_sshstring();
+    (void)s3_test_sshstring_truncated();
 
     return s3_test_failures;
 }

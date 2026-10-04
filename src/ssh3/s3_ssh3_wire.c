@@ -40,27 +40,27 @@ u_char *
 s3_ssh3_encode_varint(u_char *p, uint64_t value)
 {
     if (value <= S3_SSH3_VARINT_1_MAX) {
-        *p++ = (u_char) value;
+        *p++ = (u_char)value;
 
     } else if (value <= S3_SSH3_VARINT_2_MAX) {
-        *p++ = (u_char) ((value >> 8) | 0x40);
-        *p++ = (u_char) value;
+        *p++ = (u_char)((value >> 8) | 0x40);
+        *p++ = (u_char)value;
 
     } else if (value <= S3_SSH3_VARINT_4_MAX) {
-        *p++ = (u_char) ((value >> 24) | 0x80);
-        *p++ = (u_char) (value >> 16);
-        *p++ = (u_char) (value >> 8);
-        *p++ = (u_char) value;
+        *p++ = (u_char)((value >> 24) | 0x80);
+        *p++ = (u_char)(value >> 16);
+        *p++ = (u_char)(value >> 8);
+        *p++ = (u_char)value;
 
     } else {
-        *p++ = (u_char) ((value >> 56) | 0xc0);
-        *p++ = (u_char) (value >> 48);
-        *p++ = (u_char) (value >> 40);
-        *p++ = (u_char) (value >> 32);
-        *p++ = (u_char) (value >> 24);
-        *p++ = (u_char) (value >> 16);
-        *p++ = (u_char) (value >> 8);
-        *p++ = (u_char) value;
+        *p++ = (u_char)((value >> 56) | 0xc0);
+        *p++ = (u_char)(value >> 48);
+        *p++ = (u_char)(value >> 40);
+        *p++ = (u_char)(value >> 32);
+        *p++ = (u_char)(value >> 24);
+        *p++ = (u_char)(value >> 16);
+        *p++ = (u_char)(value >> 8);
+        *p++ = (u_char)value;
     }
 
     return p;
@@ -77,16 +77,16 @@ s3_ssh3_parse_varint(const u_char **pos, const u_char *end, uint64_t *value)
         return S3_ERROR;
     }
 
-    len = (size_t) 1 << ((*p & 0xc0) >> 6);
+    len = (size_t)1 << ((*p & 0xc0) >> 6);
 
-    if ((size_t) (end - p) < len) {
+    if ((size_t)(end - p) < len) {
         return S3_ERROR;
     }
 
-    v = (uint64_t) (*p++ & 0x3f);
+    v = (uint64_t)(*p++ & 0x3f);
 
     while (--len > 0) {
-        v = (v << 8) | (uint64_t) *p++;
+        v = (v << 8) | (uint64_t)*p++;
     }
 
     *pos = p;
@@ -98,16 +98,16 @@ s3_ssh3_parse_varint(const u_char **pos, const u_char *end, uint64_t *value)
 size_t
 s3_ssh3_sshstring_size(size_t len)
 {
-    return s3_ssh3_varint_size((uint64_t) len) + len;
+    return s3_ssh3_varint_size((uint64_t)len) + len;
 }
 
 u_char *
 s3_ssh3_encode_sshstring(u_char *p, const void *data, size_t len)
 {
-    p = s3_ssh3_encode_varint(p, (uint64_t) len);
+    p = s3_ssh3_encode_varint(p, (uint64_t)len);
 
     if (len > 0) {
-        p = (u_char *) s3_cpymem(p, data, len);
+        p = (u_char *)s3_cpymem(p, data, len);
     }
 
     return p;
@@ -123,12 +123,12 @@ s3_ssh3_parse_sshstring(const u_char **pos, const u_char *end, s3_str_t *out)
         return S3_ERROR;
     }
 
-    if ((uint64_t) (end - p) < len) {
+    if ((uint64_t)(end - p) < len) {
         return S3_ERROR;
     }
 
-    out->data = (u_char *) p;
-    out->len = (size_t) len;
+    out->data = (u_char *)p;
+    out->len = (size_t)len;
 
     *pos = p + len;
 
