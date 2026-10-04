@@ -91,6 +91,7 @@ set(S3_CORE_SOURCES
     src/h3/s3_h3_parse.c
     src/h3/s3_h3_uni.c
     src/ssh3/s3_ssh3_version.c
+    src/ssh3/s3_ssh3_wire.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -163,6 +164,7 @@ set(S3_TESTS
     test_h3_parse
     test_h3_uni
     test_ssh3_version
+    test_ssh3_wire
 )
 
 enable_testing()
