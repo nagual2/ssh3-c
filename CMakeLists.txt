@@ -89,6 +89,7 @@ set(S3_CORE_SOURCES
     src/h3/s3_h3_encode.c
     src/h3/s3_h3_table.c
     src/h3/s3_h3_parse.c
+    src/h3/s3_h3_uni.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -158,6 +159,7 @@ set(S3_TESTS
     test_quic_e2e
     test_h3_qpack
     test_h3_parse
+    test_h3_uni
 )
 
 enable_testing()

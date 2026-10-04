@@ -124,4 +124,10 @@ s3_int_t s3_h3_parse_headers(s3_connection_t *c, s3_h3_parse_headers_t *st, s3_b
 s3_int_t s3_h3_parse_data(s3_connection_t *c, s3_h3_parse_data_t *st, s3_buf_t *b);
 s3_int_t s3_h3_parse_uni(s3_connection_t *c, s3_h3_parse_uni_t *st, s3_buf_t *b);
 
+/*
+ * the Huffman decoder is public: the tests drive it directly
+ */
+s3_int_t s3_h3_huff_decode(u_char *state, u_char *src, size_t len, u_char **dst, s3_uint_t last,
+                           s3_log_t *log);
+
 #endif /* _S3_H3_PARSE_H_INCLUDED_ */
