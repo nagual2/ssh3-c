@@ -4,6 +4,8 @@
 #   1. our client (-3) -> the quic-go harness h3-server
 #   2. the quic-go harness h3-client -> our server (-3)
 #   3. our client (-3) -> our server (-3) (sanity)
+#   4. the harness h3-client with an unsupported version -> our server
+#      (-3): the request is rejected with 403 (version negotiation)
 #
 # the verdicts come from the stdout protocol of the runners:
 #   INTEROP-H3-STATUS 200    (the client side)
@@ -128,6 +130,33 @@ if wait_listen "$WORK/cc-srv.log"; then
         echo "   FAIL"
         tail -5 "$WORK/cc-cli.log" | sed 's/^/   /'
         tail -5 "$WORK/cc-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 4: quic-go h3-client (unsupported version) -> C server (-3), expect 403"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/cc-rej-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/cc-rej-srv.log"; then
+    PORT=$(port_of "$WORK/cc-rej-srv.log")
+
+    if timeout 30 "$HARNESS" -h3-client -bad-ua -a "127.0.0.1:$PORT" -timeout 10s \
+        > "$WORK/go-rej-cli.log" 2>&1 \
+        && grep -q "INTEROP-H3-STATUS 403" "$WORK/go-rej-cli.log" \
+        && grep -q "INTEROP-H3-REJECT code=403" "$WORK/cc-rej-srv.log"; then
+        echo "   PASS (unsupported version rejected with 403)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/go-rej-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/cc-rej-srv.log" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
     fi
 

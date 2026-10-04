@@ -90,6 +90,7 @@ set(S3_CORE_SOURCES
     src/h3/s3_h3_table.c
     src/h3/s3_h3_parse.c
     src/h3/s3_h3_uni.c
+    src/ssh3/s3_ssh3_version.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -100,8 +101,9 @@ target_include_directories(s3core
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event
         ${CMAKE_CURRENT_SOURCE_DIR}/src/h3
         ${CMAKE_CURRENT_SOURCE_DIR}/src/event/quic
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ssh3
         ${CMAKE_CURRENT_SOURCE_DIR}/src/os/unix
-)
+    )
 
 if(S3_HAVE_UDP_SEGMENT)
     target_compile_definitions(s3core PUBLIC S3_HAVE_UDP_SEGMENT=1)
@@ -160,6 +162,7 @@ set(S3_TESTS
     test_h3_qpack
     test_h3_parse
     test_h3_uni
+    test_ssh3_version
 )
 
 enable_testing()

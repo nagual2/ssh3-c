@@ -46,6 +46,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go/qlog"
@@ -75,6 +76,7 @@ func main() {
 	min := flag.Int("min", -1, "require at least this many echoed datagrams (-1: all)")
 	h3Server := flag.Bool("h3-server", false, "run as an HTTP/3 server accepting RFC 9220 extended CONNECT (ssh3)")
 	h3Client := flag.Bool("h3-client", false, "run as an HTTP/3 extended CONNECT client (ssh3)")
+	badUA := flag.Bool("bad-ua", false, "h3-client: announce an unsupported version, expect 403")
 	addrShort := flag.String("a", "", "dial target host:port for -h3-client (alias for -addr)")
 	flag.Parse()
 
@@ -109,7 +111,7 @@ func main() {
 		if *addrShort != "" {
 			target = *addrShort
 		}
-		runH3Client(target, *timeout)
+		runH3Client(target, *timeout, *badUA)
 		return
 	}
 
@@ -512,6 +514,50 @@ func fillPattern(b []byte, r *mrand.Rand) {
 	}
 }
 
+// s3VersionString is the version string the ssh3-c endpoints announce
+// in the User-Agent field (the reference version.go format); the
+// harness mirrors the s3_ssh3_version module verdicts: 403 unless the
+// peer version parses and is supported
+const s3VersionString = "SSH 3.0 ssh3-c 0.1.0 experimental_spec_version=alpha-00"
+
+// s3VersionSupported mirrors the reference IsVersionSupported(): the
+// protocol version must be 3.0 and the spec version ours; the legacy
+// reference releases 0.1.3..0.1.5 pass without a spec version
+func s3VersionSupported(ua string) bool {
+	fields := strings.Fields(ua)
+	if len(fields) < 4 {
+		return false
+	}
+
+	proto := strings.SplitN(fields[1], "_", 2)[0]
+	protoParts := strings.Split(proto, ".")
+	if len(protoParts) != 2 || protoParts[0] != "3" || protoParts[1] != "0" {
+		return false
+	}
+
+	sw := strings.Split(fields[3], ".")
+	if len(sw) != 3 {
+		return false
+	}
+
+	spec := ""
+	for _, f := range fields[4:] {
+		if kv := strings.SplitN(f, "=", 2); len(kv) == 2 && kv[0] == "experimental_spec_version" {
+			spec = kv[1]
+		}
+	}
+
+	if spec == "" {
+		if fields[2] != "francoismichel/ssh3" || sw[0] != "0" || sw[1] != "1" {
+			return false
+		}
+		patch := sw[2]
+		return patch == "3" || patch == "4" || patch == "5"
+	}
+
+	return spec == "alpha-00"
+}
+
 // h3ConnectHandler accepts only RFC 9220 extended CONNECT requests
 // announcing the ssh3 protocol; a valid request is answered with 200
 // and its stream is kept open until the peer goes away
@@ -523,6 +569,13 @@ func h3ConnectHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path != "/ssh3-term" {
 		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	ua := r.Header.Get("User-Agent")
+	if !s3VersionSupported(ua) {
+		fmt.Fprintf(os.Stderr, "harness: 403 for user-agent %q\n", ua)
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 
@@ -594,7 +647,7 @@ func runH3Server(addr, certFile, keyFile string) {
 // open until the response has been read: Transport.RoundTrip would
 // half-close the stream right after the headers (no request body),
 // which is not how a real ssh3 client tunnels over the CONNECT.
-func runH3Client(target string, timeout time.Duration) {
+func runH3Client(target string, timeout time.Duration, badUA bool) {
 	if target == "" {
 		fatalf("h3-client mode needs -a host:port")
 	}
@@ -638,6 +691,11 @@ func runH3Client(target string, timeout time.Duration) {
 
 	// quic-go encodes req.Proto as the :protocol pseudo-header
 	req.Proto = "ssh3"
+	req.Header.Set("User-Agent", s3VersionString)
+	if badUA {
+		// a parsable but unsupported spec version: the server must 403
+		req.Header.Set("User-Agent", "SSH 3.0 ssh3-c 0.1.0 experimental_spec_version=beta-99")
+	}
 	req.Header.Set("Authorization", "test-token")
 
 	if err := str.SendRequestHeader(req); err != nil {
@@ -655,8 +713,18 @@ func runH3Client(target string, timeout time.Duration) {
 
 	fmt.Printf("INTEROP-H3-STATUS %d\n", resp.StatusCode)
 
-	if resp.StatusCode != http.StatusOK {
+	want := http.StatusOK
+	if badUA {
+		want = http.StatusForbidden
+	}
+
+	if resp.StatusCode != want {
 		os.Exit(1)
+	}
+
+	if badUA {
+		// the negative case is done at the status: no tunnel follows
+		return
 	}
 
 	if err := str.Close(); err != nil {

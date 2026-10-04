@@ -17,6 +17,7 @@
  * (s3_h3_init_stream()), the bidi streams run the extended CONNECT
  * validator below.  In this mode stdout additionally carries:
  *   INTEROP-H3-CONNECT-OK authlen=<len>
+ *   INTEROP-H3-REJECT code=<400|401|403|425>
  */
 
 #include <arpa/inet.h>
@@ -36,6 +37,7 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_version.h>
 #include <s3_ssl.h>
 
 #define S3_INTEROP_TRACKED 64
@@ -359,6 +361,12 @@ static u_char s3_interop_h3_path[256];
 static size_t s3_interop_h3_path_len;
 static u_char s3_interop_h3_auth[256];
 static size_t s3_interop_h3_auth_len;
+static u_char s3_interop_h3_ua[128];
+static size_t s3_interop_h3_ua_len;
+static u_char s3_interop_h3_authority[256];
+static size_t s3_interop_h3_authority_len;
+static u_char s3_interop_h3_scheme[16];
+static size_t s3_interop_h3_scheme_len;
 
 /* the response tail pending on the send window */
 static u_char s3_interop_h3_out[512];
@@ -387,6 +395,9 @@ s3_interop_h3_capture(s3_h3_parse_field_t *f)
     static s3_str_t protocol = s3_string(":protocol");
     static s3_str_t path = s3_string(":path");
     static s3_str_t auth = s3_string("authorization");
+    static s3_str_t ua = s3_string("user-agent");
+    static s3_str_t authority = s3_string(":authority");
+    static s3_str_t scheme = s3_string(":scheme");
 
     if (f->name.len == method.len && s3_memcmp(f->name.data, method.data, method.len) == 0) {
         s3_interop_h3_store(s3_interop_h3_method, sizeof(s3_interop_h3_method),
@@ -404,6 +415,19 @@ s3_interop_h3_capture(s3_h3_parse_field_t *f)
     } else if (f->name.len == auth.len && s3_memcmp(f->name.data, auth.data, auth.len) == 0) {
         s3_interop_h3_store(s3_interop_h3_auth, sizeof(s3_interop_h3_auth), &s3_interop_h3_auth_len,
                             &f->value);
+
+    } else if (f->name.len == ua.len && s3_memcmp(f->name.data, ua.data, ua.len) == 0) {
+        s3_interop_h3_store(s3_interop_h3_ua, sizeof(s3_interop_h3_ua), &s3_interop_h3_ua_len,
+                            &f->value);
+
+    } else if (f->name.len == authority.len &&
+               s3_memcmp(f->name.data, authority.data, authority.len) == 0) {
+        s3_interop_h3_store(s3_interop_h3_authority, sizeof(s3_interop_h3_authority),
+                            &s3_interop_h3_authority_len, &f->value);
+
+    } else if (f->name.len == scheme.len && s3_memcmp(f->name.data, scheme.data, scheme.len) == 0) {
+        s3_interop_h3_store(s3_interop_h3_scheme, sizeof(s3_interop_h3_scheme),
+                            &s3_interop_h3_scheme_len, &f->value);
     }
 
     /* the other field lines are irrelevant to the verdict */
@@ -504,9 +528,10 @@ s3_interop_h3_send_status(unsigned code)
 }
 
 static void
-s3_interop_h3_respond(void)
+s3_interop_h3_respond(s3_connection_t *pc)
 {
-    unsigned code;
+    unsigned          code;
+    s3_ssh3_version_t ver;
 
     if (s3_interop_h3_responded) {
         return;
@@ -516,7 +541,33 @@ s3_interop_h3_respond(void)
     if (s3_interop_h3_method_len == 7 && s3_memcmp(s3_interop_h3_method, "CONNECT", 7) == 0 &&
         s3_interop_h3_protocol_len == 4 && s3_memcmp(s3_interop_h3_protocol, "ssh3", 4) == 0 &&
         s3_interop_h3_path_len == 10 && s3_memcmp(s3_interop_h3_path, "/ssh3-term", 10) == 0) {
-        code = s3_interop_h3_auth_len ? 200 : 401;
+
+        /* RFC 9114, 4.4: the extended CONNECT carries :scheme and
+         * :authority next to :method, :protocol and :path */
+
+        if (s3_interop_h3_scheme_len == 0 || s3_interop_h3_authority_len == 0) {
+            code = 400;
+
+        } else if (s3_interop_h3_ua_len == 0 ||
+                   s3_ssh3_version_parse(s3_interop_h3_ua, s3_interop_h3_ua_len, &ver) != S3_OK ||
+                   s3_ssh3_version_supported(&ver) != S3_OK) {
+
+            /* the reference rejects a bad user-agent before anything
+             * else (go_server: 403 unsupported SSH3 version) */
+
+            code = 403;
+
+        } else if (pc->ssl == NULL || !pc->ssl->handshaked) {
+
+            /* RFC 8470: a request that arrived in early data may be
+             * replayed, the reference answers 425 until the handshake
+             * is done (go_server: TLS handshake incomplete) */
+
+            code = 425;
+
+        } else {
+            code = s3_interop_h3_auth_len ? 200 : 401;
+        }
 
     } else {
         code = 400;
@@ -524,8 +575,12 @@ s3_interop_h3_respond(void)
 
     if (code == 200) {
         printf("INTEROP-H3-CONNECT-OK authlen=%zu\n", s3_interop_h3_auth_len);
-        fflush(stdout);
+
+    } else {
+        printf("INTEROP-H3-REJECT code=%u\n", code);
     }
+
+    fflush(stdout);
 
     s3_interop_h3_send_status(code);
 
@@ -633,7 +688,7 @@ s3_interop_h3_request_read(s3_event_t *ev)
             if (rc == S3_DONE) {
                 /* the last field line lands together with the section end */
                 s3_interop_h3_capture(&s3_interop_h3_parse.field_rep.field);
-                s3_interop_h3_respond();
+                s3_interop_h3_respond(pc);
                 break;
             }
 

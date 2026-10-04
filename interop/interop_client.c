@@ -37,10 +37,12 @@
 #include <s3_h3.h>
 #include <s3_h3_uni.h>
 #include <s3_nonblocking.h>
+
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_version.h>
 #include <s3_ssl.h>
 
 static s3_log_t s3_interop_log;
@@ -296,6 +298,7 @@ s3_interop_h3_request_section(u_char *p)
         n += (size_t)s3_interop_h3_field_l(NULL, ":scheme", "https");
         n += (size_t)s3_interop_h3_field_l(NULL, ":authority", "example.lan");
         n += (size_t)s3_interop_h3_field_l(NULL, ":path", "/ssh3-term");
+        n += (size_t)s3_interop_h3_field_l(NULL, "user-agent", S3_SSH3_VERSION_STRING);
         n += (size_t)s3_interop_h3_field_l(NULL, "authorization", "test-token");
         return n;
     }
@@ -306,6 +309,7 @@ s3_interop_h3_request_section(u_char *p)
     p = (u_char *)s3_interop_h3_field_l(p, ":scheme", "https");
     p = (u_char *)s3_interop_h3_field_l(p, ":authority", "example.lan");
     p = (u_char *)s3_interop_h3_field_l(p, ":path", "/ssh3-term");
+    p = (u_char *)s3_interop_h3_field_l(p, "user-agent", S3_SSH3_VERSION_STRING);
     p = (u_char *)s3_interop_h3_field_l(p, "authorization", "test-token");
 
     return (size_t)(p - start);
@@ -343,16 +347,17 @@ s3_interop_h3_selftest(void)
 {
     static const struct {
         const char *name, *value;
-    } want[6] = {{":method", "CONNECT"},  {":protocol", "ssh3"},
-                 {":scheme", "https"},    {":authority", "example.lan"},
-                 {":path", "/ssh3-term"}, {"authorization", "test-token"}};
+    } want[7] = {{":method", "CONNECT"},         {":protocol", "ssh3"},
+                 {":scheme", "https"},           {":authority", "example.lan"},
+                 {":path", "/ssh3-term"},        {"user-agent", S3_SSH3_VERSION_STRING},
+                 {"authorization", "test-token"}};
 
     s3_log_t              log = {0, S3_INVALID_FILE};
     s3_connection_t       c;
     s3_h3_session_t       h3c;
     s3_pool_t            *pool;
     s3_h3_parse_headers_t st;
-    s3_h3_parse_field_t   rep[7];
+    s3_h3_parse_field_t   rep[8];
     s3_buf_t              b;
     u_char                frame[512], resp[64], *p;
     size_t                sec_len, resp_len, total, i;
@@ -399,7 +404,7 @@ s3_interop_h3_selftest(void)
 
         if (rc == S3_OK) {
 
-            if (nrep >= 7) {
+            if (nrep >= 8) {
                 fprintf(stderr, "selftest: too many request field lines\n");
                 return 1;
             }
@@ -410,7 +415,7 @@ s3_interop_h3_selftest(void)
 
         if (rc == S3_DONE) {
 
-            if (nrep >= 7) {
+            if (nrep >= 8) {
                 fprintf(stderr, "selftest: too many request field lines\n");
                 return 1;
             }
@@ -423,12 +428,12 @@ s3_interop_h3_selftest(void)
         return 1;
     }
 
-    if (nrep != 6) {
-        fprintf(stderr, "selftest: request section has %u field lines, want 6\n", (unsigned)nrep);
+    if (nrep != 7) {
+        fprintf(stderr, "selftest: request section has %u field lines, want 7\n", (unsigned)nrep);
         return 1;
     }
 
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
 
         if (rep[i].name.len != strlen(want[i].name) ||
             s3_memcmp(rep[i].name.data, want[i].name, rep[i].name.len) != 0 ||
@@ -440,7 +445,9 @@ s3_interop_h3_selftest(void)
     }
 
     printf("SELFTEST-REQ-FIELDS :method=CONNECT :protocol=ssh3 :scheme=https"
-           " :authority=example.lan :path=/ssh3-term authorization=test-token\n");
+           " :authority=example.lan :path=/ssh3-term user-agent=%s"
+           " authorization=test-token\n",
+           S3_SSH3_VERSION_STRING);
 
     /* the status frame: HEADERS(0x01) + the zero prefix + the static :status: 200 */
 
