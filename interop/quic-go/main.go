@@ -48,6 +48,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/quic-go/quic-go/qlog"
+
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -577,6 +579,7 @@ func runH3Server(addr, certFile, keyFile string) {
 		},
 		QUICConfig: &quic.Config{
 			MaxIdleTimeout: 60 * time.Second,
+			Tracer:         qlog.DefaultConnectionTracer, /* QLOGDIR-gated, debug */
 		},
 		Handler: http.HandlerFunc(h3ConnectHandler),
 	}

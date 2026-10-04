@@ -23,6 +23,7 @@ static s3_int_t          s3_quic_stream_flush(s3_quic_stream_t *qs);
 static void              s3_quic_stream_cleanup_handler(void *data);
 static s3_int_t          s3_quic_close_stream(s3_quic_stream_t *qs);
 static s3_int_t          s3_quic_can_shutdown(s3_connection_t *c);
+static s3_uint_t         s3_quic_stream_is_own_uni(s3_quic_connection_t *qc, uint64_t id);
 static s3_int_t          s3_quic_control_flow(s3_quic_stream_t *qs, uint64_t last);
 static s3_int_t          s3_quic_update_flow(s3_quic_stream_t *qs, uint64_t last);
 static s3_int_t          s3_quic_update_max_stream_data(s3_quic_stream_t *qs);
@@ -141,6 +142,12 @@ s3_quic_open_stream(s3_connection_t *c, s3_uint_t bidi)
     if (bidi) {
         sc->read->active = 1;
     }
+
+    /*
+     * the send side of a unidirectional stream opened here is armed by
+     * s3_quic_create_stream() from the ownership check: a stream we open
+     * is send-only and takes its limit from the peer parameters
+     */
 
     return sc;
 }
@@ -417,48 +424,84 @@ s3_quic_get_stream(s3_connection_t *c, uint64_t id)
     if (id & S3_QUIC_STREAM_UNIDIRECTIONAL) {
 
         if (id & S3_QUIC_STREAM_SERVER_INITIATED) {
+
+            /*
+             * ssh3-c: the reference treats any server-initiated id as
+             * its own and closes the connection — it never opens uni
+             * streams.  Only the client receives them here; on the
+             * server such an id cannot come from the peer.
+             */
+
+            if (!qc->client) {
+                qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
+                return NULL;
+            }
+
             if ((id >> 2) < qc->streams.server_streams_uni) {
                 return S3_QUIC_STREAM_GONE;
             }
 
-            qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
-            return NULL;
-        }
+            if ((id >> 2) >= qc->streams.server_max_streams_uni) {
+                qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
+                return NULL;
+            }
 
-        if ((id >> 2) < qc->streams.client_streams_uni) {
-            return S3_QUIC_STREAM_GONE;
-        }
+            min_id = (qc->streams.server_streams_uni << 2) | S3_QUIC_STREAM_SERVER_INITIATED |
+                     S3_QUIC_STREAM_UNIDIRECTIONAL;
+            qc->streams.server_streams_uni = (id >> 2) + 1;
 
-        if ((id >> 2) >= qc->streams.client_max_streams_uni) {
-            qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
-            return NULL;
-        }
+        } else {
 
-        min_id = (qc->streams.client_streams_uni << 2) | S3_QUIC_STREAM_UNIDIRECTIONAL;
-        qc->streams.client_streams_uni = (id >> 2) + 1;
+            if ((id >> 2) < qc->streams.client_streams_uni) {
+                return S3_QUIC_STREAM_GONE;
+            }
+
+            if ((id >> 2) >= qc->streams.client_max_streams_uni) {
+                qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
+                return NULL;
+            }
+
+            min_id = (qc->streams.client_streams_uni << 2) | S3_QUIC_STREAM_UNIDIRECTIONAL;
+            qc->streams.client_streams_uni = (id >> 2) + 1;
+        }
 
     } else {
 
         if (id & S3_QUIC_STREAM_SERVER_INITIATED) {
+
+            /* the mirror of the unidirectional branch above */
+
+            if (!qc->client) {
+                qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
+                return NULL;
+            }
+
             if ((id >> 2) < qc->streams.server_streams_bidi) {
                 return S3_QUIC_STREAM_GONE;
             }
 
-            qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
-            return NULL;
-        }
+            if ((id >> 2) >= qc->streams.server_max_streams_bidi) {
+                qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
+                return NULL;
+            }
 
-        if ((id >> 2) < qc->streams.client_streams_bidi) {
-            return S3_QUIC_STREAM_GONE;
-        }
+            min_id = (qc->streams.server_streams_bidi << 2) | S3_QUIC_STREAM_SERVER_INITIATED;
+            qc->streams.server_streams_bidi = (id >> 2) + 1;
 
-        if ((id >> 2) >= qc->streams.client_max_streams_bidi) {
-            qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
-            return NULL;
-        }
+        } else {
 
-        min_id = (qc->streams.client_streams_bidi << 2);
-        qc->streams.client_streams_bidi = (id >> 2) + 1;
+            if ((id >> 2) < qc->streams.client_streams_bidi) {
+                return S3_QUIC_STREAM_GONE;
+            }
+
+            if ((id >> 2) >= qc->streams.client_max_streams_bidi) {
+                qc->error = S3_QUIC_ERR_STREAM_LIMIT_ERROR;
+                return NULL;
+            }
+
+            min_id = (qc->streams.client_streams_bidi << 2);
+            qc->streams.client_streams_bidi = (id >> 2) + 1;
+        }
     }
 
     /*
@@ -754,7 +797,18 @@ s3_quic_create_stream(s3_connection_t *c, uint64_t id)
     sc->write->handler = s3_quic_empty_handler;
 
     if (id & S3_QUIC_STREAM_UNIDIRECTIONAL) {
-        if (id & S3_QUIC_STREAM_SERVER_INITIATED) {
+
+        /*
+         * ssh3-c: the reference reads the direction off the id bits alone.
+         * That is correct for a server-only module, which never opens a
+         * unidirectional stream: a server-initiated id can only be its own
+         * and a client-initiated one can only be received.  Here both roles
+         * open them — the h3 session creates control/encoder/decoder on
+         * either end — so ownership follows the role.  Our own stream is
+         * send-only, the peer's is receive-only (RFC 9000, 2.1)
+         */
+
+        if (s3_quic_stream_is_own_uni(qc, id)) {
             qs->send_max_data = qc->ctp.initial_max_stream_data_uni;
             qs->recv_state = S3_QUIC_STREAM_RECV_DATA_READ;
             qs->send_state = S3_QUIC_STREAM_SEND_READY;
@@ -1160,6 +1214,26 @@ s3_quic_close_stream(s3_quic_stream_t *qs)
     return S3_OK;
 }
 
+/*
+ * true when a unidirectional stream was opened by this side: the client
+ * opens the client-initiated ids, the server the server-initiated ones.
+ * Such a stream is send-only for its owner, so the peer must never act
+ * on it in the reverse direction (RFC 9000, 2.1)
+ *
+ * ssh3-c: the reference hardcodes the server role — it never opens
+ * unidirectional streams itself, so a received server-initiated id
+ * could only be its own.  Both roles open them here (the h3 session
+ * creates control/encoder/decoder on both), so the check follows the
+ * role.
+ */
+static s3_uint_t
+s3_quic_stream_is_own_uni(s3_quic_connection_t *qc, uint64_t id)
+{
+    s3_uint_t server_initiated = (id & S3_QUIC_STREAM_SERVER_INITIATED) != 0;
+
+    return server_initiated == (qc->client == 0);
+}
+
 static s3_int_t
 s3_quic_can_shutdown(s3_connection_t *c)
 {
@@ -1200,7 +1274,7 @@ s3_quic_handle_stream_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_f
     (void)pkt;
 
     if ((f->stream_id & S3_QUIC_STREAM_UNIDIRECTIONAL) &&
-        (f->stream_id & S3_QUIC_STREAM_SERVER_INITIATED)) {
+        s3_quic_stream_is_own_uni(qc, f->stream_id)) {
         qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
         return S3_ERROR;
     }
@@ -1335,7 +1409,7 @@ s3_quic_handle_stream_data_blocked_frame(s3_connection_t *c, s3_quic_header_t *p
 
     (void)pkt;
 
-    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && (f->id & S3_QUIC_STREAM_SERVER_INITIATED)) {
+    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && s3_quic_stream_is_own_uni(qc, f->id)) {
         qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
         return S3_ERROR;
     }
@@ -1364,7 +1438,7 @@ s3_quic_handle_max_stream_data_frame(s3_connection_t *c, s3_quic_header_t *pkt,
 
     (void)pkt;
 
-    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && (f->id & S3_QUIC_STREAM_SERVER_INITIATED) == 0) {
+    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && !s3_quic_stream_is_own_uni(qc, f->id)) {
         qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
         return S3_ERROR;
     }
@@ -1410,7 +1484,7 @@ s3_quic_handle_reset_stream_frame(s3_connection_t *c, s3_quic_header_t *pkt,
 
     (void)pkt;
 
-    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && (f->id & S3_QUIC_STREAM_SERVER_INITIATED)) {
+    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && s3_quic_stream_is_own_uni(qc, f->id)) {
         qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
         return S3_ERROR;
     }
@@ -1474,7 +1548,7 @@ s3_quic_handle_stop_sending_frame(s3_connection_t *c, s3_quic_header_t *pkt,
 
     (void)pkt;
 
-    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && (f->id & S3_QUIC_STREAM_SERVER_INITIATED) == 0) {
+    if ((f->id & S3_QUIC_STREAM_UNIDIRECTIONAL) && !s3_quic_stream_is_own_uni(qc, f->id)) {
         qc->error = S3_QUIC_ERR_STREAM_STATE_ERROR;
         return S3_ERROR;
     }

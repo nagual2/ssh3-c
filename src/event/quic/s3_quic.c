@@ -310,6 +310,16 @@ s3_quic_open_sockets(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_heade
     s3_queue_init(&qc->client_ids);
     s3_queue_init(&qc->free_client_ids);
 
+    /*
+     * the udp layer hands the accepted connection over with the
+     * listener backlink in c->data; take it into the quic connection
+     * and clear the slot, the connection owner (the h3 session) stores
+     * itself there; the client role has no backlink and stays NULL
+     */
+
+    qc->listen = (s3_udp_listen_t *)c->data;
+    c->data = NULL;
+
     qc->tp.original_dcid.len = pkt->odcid.len;
 
     qc->tp.original_dcid.data = s3_pnalloc(c->pool, pkt->odcid.len);
@@ -473,7 +483,7 @@ s3_quic_listen(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_socket_t *q
      * (the reference ngx_quic_listen() + ngx_event_quic_udp.c); the
      * client role has no listener and keeps the socket unregistered
      */
-    qsock->listen = (s3_udp_listen_t *)c->data;
+    qsock->listen = qc->listen;
 
     if (qsock->listen != NULL) {
         qsock->node.key = s3_crc32_long(id.data, id.len);
@@ -628,7 +638,7 @@ s3_quic_input_handler(s3_event_t *rev)
      * the reference, ev->available does not bound the drain on epoll
      */
 
-    for ( ;; ) {
+    for (;;) {
 
         n = c->recv(c, buffer, sizeof(buffer));
 

@@ -261,6 +261,14 @@ struct s3_quic_connection_s {
      */
     s3_event_ctx_t *ctx;
 
+    /*
+     * the listener backlink the udp layer parked in c->data at accept
+     * time; the quic connection takes it over and leaves c->data to the
+     * connection owner (the h3 session), like the reference keeps the
+     * listening socket in the connection struct rather than in c->data
+     */
+    s3_udp_listen_t *listen;
+
     s3_event_t push;
     s3_event_t pto;
     s3_event_t close;

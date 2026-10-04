@@ -10,11 +10,17 @@
  * the echo.  Peers: the quic-go harness (interop/quic-go) and, at P3,
  * the ssh3 server of the Go fork.
  *
+ * the -3 switch switches to the h3 mode: after the handshake the h3
+ * session comes up (SETTINGS on the control stream) and one bidi
+ * stream carries the RFC 9220 extended CONNECT announcing ssh3; the
+ * verdict is the response :status.
+ *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
  *   INTEROP-DATAGRAM-OK sent=N recv=N
  *   INTEROP-STREAM-OK sent=N recv=N
- * the exit code is 0 only when every echo came back
+ *   INTEROP-H3-STATUS <code>
+ * the exit code is 0 only when the mode's success line came back
  */
 
 #include <arpa/inet.h>
@@ -28,6 +34,8 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
+#include <s3_h3.h>
+#include <s3_h3_uni.h>
 #include <s3_nonblocking.h>
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
@@ -52,6 +60,31 @@ static size_t           s3_interop_srecv;
 static unsigned         s3_interop_sfin;
 static int              s3_interop_streams_mode;
 static s3_connection_t *s3_interop_stream;
+
+/*
+ * the h3 state (-3): after the handshake the session comes up on the
+ * parent connection and one bidi stream carries the RFC 9220 extended
+ * CONNECT; the verdict is the response :status
+ */
+static int              s3_interop_h3_mode;
+static s3_connection_t *s3_interop_h3_stream;
+static unsigned         s3_interop_h3_req_sent;
+static unsigned         s3_interop_h3_status_seen;
+static unsigned         s3_interop_h3_status;
+
+static s3_h3_parse_headers_t s3_interop_h3_parse;
+static u_char               *s3_interop_h3_buf;
+static size_t                s3_interop_h3_cap;
+static size_t                s3_interop_h3_len;
+
+/*
+ * the offline selftest (-T, TEMPORARY for the wave-B bridge, removed
+ * after the uni port lands): encodes the request section and the
+ * 200-status section, round-trips both through s3_h3_parse_headers
+ * with a zeroed session and prints the hex for the byte-exact script
+ * check; no network is touched
+ */
+static int s3_interop_h3_selftest_mode;
 
 /*
  * the deterministic pattern: a constant 64-byte template with the
@@ -229,6 +262,404 @@ s3_interop_stream_echo_read(s3_event_t *ev)
     }
 }
 
+/*
+ * the h3 side (-3): the extended CONNECT request section is a zero
+ * prefix plus six literal field lines, so it decodes against any
+ * peer QPACK state and never references the dynamic table.  RFC 9114
+ * 4.4 / RFC 9220: the extended CONNECT carries :scheme and
+ * :authority next to :method, :protocol and :path
+ */
+
+static uintptr_t
+s3_interop_h3_field_l(u_char *p, const char *name, const char *value)
+{
+    s3_str_t n, v;
+
+    n.data = (u_char *)name;
+    n.len = strlen(name);
+    v.data = (u_char *)value;
+    v.len = strlen(value);
+
+    return s3_h3_encode_field_l(p, &n, &v);
+}
+
+static size_t
+s3_interop_h3_request_section(u_char *p)
+{
+    u_char *start = p;
+    size_t  n;
+
+    if (p == NULL) {
+        n = (size_t)s3_h3_encode_field_section_prefix(NULL, 0, 0, 0);
+        n += (size_t)s3_interop_h3_field_l(NULL, ":method", "CONNECT");
+        n += (size_t)s3_interop_h3_field_l(NULL, ":protocol", "ssh3");
+        n += (size_t)s3_interop_h3_field_l(NULL, ":scheme", "https");
+        n += (size_t)s3_interop_h3_field_l(NULL, ":authority", "example.lan");
+        n += (size_t)s3_interop_h3_field_l(NULL, ":path", "/ssh3-term");
+        n += (size_t)s3_interop_h3_field_l(NULL, "authorization", "test-token");
+        return n;
+    }
+
+    p = (u_char *)s3_h3_encode_field_section_prefix(p, 0, 0, 0);
+    p = (u_char *)s3_interop_h3_field_l(p, ":method", "CONNECT");
+    p = (u_char *)s3_interop_h3_field_l(p, ":protocol", "ssh3");
+    p = (u_char *)s3_interop_h3_field_l(p, ":scheme", "https");
+    p = (u_char *)s3_interop_h3_field_l(p, ":authority", "example.lan");
+    p = (u_char *)s3_interop_h3_field_l(p, ":path", "/ssh3-term");
+    p = (u_char *)s3_interop_h3_field_l(p, "authorization", "test-token");
+
+    return (size_t)(p - start);
+}
+
+static s3_uint_t
+s3_interop_h3_name_is(s3_str_t *name, const char *text, size_t len)
+{
+    return name->len == len && s3_memcmp(name->data, text, len) == 0;
+}
+
+static void
+s3_interop_h3_hexdump(const char *tag, const u_char *p, size_t n)
+{
+    size_t i;
+
+    printf("%s", tag);
+
+    for (i = 0; i < n; i++) {
+        printf("%02x", p[i]);
+    }
+
+    printf("\n");
+}
+
+/*
+ * TEMPORARY (-T, removed after the uni port lands): the offline
+ * encode/decode proof against the uni stubs.  The request section and
+ * the 200-status section round-trip through s3_h3_parse_headers with a
+ * zeroed session (the static-table references need no table state) and
+ * the script compares the printed hex byte for byte
+ */
+static int
+s3_interop_h3_selftest(void)
+{
+    static const struct {
+        const char *name, *value;
+    } want[6] = {{":method", "CONNECT"},  {":protocol", "ssh3"},
+                 {":scheme", "https"},    {":authority", "example.lan"},
+                 {":path", "/ssh3-term"}, {"authorization", "test-token"}};
+
+    s3_log_t              log = {0, S3_INVALID_FILE};
+    s3_connection_t       c;
+    s3_h3_session_t       h3c;
+    s3_pool_t            *pool;
+    s3_h3_parse_headers_t st;
+    s3_h3_parse_field_t   rep[7];
+    s3_buf_t              b;
+    u_char                frame[512], resp[64], *p;
+    size_t                sec_len, resp_len, total, i;
+    s3_uint_t             nrep;
+    s3_int_t              rc;
+
+    pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &log);
+    if (pool == NULL) {
+        return 1;
+    }
+
+    /* the zeroed session: the static-table lookups need no table state */
+    s3_memzero(&c, sizeof(s3_connection_t));
+    s3_memzero(&h3c, sizeof(s3_h3_session_t));
+
+    c.log = &log;
+    c.pool = pool;
+    c.data = &h3c;
+
+    /* the request frame: HEADERS(type 0x01) + the literal section */
+
+    sec_len = s3_interop_h3_request_section(NULL);
+
+    p = frame;
+    p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
+    p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
+
+    /* the section builder returns the length, the base stays in p */
+    sec_len = (size_t)s3_interop_h3_request_section(p);
+    total = (size_t)(p - frame) + sec_len;
+
+    s3_interop_h3_hexdump("SELFTEST-REQ-HEX ", frame + total - sec_len, sec_len);
+
+    b.pos = frame;
+    b.last = frame + total;
+
+    s3_memzero(&st, sizeof(s3_h3_parse_headers_t));
+
+    nrep = 0;
+
+    for (;;) {
+
+        rc = s3_h3_parse_headers(&c, &st, &b);
+
+        if (rc == S3_OK) {
+
+            if (nrep >= 7) {
+                fprintf(stderr, "selftest: too many request field lines\n");
+                return 1;
+            }
+
+            rep[nrep++] = st.field_rep.field;
+            continue;
+        }
+
+        if (rc == S3_DONE) {
+
+            if (nrep >= 7) {
+                fprintf(stderr, "selftest: too many request field lines\n");
+                return 1;
+            }
+
+            rep[nrep++] = st.field_rep.field;
+            break;
+        }
+
+        fprintf(stderr, "selftest: request section parse error %d\n", (int)rc);
+        return 1;
+    }
+
+    if (nrep != 6) {
+        fprintf(stderr, "selftest: request section has %u field lines, want 6\n", (unsigned)nrep);
+        return 1;
+    }
+
+    for (i = 0; i < 6; i++) {
+
+        if (rep[i].name.len != strlen(want[i].name) ||
+            s3_memcmp(rep[i].name.data, want[i].name, rep[i].name.len) != 0 ||
+            rep[i].value.len != strlen(want[i].value) ||
+            s3_memcmp(rep[i].value.data, want[i].value, rep[i].value.len) != 0) {
+            fprintf(stderr, "selftest: request field %zu mismatch\n", i);
+            return 1;
+        }
+    }
+
+    printf("SELFTEST-REQ-FIELDS :method=CONNECT :protocol=ssh3 :scheme=https"
+           " :authority=example.lan :path=/ssh3-term authorization=test-token\n");
+
+    /* the status frame: HEADERS(0x01) + the zero prefix + the static :status: 200 */
+
+    p = resp;
+    p = (u_char *)s3_h3_encode_field_section_prefix(p, 0, 0, 0);
+
+    /* RFC 9204 static table: 25 = ":status: 200" */
+    p = (u_char *)s3_h3_encode_field_ri(p, 0, 25);
+    resp_len = p - resp;
+
+    s3_interop_h3_hexdump("SELFTEST-RESP-HEX ", resp, resp_len);
+
+    frame[0] = (u_char)S3_H3_FRAME_HEADERS;
+    frame[1] = (u_char)resp_len;
+    s3_memcpy(frame + 2, resp, resp_len);
+
+    b.pos = frame;
+    b.last = frame + 2 + resp_len;
+
+    s3_memzero(&st, sizeof(s3_h3_parse_headers_t));
+
+    rc = s3_h3_parse_headers(&c, &st, &b);
+
+    /*
+     * a one-field section carries its only field line with the
+     * S3_DONE (the section end), the parser holds it in field_rep
+     */
+
+    if (rc != S3_OK && rc != S3_DONE) {
+        fprintf(stderr, "selftest: status section parse error %d\n", (int)rc);
+        s3_destroy_pool(pool);
+        return 1;
+    }
+
+    if (!s3_interop_h3_name_is(&st.field_rep.field.name, ":status", 7) ||
+        st.field_rep.field.value.len != 3 ||
+        s3_memcmp(st.field_rep.field.value.data, "200", 3) != 0) {
+        fprintf(stderr, "selftest: status field mismatch\n");
+        s3_destroy_pool(pool);
+        return 1;
+    }
+
+    /*
+     * the S3_DONE above is the section end itself: the one-field
+     * section is exhausted, no extra parse call after it
+     */
+
+    printf("SELFTEST-RESP-FIELDS :status=200\n");
+    printf("SELFTEST-H3-OK\n");
+    fflush(stdout);
+
+    s3_destroy_pool(pool);
+
+    return 0;
+}
+
+static void
+s3_interop_h3_response_read(s3_event_t *ev)
+{
+    s3_connection_t  *sc;
+    s3_quic_stream_t *qs;
+    s3_connection_t  *pc;
+    s3_buf_t          b;
+    size_t            i;
+    unsigned          code;
+    s3_int_t          rc;
+    ssize_t           n;
+
+    if (s3_interop_h3_status_seen) {
+        return;
+    }
+
+    sc = ev->data;
+    qs = sc->data;
+    pc = qs->parent;
+
+    for (;;) {
+
+        if (s3_interop_h3_len == s3_interop_h3_cap) {
+            size_t  cap = s3_interop_h3_cap + 262144;
+            u_char *grown = realloc(s3_interop_h3_buf, cap);
+
+            if (grown == NULL) {
+                fprintf(stderr, "interop-client: h3 buffer growth failed\n");
+                exit(1);
+            }
+
+            s3_interop_h3_buf = grown;
+            s3_interop_h3_cap = cap;
+        }
+
+        n = sc->recv(sc, s3_interop_h3_buf + s3_interop_h3_len,
+                     s3_interop_h3_cap - s3_interop_h3_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin without a status: the CONNECT was refused */
+            fprintf(stderr, "interop-client: h3 response stream closed without :status\n");
+            exit(1);
+        }
+
+        if (n < 0) {
+            fprintf(stderr, "interop-client: h3 response recv error\n");
+            exit(1);
+        }
+
+        s3_interop_h3_len += (size_t)n;
+
+        b.pos = s3_interop_h3_buf;
+        b.last = s3_interop_h3_buf + s3_interop_h3_len;
+
+        for (;;) {
+
+            /*
+             * ssh3-c: the parent connection goes into the parser, the
+             * frozen s3_h3_get_session() macro reads c->data and the
+             * session hangs exactly there (s3_h3_init_session(cli)
+             * put it on the parent at the handshake)
+             */
+            rc = s3_h3_parse_headers(pc, &s3_interop_h3_parse, &b);
+
+            if (rc == S3_AGAIN || rc == S3_BUSY) {
+                break;
+            }
+
+            if (rc == S3_OK || rc == S3_DONE) {
+
+                /*
+                 * s3_h3_parse_headers() reports S3_OK per field line and
+                 * S3_DONE at the end of the section; the last field line
+                 * of a section arrives with the S3_DONE, so the verdict
+                 * field is looked at on both (a one-field section —
+                 * ":status" alone — comes as S3_DONE only)
+                 */
+
+                if (s3_interop_h3_name_is(&s3_interop_h3_parse.field_rep.field.name, ":status",
+                                          7)) {
+
+                    code = 0;
+
+                    for (i = 0; i < s3_interop_h3_parse.field_rep.field.value.len && i < 3; i++) {
+
+                        if (s3_interop_h3_parse.field_rep.field.value.data[i] < '0' ||
+                            s3_interop_h3_parse.field_rep.field.value.data[i] > '9') {
+                            fprintf(stderr, "interop-client: h3 bad :status value\n");
+                            exit(1);
+                        }
+
+                        code = code * 10 +
+                               (unsigned)(s3_interop_h3_parse.field_rep.field.value.data[i] - '0');
+                    }
+
+                    s3_interop_h3_status = code;
+                    s3_interop_h3_status_seen = 1;
+
+                    printf("INTEROP-H3-STATUS %u\n", code);
+                    fflush(stdout);
+
+                    if (code != 200) {
+                        exit(1);
+                    }
+
+                    return;
+                }
+
+                if (rc == S3_DONE) {
+                    fprintf(stderr, "interop-client: h3 response headers without :status\n");
+                    exit(1);
+                }
+
+                continue;
+            }
+
+            fprintf(stderr, "interop-client: h3 response parse error %d\n", (int)rc);
+            exit(1);
+        }
+
+        /* the consumed bytes compact to the front of the receive buffer */
+        s3_interop_h3_len = (size_t)(b.last - b.pos);
+        s3_memmove(s3_interop_h3_buf, b.pos, s3_interop_h3_len);
+    }
+}
+
+static void
+s3_interop_h3_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
+{
+    s3_connection_t *pc;
+
+    /*
+     * the h3 client side (-3): the server-initiated streams are the
+     * uni control/encoder/decoder ones, they belong to the session
+     * port; the port reads the stream connection's data as the
+     * s3_quic_stream_t.  The CONNECT stream is opened locally
+     */
+
+    pc = qs->parent;
+
+    /*
+     * the quic layer may hand us a peer uni stream before the event
+     * loop reached the session bring-up (the quic-go server opens its
+     * control stream at once); the session is created once, from
+     * whichever comes first, the same lazy bring-up the server does
+     * in its accept path
+     */
+
+    if (s3_h3_get_session(pc) == NULL) {
+
+        if (s3_h3_init_session(pc) != S3_OK) {
+            fprintf(stderr, "interop-client: h3 init_session failed\n");
+            return;
+        }
+    }
+
+    s3_h3_init_stream(c);
+}
+
 static s3_int_t
 s3_interop_parse_addr(const char *text, struct sockaddr_in *sa)
 {
@@ -289,14 +720,16 @@ static void
 s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s -a addr:port [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]\n"
+            "usage: %s -a addr:port [-3] [-S] [-n count] [-s size] [-m min] [-t ms] [-A alpn]\n"
             "  -a  peer UDP address\n"
+            "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
             "  -S  stream echo mode: pump count*size pattern bytes through a stream\n"
             "  -n  datagrams to send (stream: count chunks), default 8\n"
             "  -s  datagram payload size (stream: chunk size), default 512\n"
             "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
             "  -t  overall deadline in ms, default 20000\n"
-            "  -A  ALPN name, default s3interop/1\n",
+            "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
+            "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
             prog);
 }
 
@@ -321,12 +754,20 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:Sh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:3TSh")) != -1) {
 
         switch (opt) {
 
         case 'S':
             s3_interop_streams_mode = 1;
+            break;
+
+        case '3':
+            s3_interop_h3_mode = 1;
+            break;
+
+        case 'T':
+            s3_interop_h3_selftest_mode = 1;
             break;
 
         case 'a':
@@ -361,6 +802,16 @@ main(int argc, char **argv)
             s3_interop_usage(argv[0]);
             return 1;
         }
+    }
+
+    if (s3_interop_h3_selftest_mode) {
+        /* the offline wire-format proof, before any address parsing */
+        return s3_interop_h3_selftest();
+    }
+
+    if (s3_interop_h3_mode && s3_interop_streams_mode) {
+        s3_interop_usage(argv[0]);
+        return 1;
     }
 
     if (peer_text == NULL || n_arg < 1 || n_arg > 65536 || s_arg < 8) {
@@ -467,6 +918,14 @@ main(int argc, char **argv)
     s3_memcpy(cli->sockaddr, &sa, sizeof(sa));
     cli->socklen = sizeof(sa);
 
+    /*
+     * ssh3-c: the h3 peers negotiate the h3 ALPN (the Go harness pins
+     * http3.NextProtoH3); an explicit -A still wins
+     */
+    if (s3_interop_h3_mode && strcmp(alpn_name, "s3interop/1") == 0) {
+        alpn_name = "h3";
+    }
+
     s3_interop_alpn_wire(alpn_wire, alpn_name);
 
     alpn.data = alpn_wire;
@@ -492,6 +951,11 @@ main(int argc, char **argv)
     conf.active_connection_id_limit = 8;
     conf.max_datagram_frame_size = dg_size;
     conf.datagram_handler = s3_interop_client_datagram;
+
+    if (s3_interop_h3_mode) {
+        /* the server's uni streams go to the session port, see above */
+        conf.stream_handler = s3_interop_h3_client_stream;
+    }
 
     for (i = 0; i < S3_QUIC_AV_KEY_LEN; i++) {
         conf.av_token_key[i] = (u_char)(0xa0 + i);
@@ -533,7 +997,37 @@ main(int argc, char **argv)
 
             hs_reported = 1;
 
-            if (s3_interop_streams_mode) {
+            if (s3_interop_h3_mode) {
+
+                /*
+                 * the h3 session first: SETTINGS go out on the control
+                 * stream from inside s3_h3_init_session(), the quic-go
+                 * server expects them before the request stream
+                 */
+                if (s3_h3_get_session(cli) == NULL && s3_h3_init_session(cli) != S3_OK) {
+                    fprintf(stderr, "interop-client: h3 init_session failed\n");
+                    return 1;
+                }
+
+                s3_memzero(&s3_interop_h3_parse, sizeof(s3_h3_parse_headers_t));
+
+                s3_interop_h3_stream = s3_quic_open_stream(cli, 1);
+                if (s3_interop_h3_stream == NULL) {
+                    fprintf(stderr, "interop-client: open_stream failed\n");
+                    return 1;
+                }
+
+                s3_interop_h3_stream->read->handler = s3_interop_h3_response_read;
+                s3_interop_h3_stream->read->data = s3_interop_h3_stream;
+
+                /*
+                 * the app-level read arming, the s3 analog of the
+                 * reference ngx_handle_read_event(): without it the quic
+                 * layer raises ready but never posts the stream events
+                 */
+                s3_interop_h3_stream->read->active = 1;
+
+            } else if (s3_interop_streams_mode) {
                 /* open one bidirectional stream and verify the echo */
                 s3_interop_stream = s3_quic_open_stream(cli, 1);
                 if (s3_interop_stream == NULL) {
@@ -544,13 +1038,53 @@ main(int argc, char **argv)
                 s3_interop_stream->read->handler = s3_interop_stream_echo_read;
                 s3_interop_stream->read->data = s3_interop_stream;
 
+                s3_interop_stream->read->active = 1;
+
             } else if (qc->client_tp_done && qc->ctp.max_datagram_frame_size == 0) {
                 fprintf(stderr, "interop-client: peer does not support datagrams\n");
                 return 1;
             }
         }
 
-        if (s3_interop_streams_mode) {
+        if (s3_interop_h3_mode) {
+
+            if (hs_reported && !s3_interop_h3_req_sent) {
+                u_char  frame[512];
+                u_char *p;
+                size_t  sec_len, total;
+                ssize_t m;
+
+                sec_len = s3_interop_h3_request_section(NULL);
+
+                p = frame;
+                p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
+                p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
+                sec_len = (size_t)s3_interop_h3_request_section(p);
+                total = (size_t)(p - frame) + sec_len;
+
+                m = s3_quic_stream_send(s3_interop_h3_stream, frame, total);
+
+                if (m == (ssize_t)S3_AGAIN) {
+                    /* the window opens on the write event, retried next pass */
+                    ;
+                }
+
+                else if (m != (ssize_t)total) {
+                    fprintf(stderr, "interop-client: h3 request send failed\n");
+                    return 1;
+                }
+
+                else {
+                    s3_interop_h3_req_sent = 1;
+                }
+            }
+
+            /* the verdict is printed by the response reader */
+            if (s3_interop_h3_status_seen) {
+                break;
+            }
+
+        } else if (s3_interop_streams_mode) {
 
             if (hs_reported) {
                 /*
@@ -654,6 +1188,12 @@ main(int argc, char **argv)
         }
 
         if (s3_current_msec - start > (s3_msec_t)timeout) {
+            if (s3_interop_h3_mode) {
+                fprintf(stderr, "interop-client: h3 timeout sent=%u status_seen=%u\n",
+                        s3_interop_h3_req_sent, s3_interop_h3_status_seen);
+                return 1;
+            }
+
             if (s3_interop_streams_mode) {
                 fprintf(stderr, "interop-client: timeout sent=%zu recv=%zu\n", s3_interop_ssent,
                         s3_interop_srecv);

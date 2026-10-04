@@ -407,7 +407,11 @@ s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul, struct
 
     c->buffer = b;
 
-    /* the listener backlink consumed by s3_quic_listen() */
+    /*
+     * the listener backlink handed to the quic connection: the quic
+     * layer takes it into qc->listen at open_sockets() and clears the
+     * slot for the connection owner (the h3 session)
+     */
     c->data = ul;
 
     rev = c->read;
