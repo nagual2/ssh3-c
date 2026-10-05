@@ -5635,6 +5635,10 @@ s3_h3_parse_field_inr(s3_connection_t *c, s3_h3_parse_field_t *st, s3_buf_t *b)
 
             st->literal.length = st->pint.value;
             if (st->literal.length == 0) {
+                /* a NULL data with a zero len trips the nonnull
+                 * memcpy in s3_h3_insert (the header-block literal
+                 * path parks the same "" below) */
+                st->value.data = (u_char *)"";
                 st->value.len = 0;
                 goto done;
             }
@@ -5747,6 +5751,10 @@ s3_h3_parse_field_iln(s3_connection_t *c, s3_h3_parse_field_t *st, s3_buf_t *b)
 
             st->literal.length = st->pint.value;
             if (st->literal.length == 0) {
+                /* a NULL data with a zero len trips the nonnull
+                 * memcpy in s3_h3_insert (the header-block literal
+                 * path parks the same "" below) */
+                st->value.data = (u_char *)"";
                 st->value.len = 0;
                 goto done;
             }

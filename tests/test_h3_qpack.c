@@ -598,6 +598,35 @@ s3_test_dynamic_table(s3_test_env_t *e)
     S3_ASSERT(ib2->last == ib2->pos);
 }
 
+/*
+ * the empty field value on the insert path: the QPACK INR/ILN
+ * instructions with a zero length used to leave value.data NULL and
+ * trip the nonnull memcpy here; the parse parks "" now (the fuzz
+ * harness replays its minimized repro against the wire path), this
+ * pins the table contract the parser feeds
+ */
+
+static void
+s3_test_empty_value(s3_test_env_t *e)
+{
+    u_char  *base;
+    s3_str_t name, value;
+
+    name.data = (u_char *)"alpha";
+    name.len = 5;
+    value.data = (u_char *)"";
+    value.len = 0;
+
+    base = (u_char *)(uintptr_t)e->h3c->table.insert_count;
+
+    S3_ASSERT(s3_h3_insert(e->c, &name, &value) == S3_OK);
+    S3_ASSERT(e->h3c->table.insert_count == (uint64_t)(uintptr_t)base + 1);
+
+    S3_ASSERT(s3_h3_lookup(e->c, (uint64_t)(uintptr_t)base, &name, &value) == S3_OK);
+    S3_ASSERT(name.len == 5 && s3_memcmp(name.data, "alpha", 5) == 0);
+    S3_ASSERT(value.len == 0);
+}
+
 static int
 s3_test_h3_qpack(void)
 {
@@ -615,6 +644,7 @@ s3_test_h3_qpack(void)
 
     s3_test_static_table(&e);
     s3_test_dynamic_table(&e);
+    s3_test_empty_value(&e);
 
     close(e.fd);
 
