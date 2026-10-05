@@ -37,6 +37,18 @@
  * as 94 and verifies the echo byte for byte; the udp run sends 20
  * numbered datagrams of 1024 bytes and verifies the echoes.
  *
+ * -j jump-addr:port (with -3 -C) is the proxy jump: phase 1 dials the
+ * jump host like a normal run and opens a direct-udp channel on its
+ * conversation targeting the inner server (the -a argument); a
+ * loopback udp socket pair bridges the channel to the inner quic
+ * connection, so phase 2 is the byte-for-byte normal ssh3 run whose
+ * datagrams happen to flow through the jump tunnel.  The inner
+ * packets stay at 1200 bytes (the path mtu discovery is pinned), the
+ * tunnel frames carry them with the two varints of the prefix on top,
+ * so the jump peer must accept at least 1202 (-d 1352).  The verdict
+ * is the inner scenario one plus INTEROP-PROXYJUMP-OK with the
+ * tunnel datagram counters.
+ *
  * stdout carries the machine-readable protocol of the runner:
  *   INTEROP-HANDSHAKE-OK
  *   INTEROP-DATAGRAM-OK sent=N recv=N
@@ -48,6 +60,7 @@
  *   INTEROP-PTY-SIGNAL-OK exit=137 / INTEROP-PTY-SIGNAL-FAIL exit=<code>
  *   INTEROP-FWD-TCP-OK bytes=<n> / INTEROP-FWD-TCP-FAIL
  *   INTEROP-FWD-UDP-OK count=20 / INTEROP-FWD-UDP-FAIL got=<n>
+ *   INTEROP-PROXYJUMP-OK inner-sent=<n> inner-recv=<n>
  * the exit code is 0 only when the mode's success line came back
  */
 
@@ -253,6 +266,66 @@ static u_char           s3_interop_agent_frame[S3_INTEROP_FWD_FRAME];
 static size_t           s3_interop_agent_frame_sent;
 static size_t           s3_interop_agent_frame_total;
 static s3_event_t       s3_interop_agent_timer;
+
+/*
+ * the proxy jump (-j jump-addr:port): phase 1 dials the jump host and
+ * opens the direct-udp channel to the inner server address (the -a
+ * argument); a loopback udp socket pair bridges the channel to the
+ * inner quic connection and phase 2 is the byte-for-byte normal
+ * client run whose datagrams flow through the jump tunnel.  The
+ * phases share one event loop, the jump conversation stays alive for
+ * the whole run
+ */
+#define S3_INTEROP_JUMP_NONE   0
+#define S3_INTEROP_JUMP_TUNNEL 1
+#define S3_INTEROP_JUMP_INNER  2
+
+/*
+ * the inner quic packet cap: the tunnel datagram is the packet plus
+ * the two varints of the prefix, so the jump peer must accept 1202
+ * (-d 1352 is the harness number); the cap pins the inner path mtu
+ * discovery the way the reference turns it off for the proxy jump
+ */
+#define S3_INTEROP_JUMP_INNER_MTU  1200
+#define S3_INTEROP_JUMP_DGRAM_SIZE 1352
+#define S3_INTEROP_JUMP_DGRAM_MIN  1202
+
+static int                s3_interop_jump_phase;
+static const char        *s3_interop_jump_text;
+static struct sockaddr_in s3_interop_jump_sa;
+static struct sockaddr_in s3_interop_inner_sa;
+
+static s3_fd_t          s3_interop_jump_fd = -1;
+static s3_connection_t *s3_interop_jump_cli;
+static s3_quic_conf_t   s3_interop_jump_conf;
+static s3_connection_t *s3_interop_jump_stream;  /* the CONNECT stream */
+static s3_connection_t *s3_interop_jump_channel; /* the direct-udp one */
+static uint64_t         s3_interop_jump_conv_id;
+static uint64_t         s3_interop_jump_ch_id;
+static unsigned         s3_interop_jump_req_sent;
+static unsigned         s3_interop_jump_ch_sent;
+static unsigned         s3_interop_jump_ch_confirmed;
+
+/* the receive accumulator of the jump channel (the 91 confirmation) */
+static u_char s3_interop_jump_ch_buf[64];
+static size_t s3_interop_jump_ch_len;
+
+/*
+ * the loopback bridge: a is the inner quic fd, b is the tunnel side.
+ * One parked datagram holds the backpressure, the read event sleeps
+ * (del_event) until the channel drains; the buffers are static, the
+ * hot path pays no allocation
+ */
+static s3_fd_t            s3_interop_bridge_a = -1;
+static s3_fd_t            s3_interop_bridge_b = -1;
+static s3_connection_t   *s3_interop_bridge_bc;
+static struct sockaddr_in s3_interop_bridge_sa; /* the b address, the inner peer */
+static u_char             s3_interop_bridge_frame[2048];
+static size_t             s3_interop_bridge_parked;
+
+/* the tunnel traffic counters of the verdict */
+static unsigned long long s3_interop_jump_sent; /* b -> the channel */
+static unsigned long long s3_interop_jump_recv; /* the channel -> b */
 
 /*
  * the Authorization field: test-token by default, "Basic <b64>" with
@@ -2579,13 +2652,583 @@ s3_interop_alpn_wire(u_char *wire, const char *name)
     memcpy(wire + 1, name, n);
 }
 
+/* === the proxy jump (-j, the tunnel and the loopback bridge) === */
+
+/*
+ * the datagram handler of the jump conversation: the tunnel frames
+ * carry the prefix of the direct-udp channel, the payloads are the
+ * raw quic packets of the inner connection, one send() into the
+ * bridge socket b delivers them; a dropped datagram stays a loss the
+ * inner connection recovers from (RFC 768, RFC 9002)
+ */
+static void
+s3_interop_jump_datagram(s3_connection_t *c, s3_chain_t *data)
+{
+    u_char        flat[S3_INTEROP_JUMP_INNER_MTU + 16];
+    u_char       *p;
+    size_t        len = 0;
+    s3_chain_t   *cl;
+    const u_char *pos, *end;
+    uint64_t      csid, chid;
+    s3_str_t      payload;
+    ssize_t       n;
+
+    (void)c;
+
+    if (s3_interop_bridge_b < 0) {
+        return;
+    }
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    if (len > sizeof(flat)) {
+        return;
+    }
+
+    p = flat;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+    }
+
+    pos = flat;
+    end = flat + len;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return;
+    }
+
+    if (csid != s3_interop_jump_conv_id || chid != s3_interop_jump_ch_id) {
+        return;
+    }
+
+    n = send(s3_interop_bridge_b, payload.data, payload.len, 0);
+
+    if (n == (ssize_t)payload.len) {
+        s3_interop_jump_recv++;
+    }
+}
+
+/*
+ * the tunnel side of the bridge: the quic packets of the inner
+ * connection recv straight behind the prefix (the payload bytes never
+ * move), one datagram per send; the congested channel parks the
+ * frame and puts the read event to sleep until the flush drains it
+ */
+static void
+s3_interop_bridge_read(s3_event_t *ev)
+{
+    size_t  pre;
+    ssize_t n;
+
+    if (s3_interop_bridge_parked > 0) {
+        return;
+    }
+
+    pre = s3_ssh3_dgram_prefix_size(s3_interop_jump_conv_id, s3_interop_jump_ch_id);
+
+    for (;;) {
+
+        n = recv(s3_interop_bridge_b, s3_interop_bridge_frame + pre,
+                 sizeof(s3_interop_bridge_frame) - pre, 0);
+
+        if (n < 0) {
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            fprintf(stderr, "interop-client: bridge recv failed\n");
+            exit(1);
+        }
+
+        if (n == 0) {
+            /* a zero-length datagram carries nothing */
+            continue;
+        }
+
+        if ((size_t)n > S3_INTEROP_JUMP_INNER_MTU) {
+            /* the inner packets are pinned to the cap, the rest drops */
+            continue;
+        }
+
+        {
+            u_char *p = s3_interop_bridge_frame;
+            size_t  len;
+
+            p = (u_char *)s3_ssh3_encode_varint(p, s3_interop_jump_conv_id);
+            p = (u_char *)s3_ssh3_encode_varint(p, s3_interop_jump_ch_id);
+
+            len = (size_t)(p - s3_interop_bridge_frame) + (size_t)n;
+
+            if (s3_quic_send_datagram(s3_interop_jump_cli, s3_interop_bridge_frame, len) != S3_OK) {
+
+                /* the channel is full: park the frame, the read
+                 * event sleeps until the flush drains the queue */
+
+                s3_interop_bridge_parked = len;
+
+                (void)s3_event_actions.del_event(ev, S3_READ_EVENT, 0);
+
+                return;
+            }
+
+            s3_interop_jump_sent++;
+        }
+    }
+}
+
+/* the parked frame retries each pass, the read event wakes on success */
+
+static void
+s3_interop_bridge_flush(void)
+{
+    if (s3_interop_bridge_parked == 0) {
+        return;
+    }
+
+    if (s3_quic_send_datagram(s3_interop_jump_cli, s3_interop_bridge_frame,
+                              s3_interop_bridge_parked) != S3_OK) {
+        /* still congested, the next pass retries */
+        return;
+    }
+
+    s3_interop_jump_sent++;
+    s3_interop_bridge_parked = 0;
+
+    (void)s3_event_actions.add_event(s3_interop_bridge_bc->read, S3_READ_EVENT, 0);
+}
+
+/*
+ * the loopback socket pair: two udp sockets bound to 127.0.0.1:0 and
+ * connected to each other, a becomes the fd of the inner quic
+ * connection, b is the tunnel side the bridge reads
+ */
+static s3_int_t
+s3_interop_bridge_create(s3_event_ctx_t *ctx)
+{
+    struct sockaddr_in a, b;
+    socklen_t          len;
+
+    s3_memzero(&a, sizeof(a));
+    s3_memzero(&b, sizeof(b));
+
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    s3_interop_bridge_a = socket(AF_INET, SOCK_DGRAM, 0);
+    s3_interop_bridge_b = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (s3_interop_bridge_a == -1 || s3_interop_bridge_b == -1) {
+        perror("socket");
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(s3_interop_bridge_a) != S3_OK ||
+        s3_nonblocking(s3_interop_bridge_b) != S3_OK) {
+        perror("fcntl(O_NONBLOCK)");
+        return S3_ERROR;
+    }
+
+    if (bind(s3_interop_bridge_a, (struct sockaddr *)&a, sizeof(a)) == -1) {
+        perror("bind");
+        return S3_ERROR;
+    }
+
+    len = sizeof(a);
+
+    if (getsockname(s3_interop_bridge_a, (struct sockaddr *)&a, &len) == -1) {
+        perror("getsockname");
+        return S3_ERROR;
+    }
+
+    b = a;
+    b.sin_port = 0;
+
+    if (bind(s3_interop_bridge_b, (struct sockaddr *)&b, sizeof(b)) == -1) {
+        perror("bind");
+        return S3_ERROR;
+    }
+
+    len = sizeof(b);
+
+    if (getsockname(s3_interop_bridge_b, (struct sockaddr *)&b, &len) == -1) {
+        perror("getsockname");
+        return S3_ERROR;
+    }
+
+    s3_interop_bridge_sa = b;
+
+    if (connect(s3_interop_bridge_a, (struct sockaddr *)&b, sizeof(b)) == -1 ||
+        connect(s3_interop_bridge_b, (struct sockaddr *)&a, sizeof(a)) == -1) {
+        perror("connect");
+        return S3_ERROR;
+    }
+
+    s3_interop_bridge_bc = s3_get_connection(ctx, s3_interop_bridge_b);
+
+    if (s3_interop_bridge_bc == NULL) {
+        fprintf(stderr, "interop-client: bridge connection alloc failed\n");
+        return S3_ERROR;
+    }
+
+    s3_interop_bridge_bc->read->handler = s3_interop_bridge_read;
+
+    return s3_event_actions.add_event(s3_interop_bridge_bc->read, S3_READ_EVENT, 0);
+}
+
+/*
+ * the jump channel reader: the direct-udp channel carries no stream
+ * data, the run starts once the 91 confirmation came back
+ */
+static void
+s3_interop_jump_ch_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_interop_jump_ch_confirmed) {
+        return;
+    }
+
+    sc = ev->data;
+
+    n = sc->recv(sc, s3_interop_jump_ch_buf + s3_interop_jump_ch_len,
+                 sizeof(s3_interop_jump_ch_buf) - s3_interop_jump_ch_len);
+
+    if (n == (ssize_t)S3_AGAIN) {
+        return;
+    }
+
+    if (n <= 0) {
+        fprintf(stderr, "interop-client: jump channel closed before the confirmation\n");
+        exit(1);
+    }
+
+    s3_interop_jump_ch_len += (size_t)n;
+
+    pos = s3_interop_jump_ch_buf;
+    end = s3_interop_jump_ch_buf + s3_interop_jump_ch_len;
+
+    while (pos < end) {
+
+        const u_char *msg = pos;
+        uint64_t      type;
+
+        if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+            /* a partial type varint, the next recv completes it */
+            pos = msg;
+            break;
+        }
+
+        if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+            s3_ssh3_msg_open_confirmation_t conf;
+
+            if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                pos = msg;
+                break;
+            }
+
+            s3_interop_jump_ch_confirmed = 1;
+            continue;
+        }
+
+        fprintf(stderr, "interop-client: unexpected jump channel message %llu\n",
+                (unsigned long long)type);
+        exit(1);
+    }
+
+    /* the consumed bytes compact to the front of the accumulator */
+
+    s3_interop_jump_ch_len = (size_t)(end - pos);
+    s3_memmove(s3_interop_jump_ch_buf, pos, s3_interop_jump_ch_len);
+}
+
+/*
+ * phase 1 of the proxy jump: the connection to the jump host runs the
+ * byte-for-byte normal h3 bring-up, the CONNECT answers 200 and the
+ * direct-udp channel to the inner server address confirms; the jump
+ * connection stays open for the whole run, its events ride the same
+ * loop the inner connection uses below
+ */
+static s3_int_t
+s3_interop_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
+{
+    u_char                alpn_wire[256];
+    s3_str_t              alpn;
+    s3_quic_conf_t       *conf = &s3_interop_jump_conf;
+    s3_fd_t               fd;
+    unsigned              hs_reported = 0;
+    s3_quic_connection_t *qc;
+    s3_uint_t             i;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd == -1) {
+        perror("socket");
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
+        perror("fcntl(O_NONBLOCK)");
+        return S3_ERROR;
+    }
+
+    s3_interop_jump_cli = s3_get_connection(ctx, fd);
+
+    if (s3_interop_jump_cli == NULL) {
+        fprintf(stderr, "interop-client: jump connection alloc failed\n");
+        return S3_ERROR;
+    }
+
+    s3_interop_jump_fd = fd;
+
+    s3_interop_jump_cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_interop_log);
+
+    if (s3_interop_jump_cli->pool == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_interop_jump_cli->sockaddr =
+        (struct sockaddr *)s3_palloc(s3_interop_jump_cli->pool, sizeof(s3_interop_jump_sa));
+
+    if (s3_interop_jump_cli->sockaddr == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(s3_interop_jump_cli->sockaddr, &s3_interop_jump_sa, sizeof(s3_interop_jump_sa));
+    s3_interop_jump_cli->socklen = sizeof(s3_interop_jump_sa);
+
+    s3_interop_alpn_wire(alpn_wire, "h3");
+
+    alpn.data = alpn_wire;
+    alpn.len = 1 + strlen("h3");
+
+    s3_memzero(conf, sizeof(s3_quic_conf_t));
+
+    conf->ssl = s3_ssl_client_create(&s3_interop_log, &alpn);
+
+    if (conf->ssl == NULL) {
+        fprintf(stderr, "interop-client: jump ssl init failed\n");
+        return S3_ERROR;
+    }
+
+    conf->gso_enabled = 1;
+    conf->ctx = ctx;
+    conf->handshake_timeout = timeout;
+    conf->idle_timeout = 60000;
+    conf->stream_buffer_size = 16384;
+    conf->max_concurrent_streams_bidi = 16;
+    conf->max_concurrent_streams_uni = 16;
+    conf->active_connection_id_limit = 8;
+
+    /*
+     * the tunnel frames carry the 1200-byte inner packets with the
+     * prefix on top, the advertised acceptance must cover them
+     */
+    conf->max_datagram_frame_size = S3_INTEROP_JUMP_DGRAM_SIZE;
+
+    conf->datagram_handler = s3_interop_jump_datagram;
+
+    /* the server's uni streams go to the session port, like at home */
+    conf->stream_handler = s3_interop_h3_client_stream;
+
+    for (i = 0; i < S3_QUIC_AV_KEY_LEN; i++) {
+        conf->av_token_key[i] = (u_char)(0xa0 + i);
+        conf->sr_token_key[i] = (u_char)(0xb0 + i);
+    }
+
+    if (s3_event_actions.add_event(s3_interop_jump_cli->read, S3_READ_EVENT, 0) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (s3_quic_connect(s3_interop_jump_cli, conf) != S3_OK) {
+        fprintf(stderr, "interop-client: jump connect failed\n");
+        return S3_ERROR;
+    }
+
+    for (;;) {
+
+        s3_event_process_posted(ctx, &ctx->posted_events);
+
+        s3_process_events_and_timers(ctx);
+
+        qc = s3_quic_get_connection(s3_interop_jump_cli);
+
+        if (qc == NULL) {
+            fprintf(stderr, "interop-client: jump connection is gone\n");
+            return S3_ERROR;
+        }
+
+        if (!hs_reported && s3_interop_jump_cli->ssl != NULL &&
+            s3_interop_jump_cli->ssl->handshaked) {
+
+            hs_reported = 1;
+
+            /*
+             * the h3 session first, the same the main run does: the
+             * SETTINGS go out on the control stream before the
+             * request stream
+             */
+            if (s3_h3_get_session(s3_interop_jump_cli) == NULL &&
+                s3_h3_init_session(s3_interop_jump_cli) != S3_OK) {
+                fprintf(stderr, "interop-client: jump h3 init_session failed\n");
+                return S3_ERROR;
+            }
+
+            s3_memzero(&s3_interop_h3_parse, sizeof(s3_h3_parse_headers_t));
+
+            s3_interop_jump_stream = s3_quic_open_stream(s3_interop_jump_cli, 1);
+
+            if (s3_interop_jump_stream == NULL) {
+                fprintf(stderr, "interop-client: jump open_stream failed\n");
+                return S3_ERROR;
+            }
+
+            s3_interop_jump_conv_id = ((s3_quic_stream_t *)s3_interop_jump_stream->data)->id;
+
+            s3_interop_jump_stream->read->handler = s3_interop_h3_response_read;
+            s3_interop_jump_stream->read->data = s3_interop_jump_stream;
+            s3_interop_jump_stream->read->active = 1;
+
+            /*
+             * the transport parameters are final at the handshake: a
+             * jump peer that cannot take the 1202-byte tunnel frames
+             * is a configuration error, fail at once
+             */
+            if (qc->ctp.max_datagram_frame_size < S3_INTEROP_JUMP_DGRAM_MIN) {
+                fprintf(stderr,
+                        "interop-client: jump peer max_datagram_frame_size %u is below the tunnel "
+                        "need %u, run the jump server with -d 1352\n",
+                        (unsigned)qc->ctp.max_datagram_frame_size,
+                        (unsigned)S3_INTEROP_JUMP_DGRAM_MIN);
+                return S3_ERROR;
+            }
+        }
+
+        if (hs_reported && !s3_interop_jump_req_sent) {
+            u_char  frame[512];
+            u_char *p;
+            size_t  sec_len, total;
+            ssize_t m;
+
+            sec_len = s3_interop_h3_request_section(NULL);
+
+            p = frame;
+            p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
+            p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
+            sec_len = (size_t)s3_interop_h3_request_section(p);
+            total = (size_t)(p - frame) + sec_len;
+
+            m = s3_quic_stream_send(s3_interop_jump_stream, frame, total);
+
+            if (m == (ssize_t)S3_AGAIN) {
+                /* the window opens on the write event, retried next pass */
+                ;
+            }
+
+            else if (m != (ssize_t)total) {
+                fprintf(stderr, "interop-client: jump request send failed\n");
+                return S3_ERROR;
+            }
+
+            else {
+                s3_interop_jump_req_sent = 1;
+            }
+        }
+
+        if (s3_interop_h3_status_seen && s3_interop_jump_channel == NULL) {
+
+            /*
+             * the direct-udp channel comes up right after the 200:
+             * the target extension carries the inner server address
+             * (the -a argument), the 91 confirmation completes the
+             * tunnel
+             */
+            s3_interop_jump_channel = s3_quic_open_stream(s3_interop_jump_cli, 1);
+
+            if (s3_interop_jump_channel == NULL) {
+                fprintf(stderr, "interop-client: jump channel open_stream failed\n");
+                return S3_ERROR;
+            }
+
+            s3_interop_jump_ch_id = ((s3_quic_stream_t *)s3_interop_jump_channel->data)->id;
+
+            s3_interop_jump_channel->read->handler = s3_interop_jump_ch_read;
+            s3_interop_jump_channel->read->data = s3_interop_jump_channel;
+            s3_interop_jump_channel->read->active = 1;
+        }
+
+        if (s3_interop_h3_status_seen && !s3_interop_jump_ch_sent) {
+            u_char                   frame[1024];
+            u_char                  *p;
+            s3_ssh3_channel_t        hdr;
+            s3_ssh3_forward_target_t target;
+            size_t                   total;
+            ssize_t                  m;
+
+            s3_memzero(&hdr, sizeof(hdr));
+
+            hdr.conversation_stream_id = s3_interop_jump_conv_id;
+            hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+            hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
+            hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
+
+            p = frame;
+            p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+
+            target.family = 4;
+            target.ip_len = 4;
+            s3_memcpy(target.ip, &s3_interop_inner_sa.sin_addr, 4);
+            target.port = ntohs(s3_interop_inner_sa.sin_port);
+
+            p = s3_ssh3_forward_build_target(p, &target);
+
+            total = (size_t)(p - frame);
+
+            m = s3_quic_stream_send(s3_interop_jump_channel, frame, total);
+
+            if (m == (ssize_t)S3_AGAIN) {
+                /* the window opens on the write event, retried next pass */
+                ;
+            }
+
+            else if (m != (ssize_t)total) {
+                fprintf(stderr, "interop-client: jump channel send failed\n");
+                return S3_ERROR;
+            }
+
+            else {
+                s3_interop_jump_ch_sent = 1;
+            }
+        }
+
+        if (s3_interop_jump_ch_confirmed) {
+            return S3_OK;
+        }
+
+        if (s3_current_msec - start > timeout) {
+            fprintf(stderr,
+                    "interop-client: jump tunnel timeout hs=%u req=%u status=%u "
+                    "ch_sent=%u ch_confirmed=%u\n",
+                    hs_reported, s3_interop_jump_req_sent, s3_interop_h3_status_seen,
+                    s3_interop_jump_ch_sent, s3_interop_jump_ch_confirmed);
+            return S3_ERROR;
+        }
+    }
+}
+
 static void
 s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s -a addr:port [-3] [-C] [-S] [-F tcp=@port|udp=@port] [-n count] [-s size]"
             " [-m min] [-t ms] [-A alpn] [-U user:pass] [-X] [-e cmd]"
-            " [-J put|get:local:remote (get too: local first)]\n"
+            " [-J put|get:local:remote (get too: local first)] [-j jump-addr:port]\n"
             "  -a  peer UDP address\n"
             "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
             "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
@@ -2595,6 +3238,10 @@ s3_interop_usage(const char *prog)
             "  -F  with -3 -C: the direct-tcp or direct-udp channel to the target\n"
             "      127.0.0.1@port on the server side; tcp verifies the echo of the\n"
             "      hello plus 64 KiB, udp the echo of 20 datagrams\n"
+            "  -j  the proxy jump with -3 -C: the first connection dials the jump\n"
+            "      host, a direct-udp channel tunnels the inner connection to the\n"
+            "      -a target; the jump peer needs -d 1352 (the inner 1200-byte\n"
+            "      datagrams), the verdict is INTEROP-PROXYJUMP-OK\n"
             "  -X  with -3 -C -S exec: the agent forwarding, the forward-agent\n"
             "      marker rides the burst, the server-initiated agent-connection\n"
             "      channels bridge to the local SSH_AUTH_SOCK\n"
@@ -2638,12 +3285,17 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:F:e:J:S:3CTSXh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:F:e:J:S:j:3CTSXh")) != -1) {
 
         switch (opt) {
 
         case 'X':
             s3_interop_agent_mode = 1;
+            break;
+
+        case 'j':
+            s3_interop_jump_text = optarg;
+            s3_interop_jump_phase = S3_INTEROP_JUMP_TUNNEL;
             break;
 
         case 'e':
@@ -2900,6 +3552,17 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * the proxy jump rides the channel phase, the tunnel replaces the
+     * forward and agent runs (the inner scenario stays the session one)
+     */
+    if (s3_interop_jump_phase &&
+        (!s3_interop_h3_mode || !s3_interop_h3_channel_mode || s3_interop_fwd_mode ||
+         s3_interop_sftp_mode || s3_interop_agent_mode)) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
     if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
         s3_interop_fwd_payload_init();
 
@@ -2950,6 +3613,20 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (s3_interop_jump_phase == S3_INTEROP_JUMP_TUNNEL) {
+
+        /*
+         * the -a address turns into the tunnel target and the inner
+         * peer, the -j one is the phase 1 dial
+         */
+        if (s3_interop_parse_addr(s3_interop_jump_text, &s3_interop_jump_sa) != S3_OK) {
+            fprintf(stderr, "interop-client: bad jump address %s\n", s3_interop_jump_text);
+            return 1;
+        }
+
+        s3_interop_inner_sa = sa;
+    }
+
     if (s3_event_ctx_init(&ctx, &s3_interop_log) != S3_OK) {
         fprintf(stderr, "interop-client: event ctx init failed\n");
         return 1;
@@ -2982,15 +3659,60 @@ main(int argc, char **argv)
         }
     }
 
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
-        perror("socket");
-        return 1;
+    start = s3_current_msec;
+    sent = 0;
+
+    if (s3_interop_jump_phase == S3_INTEROP_JUMP_TUNNEL) {
+
+        /*
+         * phase 1: the tunnel to the inner server comes up first, the
+         * jump conversation then stays alive for the whole run
+         */
+        if (s3_interop_jump_dial(&ctx, start, (s3_msec_t)timeout) != S3_OK) {
+            return 1;
+        }
+
+        s3_interop_jump_phase = S3_INTEROP_JUMP_INNER;
+
+        /* the loopback bridge, a becomes the inner quic fd below */
+        if (s3_interop_bridge_create(&ctx) != S3_OK) {
+            fprintf(stderr, "interop-client: bridge create failed\n");
+            return 1;
+        }
+
+        /*
+         * the h3 globals the tunnel run touched: the inner connect
+         * below replays the handshake phase clean
+         */
+        s3_interop_h3_req_sent = 0;
+        s3_interop_h3_status_seen = 0;
+        s3_interop_h3_status = 0;
+        s3_interop_h3_len = 0;
     }
 
-    if (s3_nonblocking(fd) != S3_OK) {
-        perror("fcntl(O_NONBLOCK)");
-        return 1;
+    if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
+
+        /*
+         * the inner quic rides the bridge socket a, its peer is the
+         * tunnel side b (the bridge_sa): the packets loop through the
+         * kernel into b and the bridge wraps them into the jump
+         * channel, the replies come back the same way
+         */
+        fd = s3_interop_bridge_a;
+        s3_interop_bridge_a = -1;
+
+    } else {
+
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd == -1) {
+            perror("socket");
+            return 1;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            perror("fcntl(O_NONBLOCK)");
+            return 1;
+        }
     }
 
     cli = s3_get_connection(&ctx, fd);
@@ -3009,7 +3731,9 @@ main(int argc, char **argv)
         return 1;
     }
 
-    s3_memcpy(cli->sockaddr, &sa, sizeof(sa));
+    s3_memcpy(cli->sockaddr,
+              s3_interop_jump_phase == S3_INTEROP_JUMP_INNER ? &s3_interop_bridge_sa : &sa,
+              sizeof(sa));
     cli->socklen = sizeof(sa);
 
     /*
@@ -3070,8 +3794,16 @@ main(int argc, char **argv)
         return 1;
     }
 
-    start = s3_current_msec;
-    sent = 0;
+    if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
+
+        /*
+         * the inner connection lives inside the jump tunnel: the path
+         * mtu discovery pins at the 1200 floor, the escalating probes
+         * would not fit the tunnel datagrams (the reference turns the
+         * discovery off for its --proxy-jump the same way)
+         */
+        qc->path->max_mtu = S3_INTEROP_JUMP_INNER_MTU;
+    }
 
     for (;;) {
         s3_event_process_posted(&ctx, &ctx.posted_events);
@@ -3141,6 +3873,11 @@ main(int argc, char **argv)
         }
 
         if (s3_interop_h3_mode) {
+
+            if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
+                /* the parked tunnel frame retries, the bridge wakes */
+                s3_interop_bridge_flush();
+            }
 
             if (hs_reported && !s3_interop_h3_req_sent) {
                 u_char  frame[512];
@@ -3507,6 +4244,15 @@ main(int argc, char **argv)
             if (s3_interop_h3_status_seen &&
                 (!(s3_interop_h3_channel_mode || s3_interop_fwd_mode || s3_interop_sftp_mode) ||
                  s3_interop_h3_ch_ok)) {
+
+                if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
+
+                    printf("INTEROP-PROXYJUMP-OK inner-sent=%llu inner-recv=%llu\n",
+                           (unsigned long long)s3_interop_jump_sent,
+                           (unsigned long long)s3_interop_jump_recv);
+                    fflush(stdout);
+                }
+
                 break;
             }
 
@@ -3642,6 +4388,12 @@ main(int argc, char **argv)
                     fflush(stdout);
                 }
 
+                if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
+                    fprintf(stderr, "interop-client: jump tunnel sent=%llu recv=%llu parked=%zu\n",
+                            (unsigned long long)s3_interop_jump_sent,
+                            (unsigned long long)s3_interop_jump_recv, s3_interop_bridge_parked);
+                }
+
                 return 1;
             }
 
@@ -3689,15 +4441,36 @@ main(int argc, char **argv)
      */
     (void)s3_quic_close_connection(cli, S3_ABORT);
 
+    if (s3_interop_jump_cli != NULL) {
+        (void)s3_quic_close_connection(s3_interop_jump_cli, S3_ABORT);
+    }
+
     s3_event_process_posted(&ctx, &ctx.posted_events);
 
     s3_ssl_free(conf.ssl);
+
+    if (s3_interop_jump_conf.ssl != NULL) {
+        s3_ssl_free(s3_interop_jump_conf.ssl);
+    }
 
     free(s3_interop_expected);
     free(s3_interop_got);
     free(s3_interop_fwd_payload);
 
     (void)close(fd);
+
+    if (s3_interop_jump_fd >= 0) {
+        (void)close(s3_interop_jump_fd);
+    }
+
+    if (s3_interop_bridge_a >= 0) {
+        (void)close(s3_interop_bridge_a);
+    }
+
+    if (s3_interop_bridge_b >= 0) {
+        (void)close(s3_interop_bridge_b);
+    }
+
     s3_destroy_pool(ctx.pool);
 
     return 0;

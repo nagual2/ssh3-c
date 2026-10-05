@@ -25,6 +25,9 @@
 #      real ssh-agent of the client side
 #  20. our client (-X -e agent_probe) -> the harness agent-server
 #  21. the harness agent-client (-cmd agent_probe) -> our server
+#  22. our client (-3 -C -S exec -j jump) -> two C servers: the
+#      proxy jump, the inner exec session tunnels through the
+#      direct-udp channel of the jump conversation
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -906,6 +909,51 @@ if wait_listen "$WORK/cag-srv.log"; then
 
 else
     echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 22: C client (-3 -C -S exec -j) -> two C servers, proxy jump"
+
+setsid nohup "$BUILD/s3interop_server" -3 -d 1352 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/pj-jump-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/pj-jump-srv.log"; then
+    JPORT=$(port_of "$WORK/pj-jump-srv.log")
+
+    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+        > "$WORK/pj-inner-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/pj-inner-srv.log"; then
+        IPORT=$(port_of "$WORK/pj-inner-srv.log")
+
+        # the jump peer carries the 1200-byte inner datagrams in the
+        # tunnel frames (-d 1352), the inner one runs the stock conf
+
+        if timeout 30 "$BUILD/s3interop_client" -3 -C -S exec \
+            -j "127.0.0.1:$JPORT" -a "127.0.0.1:$IPORT" -t 20000 \
+            > "$WORK/pj-cli.log" 2>&1 \
+            && grep -q "INTEROP-PROXYJUMP-OK" "$WORK/pj-cli.log" \
+            && grep -q "INTEROP-H3-CONNECT-OK" "$WORK/pj-jump-srv.log" \
+            && grep -q "INTEROP-H3-CONNECT-OK" "$WORK/pj-inner-srv.log" \
+            && grep -q "INTEROP-SESSION-EXIT code=0" "$WORK/pj-inner-srv.log"; then
+            echo "   PASS (proxy jump: the inner exec session ran through the tunnel)"
+        else
+            echo "   FAIL"
+            tail -5 "$WORK/pj-cli.log" | sed 's/^/   /'
+            tail -5 "$WORK/pj-jump-srv.log" | sed 's/^/   /'
+            tail -5 "$WORK/pj-inner-srv.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+    else
+        echo "   FAIL: the inner server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the jump server did not start"
     FAILURES=$((FAILURES + 1))
 fi
 
