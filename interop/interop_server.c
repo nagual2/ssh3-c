@@ -47,6 +47,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <openssl/rand.h>
@@ -64,6 +65,7 @@
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
+#include <s3_ssh3_oidc.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_srv.h>
 #include <s3_ssh3_sftp_srv.h>
@@ -103,6 +105,17 @@ static const char *s3_interop_passfile;
  * their workdir so the runs do not touch the real home
  */
 static char s3_interop_sftp_home[512];
+
+/*
+ * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
+ * the Bearer id_token of that provider, the audience is the client
+ * id of the token, the nonce binds the token to the conversation
+ * (the reference authorized_identities OpenIDConnectIdentity)
+ */
+static const char             *s3_interop_oidc_issuer;
+static char                    s3_interop_oidc_aud[128];
+static unsigned                s3_interop_oidc_ready;
+static s3_ssh3_oidc_verifier_t s3_interop_oidc_ver;
 
 static void
 s3_interop_log_init(void)
@@ -486,7 +499,9 @@ static u_char s3_interop_h3_protocol[32];
 static size_t s3_interop_h3_protocol_len;
 static u_char s3_interop_h3_path[256];
 static size_t s3_interop_h3_path_len;
-static u_char s3_interop_h3_auth[256];
+/* the authorization header holds the OIDC Bearer jwt (the RS256
+ * id_token of the reference rides ~1.2 KB), 256 was the Basic era */
+static u_char s3_interop_h3_auth[4096];
 static size_t s3_interop_h3_auth_len;
 static u_char s3_interop_h3_ua[128];
 static size_t s3_interop_h3_ua_len;
@@ -810,6 +825,113 @@ s3_interop_h3_basic_verdict(void)
     return 200;
 }
 
+/*
+ * the OIDC verdict (the reference authorized_identities chain): the
+ * Bearer scheme carries the id_token, the expected nonce derives
+ * from the EXPORTER-SSH3 exporter of the live conversation (the
+ * reference ConversationID), the issuer, the audience and the
+ * provider signature decide; the first call bootstraps the
+ * discovery and the JWKS cache, the unknown kid refreshes once
+ * (the provider key rotation)
+ */
+
+static unsigned
+s3_interop_h3_oidc_verdict(s3_connection_t *pc)
+{
+    static const s3_str_t scheme = s3_string("Bearer ");
+
+    const char *ca_file;
+    const char *why;
+    char        nonce[64];
+    s3_str_t    token;
+    s3_int_t    rc;
+
+    token.data = s3_interop_h3_auth;
+    token.len = s3_interop_h3_auth_len;
+
+    if (token.len <= scheme.len || s3_memcmp(token.data, scheme.data, scheme.len) != 0) {
+        fprintf(stderr, "interop-server: oidc auth: the scheme is not Bearer\n");
+        return 401;
+    }
+
+    token.data += scheme.len;
+    token.len -= scheme.len;
+
+    if (pc->ssl == NULL || pc->ssl->connection == NULL ||
+        s3_ssh3_oidc_conversation_nonce(pc->ssl->connection, nonce) != S3_OK) {
+        fprintf(stderr, "interop-server: oidc auth: no conversation nonce\n");
+        return 401;
+    }
+
+    if (!s3_interop_oidc_ready) {
+
+        ca_file = getenv("S3_OIDC_CA_FILE");
+
+        if (s3_ssh3_oidc_verifier_init(&s3_interop_oidc_ver, s3_interop_oidc_issuer, ca_file) !=
+            S3_OK) {
+            return 401;
+        }
+
+        s3_interop_oidc_ready = 1;
+    }
+
+    rc = s3_ssh3_oidc_verifier_verify(&s3_interop_oidc_ver, s3_interop_oidc_aud,
+                                      (const char *)token.data, nonce, time(NULL));
+
+    switch (rc) {
+
+    case S3_SSH3_OIDC_EFORM:
+        why = " form";
+        break;
+
+    case S3_SSH3_OIDC_EALG:
+        why = " alg";
+        break;
+
+    case S3_SSH3_OIDC_EKID:
+        why = " kid";
+        break;
+
+    case S3_SSH3_OIDC_ESIG:
+        why = " signature";
+        break;
+
+    case S3_SSH3_OIDC_EISS:
+        why = " issuer";
+        break;
+
+    case S3_SSH3_OIDC_EAUD:
+        why = " audience";
+        break;
+
+    case S3_SSH3_OIDC_EEXP:
+        why = " expiry";
+        break;
+
+    case S3_SSH3_OIDC_ENONCE:
+        why = " nonce";
+        break;
+
+    case S3_OK:
+        why = "";
+        break;
+
+    default:
+        why = " provider";
+        break;
+    }
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: oidc auth: rejected:%s rc=%d\n", why, (int)rc);
+        return 401;
+    }
+
+    printf("INTEROP-AUTH-OK user=oidc iss=%s\n", s3_interop_oidc_issuer);
+    fflush(stdout);
+
+    return 200;
+}
+
 static void
 s3_interop_h3_respond(s3_connection_t *pc)
 {
@@ -851,6 +973,12 @@ s3_interop_h3_respond(s3_connection_t *pc)
              * is done (go_server: TLS handshake incomplete) */
 
             code = 425;
+
+        } else if (s3_interop_oidc_issuer != NULL) {
+
+            /* the OIDC mode: the Bearer id_token of the provider
+             * decides, the conversation nonce binds it */
+            code = s3_interop_h3_oidc_verdict(pc);
 
         } else if (s3_interop_passfile == NULL) {
             code = s3_interop_h3_auth_len ? 200 : 401;
@@ -3021,7 +3149,10 @@ s3_interop_usage(const char *prog)
             "  -P  password file: the CONNECT passes only with the Basic"
             " user:secret (h3 mode)\n"
             "  -H  the sftp jail directory override, default the user's home"
-            " (h3 mode)\n",
+            " (h3 mode)\n"
+            "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
+            " with the Bearer id_token of that provider (h3 mode, the"
+            " S3_OIDC_CA_FILE env pins the https trust)\n",
             prog);
 }
 
@@ -3045,6 +3176,48 @@ main(int argc, char **argv)
     s3_udp_listen_t    ul;
 
     s3_interop_log_init();
+
+    /*
+     * the OIDC options ride the long form (the daemon keeps the
+     * names), the pre-scan pulls them out of argv before the short
+     * getopt loop
+     */
+
+    {
+        int   i, j, keep;
+        char *value;
+
+        for (i = 1; i < argc;) {
+
+            keep = 1;
+            value = NULL;
+
+            if (strcmp(argv[i], "--oidc-issuer") == 0 && i + 1 < argc) {
+                s3_interop_oidc_issuer = argv[i + 1];
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--oidc-audience") == 0 && i + 1 < argc) {
+                snprintf(s3_interop_oidc_aud, sizeof(s3_interop_oidc_aud), "%s", argv[i + 1]);
+                value = argv[i + 1];
+            }
+
+            if (value != NULL) {
+
+                /* the option and its value leave the argv */
+
+                for (j = i; j + 2 < argc; j++) {
+                    argv[j] = argv[j + 2];
+                }
+
+                argc -= 2;
+                keep = 0;
+            }
+
+            if (keep) {
+                i++;
+            }
+        }
+    }
 
     while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:3h")) != -1) {
 
