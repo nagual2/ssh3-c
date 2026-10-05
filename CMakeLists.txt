@@ -162,6 +162,13 @@ if(NOT S3_BUILD_FUZZ)
         target_compile_options(s3${S3_INTEROP} PRIVATE -Wall -Wextra -Werror)
         target_link_libraries(s3${S3_INTEROP} PRIVATE s3core Threads::Threads)
     endforeach()
+
+    # the production daemon (P6.5): the ssh3 route only, SIGTERM/SIGINT
+    # drain, journald-friendly logging (the wiring is the harness one
+    # by design, interop/interop_server.c stays the matrix peer)
+    add_executable(ssh3-server app/ssh3_server.c)
+    target_compile_options(ssh3-server PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3-server PRIVATE s3core Threads::Threads)
 endif()
 
 # the fuzz harnesses link the libFuzzer runtime through their own
