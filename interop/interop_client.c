@@ -5401,6 +5401,20 @@ s3_interop_usage(const char *prog)
             prog);
 }
 
+/*
+ * the harness-owned streams keep their pools until an explicit
+ * s3_close_connection(): the pool cleanup handler is the quic stream
+ * cleanup, nobody else drops them - the exit teardown runs it for
+ * every stream the client opened, the leak check at exit stays silent
+ */
+static void
+s3_interop_client_stream_close(s3_connection_t *sc)
+{
+    if (sc != NULL) {
+        s3_close_connection(sc);
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6723,6 +6737,19 @@ main(int argc, char **argv)
      * the openssl object, the keys are cleansed and the connection
      * pool dies with the quic connection in it
      */
+
+    /*
+     * the harness-owned streams first: dropping them runs the quic
+     * stream cleanup and removes them from the parent tree, so the
+     * silent abort below completes in one pass and no stream pool
+     * outlives the process
+     */
+    s3_interop_client_stream_close(s3_interop_h3_stream);
+    s3_interop_client_stream_close(s3_interop_h3_channel);
+    s3_interop_client_stream_close(s3_interop_stream);
+    s3_interop_client_stream_close(s3_interop_jump_stream);
+    s3_interop_client_stream_close(s3_interop_jump_channel);
+
     (void)s3_quic_close_connection(cli, S3_ABORT);
 
     if (s3_interop_jump_cli != NULL) {
