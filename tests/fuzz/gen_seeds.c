@@ -16,9 +16,13 @@
 
 #include <s3_h3.h>
 
+#include <s3_ssh3_channel.h>
 #include <s3_ssh3_cm.h>
+#include <s3_ssh3_conversation.h>
+#include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
+#include <s3_ssh3_request.h>
 #include <s3_ssh3_sftp_codec.h>
 #include <s3_ssh3_wire.h>
 
@@ -1113,6 +1117,360 @@ gs_h3(const char *dir)
     gs_write(dir, "seq_mixed", (size_t)(p - gs_buf));
 }
 
+/*
+ * the ssh3 stateful steps: the op byte and the length byte wrap every
+ * payload, the payloads are the same shapes the ssh3 unit tests build
+ * through the codec encoders; the ops match fuzz_ssh3_state.c (0 open,
+ * 1 close, 2 message, 3 datagram, 4 pop, 5 find, 6 accept, 7 raw
+ * header)
+ */
+
+static u_char *
+gs_ssh3_step(u_char *p, u_char op, const u_char *payload, size_t len)
+{
+    *p++ = op;
+    *p++ = (u_char)len;
+
+    if (len != 0) {
+        s3_memcpy(p, payload, len);
+    }
+
+    return p + len;
+}
+
+/*
+ * the open step payload: the slot, the flags (the low bit marks the
+ * incoming side), the type selector and the three varints, then the
+ * raw type bytes of the selector 3
+ */
+
+static u_char *
+gs_ssh3_open_pay(u_char *p, u_char slot, u_char flags, u_char sel, uint64_t channel_id,
+                 uint64_t conv_id, uint64_t max_packet, const char *raw_type)
+{
+    *p++ = slot;
+    *p++ = flags;
+    *p++ = sel;
+
+    p = s3_ssh3_encode_varint(p, channel_id);
+    p = s3_ssh3_encode_varint(p, conv_id);
+    p = s3_ssh3_encode_varint(p, max_packet);
+
+    if (raw_type != NULL) {
+        while (*raw_type != '\0') {
+            *p++ = (u_char)*raw_type++;
+        }
+    }
+
+    return p;
+}
+
+/* the message step payload: the slot and the type byte before the
+ * encoded body */
+
+static u_char *
+gs_ssh3_msg_pay(u_char *p, u_char slot, u_char type)
+{
+    *p++ = slot;
+    *p++ = type;
+
+    return p;
+}
+
+static void
+gs_ssh3(const char *dir)
+{
+    u_char                          pay[512];
+    u_char                         *p, *q, *w;
+    s3_ssh3_channel_t               ch;
+    s3_ssh3_msg_open_confirmation_t oc;
+    s3_ssh3_msg_open_failure_t      of;
+    s3_ssh3_msg_data_t              d;
+    s3_ssh3_msg_extended_data_t     ed;
+    uint64_t                        i;
+
+    /* the single open steps: the session opener, the incoming
+     * direct-tcp (the accept queue), the raw type bytes and the
+     * 8-byte varint forms */
+
+    q = gs_ssh3_open_pay(pay, 0, 0, 0, 0, 4, 30000, NULL);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+    gs_write(dir, "open_session", (size_t)(p - gs_buf));
+
+    q = gs_ssh3_open_pay(pay, 1, 1, 1, 8, 4, 16384, NULL);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+    gs_write(dir, "open_direct_incoming", (size_t)(p - gs_buf));
+
+    q = gs_ssh3_open_pay(pay, 2, 0, 3, 12, 4, 64, "sftp");
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+    gs_write(dir, "open_raw_type", (size_t)(p - gs_buf));
+
+    q = gs_ssh3_open_pay(pay, 3, 0, 2, 16, 4, 4294967295ULL, NULL);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+    gs_write(dir, "open_huge_max", (size_t)(p - gs_buf));
+
+    /* the close of a free slot and of the first channel */
+
+    pay[0] = 1;
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x01, pay, 1);
+    gs_write(dir, "close_1", (size_t)(p - gs_buf));
+
+    /* the channel messages against slot 0 */
+
+    s3_memzero(&oc, sizeof(oc));
+    oc.max_packet_size = 32768;
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    q = (u_char *)s3_ssh3_msg_encode_open_confirmation(q, &oc);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+    gs_write(dir, "confirm_91", (size_t)(p - gs_buf));
+
+    s3_memzero(&of, sizeof(of));
+    of.reason_code = 1;
+    s3_str_set(&of.error_message, "denied");
+    s3_str_set(&of.language_tag, "en");
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_FAILURE);
+    q = (u_char *)s3_ssh3_msg_encode_open_failure(q, &of);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+    gs_write(dir, "openfailure_92", (size_t)(p - gs_buf));
+
+    s3_memzero(&d, sizeof(d));
+    s3_str_set(&d.data, "hello");
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_DATA);
+    q = (u_char *)s3_ssh3_msg_encode_data(q, &d);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+    gs_write(dir, "data_94", (size_t)(p - gs_buf));
+
+    s3_memzero(&ed, sizeof(ed));
+    ed.data_type = S3_SSH3_EXTENDED_DATA_STDERR;
+    s3_str_set(&ed.data, "err");
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_EXTENDED_DATA);
+    q = (u_char *)s3_ssh3_msg_encode_extended_data(q, &ed);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+    gs_write(dir, "extdata_95", (size_t)(p - gs_buf));
+
+    /* the datagrams: the own channel, the foreign one, the 4-byte
+     * varint forms and the truncated prefix */
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 0, (const u_char *)"udp", 3);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+    gs_write(dir, "dgram_valid", (size_t)(p - gs_buf));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 99, (const u_char *)"xyz", 3);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+    gs_write(dir, "dgram_foreign", (size_t)(p - gs_buf));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 1073741824, 16384, NULL, 0);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+    gs_write(dir, "dgram_big_ids", (size_t)(p - gs_buf));
+
+    pay[0] = 0x04;
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x03, pay, 1);
+    gs_write(dir, "dgram_trunc", (size_t)(p - gs_buf));
+
+    /* the store reads and the registry probes */
+
+    q = s3_ssh3_encode_varint(pay, 0);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(q - pay));
+    gs_write(dir, "pop_zero", (size_t)(p - gs_buf));
+
+    q = s3_ssh3_encode_varint(pay, 999);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(q - pay));
+    gs_write(dir, "pop_foreign", (size_t)(p - gs_buf));
+
+    q = s3_ssh3_encode_varint(pay, 8);
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x05, pay, (size_t)(q - pay));
+    gs_write(dir, "find_8", (size_t)(p - gs_buf));
+
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x06, NULL, 0);
+    gs_write(dir, "accept", (size_t)(p - gs_buf));
+
+    /* the raw header walk: the valid wire form, the truncated one and
+     * the foreign frame type */
+
+    s3_memzero(&ch, sizeof(ch));
+    ch.type.data = (u_char *)"session";
+    ch.type.len = 7;
+    ch.conversation_stream_id = 4;
+    ch.max_packet_size = 30000;
+
+    q = s3_ssh3_channel_build_header(pay, &ch);
+
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x07, pay, (size_t)(q - pay));
+    gs_write(dir, "rawhdr_valid", (size_t)(p - gs_buf));
+
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x07, pay, 10);
+    gs_write(dir, "rawhdr_trunc", (size_t)(p - gs_buf));
+
+    pay[0] ^= 0x01;
+
+    p = gs_buf;
+    p = gs_ssh3_step(p, 0x07, pay, (size_t)(q - pay));
+    gs_write(dir, "rawhdr_bad", (size_t)(p - gs_buf));
+
+    /* the request on the confirmed channel: the open, the 91, then
+     * the 98 envelope */
+
+    p = gs_buf;
+
+    q = gs_ssh3_open_pay(pay, 0, 0, 0, 0, 4, 30000, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    s3_memzero(&oc, sizeof(oc));
+    oc.max_packet_size = 32768;
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    q = (u_char *)s3_ssh3_msg_encode_open_confirmation(q, &oc);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_REQUEST);
+    q = s3_ssh3_encode_sshstring(q, "shell", 5);
+    *q++ = 0;
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    gs_write(dir, "seq_request_shell", (size_t)(p - gs_buf));
+
+    p = gs_buf;
+
+    q = gs_ssh3_open_pay(pay, 0, 0, 0, 0, 4, 30000, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    q = (u_char *)s3_ssh3_msg_encode_open_confirmation(q, &oc);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_REQUEST);
+    q = s3_ssh3_encode_sshstring(q, "exit-status", 11);
+    *q++ = 1;
+    q = s3_ssh3_encode_varint(q, 42);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    gs_write(dir, "seq_request_exit_status", (size_t)(p - gs_buf));
+
+    /* the full round-trip: the open, the confirm, the datagram in and
+     * out, the data message, the close, the miss in the registry */
+
+    p = gs_buf;
+
+    q = gs_ssh3_open_pay(pay, 0, 0, 0, 0, 4, 30000, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    q = (u_char *)s3_ssh3_msg_encode_open_confirmation(q, &oc);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 0, (const u_char *)"udp", 3);
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+
+    q = s3_ssh3_encode_varint(pay, 0);
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_DATA);
+    q = (u_char *)s3_ssh3_msg_encode_data(q, &d);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    pay[0] = 0;
+    p = gs_ssh3_step(p, 0x01, pay, 1);
+
+    q = s3_ssh3_encode_varint(pay, 0);
+    p = gs_ssh3_step(p, 0x05, pay, (size_t)(q - pay));
+
+    gs_write(dir, "seq_roundtrip", (size_t)(p - gs_buf));
+
+    /* the incoming channel: the datagram of a linked channel, the
+     * accept, the close and the post-close miss */
+
+    p = gs_buf;
+
+    q = gs_ssh3_open_pay(pay, 1, 1, 1, 8, 4, 16384, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 8, (const u_char *)"dg", 2);
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+
+    p = gs_ssh3_step(p, 0x06, NULL, 0);
+
+    pay[0] = 1;
+    p = gs_ssh3_step(p, 0x01, pay, 1);
+
+    q = s3_ssh3_encode_varint(pay, 8);
+    p = gs_ssh3_step(p, 0x05, pay, (size_t)(q - pay));
+
+    gs_write(dir, "seq_accept_close", (size_t)(p - gs_buf));
+
+    /* the dangling queue overflow: the 64 payloads pass, the next one
+     * comes back BUSY, one pop drains the oldest */
+
+    p = gs_buf;
+
+    for (i = 0; i <= S3_SSH3_DGRAM_QUEUE_MAX; i++) {
+        q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 77, (const u_char *)"x", 1);
+        p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+    }
+
+    q = s3_ssh3_encode_varint(pay, 77);
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(q - pay));
+
+    gs_write(dir, "seq_dgram_overflow", (size_t)(p - gs_buf));
+
+    /* the two-channel mix: the types, the stderr, the foreign store
+     * traffic and the second accept */
+
+    p = gs_buf;
+
+    q = gs_ssh3_open_pay(pay, 0, 0, 0, 0, 4, 30000, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_open_pay(pay, 1, 1, 2, 8, 4, 16384, NULL);
+    p = gs_ssh3_step(p, 0x00, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+    q = (u_char *)s3_ssh3_msg_encode_open_confirmation(q, &oc);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    q = gs_ssh3_msg_pay(pay, 0, S3_SSH3_MSG_CHANNEL_EXTENDED_DATA);
+    q = (u_char *)s3_ssh3_msg_encode_extended_data(q, &ed);
+    p = gs_ssh3_step(p, 0x02, pay, (size_t)(q - pay));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 8, (const u_char *)"xy", 2);
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+
+    q = (u_char *)s3_ssh3_dgram_encode(pay, 4, 99, (const u_char *)"z", 1);
+    p = gs_ssh3_step(p, 0x03, pay, (size_t)(q - pay));
+
+    p = gs_ssh3_step(p, 0x06, NULL, 0);
+
+    q = s3_ssh3_encode_varint(pay, 8);
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(q - pay));
+
+    w = s3_ssh3_encode_varint(pay, 99);
+    p = gs_ssh3_step(p, 0x04, pay, (size_t)(w - pay));
+
+    gs_write(dir, "seq_mixed", (size_t)(p - gs_buf));
+}
+
 int
 main(int argc, char *const *argv)
 {
@@ -1155,6 +1513,9 @@ main(int argc, char *const *argv)
     snprintf(dir, sizeof(dir), "%s/h3", root);
     gs_dir(dir);
     gs_h3(dir);
+    snprintf(dir, sizeof(dir), "%s/ssh3", root);
+    gs_dir(dir);
+    gs_ssh3(dir);
 
     return gs_failures != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
