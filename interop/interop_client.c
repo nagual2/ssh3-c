@@ -59,6 +59,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <time.h>
+
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
@@ -507,6 +509,14 @@ s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
 }
 
 /*
+ * the -W stall: sleeping here shrinks the receive window the way a busy
+ * machine does, which is the wedge ingredient the deadlock repro needs.
+ * Set at runtime so the repro script drives it with a flag instead of
+ * patching this file.
+ */
+static unsigned s3_interop_stall_usec;
+
+/*
  * the stream echo verifier: the pattern is a function of the absolute
  * offset, so the reading side checks without sharing state with the
  * writer
@@ -519,6 +529,14 @@ s3_interop_stream_echo_read(s3_event_t *ev)
     ssize_t          m;
 
     sc = ev->data;
+
+    if (s3_interop_stall_usec) {
+        struct timespec ts;
+
+        ts.tv_sec = s3_interop_stall_usec / 1000000;
+        ts.tv_nsec = (s3_interop_stall_usec % 1000000) * 1000;
+        nanosleep(&ts, NULL);
+    }
 
     for (;;) {
 
@@ -2592,6 +2610,9 @@ s3_interop_usage(const char *prog)
             "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
             "  -t  overall deadline in ms, default 20000\n"
             "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
+            "  -W  sleep this many usec in the stream echo reader; shrinks the\n"
+            "      receive window, the deadlock repro with stream_buffer_size >= 64K\n"
+            "  -L  log level: 0..8 or \"all\", default 7 (info)\n"
             "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
             prog);
 }
@@ -2617,7 +2638,7 @@ main(int argc, char **argv)
     s3_interop_log_init();
     s3_interop_pattern_init();
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:U:F:e:J:S:3CTSXh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:F:e:J:S:3CTSXh")) != -1) {
 
         switch (opt) {
 
@@ -2812,6 +2833,15 @@ main(int argc, char **argv)
 
         case 'd':
             dg_size = (unsigned)atoi(optarg);
+            break;
+
+        case 'W':
+            s3_interop_stall_usec = (unsigned)atoi(optarg);
+            break;
+
+        case 'L':
+            s3_interop_log.log_level =
+                (strcmp(optarg, "all") == 0) ? S3_LOG_DEBUG_ALL : (s3_uint_t)atol(optarg);
             break;
 
         default:
