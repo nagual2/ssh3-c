@@ -22,7 +22,7 @@
  * process output rides back as 94/95 and the verdict is the 98
  * exit-status.  In this mode stdout additionally carries:
  *   INTEROP-H3-CONNECT-OK authlen=<len>
- *   INTEROP-AUTH-OK user=<name>  (the -P password file mode)
+ *   INTEROP-AUTH-OK user=<name>  (the -P password or -K pubkey mode)
  *   INTEROP-H3-REJECT code=<400|401|403|425>
  *   INTEROP-CHANNEL-ACCEPT id=<stream id> type=<channel type>
  *   INTEROP-SESSION-PTY
@@ -60,6 +60,7 @@
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_agent.h>
+#include <s3_ssh3_auth_jwt.h>
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_dgram.h>
@@ -99,6 +100,14 @@ static unsigned s3_interop_h3_mode;
  * Basic credentials against its user:secret lines
  */
 static const char *s3_interop_passfile;
+
+/*
+ * the authorized_keys file (-K): the CONNECT passes only with a
+ * Bearer JWT signed by one of its keys; a %u token is the session
+ * username (the sshd AuthorizedKeysFile shape), a path without it is
+ * one file for every user
+ */
+static const char *s3_interop_keyfile;
 
 /*
  * the sftp jail override (-H): the harness scenarios point it into
@@ -499,8 +508,12 @@ static u_char s3_interop_h3_protocol[32];
 static size_t s3_interop_h3_protocol_len;
 static u_char s3_interop_h3_path[256];
 static size_t s3_interop_h3_path_len;
-/* the authorization header holds the OIDC Bearer jwt (the RS256
- * id_token of the reference rides ~1.2 KB), 256 was the Basic era */
+/*
+ * the Authorization snapshot: the biggest Bearer the CONNECT carries
+ * (an Ed25519 pubkey JWT is ~340 bytes, an RS256 one goes past 600,
+ * an RS256 OIDC id_token rides ~1.2 KB), the 256-byte capture of the
+ * Basic wave truncated it and the verdict failed on the tail
+ */
 static u_char s3_interop_h3_auth[4096];
 static size_t s3_interop_h3_auth_len;
 static u_char s3_interop_h3_ua[128];
@@ -738,23 +751,44 @@ s3_interop_h3_flush(void)
 static void
 s3_interop_h3_send_status(unsigned code)
 {
+    u_char  sec[512];
     u_char *p;
     size_t  sec_len, total;
     ssize_t m;
 
     /*
-     * the section is built first: the HEADERS frame header carries its
-     * exact length.  Every status section here fits the two-byte
-     * varlen frame header on top
+     * the section is built into the scratch buffer first: the HEADERS
+     * frame header carries its exact length as the variable-length
+     * int (the section grew past the one-byte form when the Server
+     * field came in), the length encode lands behind the frame type
+     * and the section follows it
      */
-    p = s3_interop_h3_out + 2;
+    p = sec;
     p = s3_interop_h3_put_status(p, code);
-    sec_len = p - (s3_interop_h3_out + 2);
+
+    if (code == 200) {
+
+        /*
+         * the Server field of the reference (w.Header().Set("Server",
+         * GetCurrentVersionString())), the client parses it before it
+         * opens the conversation
+         */
+
+        s3_str_t name = s3_string("server");
+        s3_str_t value = s3_string(S3_SSH3_VERSION_STRING);
+
+        p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
+    }
+
+    sec_len = (size_t)(p - sec);
 
     s3_interop_h3_out[0] = S3_H3_FRAME_HEADERS;
-    s3_interop_h3_out[1] = (u_char)sec_len;
 
-    total = 2 + sec_len;
+    p = (u_char *)s3_h3_encode_varlen_int(s3_interop_h3_out + 1, sec_len);
+
+    memcpy(p, sec, sec_len);
+
+    total = (size_t)(p - s3_interop_h3_out) + sec_len;
 
     m = s3_quic_stream_send(s3_interop_h3_sc, s3_interop_h3_out, total);
 
@@ -927,6 +961,156 @@ s3_interop_h3_oidc_verdict(s3_connection_t *pc)
     }
 
     printf("INTEROP-AUTH-OK user=oidc iss=%s\n", s3_interop_oidc_issuer);
+
+    fflush(stdout);
+
+    return 200;
+}
+
+/*
+ * the -K path of one user: a %u token is the session username (the
+ * sshd AuthorizedKeysFile shape), the unknown directives stay
+ * literal; the username passes the plain-name guard - no leading
+ * dot, no separator - so the substitution cannot climb out of the
+ * directory; S3_ERROR when the expanded path does not fit
+ */
+
+static s3_int_t
+s3_interop_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, size_t size)
+{
+    const char *p;
+    char       *o = out;
+    size_t      left = size - 1, i;
+
+    for (p = pattern; *p != '\0'; p++) {
+
+        if (*p != '%') {
+
+            if (left == 0) {
+                return S3_ERROR;
+            }
+
+            *o++ = *p;
+            left--;
+
+            continue;
+        }
+
+        if (p[1] == 'u') {
+
+            /* the traversal guard: the plain session names only */
+
+            if (user->len == 0 || user->data[0] == '.') {
+                return S3_ERROR;
+            }
+
+            for (i = 0; i < user->len; i++) {
+
+                u_char c = user->data[i];
+
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '.' || c == '_' || c == '-')) {
+                    return S3_ERROR;
+                }
+            }
+
+            if (user->len > left) {
+                return S3_ERROR;
+            }
+
+            memcpy(o, user->data, user->len);
+
+            o += user->len;
+            left -= user->len;
+            p++;
+
+            continue;
+        }
+
+        /* the lone percent or the unknown directive is literal */
+
+        if (left < 2) {
+            return S3_ERROR;
+        }
+
+        *o++ = '%';
+
+        if (p[1] != '\0') {
+            *o++ = p[1];
+            p++;
+        }
+
+        left -= 2;
+    }
+
+    *o = '\0';
+
+    return S3_OK;
+}
+
+/*
+ * the Bearer JWT verdict against the -K authorized_keys file (the
+ * pubkey step of the reference chain): the username comes from the
+ * CONNECT target (?user=), the jti binding rides the TLS exporter
+ * ("EXPORTER-SSH3", the conversation id the reference signs into the
+ * token)
+ */
+
+static unsigned
+s3_interop_h3_jwt_verdict(void)
+{
+    s3_str_t header, path, user;
+    u_char   conv[32];
+    char     keys[512];
+    s3_int_t rc;
+
+    header.data = s3_interop_h3_auth;
+    header.len = s3_interop_h3_auth_len;
+
+    path.data = s3_interop_h3_path;
+    path.len = s3_interop_h3_path_len;
+
+    s3_str_null(&user);
+
+    rc = s3_ssh3_auth_user_from_path(&path, &user);
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: pubkey auth: no user in the path\n");
+        return 401;
+    }
+
+    if (strchr(s3_interop_keyfile, '%') != NULL) {
+
+        rc = s3_interop_keyfile_user_path(s3_interop_keyfile, &user, keys, sizeof(keys));
+
+        if (rc != S3_OK) {
+            fprintf(stderr, "interop-server: pubkey auth: bad keys path for user=%.*s\n",
+                    (int)user.len, (const char *)user.data);
+            return 401;
+        }
+
+    } else {
+
+        snprintf(keys, sizeof(keys), "%s", s3_interop_keyfile);
+    }
+
+    if (s3_interop_h3_pc == NULL || s3_interop_h3_pc->ssl == NULL ||
+        s3_interop_h3_pc->ssl->connection == NULL ||
+        SSL_export_keying_material(s3_interop_h3_pc->ssl->connection, conv, sizeof(conv),
+                                   "EXPORTER-SSH3", 13, NULL, 0, 0) != 1) {
+        fprintf(stderr, "interop-server: pubkey auth: exporter failed\n");
+        return 401;
+    }
+
+    rc = s3_ssh3_auth_jwt_verify(&header, &user, keys, conv, sizeof(conv));
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-server: pubkey auth: user=%.*s rejected rc=%d\n", (int)user.len,
+                (const char *)user.data, (int)rc);
+        return 401;
+    }
+
+    printf("INTEROP-AUTH-OK user=%.*s\n", (int)user.len, (const char *)user.data);
     fflush(stdout);
 
     return 200;
@@ -979,6 +1163,29 @@ s3_interop_h3_respond(s3_connection_t *pc)
             /* the OIDC mode: the Bearer id_token of the provider
              * decides, the conversation nonce binds it */
             code = s3_interop_h3_oidc_verdict(pc);
+
+        } else if (s3_interop_keyfile != NULL && s3_interop_h3_auth_len > 0) {
+
+            s3_str_t header;
+
+            header.data = s3_interop_h3_auth;
+            header.len = s3_interop_h3_auth_len;
+
+            if (s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+
+                /* the pubkey mode: the Bearer token decides */
+
+                code = s3_interop_h3_jwt_verdict();
+
+            } else if (s3_interop_passfile != NULL) {
+
+                /* the Basic credentials still speak when -P rides along */
+
+                code = s3_interop_h3_basic_verdict();
+
+            } else {
+                code = 401;
+            }
 
         } else if (s3_interop_passfile == NULL) {
             code = s3_interop_h3_auth_len ? 200 : 401;
@@ -3139,7 +3346,7 @@ s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s -l addr:port -c cert.pem -k key.pem [-3] [-A alpn] [-d dg_size]"
-            " [-P pwfile] [-H dir]\n"
+            " [-P pwfile] [-K keysfile] [-H dir]\n"
             "  -l  UDP listen address, port 0 picks an ephemeral one\n"
             "  -c  certificate PEM file\n"
             "  -k  private key PEM file\n"
@@ -3148,6 +3355,10 @@ s3_interop_usage(const char *prog)
             "  -d  max_datagram_frame_size transport parameter, default 1200\n"
             "  -P  password file: the CONNECT passes only with the Basic"
             " user:secret (h3 mode)\n"
+            "  -K  authorized_keys file: the CONNECT passes only with a Bearer JWT"
+            " signed by\n"
+            "      one of its keys; %%u in the path is the session username"
+            " (h3 mode)\n"
             "  -H  the sftp jail directory override, default the user's home"
             " (h3 mode)\n"
             "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
@@ -3219,7 +3430,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:3h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3h")) != -1) {
 
         switch (opt) {
 
@@ -3254,6 +3465,10 @@ main(int argc, char **argv)
 
         case 'P':
             s3_interop_passfile = optarg;
+            break;
+
+        case 'K':
+            s3_interop_keyfile = optarg;
             break;
 
         case 'H':

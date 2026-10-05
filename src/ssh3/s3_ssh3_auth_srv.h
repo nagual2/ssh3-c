@@ -10,8 +10,8 @@
 /*
  * the server auth chain of the reference server_auth/ (docs/P4-WIRE.md
  * 7), the wire-level steps only: the version and the 0-RTT gates live
- * in the h3 layer (P3).  The reference pubkey/JWT verification signs
- * the whole request - out of the wave scope; this module covers the
+ * in the h3 layer (P3).  The reference pubkey/JWT verification lives
+ * in s3_ssh3_auth_jwt.h; this module covers the
  * username extraction, the Basic credentials and the sshd authorized
  * keys file shape, the wiring picks the checks it speaks
  */
