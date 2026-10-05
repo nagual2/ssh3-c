@@ -318,10 +318,16 @@ s3_interop_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 /*
  * the pending tail is a heap buffer on purpose: the echo must keep
  * draining the peer no matter how far its read side lags behind our
- * send window, otherwise the two naive sides deadlock
+ * send window, otherwise the two naive sides deadlock.  The consumed
+ * head advances in place and the remainder compacts only when the
+ * compaction reclaims at least what it moves: with the flow control
+ * quanta of a large window the drain runs at a few tens of KiB per
+ * wakeup, and a memmove of the whole tail per wakeup made every event
+ * quadratic in the backlog, freezing the whole loop for seconds
  */
 static u_char          *s3_interop_echo_buf;
 static size_t           s3_interop_echo_cap;
+static size_t           s3_interop_echo_off;
 static size_t           s3_interop_echo_len;
 static int              s3_interop_echo_fin;
 static size_t           s3_interop_echo_read_total;
@@ -336,7 +342,7 @@ s3_interop_stream_flush(void)
 
     while (s3_interop_echo_len > 0) {
 
-        m = s3_quic_stream_send(sc, s3_interop_echo_buf, s3_interop_echo_len);
+        m = s3_quic_stream_send(sc, s3_interop_echo_buf + s3_interop_echo_off, s3_interop_echo_len);
 
         if (m == (ssize_t)S3_AGAIN) {
             return;
@@ -345,12 +351,15 @@ s3_interop_stream_flush(void)
         if (m <= 0) {
             fprintf(stderr, "interop-server: stream send failed\n");
             s3_interop_echo_len = 0;
+            s3_interop_echo_off = 0;
             return;
         }
 
-        s3_memmove(s3_interop_echo_buf, s3_interop_echo_buf + m, s3_interop_echo_len - m);
-        s3_interop_echo_len -= m;
+        s3_interop_echo_off += (size_t)m;
+        s3_interop_echo_len -= (size_t)m;
     }
+
+    s3_interop_echo_off = 0;
 
     if (s3_interop_echo_fin) {
         (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
@@ -378,23 +387,40 @@ s3_interop_stream_read(s3_event_t *ev)
 
     for (;;) {
 
-        free_len = s3_interop_echo_cap - s3_interop_echo_len;
+        free_len = s3_interop_echo_cap - s3_interop_echo_off - s3_interop_echo_len;
 
         if (free_len == 0) {
-            size_t  cap = s3_interop_echo_cap + 262144;
-            u_char *grown = realloc(s3_interop_echo_buf, cap);
 
-            if (grown == NULL) {
-                fprintf(stderr, "interop-server: echo buffer growth failed\n");
-                exit(1);
+            /*
+             * the compaction must reclaim at least what it moves, or the
+             * drain degenerates back into a quadratic shuffle; a shallow
+             * head with a deep tail grows the buffer instead, and the
+             * cold start (cap == 0) always lands on the growth
+             */
+            if (s3_interop_echo_off > 0 && s3_interop_echo_off >= s3_interop_echo_len) {
+
+                s3_memmove(s3_interop_echo_buf, s3_interop_echo_buf + s3_interop_echo_off,
+                           s3_interop_echo_len);
+                s3_interop_echo_off = 0;
+                free_len = s3_interop_echo_cap - s3_interop_echo_len;
             }
 
-            s3_interop_echo_buf = grown;
-            s3_interop_echo_cap = cap;
-            free_len = s3_interop_echo_cap - s3_interop_echo_len;
+            if (free_len == 0) {
+                size_t  cap = s3_interop_echo_cap + 262144;
+                u_char *grown = realloc(s3_interop_echo_buf, cap);
+
+                if (grown == NULL) {
+                    fprintf(stderr, "interop-server: echo buffer growth failed\n");
+                    exit(1);
+                }
+
+                s3_interop_echo_buf = grown;
+                s3_interop_echo_cap = cap;
+                free_len = cap - s3_interop_echo_off - s3_interop_echo_len;
+            }
         }
 
-        n = sc->recv(sc, s3_interop_echo_buf + s3_interop_echo_len, free_len);
+        n = sc->recv(sc, s3_interop_echo_buf + s3_interop_echo_off + s3_interop_echo_len, free_len);
 
         if (n > 0) {
             s3_interop_echo_read_total += (size_t)n;
@@ -412,7 +438,7 @@ s3_interop_stream_read(s3_event_t *ev)
 
         s3_interop_echo_len += (size_t)n;
 
-        m = s3_quic_stream_send(sc, s3_interop_echo_buf, s3_interop_echo_len);
+        m = s3_quic_stream_send(sc, s3_interop_echo_buf + s3_interop_echo_off, s3_interop_echo_len);
 
         if (m == (ssize_t)S3_AGAIN) {
             continue; /* the window is full, the tail flushes on wev */
@@ -421,14 +447,16 @@ s3_interop_stream_read(s3_event_t *ev)
         if (m <= 0) {
             fprintf(stderr, "interop-server: stream send failed\n");
             s3_interop_echo_len = 0;
+            s3_interop_echo_off = 0;
             break;
         }
 
-        s3_memmove(s3_interop_echo_buf, s3_interop_echo_buf + m, s3_interop_echo_len - m);
-        s3_interop_echo_len -= m;
+        s3_interop_echo_off += (size_t)m;
+        s3_interop_echo_len -= (size_t)m;
     }
 
     if (s3_interop_echo_fin && s3_interop_echo_len == 0) {
+        s3_interop_echo_off = 0;
         (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
     }
 }
@@ -2933,6 +2961,7 @@ s3_interop_stream_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 
     s3_interop_echo_sc = qs->connection;
     s3_interop_echo_len = 0;
+    s3_interop_echo_off = 0;
     s3_interop_echo_fin = 0;
     s3_interop_echo_read_total = 0;
     s3_interop_echo_reads = 0;
