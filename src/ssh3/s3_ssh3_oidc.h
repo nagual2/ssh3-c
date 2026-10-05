@@ -61,11 +61,37 @@ typedef struct {
 } s3_ssh3_oidc_jwks_t;
 
 /*
- * the verifier of one issuer: the discovery and the JWKS fetch run on
- * the first verify, the unknown kid triggers one refresh (the provider
- * key rotation); the offline form skips the network - the tests parse
- * the key sets in by hand
+ * the verifier of one issuer: the discovery and the first key set
+ * bootstrap once, the key set carries the ttl (the wiring timer
+ * rotates it in the background, the old set serves until the fresh
+ * one lands - the grace), the unknown kid schedules one background
+ * refetch instead of fetching on the request path (the fetch_due
+ * flag closes the episode: one fetch per rotation, not per request);
+ * the offline form skips the network - the tests parse the key sets
+ * in by hand and ride the fetch seam
  */
+
+/* the key set lifetime the wiring timer rotates on */
+
+#define S3_SSH3_OIDC_TTL_DEFAULT 3600
+
+/* the stampede window of one kid episode: the verifies inside it
+ * schedule nothing, the episode stays one fetch */
+
+#define S3_SSH3_OIDC_REFRESH_COOLDOWN 5
+
+/* the cadence the timer retries a provider that keeps failing */
+
+#define S3_SSH3_OIDC_FETCH_RETRY 60
+
+/*
+ * the fetch the verifier loads the key sets with: the built-in form
+ * speaks the blocking https fetch of s3_https_fetch, the tests inject
+ * the counting hook
+ */
+
+typedef s3_int_t (*s3_ssh3_oidc_fetch_pt)(const s3_ssh3_oidc_provider_t *provider,
+                                          const char *ca_file, s3_ssh3_oidc_jwks_t *jwks);
 
 typedef struct {
     char                    issuer[S3_SSH3_OIDC_URL_MAX];
@@ -73,6 +99,11 @@ typedef struct {
     s3_ssh3_oidc_provider_t provider;
     unsigned                provider_ready;
     s3_ssh3_oidc_jwks_t     jwks;
+    time_t                  ttl;           /* 0 = S3_SSH3_OIDC_TTL_DEFAULT */
+    time_t                  jwks_time;     /* the wall clock of the good set */
+    time_t                  fetch_time;    /* the last attempt, the cadence gate */
+    unsigned                fetch_due : 1; /* a fetch is scheduled for the timer */
+    s3_ssh3_oidc_fetch_pt   fetch_fn;      /* NULL = the built-in https fetch */
 } s3_ssh3_oidc_verifier_t;
 
 /*
@@ -141,6 +172,33 @@ s3_int_t s3_ssh3_oidc_verify(const s3_ssh3_oidc_jwks_t *jwks, const char *issuer
 s3_int_t s3_ssh3_oidc_verifier_init(s3_ssh3_oidc_verifier_t *v, const char *issuer,
                                     const char *ca_file);
 s3_int_t s3_ssh3_oidc_verifier_init_offline(s3_ssh3_oidc_verifier_t *v, const char *issuer);
+void     s3_ssh3_oidc_verifier_set_ttl(s3_ssh3_oidc_verifier_t *v, time_t seconds);
+
+/*
+ * the discovery and the first key set: the daemon runs it once before
+ * the event loop (a provider that never answers keeps the daemon
+ * from starting), the lazy consumers let verifier_verify() run it on
+ * the first token
+ */
+
+s3_int_t s3_ssh3_oidc_verifier_bootstrap(s3_ssh3_oidc_verifier_t *v, time_t now);
+
+/*
+ * the one fetch cycle of the wiring timer: the schedule closes, the
+ * attempt stamps the cadence gate, the key set swaps only on success
+ * (the old set serves through the failures); S3_OK stamps jwks_time
+ */
+
+s3_int_t s3_ssh3_oidc_verifier_fetch(s3_ssh3_oidc_verifier_t *v, time_t now);
+
+/*
+ * the milliseconds till the fetch cycle the wiring timer owes: 0 =
+ * run one now (the scheduled kid refetch, the first set, the ttl
+ * rotation off the retry cadence)
+ */
+
+s3_msec_t s3_ssh3_oidc_verifier_fetch_timer(const s3_ssh3_oidc_verifier_t *v, time_t now);
+
 s3_int_t s3_ssh3_oidc_verifier_verify(s3_ssh3_oidc_verifier_t *v, const char *audience,
                                       const char *token, const char *nonce, time_t now);
 void     s3_ssh3_oidc_verifier_clear(s3_ssh3_oidc_verifier_t *v);

@@ -151,14 +151,17 @@ static const char *s3_srv_keyfile;
  * the Bearer id_token of that provider, the audience is the client
  * id of the token, the nonce binds the token to the conversation
  * (the reference authorized_identities OpenIDConnectIdentity); the
- * discovery and the JWKS fetch run once at the startup, before the
- * sockets open - the lazy fallback would run the blocking https
- * inside the event loop on the first CONNECT (the unknown-kid
- * refresh still does, the TTL timer is the P6/P7 backlog)
+ * discovery and the first key set run once at the startup, before
+ * the sockets open - the lazy fallback would run the blocking https
+ * inside the event loop on the first CONNECT; the rotation and the
+ * unknown-kid refetch ride the timer below, the request path never
+ * fetches
  */
 static const char             *s3_srv_oidc_issuer;
 static char                    s3_srv_oidc_aud[128];
+static time_t                  s3_srv_oidc_ttl;
 static s3_ssh3_oidc_verifier_t s3_srv_oidc_ver;
+static s3_event_t              s3_srv_oidc_timer;
 
 /*
  * the sftp jail override (-H): the harness scenarios point it into
@@ -1180,11 +1183,31 @@ s3_srv_h3_jwt_verdict(void)
  * Bearer scheme carries the id_token, the expected nonce derives
  * from the EXPORTER-SSH3 exporter of the live conversation (the
  * reference ConversationID), the issuer, the audience and the
- * provider signature decide; the discovery and the JWKS ran once at
- * the startup, the unknown kid refresh of the verifier is the one
- * lazy fetch left in the event loop (the TTL timer is the P6/P7
- * backlog)
+ * provider signature decide; the discovery and the first key set ran
+ * once at the startup, the unknown kid only schedules the background
+ * refetch of the timer (the retryable kid reject answers the
+ * request) - the verdict never blocks on the provider
  */
+
+static void
+s3_srv_oidc_timer_handler(s3_event_t *ev)
+{
+    time_t now = time(NULL);
+
+    /*
+     * the jwks timer: the scheduled unknown-kid refetch and the ttl
+     * rotation run here, outside the request path; a failed cycle
+     * keeps the old key set (the grace) and rides the retry cadence
+     */
+
+    if (s3_ssh3_oidc_verifier_fetch_timer(&s3_srv_oidc_ver, now) == 0 &&
+        s3_ssh3_oidc_verifier_fetch(&s3_srv_oidc_ver, now) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "oidc jwks fetch failed, %u stale key(s) serve on",
+                     (s3_uint_t)s3_srv_oidc_ver.jwks.nkeys);
+    }
+
+    s3_event_add_timer(ev, s3_ssh3_oidc_verifier_fetch_timer(&s3_srv_oidc_ver, time(NULL)));
+}
 
 static unsigned
 s3_srv_h3_oidc_verdict(s3_connection_t *pc)
@@ -3482,6 +3505,9 @@ s3_srv_usage(const char *prog)
             " with the Bearer\n"
             "      id_token of that provider (the S3_OIDC_CA_FILE env pins"
             " the https trust)\n"
+            "  --oidc-jwks-ttl seconds: the key set lifetime of the oidc"
+            " provider, default\n"
+            "      3600, the timer rotates the set in the background\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
@@ -3556,6 +3582,10 @@ main(int argc, char **argv)
 
             } else if (strcmp(argv[n], "--oidc-audience") == 0 && n + 1 < argc) {
                 snprintf(s3_srv_oidc_aud, sizeof(s3_srv_oidc_aud), "%s", argv[n + 1]);
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--oidc-jwks-ttl") == 0 && n + 1 < argc) {
+                s3_srv_oidc_ttl = (time_t)atoi(argv[n + 1]);
                 value = argv[n + 1];
             }
 
@@ -3681,22 +3711,26 @@ main(int argc, char **argv)
     }
 
     /*
-     * the OIDC bootstrap: the discovery and the JWKS fetch run once
-     * here, before the sockets open - a provider that never answers
-     * keeps the daemon from starting instead of stalling the first
-     * CONNECT behind a blocking https inside the event loop; the
-     * unknown-kid refresh of the verifier stays lazy (the TTL timer
-     * is the P6/P7 backlog)
+     * the OIDC bootstrap: the discovery and the first key set run
+     * once here, before the sockets open - a provider that never
+     * answers keeps the daemon from starting instead of stalling the
+     * first CONNECT behind a blocking https inside the event loop;
+     * the rotation and the unknown-kid refetch ride the timer below,
+     * the request path never fetches
      */
 
     if (s3_srv_oidc_issuer != NULL) {
         const char *ca_file = getenv("S3_OIDC_CA_FILE");
 
-        if (s3_ssh3_oidc_verifier_init(&s3_srv_oidc_ver, s3_srv_oidc_issuer, ca_file) != S3_OK ||
-            s3_ssh3_oidc_discover(s3_srv_oidc_issuer, ca_file, &s3_srv_oidc_ver.provider) !=
-                S3_OK ||
-            s3_ssh3_oidc_jwks_fetch(&s3_srv_oidc_ver.provider, ca_file, &s3_srv_oidc_ver.jwks) !=
-                S3_OK) {
+        if (s3_ssh3_oidc_verifier_init(&s3_srv_oidc_ver, s3_srv_oidc_issuer, ca_file) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "oidc verifier init failed for issuer %s",
+                         s3_srv_oidc_issuer);
+            return 1;
+        }
+
+        s3_ssh3_oidc_verifier_set_ttl(&s3_srv_oidc_ver, s3_srv_oidc_ttl);
+
+        if (s3_ssh3_oidc_verifier_bootstrap(&s3_srv_oidc_ver, time(NULL)) != S3_OK) {
             s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "oidc bootstrap failed for issuer %s",
                          s3_srv_oidc_issuer);
             s3_ssh3_oidc_verifier_clear(&s3_srv_oidc_ver);
@@ -3710,6 +3744,17 @@ main(int argc, char **argv)
     if (s3_event_ctx_init(&ctx, &s3_srv_log) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "event ctx init failed");
         return 1;
+    }
+
+    /* the jwks timer: the ttl rotation and the unknown-kid refetch */
+
+    if (s3_srv_oidc_issuer != NULL) {
+        s3_memzero(&s3_srv_oidc_timer, sizeof(s3_srv_oidc_timer));
+        s3_srv_oidc_timer.handler = s3_srv_oidc_timer_handler;
+        s3_srv_oidc_timer.log = &s3_srv_log;
+
+        s3_event_add_timer(&s3_srv_oidc_timer,
+                           s3_ssh3_oidc_verifier_fetch_timer(&s3_srv_oidc_ver, time(NULL)));
     }
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
