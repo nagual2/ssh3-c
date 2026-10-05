@@ -566,6 +566,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the happy paths, one per allowlisted algorithm */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
@@ -586,6 +589,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the aud array form carries the audience in a member */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "[\"wrong\",\"unused\"]", "ssh3-bob", jti,
                  now, now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
@@ -593,6 +599,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the tampered tokens: the payload byte and the signature byte */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
@@ -607,50 +616,80 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the claim verdicts */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now - 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("expired", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now, 0, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("exp missing", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, now + 3600);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("nbf future", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now + 3600,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("iat future", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "wrong", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("wrong sub", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"wrong\"", "ssh3-bob", jti, now, now + 10,
                  0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("wrong aud", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", NULL, "ssh3-bob", jti, now, now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("aud missing", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "alice", "ssh3", "\"unused\"", "ssh3-alice", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("wrong user", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv), S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-alice", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("wrong client_id", token, "bob", path_a, s3_tj_conv, sizeof(s3_tj_conv),
                S3_DECLINED);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", "wrong-jti", now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
@@ -659,11 +698,17 @@ s3_test_ssh3_auth_jwt(void)
     /* the jti binding is skipped without the conversation id but the
      * claim itself stays required, like the reference checks */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("convid absent", token, "bob", path_a, NULL, 0, S3_OK);
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", "", now, now + 10,
                  0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
@@ -671,6 +716,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the foreign key and the algorithm/key mismatch */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, foreign, 0);
@@ -682,6 +730,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the rejected headers: none, the unknown scheme, the shape */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "none", claims, ed, 1);
@@ -701,6 +752,9 @@ s3_test_ssh3_auth_jwt(void)
 
     /* the unreadable keys file is S3_ERROR, not a rejection */
 
+    /* the fresh clock: the whole suite runs over 10s under
+     * valgrind, a now captured up front expires the tokens */
+    now = (long long)time(NULL);
     s3_tj_claims(claims, sizeof(claims), "bob", "ssh3", "\"unused\"", "ssh3-bob", jti, now,
                  now + 10, 0);
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);

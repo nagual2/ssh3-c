@@ -51,6 +51,13 @@ s3_test_buf(void)
     S3_ASSERT(cl->buf != NULL);
     S3_ASSERT(cl->next == NULL);
 
+    /* the fresh buf comes from s3_calloc_buf: flag-only, without memory;
+     * point it at a pool block first, start + N on a NULL start is UB */
+
+    cl->buf->start = s3_pnalloc(pool, 128);
+    S3_ASSERT(cl->buf->start != NULL);
+    cl->buf->end = cl->buf->start + 128;
+
     /* the caller tags the recycled buf and marks it writable */
 
     cl->buf->tag = tag;
