@@ -23,18 +23,50 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_frames.h>
+#include <s3_quic_streams.h>
 
 #define S3_TEST_TLS_NO_LOCKSTEP
 #define S3_TEST_TLS_NO_CLIENT
 #include "s3_quic_tls_helper.h"
 #include "s3_test.h"
 
-#define S3_TEST_PUMP_LIMIT 5000
+#define S3_TEST_PUMP_LIMIT        5000
+#define S3_TEST_STREAM_PUMP_LIMIT 50000
+
+/*
+ * the stream echo regression payload: many flow control windows deep,
+ * so the writer parks on the window and lives or dies by the posted
+ * write events the library re-arms on the peer ACKs and grants
+ */
+#define S3_TEST_ECHO_TOTAL (256 * 1024)
+#define S3_TEST_ECHO_BUF   (512 * 1024)
 
 static u_char s3_test_cli_received[64];
 static size_t s3_test_cli_received_len;
 static u_char s3_test_srv_received[64];
 static size_t s3_test_srv_received_len;
+
+/* the echo state of the stream regression (one stream at a time) */
+
+static u_char           s3_test_echo_buf[S3_TEST_ECHO_BUF];
+static size_t           s3_test_echo_off;
+static size_t           s3_test_echo_len;
+static int              s3_test_echo_fin;
+static s3_connection_t *s3_test_echo_sc;
+
+/* the client side of the stream regression */
+
+static size_t           s3_test_cli_sent;
+static size_t           s3_test_cli_got;
+static int              s3_test_cli_fin_in;
+static int              s3_test_cli_done;
+static s3_connection_t *s3_test_cli_sc;
+
+static u_char
+s3_test_echo_byte(size_t pos)
+{
+    return (u_char)(pos * 31 + 7);
+}
 
 typedef struct {
     s3_pool_t     *pool;
@@ -110,6 +142,212 @@ s3_test_accept(s3_connection_t *c)
     s3_test_e2e.server = c;
 
     s3_quic_run(c, &s3_test_e2e.srv_conf);
+}
+
+/*
+ * the event-driven echo of the stream regression: the pending tail
+ * drains in place (the consumed head advances, no per-send compaction)
+ * and after a partial send the handler returns, trusting the library
+ * to re-post the write event when the window reopens
+ */
+
+static void
+s3_test_echo_drain(void)
+{
+    s3_connection_t *sc = s3_test_echo_sc;
+    ssize_t          m;
+
+    while (s3_test_echo_len > 0) {
+
+        m = s3_quic_stream_send(sc, s3_test_echo_buf + s3_test_echo_off, s3_test_echo_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (m <= 0) {
+            s3_test_echo_len = 0;
+            s3_test_echo_off = 0;
+            return;
+        }
+
+        s3_test_echo_off += (size_t)m;
+        s3_test_echo_len -= (size_t)m;
+    }
+
+    s3_test_echo_off = 0;
+
+    if (s3_test_echo_fin) {
+        (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+    }
+}
+
+static void
+s3_test_echo_write(s3_event_t *ev)
+{
+    (void)ev;
+
+    s3_test_echo_drain();
+}
+
+static void
+s3_test_echo_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    ssize_t          n, m;
+
+    sc = ev->data;
+
+    for (;;) {
+
+        if (s3_test_echo_off + s3_test_echo_len == sizeof(s3_test_echo_buf)) {
+
+            s3_memmove(s3_test_echo_buf, s3_test_echo_buf + s3_test_echo_off, s3_test_echo_len);
+            s3_test_echo_off = 0;
+        }
+
+        n = sc->recv(sc, s3_test_echo_buf + s3_test_echo_off + s3_test_echo_len,
+                     sizeof(s3_test_echo_buf) - s3_test_echo_off - s3_test_echo_len);
+
+        if (n == (ssize_t)S3_AGAIN || n < 0) {
+            break;
+        }
+
+        if (n == 0) {
+            s3_test_echo_fin = 1;
+            break;
+        }
+
+        s3_test_echo_len += (size_t)n;
+
+        m = s3_quic_stream_send(sc, s3_test_echo_buf + s3_test_echo_off, s3_test_echo_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            continue;
+        }
+
+        if (m <= 0) {
+            s3_test_echo_len = 0;
+            s3_test_echo_off = 0;
+            break;
+        }
+
+        s3_test_echo_off += (size_t)m;
+        s3_test_echo_len -= (size_t)m;
+    }
+
+    if (s3_test_echo_fin && s3_test_echo_len == 0) {
+        s3_test_echo_off = 0;
+        (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+    }
+}
+
+static void
+s3_test_stream_accept(s3_connection_t *c, s3_quic_stream_t *qs)
+{
+    s3_event_t *rev, *wev;
+
+    (void)c;
+
+    s3_test_echo_sc = qs->connection;
+    s3_test_echo_off = 0;
+    s3_test_echo_len = 0;
+    s3_test_echo_fin = 0;
+
+    rev = qs->connection->read;
+    wev = qs->connection->write;
+
+    rev->handler = s3_test_echo_read;
+    rev->data = qs->connection;
+    rev->active = 1;
+
+    wev->handler = s3_test_echo_write;
+    wev->data = qs->connection;
+    wev->active = 1;
+
+    if (rev->ready) {
+        rev->handler(rev);
+    }
+}
+
+/* the client writer: one initial post, the library must re-arm the rest */
+
+static void
+s3_test_cli_writer(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    u_char           chunk[16384];
+    ssize_t          m;
+
+    while (s3_test_cli_sent < S3_TEST_ECHO_TOTAL) {
+
+        size_t len = sizeof(chunk);
+        size_t j;
+
+        if (s3_test_cli_sent + len > S3_TEST_ECHO_TOTAL) {
+            len = S3_TEST_ECHO_TOTAL - s3_test_cli_sent;
+        }
+
+        for (j = 0; j < len; j++) {
+            chunk[j] = s3_test_echo_byte(s3_test_cli_sent + j);
+        }
+
+        m = s3_quic_stream_send(sc, chunk, len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return; /* the window is full: only the posted events go on */
+        }
+
+        if (m <= 0) {
+            return;
+        }
+
+        s3_test_cli_sent += (size_t)m;
+    }
+
+    if (s3_test_cli_sent == S3_TEST_ECHO_TOTAL && !s3_test_cli_fin_in) {
+        (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+        s3_test_cli_fin_in = 1;
+    }
+}
+
+static void
+s3_test_cli_reader(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    u_char           chunk[4096];
+    ssize_t          n;
+
+    for (;;) {
+
+        n = sc->recv(sc, chunk, sizeof(chunk));
+
+        if (n == (ssize_t)S3_AGAIN || n < 0) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin after the full echo */
+            if (s3_test_cli_got == S3_TEST_ECHO_TOTAL) {
+                s3_test_cli_done = 1;
+            }
+
+            return;
+        }
+
+        {
+            ssize_t j;
+
+            for (j = 0; j < n; j++) {
+                if (chunk[j] != s3_test_echo_byte(s3_test_cli_got + (size_t)j)) {
+                    s3_test_cli_done = 0;
+                    return;
+                }
+            }
+        }
+
+        s3_test_cli_got += (size_t)n;
+    }
 }
 
 static s3_int_t
@@ -405,6 +643,45 @@ s3_test_quic_e2e_run(void)
         }
 
         S3_ASSERT(qc->path->mtu > S3_QUIC_MIN_INITIAL_SIZE);
+    }
+
+    /*
+     * the stream echo over the same connection: the client writes many
+     * windows deep through the posted write events only (one initial
+     * post, then the library re-arms), the server echoes the same way.
+     * This pins the writer wake chain - a partial send parks the writer
+     * on wev->ready=0 and only the re-posted events (the ACK and the
+     * MAX_STREAM_DATA paths) may finish the transfer; a lost wake would
+     * hit the pump limit here
+     */
+    {
+        s3_connection_t *sc;
+
+        env->srv_conf.stream_handler = s3_test_stream_accept;
+
+        sc = s3_quic_open_stream(env->cli, 1);
+        S3_ASSERT(sc != NULL);
+
+        s3_test_cli_sc = sc;
+
+        sc->read->handler = s3_test_cli_reader;
+        sc->read->data = sc;
+
+        sc->write->handler = s3_test_cli_writer;
+        sc->write->data = sc;
+
+        /* the single initial post: everything after must ride the library */
+
+        s3_post_event(sc->write, &env->ctx.posted_events);
+
+        for (i = 0; i < S3_TEST_STREAM_PUMP_LIMIT && !s3_test_cli_done; i++) {
+            s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+            s3_process_events_and_timers(&env->ctx);
+        }
+
+        S3_ASSERT(s3_test_cli_done == 1);
+        S3_ASSERT(s3_test_cli_sent == S3_TEST_ECHO_TOTAL);
+        S3_ASSERT(s3_test_cli_got == S3_TEST_ECHO_TOTAL);
     }
 
     s3_test_env_done(env);
