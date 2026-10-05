@@ -3776,6 +3776,15 @@ main(int argc, char **argv)
     s3_srv_conf.ssl =
         s3_ssl_create(&s3_srv_log, (const char *)cert, cert_len, (const char *)key, key_len, &alpn);
 
+    /*
+     * the pem buffers served their purpose: s3_ssl_create() loaded the
+     * x509 and the key into the ssl ctx through read-only BIO views,
+     * nothing retains the pointers - free them here, the daemon runs
+     * for weeks and the leak check at exit must stay silent
+     */
+    free(cert);
+    free(key);
+
     if (s3_srv_conf.ssl == NULL) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "ssl init failed");
         return 1;
@@ -3897,6 +3906,15 @@ main(int argc, char **argv)
         while (s3_current_msec < deadline && s3_srv_active_conns() > 0) {
             s3_srv_event_pass(&ctx);
         }
+
+        /*
+         * a peer gone quiet leaves its connection in the 3*PTO close
+         * state, the streams of a force-reset channel wait for their
+         * posted events - the pools of such a connection die with the
+         * process here, the leak check sees them only as reachable
+         * (the P7 backlog: the app-owned stream teardown on the
+         * forced path)
+         */
     }
 
     s3_srv_teardown_channels();
@@ -3904,6 +3922,15 @@ main(int argc, char **argv)
     /* the provider keys of the OIDC verifier die with the daemon */
 
     s3_ssh3_oidc_verifier_clear(&s3_srv_oidc_ver);
+
+    /*
+     * the pools outlive the shutdown tail on purpose: the event ctx
+     * pool and the streams of a connection caught mid-close stay
+     * reachable from the process roots until exit, the kernel
+     * reclaims them - a destroy here would orphan the leftover
+     * connection pools and turn them into definite leaks (the P7
+     * backlog: the app-owned teardown of the forced-close path)
+     */
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "shutdown complete");
 

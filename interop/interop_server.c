@@ -3576,6 +3576,15 @@ main(int argc, char **argv)
     s3_interop_conf.ssl = s3_ssl_create(&s3_interop_log, (const char *)cert, cert_len,
                                         (const char *)key, key_len, &alpn);
 
+    /*
+     * the pem buffers served their purpose: s3_ssl_create() loaded the
+     * x509 and the key into the ssl ctx through read-only BIO views,
+     * nothing retains the pointers - free them here, the long server
+     * runs and the leak checks at exit stay silent
+     */
+    free(cert);
+    free(key);
+
     if (s3_interop_conf.ssl == NULL) {
         fprintf(stderr, "interop-server: ssl init failed\n");
         return 1;
