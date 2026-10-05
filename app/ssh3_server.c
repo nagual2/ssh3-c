@@ -20,6 +20,13 @@
  * traffic to the target, "sftp" channels run the request server and
  * the forward-agent marker opens the agent bridge.
  *
+ * the CONNECT verdict runs the auth chain of the reference
+ * (cmd/ssh3-server.go): the OIDC id_token (--oidc-issuer, the
+ * discovery and the JWKS bootstrap at the startup), the Bearer JWT
+ * signed by an authorized_keys key (-K) or the Basic credentials
+ * (-P); the 200 answer carries the Server field the Go client parses
+ * before it opens the conversation
+ *
  * production semantics:
  *   - the logs are s3_log one-liners on stderr (journald-friendly);
  *     the machine-readable runner markers ride stdout only under
@@ -46,6 +53,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <openssl/rand.h>
@@ -58,11 +66,13 @@
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_agent.h>
+#include <s3_ssh3_auth_jwt.h>
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
+#include <s3_ssh3_oidc.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_srv.h>
 #include <s3_ssh3_sftp_srv.h>
@@ -127,6 +137,28 @@ static unsigned s3_srv_proto_mode;
  * Basic credentials against its user:secret lines
  */
 static const char *s3_srv_passfile;
+
+/*
+ * the authorized_keys file (-K): the CONNECT passes only with a
+ * Bearer JWT signed by one of its keys; a %u token is the session
+ * username (the sshd AuthorizedKeysFile shape), a path without it is
+ * one file for every user
+ */
+static const char *s3_srv_keyfile;
+
+/*
+ * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
+ * the Bearer id_token of that provider, the audience is the client
+ * id of the token, the nonce binds the token to the conversation
+ * (the reference authorized_identities OpenIDConnectIdentity); the
+ * discovery and the JWKS fetch run once at the startup, before the
+ * sockets open - the lazy fallback would run the blocking https
+ * inside the event loop on the first CONNECT (the unknown-kid
+ * refresh still does, the TTL timer is the P6/P7 backlog)
+ */
+static const char             *s3_srv_oidc_issuer;
+static char                    s3_srv_oidc_aud[128];
+static s3_ssh3_oidc_verifier_t s3_srv_oidc_ver;
 
 /*
  * the sftp jail override (-H): the harness scenarios point it into
@@ -575,7 +607,13 @@ static u_char s3_srv_h3_protocol[32];
 static size_t s3_srv_h3_protocol_len;
 static u_char s3_srv_h3_path[256];
 static size_t s3_srv_h3_path_len;
-static u_char s3_srv_h3_auth[256];
+/*
+ * the Authorization snapshot: the biggest Bearer the CONNECT carries
+ * (an Ed25519 pubkey JWT is ~340 bytes, an RS256 one goes past 600,
+ * an RS256 OIDC id_token rides ~1.2 KB), the 256-byte capture of the
+ * Basic wave truncated it and the verdict failed on the tail
+ */
+static u_char s3_srv_h3_auth[4096];
 static size_t s3_srv_h3_auth_len;
 static u_char s3_srv_h3_ua[128];
 static size_t s3_srv_h3_ua_len;
@@ -882,23 +920,44 @@ s3_srv_h3_flush(void)
 static void
 s3_srv_h3_send_status(unsigned code)
 {
+    u_char  sec[512];
     u_char *p;
     size_t  sec_len, total;
     ssize_t m;
 
     /*
-     * the section is built first: the HEADERS frame header carries its
-     * exact length.  Every status section here fits the two-byte
-     * varlen frame header on top
+     * the section is built into the scratch buffer first: the HEADERS
+     * frame header carries its exact length as the variable-length
+     * int (the section grew past the one-byte form when the Server
+     * field came in), the length encode lands behind the frame type
+     * and the section follows it
      */
-    p = s3_srv_h3_out + 2;
+    p = sec;
     p = s3_srv_h3_put_status(p, code);
-    sec_len = p - (s3_srv_h3_out + 2);
+
+    if (code == 200) {
+
+        /*
+         * the Server field of the reference (w.Header().Set("Server",
+         * GetCurrentVersionString())), the client parses it before it
+         * opens the conversation
+         */
+
+        s3_str_t name = s3_string("server");
+        s3_str_t value = s3_string(S3_SSH3_VERSION_STRING);
+
+        p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
+    }
+
+    sec_len = (size_t)(p - sec);
 
     s3_srv_h3_out[0] = S3_H3_FRAME_HEADERS;
-    s3_srv_h3_out[1] = (u_char)sec_len;
 
-    total = 2 + sec_len;
+    p = (u_char *)s3_h3_encode_varlen_int(s3_srv_h3_out + 1, sec_len);
+
+    memcpy(p, sec, sec_len);
+
+    total = (size_t)(p - s3_srv_h3_out) + sec_len;
 
     m = s3_quic_stream_send(s3_srv_h3_sc, s3_srv_h3_out, total);
 
@@ -968,6 +1027,248 @@ s3_srv_h3_basic_verdict(void)
     return 200;
 }
 
+/*
+ * the -K path of one user: a %u token is the session username (the
+ * sshd AuthorizedKeysFile shape), the unknown directives stay
+ * literal; the username passes the plain-name guard - no leading
+ * dot, no separator - so the substitution cannot climb out of the
+ * directory; S3_ERROR when the expanded path does not fit
+ */
+
+static s3_int_t
+s3_srv_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, size_t size)
+{
+    const char *p;
+    char       *o = out;
+    size_t      left = size - 1, i;
+
+    for (p = pattern; *p != '\0'; p++) {
+
+        if (*p != '%') {
+
+            if (left == 0) {
+                return S3_ERROR;
+            }
+
+            *o++ = *p;
+            left--;
+
+            continue;
+        }
+
+        if (p[1] == 'u') {
+
+            /* the traversal guard: the plain session names only */
+
+            if (user->len == 0 || user->data[0] == '.') {
+                return S3_ERROR;
+            }
+
+            for (i = 0; i < user->len; i++) {
+
+                u_char c = user->data[i];
+
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '.' || c == '_' || c == '-')) {
+                    return S3_ERROR;
+                }
+            }
+
+            if (user->len > left) {
+                return S3_ERROR;
+            }
+
+            memcpy(o, user->data, user->len);
+
+            o += user->len;
+            left -= user->len;
+            p++;
+
+            continue;
+        }
+
+        /* the lone percent or the unknown directive is literal */
+
+        if (left < 2) {
+            return S3_ERROR;
+        }
+
+        *o++ = '%';
+
+        if (p[1] != '\0') {
+            *o++ = p[1];
+            p++;
+        }
+
+        left -= 2;
+    }
+
+    *o = '\0';
+
+    return S3_OK;
+}
+
+/*
+ * the Bearer JWT verdict against the -K authorized_keys file (the
+ * pubkey step of the reference chain): the username comes from the
+ * CONNECT target (?user=), the jti binding rides the TLS exporter
+ * ("EXPORTER-SSH3", the conversation id the reference signs into the
+ * token)
+ */
+
+static unsigned
+s3_srv_h3_jwt_verdict(void)
+{
+    s3_str_t header, path, user;
+    u_char   conv[32];
+    char     keys[512];
+    s3_int_t rc;
+
+    header.data = s3_srv_h3_auth;
+    header.len = s3_srv_h3_auth_len;
+
+    path.data = s3_srv_h3_path;
+    path.len = s3_srv_h3_path_len;
+
+    s3_str_null(&user);
+
+    rc = s3_ssh3_auth_user_from_path(&path, &user);
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "ssh3-server: pubkey auth: no user in the path\n");
+        return 401;
+    }
+
+    if (strchr(s3_srv_keyfile, '%') != NULL) {
+
+        rc = s3_srv_keyfile_user_path(s3_srv_keyfile, &user, keys, sizeof(keys));
+
+        if (rc != S3_OK) {
+            fprintf(stderr, "ssh3-server: pubkey auth: bad keys path for user=%.*s\n",
+                    (int)user.len, (const char *)user.data);
+            return 401;
+        }
+
+    } else {
+
+        snprintf(keys, sizeof(keys), "%s", s3_srv_keyfile);
+    }
+
+    if (s3_srv_h3_pc == NULL || s3_srv_h3_pc->ssl == NULL ||
+        s3_srv_h3_pc->ssl->connection == NULL ||
+        SSL_export_keying_material(s3_srv_h3_pc->ssl->connection, conv, sizeof(conv),
+                                   "EXPORTER-SSH3", 13, NULL, 0, 0) != 1) {
+        fprintf(stderr, "ssh3-server: pubkey auth: exporter failed\n");
+        return 401;
+    }
+
+    rc = s3_ssh3_auth_jwt_verify(&header, &user, keys, conv, sizeof(conv));
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "ssh3-server: pubkey auth: user=%.*s rejected rc=%d\n", (int)user.len,
+                (const char *)user.data, (int)rc);
+        return 401;
+    }
+
+    s3_srv_report("INTEROP-AUTH-OK user=%.*s\n", (int)user.len, (const char *)user.data);
+
+    return 200;
+}
+
+/*
+ * the OIDC verdict (the reference authorized_identities chain): the
+ * Bearer scheme carries the id_token, the expected nonce derives
+ * from the EXPORTER-SSH3 exporter of the live conversation (the
+ * reference ConversationID), the issuer, the audience and the
+ * provider signature decide; the discovery and the JWKS ran once at
+ * the startup, the unknown kid refresh of the verifier is the one
+ * lazy fetch left in the event loop (the TTL timer is the P6/P7
+ * backlog)
+ */
+
+static unsigned
+s3_srv_h3_oidc_verdict(s3_connection_t *pc)
+{
+    static const s3_str_t scheme = s3_string("Bearer ");
+
+    const char *why;
+    char        nonce[64];
+    s3_str_t    token;
+    s3_int_t    rc;
+
+    token.data = s3_srv_h3_auth;
+    token.len = s3_srv_h3_auth_len;
+
+    if (token.len <= scheme.len || s3_memcmp(token.data, scheme.data, scheme.len) != 0) {
+        fprintf(stderr, "ssh3-server: oidc auth: the scheme is not Bearer\n");
+        return 401;
+    }
+
+    token.data += scheme.len;
+    token.len -= scheme.len;
+
+    if (pc->ssl == NULL || pc->ssl->connection == NULL ||
+        s3_ssh3_oidc_conversation_nonce(pc->ssl->connection, nonce) != S3_OK) {
+        fprintf(stderr, "ssh3-server: oidc auth: no conversation nonce\n");
+        return 401;
+    }
+
+    rc = s3_ssh3_oidc_verifier_verify(&s3_srv_oidc_ver, s3_srv_oidc_aud, (const char *)token.data,
+                                      nonce, time(NULL));
+
+    switch (rc) {
+
+    case S3_SSH3_OIDC_EFORM:
+        why = " form";
+        break;
+
+    case S3_SSH3_OIDC_EALG:
+        why = " alg";
+        break;
+
+    case S3_SSH3_OIDC_EKID:
+        why = " kid";
+        break;
+
+    case S3_SSH3_OIDC_ESIG:
+        why = " signature";
+        break;
+
+    case S3_SSH3_OIDC_EISS:
+        why = " issuer";
+        break;
+
+    case S3_SSH3_OIDC_EAUD:
+        why = " audience";
+        break;
+
+    case S3_SSH3_OIDC_EEXP:
+        why = " expiry";
+        break;
+
+    case S3_SSH3_OIDC_ENONCE:
+        why = " nonce";
+        break;
+
+    case S3_OK:
+        why = "";
+        break;
+
+    default:
+        why = " provider";
+        break;
+    }
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "ssh3-server: oidc auth: rejected:%s rc=%d\n", why, (int)rc);
+        return 401;
+    }
+
+    s3_srv_report("INTEROP-AUTH-OK user=oidc iss=%s\n", s3_srv_oidc_issuer);
+
+    return 200;
+}
+
 static void
 s3_srv_h3_respond(s3_connection_t *pc)
 {
@@ -1009,6 +1310,35 @@ s3_srv_h3_respond(s3_connection_t *pc)
              * is done (go_server: TLS handshake incomplete) */
 
             code = 425;
+
+        } else if (s3_srv_oidc_issuer != NULL) {
+
+            /* the OIDC mode: the Bearer id_token of the provider
+             * decides, the conversation nonce binds it */
+            code = s3_srv_h3_oidc_verdict(pc);
+
+        } else if (s3_srv_keyfile != NULL && s3_srv_h3_auth_len > 0) {
+
+            s3_str_t header;
+
+            header.data = s3_srv_h3_auth;
+            header.len = s3_srv_h3_auth_len;
+
+            if (s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+
+                /* the pubkey mode: the Bearer token decides */
+
+                code = s3_srv_h3_jwt_verdict();
+
+            } else if (s3_srv_passfile != NULL) {
+
+                /* the Basic credentials still speak when -P rides along */
+
+                code = s3_srv_h3_basic_verdict();
+
+            } else {
+                code = 401;
+            }
 
         } else if (s3_srv_passfile == NULL) {
             code = s3_srv_h3_auth_len ? 200 : 401;
@@ -3144,7 +3474,14 @@ s3_srv_usage(const char *prog)
             "  -L  log level: a name (debug|info|warn|error) or an s3 numeric\n"
             "  -P  password file: the CONNECT passes only with the Basic"
             " user:secret\n"
+            "  -K  authorized_keys file: the CONNECT passes only with a Bearer JWT"
+            " signed by\n"
+            "      one of its keys; %%u in the path is the session username\n"
             "  -H  the sftp jail directory override, default the user's home\n"
+            "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
+            " with the Bearer\n"
+            "      id_token of that provider (the S3_OIDC_CA_FILE env pins"
+            " the https trust)\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
@@ -3198,7 +3535,49 @@ main(int argc, char **argv)
         s3_srv_proto_mode = 1;
     }
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:3vVh")) != -1) {
+    /*
+     * the OIDC options ride the long form (the daemon keeps the
+     * names), the pre-scan pulls them out of argv before the short
+     * getopt loop
+     */
+
+    {
+        int   n, m, keep;
+        char *value;
+
+        for (n = 1; n < argc;) {
+
+            keep = 1;
+            value = NULL;
+
+            if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
+                s3_srv_oidc_issuer = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--oidc-audience") == 0 && n + 1 < argc) {
+                snprintf(s3_srv_oidc_aud, sizeof(s3_srv_oidc_aud), "%s", argv[n + 1]);
+                value = argv[n + 1];
+            }
+
+            if (value != NULL) {
+
+                /* the option and its value leave the argv */
+
+                for (m = n; m + 2 < argc; m++) {
+                    argv[m] = argv[m + 2];
+                }
+
+                argc -= 2;
+                keep = 0;
+            }
+
+            if (keep) {
+                n++;
+            }
+        }
+    }
+
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3vVh")) != -1) {
 
         switch (opt) {
 
@@ -3241,6 +3620,10 @@ main(int argc, char **argv)
 
         case 'P':
             s3_srv_passfile = optarg;
+            break;
+
+        case 'K':
+            s3_srv_keyfile = optarg;
             break;
 
         case 'H':
@@ -3295,6 +3678,33 @@ main(int argc, char **argv)
 
     if (cert == NULL || key == NULL) {
         return 1;
+    }
+
+    /*
+     * the OIDC bootstrap: the discovery and the JWKS fetch run once
+     * here, before the sockets open - a provider that never answers
+     * keeps the daemon from starting instead of stalling the first
+     * CONNECT behind a blocking https inside the event loop; the
+     * unknown-kid refresh of the verifier stays lazy (the TTL timer
+     * is the P6/P7 backlog)
+     */
+
+    if (s3_srv_oidc_issuer != NULL) {
+        const char *ca_file = getenv("S3_OIDC_CA_FILE");
+
+        if (s3_ssh3_oidc_verifier_init(&s3_srv_oidc_ver, s3_srv_oidc_issuer, ca_file) != S3_OK ||
+            s3_ssh3_oidc_discover(s3_srv_oidc_issuer, ca_file, &s3_srv_oidc_ver.provider) !=
+                S3_OK ||
+            s3_ssh3_oidc_jwks_fetch(&s3_srv_oidc_ver.provider, ca_file, &s3_srv_oidc_ver.jwks) !=
+                S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "oidc bootstrap failed for issuer %s",
+                         s3_srv_oidc_issuer);
+            s3_ssh3_oidc_verifier_clear(&s3_srv_oidc_ver);
+            return 1;
+        }
+
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "oidc bootstrap complete: issuer %s, %u key(s)",
+                     s3_srv_oidc_issuer, (s3_uint_t)s3_srv_oidc_ver.jwks.nkeys);
     }
 
     if (s3_event_ctx_init(&ctx, &s3_srv_log) != S3_OK) {
@@ -3490,6 +3900,10 @@ main(int argc, char **argv)
     }
 
     s3_srv_teardown_channels();
+
+    /* the provider keys of the OIDC verifier die with the daemon */
+
+    s3_ssh3_oidc_verifier_clear(&s3_srv_oidc_ver);
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "shutdown complete");
 
