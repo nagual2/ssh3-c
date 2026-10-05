@@ -649,6 +649,12 @@ s3_quic_input_handler(s3_event_t *rev)
         s3_memzero(&b, sizeof(s3_buf_t));
 
         b.temporary = 1;
+        /*
+         * the datagram length the path accounting sees is computed against
+         * start (s3_quic_set_path()); a staged buffer without start would
+         * poison path->received with pointer-magnitude garbage
+         */
+        b.start = buffer;
         b.pos = buffer;
         b.last = buffer + n;
 
