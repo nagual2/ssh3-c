@@ -28,7 +28,8 @@ u_char *s3_ssh3_encode_varint(u_char *p, uint64_t value);
 
 /*
  * parses one varint at *pos against end; advances *pos past it on
- * S3_OK and leaves it untouched on S3_ERROR (a truncated buffer)
+ * S3_OK and leaves it untouched on S3_ERROR (a truncated buffer or
+ * an over-long, non-canonical encoding of the value)
  */
 s3_int_t s3_ssh3_parse_varint(const u_char **pos, const u_char *end, uint64_t *value);
 
