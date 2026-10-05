@@ -712,6 +712,35 @@ s3_ssh3_cm_sessions_init(s3_ssh3_cm_sessions_t *t, s3_pool_t *pool)
     return S3_OK;
 }
 
+/*
+ * the release of a finished session: the whole slot clears here so
+ * the next alloc reuses it without the flag leaks an app-side
+ * cleanup used to leak into the reused slots
+ */
+
+s3_int_t
+s3_ssh3_cm_sessions_release(s3_ssh3_cm_sessions_t *t, const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    uint32_t i;
+
+    if (t == NULL || token == NULL) {
+        return S3_ERROR;
+    }
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+
+        if (t->sessions[i].used &&
+            s3_memcmp(t->sessions[i].token, token, S3_SSH3_CM_TOKEN_LEN) == 0) {
+            s3_memzero(&t->sessions[i], sizeof(t->sessions[i]));
+            t->count--;
+
+            return S3_OK;
+        }
+    }
+
+    return S3_ERROR;
+}
+
 s3_int_t
 s3_ssh3_cm_srv_init(s3_ssh3_cm_srv_t *t, s3_pool_t *pool, s3_ssh3_cm_sessions_t *sessions,
                     const s3_ssh3_cm_srv_cbs_t *cbs, void *cb_ctx)
@@ -930,7 +959,20 @@ s3_srv_attach(s3_ssh3_cm_srv_t *t, const s3_str_t *payload)
 
         s->stderr_attached = 1;
 
-        return s3_srv_reply(t, S3_SSH3_CM_MSG_OK, NULL, 0);
+        rc = s3_srv_reply(t, S3_SSH3_CM_MSG_OK, NULL, 0);
+
+        if (rc != S3_OK) {
+            return rc;
+        }
+
+        /* the stderr bridge owns the stream, the master has already
+           acknowledged the attach */
+
+        if (t->cbs.bridge_stderr != NULL) {
+            t->cbs.bridge_stderr(t->cb_ctx, token);
+        }
+
+        return S3_OK;
 
     case S3_SSH3_CM_STREAM_IO:
 

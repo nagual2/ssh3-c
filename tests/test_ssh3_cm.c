@@ -21,11 +21,13 @@
 typedef struct {
     unsigned open_called;
     unsigned bridge_called;
+    unsigned bridge_stderr_called;
     unsigned status_called;
     int      open_rc;
     u_char   token_base; /* the first byte of the generated token */
 
     u_char bridge_token[S3_SSH3_CM_TOKEN_LEN];
+    u_char bridge_stderr_token[S3_SSH3_CM_TOKEN_LEN];
 
     /* the parsed request, copied inside the callback: the views die
        with the receive tail shift */
@@ -54,6 +56,8 @@ static s3_int_t s3_test_open_session_cb(void *ctx, const s3_ssh3_cm_open_session
                                         u_char token[S3_SSH3_CM_TOKEN_LEN], const char **err);
 
 static void s3_test_bridge_cb(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN]);
+
+static void s3_test_bridge_stderr_cb(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN]);
 
 static s3_int_t s3_test_status_cb(void *ctx, s3_ssh3_cm_status_t *st);
 
@@ -192,6 +196,15 @@ s3_test_bridge_cb(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
 
     c->bridge_called++;
     s3_memcpy(c->bridge_token, token, S3_SSH3_CM_TOKEN_LEN);
+}
+
+static void
+s3_test_bridge_stderr_cb(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    s3_test_srv_ctx_t *c = ctx;
+
+    c->bridge_stderr_called++;
+    s3_memcpy(c->bridge_stderr_token, token, S3_SSH3_CM_TOKEN_LEN);
 }
 
 static s3_int_t
@@ -795,6 +808,8 @@ s3_test_srv(void)
     u_char                req_payload[16];
     u_char                req_frame[64];
     u_char                att_frame[32];
+    u_char                rel_token[S3_SSH3_CM_TOKEN_LEN];
+    uint32_t              i;
 
     log.log_level = S3_LOG_ALERT;
     log.fd = S3_INVALID_FILE;
@@ -807,6 +822,7 @@ s3_test_srv(void)
     s3_memzero(&cbs, sizeof(cbs));
     cbs.open_session = s3_test_open_session_cb;
     cbs.bridge = s3_test_bridge_cb;
+    cbs.bridge_stderr = s3_test_bridge_stderr_cb;
     cbs.status = s3_test_status_cb;
 
     s3_memzero(&ctx, sizeof(ctx));
@@ -855,12 +871,20 @@ s3_test_srv(void)
     S3_ASSERT(out_len == sizeof(s3_test_ok));
     S3_ASSERT(ctx.bridge_called == 0);
 
+    /* the stderr bridge fires before the io attach, the token is
+       the attached session */
+
+    S3_ASSERT(ctx.bridge_stderr_called == 1);
+    S3_ASSERT(ctx.bridge_stderr_token[0] == 0xa0);
+    S3_ASSERT(ctx.bridge_stderr_token[15] == 0xaf);
+
     s3_test_attach_frame(att_frame, 0xa0, S3_SSH3_CM_STREAM_IO);
     s3_test_srv_feed(&srv2, att_frame, S3_SSH3_CM_HEADER_LEN + 17, out, &out_len);
     S3_ASSERT(out_len == sizeof(s3_test_ok));
     S3_ASSERT(ctx.bridge_called == 1);
     S3_ASSERT(ctx.bridge_token[0] == 0xa0);
     S3_ASSERT(ctx.bridge_token[15] == 0xaf);
+    S3_ASSERT(ctx.bridge_stderr_called == 1);
 
     /* the check op over a third connection, the JSON literal */
 
@@ -929,6 +953,11 @@ s3_test_srv(void)
     S3_ASSERT(out[5] == S3_SSH3_CM_MSG_ERROR);
     S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 1);
 
+    /* the refused io attach fires neither bridge */
+
+    S3_ASSERT(ctx.bridge_called == 1);
+    S3_ASSERT(ctx.bridge_stderr_called == 1);
+
     /* the unknown token closes the connection */
 
     S3_ASSERT(s3_ssh3_cm_srv_init(&srv3, pool, &sessions, &cbs, &ctx) == S3_OK);
@@ -940,7 +969,8 @@ s3_test_srv(void)
     S3_ASSERT(out[5] == S3_SSH3_CM_MSG_ERROR);
     S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 1);
 
-    /* the double stderr attach closes the connection */
+    /* the double stderr attach closes the connection, the second
+       attach fires the stderr bridge no more */
 
     S3_ASSERT(s3_ssh3_cm_srv_init(&srv3, pool, &sessions, &cbs, &ctx) == S3_OK);
     s3_test_srv_feed(&srv3, s3_test_hello, sizeof(s3_test_hello), out, &out_len);
@@ -949,11 +979,15 @@ s3_test_srv(void)
     s3_test_srv_feed(&srv3, att_frame, S3_SSH3_CM_HEADER_LEN + 17, out, &out_len);
     S3_ASSERT(out[5] == S3_SSH3_CM_MSG_OK);
     S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 0);
+    S3_ASSERT(ctx.bridge_stderr_called == 2);
+    S3_ASSERT(ctx.bridge_stderr_token[0] == 0xb0);
+    S3_ASSERT(ctx.bridge_stderr_token[15] == 0xbf);
 
     s3_test_srv_feed(&srv3, att_frame, S3_SSH3_CM_HEADER_LEN + 17, out, &out_len);
 
     S3_ASSERT(out[5] == S3_SSH3_CM_MSG_ERROR);
     S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 1);
+    S3_ASSERT(ctx.bridge_stderr_called == 2);
 
     /* the unknown message type (the v1 forward) is refused */
 
@@ -1018,6 +1052,74 @@ s3_test_srv(void)
 
     s3_test_srv_feed(&srv3, s3_test_hello + 7, sizeof(s3_test_hello) - 7, out, &out_len);
     S3_ASSERT(out_len == sizeof(s3_test_ok));
+
+    /*
+     * the release clears the slot: the app ends the session, the
+     * reopen lands on the same index with no flags and the full
+     * stderr-then-io flow runs again
+     */
+
+    S3_ASSERT(sessions.count == 2);
+    S3_ASSERT(sessions.sessions[0].used == 1);
+    S3_ASSERT(sessions.sessions[0].started == 1);
+    S3_ASSERT(sessions.sessions[0].stderr_attached == 1);
+
+    for (i = 0; i < S3_SSH3_CM_TOKEN_LEN; i++) {
+        rel_token[i] = (u_char)(0xa0 + i);
+    }
+
+    S3_ASSERT(s3_ssh3_cm_sessions_release(&sessions, rel_token) == S3_OK);
+    S3_ASSERT(sessions.count == 1);
+    S3_ASSERT(sessions.sessions[0].used == 0);
+    S3_ASSERT(sessions.sessions[0].started == 0);
+    S3_ASSERT(sessions.sessions[0].stderr_attached == 0);
+
+    /* the unknown token is refused, the table stays intact */
+
+    rel_token[0] = 0x5a;
+
+    S3_ASSERT(s3_ssh3_cm_sessions_release(&sessions, rel_token) == S3_ERROR);
+    S3_ASSERT(sessions.count == 1);
+
+    /* the reopen takes the released slot, the flags start cleared */
+
+    ctx.token_base = 0xa0;
+
+    s3_test_srv_feed(&srv, s3_test_open_frame, sizeof(s3_test_open_frame), out, &out_len);
+
+    S3_ASSERT(ctx.open_called == 4);
+    S3_ASSERT(out_len == sizeof(s3_test_ok_token));
+    S3_ASSERT(sessions.count == 2);
+    S3_ASSERT(sessions.sessions[0].used == 1);
+    S3_ASSERT(sessions.sessions[0].started == 0);
+    S3_ASSERT(sessions.sessions[0].stderr_attached == 0);
+
+    /*
+     * the stderr attach of the reused slot arrives in two chunks: the
+     * stderr bridge fires when the frame completes, any arrival order
+     * of the bytes lands the same way
+     */
+
+    s3_test_attach_frame(att_frame, 0xa0, S3_SSH3_CM_STREAM_STDERR);
+
+    s3_test_srv_feed(&srv2, att_frame, 10, out, &out_len);
+    S3_ASSERT(out_len == 0);
+    S3_ASSERT(ctx.bridge_stderr_called == 2);
+
+    s3_test_srv_feed(&srv2, att_frame + 10, S3_SSH3_CM_HEADER_LEN + 17 - 10, out, &out_len);
+    S3_ASSERT(out_len == sizeof(s3_test_ok));
+    S3_ASSERT(out[5] == S3_SSH3_CM_MSG_OK);
+    S3_ASSERT(ctx.bridge_stderr_called == 3);
+    S3_ASSERT(ctx.bridge_stderr_token[0] == 0xa0);
+    S3_ASSERT(ctx.bridge_stderr_token[15] == 0xaf);
+
+    /* the io attach completes the reused session like the first one */
+
+    s3_test_attach_frame(att_frame, 0xa0, S3_SSH3_CM_STREAM_IO);
+    s3_test_srv_feed(&srv2, att_frame, S3_SSH3_CM_HEADER_LEN + 17, out, &out_len);
+    S3_ASSERT(out_len == sizeof(s3_test_ok));
+    S3_ASSERT(ctx.bridge_called == 2);
+    S3_ASSERT(ctx.bridge_token[0] == 0xa0);
 
     s3_destroy_pool(pool);
 

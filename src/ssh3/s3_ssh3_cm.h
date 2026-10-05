@@ -189,6 +189,10 @@ typedef struct {
        the master has already replied OK to the attach */
     void (*bridge)(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN]);
 
+    /* the stderr attachment completed, the stderr bridge starts; the
+       master has already replied OK to the attach */
+    void (*bridge_stderr)(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN]);
+
     /* the check-op snapshot; S3_ERROR refuses the op */
     s3_int_t (*status)(void *ctx, s3_ssh3_cm_status_t *st);
 } s3_ssh3_cm_srv_cbs_t;
@@ -219,6 +223,15 @@ struct s3_ssh3_cm_srv_s {
 };
 
 s3_int_t s3_ssh3_cm_sessions_init(s3_ssh3_cm_sessions_t *t, s3_pool_t *pool);
+
+/*
+ * releases the slot of the token: the whole slot clears and the count
+ * drops, the slot is ready for reuse with no app-side cleanup;
+ * S3_ERROR when no live slot matches the token
+ */
+
+s3_int_t s3_ssh3_cm_sessions_release(s3_ssh3_cm_sessions_t *t,
+                                     const u_char           token[S3_SSH3_CM_TOKEN_LEN]);
 
 /*
  * prepares one control or stream-attachment connection; the rules
