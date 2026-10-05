@@ -1,0 +1,16 @@
+# the valgrind suppressions for the libcrypto internals, the frames are
+# inside OpenSSL, not the ssh3-c code
+#
+# usage:
+#   valgrind --suppressions=tests/valgrind/openssl.supp ...
+
+{
+   # OpenSSL 3.5 AES-GCM (aesni/vaes assembly path): EVP_DecryptFinal_ex
+   # branches on the tag compare through ossl_gcm_stream_final, the
+   # vectorized ghash leaves the masked lanes uninitialised for valgrind.
+   # Reproduced with a bare EVP encrypt/decrypt pair on fully initialised
+   # buffers, no ssh3-c frame involved (valgrind 3.22, openssl-3.5).
+   openssl-3.5-gcm-stream-final-cond
+   Memcheck:Cond
+   fun:ossl_gcm_stream_final
+}
