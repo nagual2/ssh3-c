@@ -5,7 +5,10 @@
  * JWKS parse of the RSA and the EC keys, the id_token verification
  * (the happy path and the reject table: tamper, exp, iss, aud,
  * nonce, kid, alg) and the kid rotation of the key cache; the keys
- * and the tokens mint in the test over OpenSSL
+ * and the tokens mint in the test over OpenSSL; the verifier
+ * behaviours (the unknown-kid schedule with the stampede guard, the
+ * ttl rotation with the grace) ride the fetch seam, the scripted
+ * hook counts the attempts without the network
  */
 
 #include <openssl/bn.h>
@@ -664,6 +667,221 @@ s3_test_verifier_offline(void)
     return s3_test_failures;
 }
 
+/* ------------------------------------------------------------------ */
+/* the fetch seam: the scripted refresh of the verifier                 */
+/* ------------------------------------------------------------------ */
+
+static int         t_fetch_calls;
+static int         t_fetch_fail;
+static const char *t_fetch_doc;
+
+static s3_int_t
+t_fetch_hook(const s3_ssh3_oidc_provider_t *provider, const char *ca_file,
+             s3_ssh3_oidc_jwks_t *jwks)
+{
+    (void)provider;
+    (void)ca_file;
+
+    t_fetch_calls++;
+
+    if (t_fetch_fail) {
+        return S3_ERROR;
+    }
+
+    /* the fetch replaces the whole set, like the built-in form */
+
+    s3_ssh3_oidc_jwks_clear(jwks);
+
+    return s3_ssh3_oidc_jwks_parse(jwks, (const u_char *)t_fetch_doc, s3_strlen(t_fetch_doc));
+}
+
+/*
+ * the stampede guard of the unknown kid: the first verify schedules
+ * exactly one background fetch, the verifies during the schedule (and
+ * inside the cooldown window) schedule nothing, the fetch cycle of
+ * the wiring timer closes the episode
+ */
+
+static int
+s3_test_verifier_kid_refetch(void)
+{
+    char                    doc[2048], jwk[1024];
+    char                    payload[512], token[4096];
+    long long               exp;
+    time_t                  t0 = 1700000000;
+    s3_ssh3_oidc_verifier_t v;
+
+    exp = t0 + 600;
+
+    S3_ASSERT(t_payload(payload, sizeof(payload), T_ISSUER, T_AUD, exp, T_NONCE) > 0);
+    S3_ASSERT(t_mint(t_rsa2, 0, "rsa-other", payload, token, sizeof(token)) == 0);
+
+    /* the offline verifier rides the fetch seam: the uri rides in so
+     * the unknown-kid path schedules, the cache of rsa1 is good at t0 */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_init_offline(&v, T_ISSUER) == S3_OK);
+    snprintf(v.provider.jwks_uri, sizeof(v.provider.jwks_uri), "http://127.0.0.1:1/jwks");
+
+    S3_ASSERT(t_jwk_rsa(t_rsa1, "rsa1", jwk, sizeof(jwk)) > 0);
+    t_jwks_doc(doc, sizeof(doc), jwk, NULL);
+    S3_ASSERT(s3_ssh3_oidc_jwks_parse(&v.jwks, (const u_char *)doc, s3_strlen(doc)) == S3_OK);
+
+    v.jwks_time = t0;
+    v.fetch_fn = t_fetch_hook;
+
+    t_fetch_calls = 0;
+    t_fetch_fail = 0;
+    t_fetch_doc = doc;
+
+    /* the good set owes nothing till the ttl ends */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 1) > 0);
+
+    /* the unknown kid: the schedule of one fetch, the retryable kid
+     * reject answers the request itself */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token, T_NONCE, t0 + 1) == S3_SSH3_OIDC_EKID);
+    S3_ASSERT(v.fetch_due == 1);
+
+    /* the request during the schedule: no second episode */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token, T_NONCE, t0 + 2) == S3_SSH3_OIDC_EKID);
+    S3_ASSERT(v.fetch_due == 1);
+
+    /* the wiring timer closes the schedule: exactly one fetch cycle */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 2) == 0);
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch(&v, t0 + 3) == S3_OK);
+    S3_ASSERT(t_fetch_calls == 1);
+    S3_ASSERT(v.fetch_due == 0);
+
+    /* the retry inside the cooldown window schedules nothing */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token, T_NONCE, t0 + 4) == S3_SSH3_OIDC_EKID);
+    S3_ASSERT(v.fetch_due == 0);
+    S3_ASSERT(t_fetch_calls == 1);
+
+    /* the window out: the next episode may schedule again */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token, T_NONCE, t0 + 9) == S3_SSH3_OIDC_EKID);
+    S3_ASSERT(v.fetch_due == 1);
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch(&v, t0 + 10) == S3_OK);
+    S3_ASSERT(t_fetch_calls == 2);
+
+    s3_ssh3_oidc_verifier_clear(&v);
+
+    return s3_test_failures;
+}
+
+/*
+ * the ttl of the key set: the request path serves the stale set past
+ * the ttl (the rotation rides the timer only), the failed rotation
+ * keeps the old set (the grace) and rides the retry cadence, the
+ * landed rotation replaces the set
+ */
+
+static int
+s3_test_verifier_ttl(void)
+{
+    char                    doc_a[2048], doc_b[2048], jwk_a[1024], jwk_b[1024];
+    char                    payload[512], token_a[4096], token_b[4096];
+    long long               exp;
+    time_t                  t0 = 1700000000;
+    s3_ssh3_oidc_verifier_t v;
+
+    exp = t0 + 600;
+
+    S3_ASSERT(t_jwk_rsa(t_rsa1, "rsa1", jwk_a, sizeof(jwk_a)) > 0);
+    S3_ASSERT(t_jwk_rsa(t_rsa2, "rsa2", jwk_b, sizeof(jwk_b)) > 0);
+    t_jwks_doc(doc_a, sizeof(doc_a), jwk_a, NULL);
+    t_jwks_doc(doc_b, sizeof(doc_b), jwk_b, NULL);
+
+    S3_ASSERT(t_payload(payload, sizeof(payload), T_ISSUER, T_AUD, exp, T_NONCE) > 0);
+    S3_ASSERT(t_mint(t_rsa1, 0, "rsa1", payload, token_a, sizeof(token_a)) == 0);
+    S3_ASSERT(t_mint(t_rsa2, 0, "rsa2", payload, token_b, sizeof(token_b)) == 0);
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_init_offline(&v, T_ISSUER) == S3_OK);
+    snprintf(v.provider.jwks_uri, sizeof(v.provider.jwks_uri), "http://127.0.0.1:1/jwks");
+
+    s3_ssh3_oidc_verifier_set_ttl(&v, 10);
+
+    S3_ASSERT(s3_ssh3_oidc_jwks_parse(&v.jwks, (const u_char *)doc_a, s3_strlen(doc_a)) == S3_OK);
+
+    v.jwks_time = t0;
+    v.fetch_fn = t_fetch_hook;
+
+    t_fetch_calls = 0;
+    t_fetch_fail = 0;
+    t_fetch_doc = doc_b;
+
+    /* the delay till the rotation: the ttl decides */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 1) == (s3_msec_t)9 * 1000);
+
+    /* the stale set serves past the ttl: the request path never
+     * fetches, the timer owes the rotation */
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token_a, T_NONCE, t0 + 11) == S3_OK);
+    S3_ASSERT(t_fetch_calls == 0);
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 11) == 0);
+
+    /* the failed rotation keeps the old set, the retry rides the
+     * failure cadence */
+
+    t_fetch_fail = 1;
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch(&v, t0 + 11) == S3_ERROR);
+    S3_ASSERT(t_fetch_calls == 1);
+    S3_ASSERT(v.jwks.nkeys == 1);
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token_a, T_NONCE, t0 + 12) == S3_OK);
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 13) == (s3_msec_t)58 * 1000);
+
+    /* the retried rotation lands: the new kid lives, the old one
+     * rotates out, the ttl window restarts */
+
+    t_fetch_fail = 0;
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch(&v, t0 + 71) == S3_OK);
+    S3_ASSERT(v.jwks_time == t0 + 71);
+
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token_b, T_NONCE, t0 + 72) == S3_OK);
+    S3_ASSERT(s3_ssh3_oidc_verifier_verify(&v, T_AUD, token_a, T_NONCE, t0 + 72) ==
+              S3_SSH3_OIDC_EKID);
+    S3_ASSERT(s3_ssh3_oidc_verifier_fetch_timer(&v, t0 + 72) == (s3_msec_t)9 * 1000);
+
+    s3_ssh3_oidc_verifier_clear(&v);
+
+    return s3_test_failures;
+}
+
+/* the built-in fetch: the dead endpoint keeps the old key set */
+
+static int
+s3_test_jwks_fetch_grace(void)
+{
+    char                    doc[2048], jwk[1024];
+    s3_ssh3_oidc_provider_t provider;
+    s3_ssh3_oidc_jwks_t     jwks;
+
+    s3_memzero(&provider, sizeof(provider));
+    snprintf(provider.jwks_uri, sizeof(provider.jwks_uri), "http://127.0.0.1:1/jwks");
+
+    S3_ASSERT(t_jwk_rsa(t_rsa1, "rsa1", jwk, sizeof(jwk)) > 0);
+    t_jwks_doc(doc, sizeof(doc), jwk, NULL);
+
+    s3_memzero(&jwks, sizeof(jwks));
+    S3_ASSERT(s3_ssh3_oidc_jwks_parse(&jwks, (const u_char *)doc, s3_strlen(doc)) == S3_OK);
+
+    S3_ASSERT(s3_ssh3_oidc_jwks_fetch(&provider, NULL, &jwks) == S3_ERROR);
+    S3_ASSERT(jwks.nkeys == 1);
+
+    s3_ssh3_oidc_jwks_clear(&jwks);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_ssh3_oidc(void)
 {
@@ -688,6 +906,9 @@ s3_test_ssh3_oidc(void)
     (void)s3_test_verify_rejects();
     (void)s3_test_rotation();
     (void)s3_test_verifier_offline();
+    (void)s3_test_verifier_kid_refetch();
+    (void)s3_test_verifier_ttl();
+    (void)s3_test_jwks_fetch_grace();
 
     EVP_PKEY_free(t_rsa1);
     EVP_PKEY_free(t_rsa2);

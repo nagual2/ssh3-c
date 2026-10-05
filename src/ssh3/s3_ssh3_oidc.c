@@ -1246,9 +1246,10 @@ s3_int_t
 s3_ssh3_oidc_jwks_fetch(const s3_ssh3_oidc_provider_t *provider, const char *ca_file,
                         s3_ssh3_oidc_jwks_t *jwks)
 {
-    s3_str_t body;
-    unsigned status;
-    s3_int_t rc;
+    s3_ssh3_oidc_jwks_t fresh;
+    s3_str_t            body;
+    unsigned            status;
+    s3_int_t            rc;
 
     if (provider->jwks_uri[0] == '\0') {
         return S3_ERROR;
@@ -1263,18 +1264,26 @@ s3_ssh3_oidc_jwks_fetch(const s3_ssh3_oidc_provider_t *provider, const char *ca_
         return S3_ERROR;
     }
 
-    /* the fetch replaces the whole set: the provider key rotation */
+    /*
+     * the set parses aside from the served one: the old keys live
+     * until the complete new set exists (the rotation grace), the
+     * swap moves the key handles at once
+     */
 
-    s3_ssh3_oidc_jwks_clear(jwks);
+    s3_memzero(&fresh, sizeof(fresh));
 
-    rc = s3_ssh3_oidc_jwks_parse(jwks, body.data, body.len);
+    rc = s3_ssh3_oidc_jwks_parse(&fresh, body.data, body.len);
 
     s3_free(body.data);
 
     if (rc != S3_OK) {
-        s3_ssh3_oidc_jwks_clear(jwks);
+        s3_ssh3_oidc_jwks_clear(&fresh);
         return S3_ERROR;
     }
+
+    s3_ssh3_oidc_jwks_clear(jwks);
+
+    *jwks = fresh;
 
     return S3_OK;
 }
@@ -1471,6 +1480,16 @@ s3_ssh3_oidc_verify(const s3_ssh3_oidc_jwks_t *jwks, const char *issuer, const c
 /* the verifier (the discovery + the JWKS cache with the rotation)     */
 /* ------------------------------------------------------------------ */
 
+static s3_int_t
+s3_oidc_verifier_jwks_load(s3_ssh3_oidc_verifier_t *v)
+{
+    if (v->fetch_fn != NULL) {
+        return v->fetch_fn(&v->provider, v->ca_file, &v->jwks);
+    }
+
+    return s3_ssh3_oidc_jwks_fetch(&v->provider, v->ca_file, &v->jwks);
+}
+
 s3_int_t
 s3_ssh3_oidc_verifier_init(s3_ssh3_oidc_verifier_t *v, const char *issuer, const char *ca_file)
 {
@@ -1507,8 +1526,14 @@ s3_ssh3_oidc_verifier_init_offline(s3_ssh3_oidc_verifier_t *v, const char *issue
     return S3_OK;
 }
 
-static s3_int_t
-s3_oidc_verifier_bootstrap(s3_ssh3_oidc_verifier_t *v)
+void
+s3_ssh3_oidc_verifier_set_ttl(s3_ssh3_oidc_verifier_t *v, time_t seconds)
+{
+    v->ttl = seconds;
+}
+
+s3_int_t
+s3_ssh3_oidc_verifier_bootstrap(s3_ssh3_oidc_verifier_t *v, time_t now)
 {
     if (v->provider_ready) {
         return S3_OK;
@@ -1522,13 +1547,86 @@ s3_oidc_verifier_bootstrap(s3_ssh3_oidc_verifier_t *v)
         return S3_ERROR;
     }
 
-    if (s3_ssh3_oidc_jwks_fetch(&v->provider, v->ca_file, &v->jwks) != S3_OK) {
+    if (s3_oidc_verifier_jwks_load(v) != S3_OK) {
         return S3_ERROR;
     }
 
     v->provider_ready = 1;
+    v->jwks_time = now;
 
     return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_oidc_verifier_fetch(s3_ssh3_oidc_verifier_t *v, time_t now)
+{
+    /* the one fetch cycle of the wiring timer: the schedule closes
+     * and the attempt stamps the cadence gate either way; the old key
+     * set serves through a failed cycle (the grace) */
+
+    v->fetch_due = 0;
+    v->fetch_time = now;
+
+    if (!v->provider_ready) {
+
+        if (v->issuer[0] == '\0' ||
+            s3_ssh3_oidc_discover(v->issuer, v->ca_file, &v->provider) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        v->provider_ready = 1;
+    }
+
+    if (s3_oidc_verifier_jwks_load(v) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    v->jwks_time = now;
+
+    return S3_OK;
+}
+
+s3_msec_t
+s3_ssh3_oidc_verifier_fetch_timer(const s3_ssh3_oidc_verifier_t *v, time_t now)
+{
+    time_t ttl, since, left;
+
+    /* the schedule of the unknown kid runs on the next pass */
+
+    if (v->fetch_due) {
+        return 0;
+    }
+
+    ttl = (v->ttl > 0) ? v->ttl : S3_SSH3_OIDC_TTL_DEFAULT;
+
+    /* the delay past a failed attempt rides the retry cadence: the
+     * provider that keeps failing takes one cycle per cadence, not
+     * one per event loop pass */
+
+    since = now - v->fetch_time;
+
+    if (v->jwks_time == 0) {
+
+        /* no good set yet: the first fetch is due */
+
+        left = 0;
+
+    } else {
+
+        left = v->jwks_time + ttl - now;
+
+        if (left < 0) {
+            left = 0;
+        }
+    }
+
+    if (left > 0) {
+        return (s3_msec_t)(left * 1000);
+    }
+
+    return (since < S3_SSH3_OIDC_FETCH_RETRY)
+               ? (s3_msec_t)((S3_SSH3_OIDC_FETCH_RETRY - since) * 1000)
+               : 0;
 }
 
 s3_int_t
@@ -1537,21 +1635,24 @@ s3_ssh3_oidc_verifier_verify(s3_ssh3_oidc_verifier_t *v, const char *audience, c
 {
     s3_int_t rc;
 
-    rc = s3_oidc_verifier_bootstrap(v);
-
-    if (rc != S3_OK) {
-        return rc;
+    if (!v->provider_ready && s3_ssh3_oidc_verifier_bootstrap(v, now) != S3_OK) {
+        return S3_ERROR;
     }
 
     rc = s3_ssh3_oidc_verify(&v->jwks, v->issuer, audience, token, nonce, now);
 
-    if (rc == S3_SSH3_OIDC_EKID && v->provider.jwks_uri[0] != '\0') {
+    if (rc == S3_SSH3_OIDC_EKID && v->provider.jwks_uri[0] != '\0' && !v->fetch_due &&
+        now - v->fetch_time >= S3_SSH3_OIDC_REFRESH_COOLDOWN) {
 
-        /* the unknown kid: one refresh picks the rotated provider key */
+        /*
+         * the unknown kid schedules one background refetch: the timer
+         * of the wiring runs it outside the request path, this and
+         * the concurrent verifies answer the retryable kid reject
+         * (the stampede guard: one fetch per episode, not per
+         * request); the cooldown window gates the next episode
+         */
 
-        if (s3_ssh3_oidc_jwks_fetch(&v->provider, v->ca_file, &v->jwks) == S3_OK) {
-            rc = s3_ssh3_oidc_verify(&v->jwks, v->issuer, audience, token, nonce, now);
-        }
+        v->fetch_due = 1;
     }
 
     return rc;

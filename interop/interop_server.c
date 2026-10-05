@@ -119,12 +119,16 @@ static char s3_interop_sftp_home[512];
  * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
  * the Bearer id_token of that provider, the audience is the client
  * id of the token, the nonce binds the token to the conversation
- * (the reference authorized_identities OpenIDConnectIdentity)
+ * (the reference authorized_identities OpenIDConnectIdentity); the
+ * verifier inits once at the startup, the first token bootstraps the
+ * discovery and the key set (the harness keeps the lazy bootstrap),
+ * the rotation and the unknown-kid refetch ride the timer below
  */
 static const char             *s3_interop_oidc_issuer;
 static char                    s3_interop_oidc_aud[128];
-static unsigned                s3_interop_oidc_ready;
+static time_t                  s3_interop_oidc_ttl;
 static s3_ssh3_oidc_verifier_t s3_interop_oidc_ver;
+static s3_event_t              s3_interop_oidc_timer;
 
 static void
 s3_interop_log_init(void)
@@ -865,16 +869,36 @@ s3_interop_h3_basic_verdict(void)
  * from the EXPORTER-SSH3 exporter of the live conversation (the
  * reference ConversationID), the issuer, the audience and the
  * provider signature decide; the first call bootstraps the
- * discovery and the JWKS cache, the unknown kid refreshes once
- * (the provider key rotation)
+ * discovery and the JWKS cache (the lazy form of the harness), the
+ * unknown kid only schedules the background refetch of the timer -
+ * the verdict answers the retryable kid reject
  */
+
+static void
+s3_interop_oidc_timer_handler(s3_event_t *ev)
+{
+    time_t now = time(NULL);
+
+    /*
+     * the jwks timer: the scheduled unknown-kid refetch and the ttl
+     * rotation run here; a failed cycle keeps the old key set (the
+     * grace) and rides the retry cadence
+     */
+
+    if (s3_ssh3_oidc_verifier_fetch_timer(&s3_interop_oidc_ver, now) == 0 &&
+        s3_ssh3_oidc_verifier_fetch(&s3_interop_oidc_ver, now) != S3_OK) {
+        fprintf(stderr, "interop-server: oidc jwks fetch failed, %u stale key(s) serve on\n",
+                (unsigned)s3_interop_oidc_ver.jwks.nkeys);
+    }
+
+    s3_event_add_timer(ev, s3_ssh3_oidc_verifier_fetch_timer(&s3_interop_oidc_ver, time(NULL)));
+}
 
 static unsigned
 s3_interop_h3_oidc_verdict(s3_connection_t *pc)
 {
     static const s3_str_t scheme = s3_string("Bearer ");
 
-    const char *ca_file;
     const char *why;
     char        nonce[64];
     s3_str_t    token;
@@ -895,18 +919,6 @@ s3_interop_h3_oidc_verdict(s3_connection_t *pc)
         s3_ssh3_oidc_conversation_nonce(pc->ssl->connection, nonce) != S3_OK) {
         fprintf(stderr, "interop-server: oidc auth: no conversation nonce\n");
         return 401;
-    }
-
-    if (!s3_interop_oidc_ready) {
-
-        ca_file = getenv("S3_OIDC_CA_FILE");
-
-        if (s3_ssh3_oidc_verifier_init(&s3_interop_oidc_ver, s3_interop_oidc_issuer, ca_file) !=
-            S3_OK) {
-            return 401;
-        }
-
-        s3_interop_oidc_ready = 1;
     }
 
     rc = s3_ssh3_oidc_verifier_verify(&s3_interop_oidc_ver, s3_interop_oidc_aud,
@@ -3363,7 +3375,9 @@ s3_interop_usage(const char *prog)
             " (h3 mode)\n"
             "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
             " with the Bearer id_token of that provider (h3 mode, the"
-            " S3_OIDC_CA_FILE env pins the https trust)\n",
+            " S3_OIDC_CA_FILE env pins the https trust)\n"
+            "  --oidc-jwks-ttl seconds: the key set lifetime of the oidc"
+            " provider, default 3600 (h3 mode)\n",
             prog);
 }
 
@@ -3409,6 +3423,10 @@ main(int argc, char **argv)
 
             } else if (strcmp(argv[i], "--oidc-audience") == 0 && i + 1 < argc) {
                 snprintf(s3_interop_oidc_aud, sizeof(s3_interop_oidc_aud), "%s", argv[i + 1]);
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--oidc-jwks-ttl") == 0 && i + 1 < argc) {
+                s3_interop_oidc_ttl = (time_t)atoi(argv[i + 1]);
                 value = argv[i + 1];
             }
 
@@ -3503,6 +3521,20 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* the verifier inits here: the timer below and the first token
+     * share the ready state, the discovery stays lazy */
+
+    if (s3_interop_oidc_issuer != NULL) {
+        if (s3_ssh3_oidc_verifier_init(&s3_interop_oidc_ver, s3_interop_oidc_issuer,
+                                       getenv("S3_OIDC_CA_FILE")) != S3_OK) {
+            fprintf(stderr, "interop-server: oidc verifier init failed for issuer %s\n",
+                    s3_interop_oidc_issuer);
+            return 1;
+        }
+
+        s3_ssh3_oidc_verifier_set_ttl(&s3_interop_oidc_ver, s3_interop_oidc_ttl);
+    }
+
     cert = s3_interop_read_file(cert_path, &cert_len);
     key = s3_interop_read_file(key_path, &key_len);
 
@@ -3513,6 +3545,17 @@ main(int argc, char **argv)
     if (s3_event_ctx_init(&ctx, &s3_interop_log) != S3_OK) {
         fprintf(stderr, "interop-server: event ctx init failed\n");
         return 1;
+    }
+
+    /* the jwks timer: the ttl rotation and the unknown-kid refetch */
+
+    if (s3_interop_oidc_issuer != NULL) {
+        s3_memzero(&s3_interop_oidc_timer, sizeof(s3_interop_oidc_timer));
+        s3_interop_oidc_timer.handler = s3_interop_oidc_timer_handler;
+        s3_interop_oidc_timer.log = &s3_interop_log;
+
+        s3_event_add_timer(&s3_interop_oidc_timer,
+                           s3_ssh3_oidc_verifier_fetch_timer(&s3_interop_oidc_ver, time(NULL)));
     }
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
