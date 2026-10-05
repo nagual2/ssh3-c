@@ -94,6 +94,7 @@
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
+#include <s3_ssh3_oidc_client.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_sftp.h>
 #include <s3_ssh3_sftp_cli.h>
@@ -337,6 +338,110 @@ static unsigned long long s3_interop_jump_recv; /* the channel -> b */
  */
 static const char *s3_interop_h3_auth_value = "test-token";
 static char        s3_interop_h3_basic[512];
+
+/*
+ * the OIDC mode (--oidc-issuer): the Bearer id_token replaces the
+ * auth value once the flow answers (the reference OidcAuthMethod);
+ * --oidc-token pins a raw token (the test negatives), the browser
+ * spawn stops under S3_OIDC_NO_BROWSER=1
+ */
+static const char *s3_interop_oidc_issuer;
+static const char *s3_interop_oidc_audience;
+static const char *s3_interop_oidc_raw;
+static char        s3_interop_oidc_bearer[256 + S3_SSH3_OIDC_CLI_TOKEN_MAX];
+
+/*
+ * the flow of the reference auth/oidc/openid_connect.go Connect():
+ * the conversation nonce derives from the live TLS session (the
+ * reference ConversationID), the loopback listener takes the
+ * redirect, the code exchanges under PKCE, the id_token verifies
+ * locally before it rides the CONNECT
+ */
+
+static int
+s3_interop_oidc_acquire(SSL *ssl)
+{
+    char                    nonce[64], code[S3_SSH3_OIDC_CLI_CODE_MAX];
+    char                    token[S3_SSH3_OIDC_CLI_TOKEN_MAX];
+    const char             *ca_file, *no_browser;
+    s3_ssh3_oidc_provider_t prov;
+    s3_ssh3_oidc_flow_t     flow;
+    int                     rc;
+
+    if (s3_interop_oidc_raw != NULL) {
+
+        /* the test negatives: the token rides as-is */
+
+        snprintf(s3_interop_oidc_bearer, sizeof(s3_interop_oidc_bearer), "Bearer %s",
+                 s3_interop_oidc_raw);
+        s3_interop_h3_auth_value = s3_interop_oidc_bearer;
+
+        return S3_OK;
+    }
+
+    if (s3_interop_oidc_issuer == NULL || s3_interop_oidc_audience == NULL || ssl == NULL) {
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_oidc_conversation_nonce(ssl, nonce) != S3_OK) {
+        fprintf(stderr, "interop-client: oidc: no conversation nonce\n");
+        return S3_ERROR;
+    }
+
+    ca_file = getenv("S3_OIDC_CA_FILE");
+
+    if (s3_ssh3_oidc_discover(s3_interop_oidc_issuer, ca_file, &prov) != S3_OK) {
+        fprintf(stderr, "interop-client: oidc: discovery failed\n");
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_oidc_flow_init(&flow, prov.authorization_endpoint, s3_interop_oidc_audience,
+                               nonce) != S3_OK) {
+        fprintf(stderr, "interop-client: oidc: flow init failed\n");
+        return S3_ERROR;
+    }
+
+    printf("OIDC-AUTHORIZE-URL: %s\n", flow.authorize_url);
+    fflush(stdout);
+
+    no_browser = getenv("S3_OIDC_NO_BROWSER");
+
+    if (no_browser == NULL) {
+
+        /* the reference spawns the platform browser (xdg-open on
+         * linux), the failure is fatal like the reference */
+
+        pid_t pid = fork();
+
+        if (pid == 0) {
+            execlp("xdg-open", "xdg-open", flow.authorize_url, (char *)NULL);
+            _exit(127);
+        }
+
+        if (pid < 0) {
+            fprintf(stderr, "interop-client: oidc: browser spawn failed\n");
+            return S3_ERROR;
+        }
+    }
+
+    if (s3_ssh3_oidc_flow_wait_code(&flow, code, sizeof(code)) != S3_OK) {
+        fprintf(stderr, "interop-client: oidc: no redirect code\n");
+        return S3_ERROR;
+    }
+
+    rc = s3_ssh3_oidc_client_token(s3_interop_oidc_issuer, s3_interop_oidc_audience, ca_file, &flow,
+                                   code, token, sizeof(token));
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "interop-client: oidc: token exchange/verify failed rc=%d\n", (int)rc);
+        return S3_ERROR;
+    }
+
+    snprintf(s3_interop_oidc_bearer, sizeof(s3_interop_oidc_bearer), "Bearer %s", token);
+    s3_interop_h3_auth_value = s3_interop_oidc_bearer;
+
+    return S3_OK;
+}
 
 /*
  * the CONNECT target: "/ssh3-term" by default, the -U user rides in
@@ -5248,6 +5353,7 @@ s3_interop_usage(const char *prog)
             " [-m min] [-t ms] [-A alpn] [-U user:pass] [-X] [-e cmd]"
             " [-J put|get:local:remote (get too: local first)] [-j jump-addr:port]"
             " [-M [-i ms]] [-O op] (cm modes: -U is the socket path)\n"
+            "     [--oidc-issuer url --oidc-audience id | --oidc-token raw]\n"
             "  -a  peer UDP address\n"
             "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
             "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
@@ -5315,6 +5421,52 @@ main(int argc, char **argv)
 
     s3_interop_log_init();
     s3_interop_pattern_init();
+
+    /*
+     * the OIDC options ride the long form (the daemon keeps the
+     * names), the pre-scan pulls them out of argv before the short
+     * getopt loop
+     */
+
+    {
+        int   i, j, keep;
+        char *value;
+
+        for (i = 1; i < argc;) {
+
+            keep = 1;
+            value = NULL;
+
+            if (strcmp(argv[i], "--oidc-issuer") == 0 && i + 1 < argc) {
+                s3_interop_oidc_issuer = argv[i + 1];
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--oidc-audience") == 0 && i + 1 < argc) {
+                s3_interop_oidc_audience = argv[i + 1];
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--oidc-token") == 0 && i + 1 < argc) {
+                s3_interop_oidc_raw = argv[i + 1];
+                value = argv[i + 1];
+            }
+
+            if (value != NULL) {
+
+                /* the option and its value leave the argv */
+
+                for (j = i; j + 2 < argc; j++) {
+                    argv[j] = argv[j + 2];
+                }
+
+                argc -= 2;
+                keep = 0;
+            }
+
+            if (keep) {
+                i++;
+            }
+        }
+    }
 
     while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:F:e:J:S:j:O:i:3CMTSXh")) != -1) {
 
@@ -5932,6 +6084,12 @@ main(int argc, char **argv)
             fflush(stdout);
 
             hs_reported = 1;
+
+            if ((s3_interop_oidc_issuer != NULL || s3_interop_oidc_raw != NULL) &&
+                s3_interop_oidc_acquire(cli->ssl->connection) != S3_OK) {
+                fprintf(stderr, "interop-client: oidc auth failed\n");
+                return 1;
+            }
 
             if (s3_interop_h3_mode) {
 
