@@ -30,6 +30,26 @@
         "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
       }
+    },
+    {
+      "name": "linux-fuzz",
+      "displayName": "Linux Fuzz (libFuzzer + ASan/UBSan, clang-18)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "None",
+        "CMAKE_C_COMPILER": "clang-18",
+        "CMAKE_CXX_COMPILER": "clang++-18",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "S3_BUILD_FUZZ": "ON",
+        "CMAKE_C_FLAGS": "-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g -O1",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     }
   ],
   "buildPresets": [
@@ -40,6 +60,10 @@
     {
       "name": "linux-asan",
       "configurePreset": "linux-asan"
+    },
+    {
+      "name": "linux-fuzz",
+      "configurePreset": "linux-fuzz"
     }
   ],
   "testPresets": [

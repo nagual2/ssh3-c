@@ -145,16 +145,51 @@ target_link_libraries(s3core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
 find_package(Threads REQUIRED)
 
-add_executable(s3gso_bench bench/gso_bench.c)
-target_compile_options(s3gso_bench PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(s3gso_bench PRIVATE Threads::Threads)
+# the libFuzzer parser-fuzzing harnesses (tests/fuzz/); the fuzz
+# preset turns this on and skips the bench, the interop runners and
+# the unit tests, the plain presets keep building everything
 
-# the interop runners over real UDP (the quic-go harness, later the Go fork)
-foreach(S3_INTEROP interop_server interop_client)
-    add_executable(s3${S3_INTEROP} interop/${S3_INTEROP}.c)
-    target_compile_options(s3${S3_INTEROP} PRIVATE -Wall -Wextra -Werror)
-    target_link_libraries(s3${S3_INTEROP} PRIVATE s3core Threads::Threads)
-endforeach()
+option(S3_BUILD_FUZZ "Build the libFuzzer parser-fuzzing harnesses" OFF)
+
+if(NOT S3_BUILD_FUZZ)
+    add_executable(s3gso_bench bench/gso_bench.c)
+    target_compile_options(s3gso_bench PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(s3gso_bench PRIVATE Threads::Threads)
+
+    # the interop runners over real UDP (the quic-go harness, later the Go fork)
+    foreach(S3_INTEROP interop_server interop_client)
+        add_executable(s3${S3_INTEROP} interop/${S3_INTEROP}.c)
+        target_compile_options(s3${S3_INTEROP} PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(s3${S3_INTEROP} PRIVATE s3core Threads::Threads)
+    endforeach()
+endif()
+
+# the fuzz harnesses link the libFuzzer runtime through their own
+# link options, the global linker flags stay fuzz-free so the CMake
+# compiler checks keep linking their own main()
+
+if(S3_BUILD_FUZZ)
+    foreach(S3_FUZZ fuzz_sftp_frame fuzz_cm_frame fuzz_forward_target fuzz_wire)
+        add_executable(${S3_FUZZ} tests/fuzz/${S3_FUZZ}.c)
+        target_compile_options(${S3_FUZZ} PRIVATE -Wall -Wextra -Werror)
+        target_link_options(${S3_FUZZ} PRIVATE -fsanitize=fuzzer)
+        target_link_libraries(${S3_FUZZ} PRIVATE s3core)
+        set_target_properties(${S3_FUZZ} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests/fuzz)
+    endforeach()
+
+    add_executable(s3_fuzz_gen_seeds tests/fuzz/gen_seeds.c)
+    target_compile_options(s3_fuzz_gen_seeds PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(s3_fuzz_gen_seeds PRIVATE s3core)
+    set_target_properties(s3_fuzz_gen_seeds PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests/fuzz)
+
+    add_custom_target(fuzz_seeds ALL
+        COMMAND ${CMAKE_BINARY_DIR}/tests/fuzz/s3_fuzz_gen_seeds
+                ${CMAKE_BINARY_DIR}/tests/fuzz/seeds
+        DEPENDS s3_fuzz_gen_seeds
+        COMMENT "generating the fuzz seed corpora")
+endif()
 
 set(S3_TESTS
     test_pool
@@ -197,10 +232,12 @@ set(S3_TESTS
 
 enable_testing()
 
-foreach(S3_TEST ${S3_TESTS})
-    add_executable(${S3_TEST} tests/${S3_TEST}.c)
-    target_link_libraries(${S3_TEST} PRIVATE s3core)
-    target_include_directories(${S3_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_options(${S3_TEST} PRIVATE -Wall -Wextra -Werror)
-    add_test(NAME ${S3_TEST} COMMAND ${S3_TEST})
-endforeach()
+if(NOT S3_BUILD_FUZZ)
+    foreach(S3_TEST ${S3_TESTS})
+        add_executable(${S3_TEST} tests/${S3_TEST}.c)
+        target_link_libraries(${S3_TEST} PRIVATE s3core)
+        target_include_directories(${S3_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_compile_options(${S3_TEST} PRIVATE -Wall -Wextra -Werror)
+        add_test(NAME ${S3_TEST} COMMAND ${S3_TEST})
+    endforeach()
+endif()
