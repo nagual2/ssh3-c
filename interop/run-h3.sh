@@ -32,6 +32,13 @@
 #      master, two slave sessions (-U sock -e cmd) run through the
 #      SAME master connection, -O check under a live session shows
 #      it, -O stop closes the master and removes the socket
+#  24. the harness forward-client (-fwd-udp) -> our server (-3):
+#      one direct-udp channel per source, 20 numbered datagrams of
+#      1024 bytes round trip through the tunnel
+#  25. the harness pty-client (-h3-session-client -pty) -> our
+#      server (-3): the programmatic pty pair, the exec probe prints
+#      the geometry twice, the SIGWINCH relay resizes to 100x40 and
+#      the second line verifies it
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -72,6 +79,8 @@
 #   INTEROP-GO-EXEC-OK       (the go session-client side, the exec verdict)
 #   INTEROP-GO-SESSION-EXEC  (the go session-server side, the exec accepted)
 #   INTEROP-GO-SESSION-EXIT  (the go session-server side, the session exit code)
+#   INTEROP-GO-FWD-UDP-OK    (the go forward-client side, the udp echo verdict)
+#   INTEROP-GO-PTY-OK        (the go pty-client side, the pty resize verdict)
 #   INTEROP-PTY-SIGNAL-OK    (the C client side, the pty verdict)
 #   INTEROP-FWD-TCP-OK       (the C client side, the tcp forward echo)
 #   INTEROP-FWD-UDP-OK       (the C client side, the udp forward echo)
@@ -1087,6 +1096,85 @@ if wait_listen "$WORK/cm-srv.log"; then
     else
         echo "   FAIL: the master did not come up"
         tail -5 "$WORK/cm-master.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+# == the 7a scenarios: the quic-go client sides the harness missed ==
+#
+#  24. the harness forward-client (-fwd-udp) -> our server: the
+#      direct-udp channel per source, 20 numbered datagrams of
+#      1024 bytes round trip through the tunnel (the go verdict
+#      INTEROP-GO-FWD-UDP-OK)
+#  25. the harness pty-client (-h3-session-client -pty) -> our
+#      server: the programmatic pty pair, the exec probe prints the
+#      geometry twice, the SIGWINCH relay resizes to 100x40 and the
+#      second line verifies it (the go verdict INTEROP-GO-PTY-OK)
+
+echo "== scenario 24: quic-go forward-client (-fwd-udp) -> C server (-3), direct-udp forward"
+
+start_echo udp
+
+if wait_echo udp; then
+
+    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+        > "$WORK/gfwdudp-srv.log" 2>&1 < /dev/null &
+
+    if wait_listen "$WORK/gfwdudp-srv.log"; then
+        PORT=$(port_of "$WORK/gfwdudp-srv.log")
+
+        if timeout 30 "$HARNESS" -h3-forward-client -fwd-udp "13457/127.0.0.1@19998" \
+            -a "127.0.0.1:$PORT" -timeout 15s > "$WORK/gfwdudp-cli.log" 2>&1 \
+            && grep -q "INTEROP-GO-FWD-UDP-OK count=20" "$WORK/gfwdudp-cli.log" \
+            && grep -q "INTEROP-FWD-UDP-OPEN target=127.0.0.1:19998" "$WORK/gfwdudp-srv.log"; then
+            echo "   PASS (direct-udp: the go client through the C server, 20 datagrams echoed)"
+        else
+            echo "   FAIL"
+            tail -8 "$WORK/gfwdudp-cli.log" 2>/dev/null | sed 's/^/   /'
+            tail -5 "$WORK/gfwdudp-srv.log" 2>/dev/null | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        pkill -f "h3-forward-client" 2>/dev/null
+
+    else
+        echo "   FAIL: the C server did not start"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    pkill -f "s3interop_server -3" 2>/dev/null
+
+else
+    echo "   FAIL: the udp echo service did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+stop_echo
+
+echo "== scenario 25: quic-go pty-client -> C server (-3), exec through pty + resize"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/gpty-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gpty-srv.log"; then
+    PORT=$(port_of "$WORK/gpty-srv.log")
+
+    if timeout 30 "$HARNESS" -h3-session-client -pty -cmd "stty size; sleep 1; stty size" \
+        -a "127.0.0.1:$PORT" -timeout 20s > "$WORK/gpty-cli.log" 2>&1 \
+        && grep -q "INTEROP-GO-PTY-OK resize=40x100" "$WORK/gpty-cli.log" \
+        && grep -q "INTEROP-SESSION-PTY" "$WORK/gpty-srv.log" \
+        && grep -q "INTEROP-SESSION-EXIT code=0" "$WORK/gpty-srv.log"; then
+        echo "   PASS (pty: the exec probe through the pty, the resize to 40x100 applied)"
+    else
+        echo "   FAIL"
+        tail -8 "$WORK/gpty-cli.log" 2>/dev/null | sed 's/^/   /'
+        tail -5 "$WORK/gpty-srv.log" 2>/dev/null | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
     fi
 

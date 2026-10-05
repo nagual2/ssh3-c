@@ -5,6 +5,7 @@ go 1.26.0
 require github.com/quic-go/quic-go v0.63.0
 
 require (
+	github.com/creack/pty v1.1.18 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
