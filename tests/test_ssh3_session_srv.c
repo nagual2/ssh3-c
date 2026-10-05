@@ -346,6 +346,8 @@ s3_test_session_signal_term(void)
     S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
     S3_ASSERT(s3_ssh3_session_srv_exec(&s, "/bin/sh", &cmd) == S3_OK);
 
+    s3_test_sleep_ms(300); /* the valgrind child lingers pre-exec, the early TERM is swallowed */
+
     S3_ASSERT(s3_ssh3_session_srv_signal(&s, &term) == S3_OK);
 
     /* sh -c is not interactive, the default TERM kills the process */
