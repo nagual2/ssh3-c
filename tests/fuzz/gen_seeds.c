@@ -529,6 +529,213 @@ gs_message(const char *dir)
     gs_write(dir, "multi", (size_t)(p - gs_buf));
 }
 
+/*
+ * the QUIC varint of the frame fields, the same 2-bit length
+ * discriminators the decoder reads
+ */
+
+static u_char *
+gs_quic_varint(u_char *p, uint64_t v)
+{
+    if (v <= 0x3f) {
+        *p++ = (u_char)v;
+
+    } else if (v <= 0x3fff) {
+        *p++ = (u_char)(0x40 | (v >> 8));
+        *p++ = (u_char)v;
+
+    } else if (v <= 0x3fffffff) {
+        *p++ = (u_char)(0x80 | (v >> 24));
+        *p++ = (u_char)(v >> 16);
+        *p++ = (u_char)(v >> 8);
+        *p++ = (u_char)v;
+
+    } else {
+        *p++ = (u_char)(0xc0 | (v >> 56));
+        *p++ = (u_char)(v >> 48);
+        *p++ = (u_char)(v >> 40);
+        *p++ = (u_char)(v >> 32);
+        *p++ = (u_char)(v >> 24);
+        *p++ = (u_char)(v >> 16);
+        *p++ = (u_char)(v >> 8);
+        *p++ = (u_char)v;
+    }
+
+    return p;
+}
+
+/*
+ * one fuzz_quic_state record: [meta][pn:2][len:2][payload], the meta
+ * low bits pick the packet flags (0 short, 1 initial, 2 handshake,
+ * 3 zero-rtt)
+ */
+
+static void
+gs_quic_rec(u_char *dst, u_char sel, uint64_t pn, const u_char *body, size_t len)
+{
+    dst[0] = sel;
+    dst[1] = (u_char)(pn >> 8);
+    dst[2] = (u_char)pn;
+    dst[3] = (u_char)(len >> 8);
+    dst[4] = (u_char)len;
+
+    s3_memcpy(dst + 5, body, len);
+}
+
+static size_t
+gs_quic_rec_len(size_t len)
+{
+    return len + 5;
+}
+
+static void
+gs_quic(const char *dir)
+{
+    /* the frame bodies, one per record */
+
+    static const u_char ping[] = {0x01};
+    static const u_char crypto[] = {0x06, 0x00, 0x06, 's', 's', 'h', '3', '-', 'c'};
+    static const u_char ack_one[] = {
+        0x02, 0x00, 0x00, 0x00, 0x00 /* largest 0, delay 0, no ranges, first 0 */
+    };
+    static const u_char ack_all[] = {
+        0x02, 0x03, 0x08, 0x00, 0x03 /* the whole seeded 0..3 space */
+    };
+    static const u_char ack_gap[] = {
+        0x02, 0x0a, 0x00, 0x01, 0x00, /* largest 10, one range */
+        0x02, 0x01                    /* gap 2, range 1 */
+    };
+    static const u_char stream_hello[] = {
+        0x0e, 0x00, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o' /* id 0, off 0, len 5 */
+    };
+    static const u_char stream_two[] = {
+        0x0e, 0x00, 0x00, 0x03, 'a', 'b', 'c', /* stream 0 */
+        0x0e, 0x04, 0x00, 0x03, 'd', 'e', 'f'  /* stream 4 */
+    };
+    static const u_char stream_fin_reset[] = {
+        0x0f, 0x00, 0x00, 0x03, 'x', 'y', 'z', /* stream 0 with FIN */
+        0x04, 0x00, 0x01, 0x03                 /* RESET_STREAM, final 3 */
+    };
+    static const u_char zrtt_stream[] = {
+        0x0e, 0x0c, 0x00, 0x02, 'z', 'r' /* stream 12, off 0, len 2 */
+    };
+    static const u_char datagram[] = {0x31, 0x04, 'q', 'u', 'i', 'c'};
+    static const u_char path[] = {
+        0x1a, 1, 2, 3, 4, 5, 6, 7, 8, /* PATH_CHALLENGE */
+        0x1b, 9, 8, 7, 6, 5, 4, 3, 2  /* PATH_RESPONSE */
+    };
+    static const u_char ncid[] = {
+        0x18, 0x01, 0x00, 0x08,                         /* seq 1, retire 0, cid len 8 */
+        0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, /* connection id */
+        0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, /* stateless reset token */
+        0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0};
+    static const u_char close_ping[] = {
+        0x01,                                 /* PING first, the walk goes on */
+        0x1c, 0x0a, 0x01, 0x03, 'b', 'y', 'e' /* CONNECTION_CLOSE, reason "bye" */
+    };
+    u_char *b, *p;
+    size_t  n;
+
+    gs_quic_rec(gs_buf, 0, 0, ping, sizeof(ping));
+    gs_write(dir, "ping", gs_quic_rec_len(sizeof(ping)));
+
+    gs_quic_rec(gs_buf, 1, 0, ping, sizeof(ping));
+    gs_write(dir, "ping_initial", gs_quic_rec_len(sizeof(ping)));
+
+    gs_quic_rec(gs_buf, 2, 0, crypto, sizeof(crypto));
+    gs_write(dir, "crypto_hs", gs_quic_rec_len(sizeof(crypto)));
+
+    gs_quic_rec(gs_buf, 0, 1, ack_one, sizeof(ack_one));
+    gs_write(dir, "ack_one", gs_quic_rec_len(sizeof(ack_one)));
+
+    gs_quic_rec(gs_buf, 0, 2, ack_all, sizeof(ack_all));
+    gs_write(dir, "ack_all", gs_quic_rec_len(sizeof(ack_all)));
+
+    gs_quic_rec(gs_buf, 0, 3, ack_gap, sizeof(ack_gap));
+    gs_write(dir, "ack_gap", gs_quic_rec_len(sizeof(ack_gap)));
+
+    gs_quic_rec(gs_buf, 0, 4, stream_hello, sizeof(stream_hello));
+    gs_write(dir, "stream_hello", gs_quic_rec_len(sizeof(stream_hello)));
+
+    n = sizeof(stream_two);
+
+    gs_quic_rec(gs_buf, 0, 5, stream_two, n);
+    gs_write(dir, "stream_two", gs_quic_rec_len(n));
+
+    gs_quic_rec(gs_buf, 0, 6, stream_fin_reset, sizeof(stream_fin_reset));
+    gs_write(dir, "stream_fin_reset", gs_quic_rec_len(sizeof(stream_fin_reset)));
+
+    /* the flow-control family, the limits through the varint writer */
+
+    b = gs_body;
+
+    *b++ = 0x10; /* MAX_DATA */
+    b = gs_quic_varint(b, 1000000);
+    *b++ = 0x12; /* MAX_STREAMS, bidi */
+    b = gs_quic_varint(b, 288);
+    *b++ = 0x14; /* DATA_BLOCKED */
+    b = gs_quic_varint(b, 500000);
+    *b++ = 0x16; /* STREAMS_BLOCKED, bidi */
+    b = gs_quic_varint(b, 300);
+
+    n = (size_t)(b - gs_body);
+
+    gs_quic_rec(gs_buf, 0, 7, gs_body, n);
+    gs_write(dir, "flow_control", gs_quic_rec_len(n));
+
+    b = gs_body;
+
+    *b++ = 0x11; /* MAX_STREAM_DATA */
+    *b++ = 0x00; /* stream 0 */
+    b = gs_quic_varint(b, 200000);
+    *b++ = 0x15; /* STREAM_DATA_BLOCKED */
+    *b++ = 0x00;
+    b = gs_quic_varint(b, 100);
+    *b++ = 0x05; /* STOP_SENDING */
+    *b++ = 0x00;
+    *b++ = 0x01;
+
+    n = (size_t)(b - gs_body);
+
+    gs_quic_rec(gs_buf, 0, 8, gs_body, n);
+    gs_write(dir, "stream_blocked", gs_quic_rec_len(n));
+
+    gs_quic_rec(gs_buf, 3, 0, zrtt_stream, sizeof(zrtt_stream));
+    gs_write(dir, "zrtt_stream", gs_quic_rec_len(sizeof(zrtt_stream)));
+
+    gs_quic_rec(gs_buf, 0, 9, datagram, sizeof(datagram));
+    gs_write(dir, "datagram", gs_quic_rec_len(sizeof(datagram)));
+
+    gs_quic_rec(gs_buf, 0, 10, path, sizeof(path));
+    gs_write(dir, "path", gs_quic_rec_len(sizeof(path)));
+
+    gs_quic_rec(gs_buf, 0, 11, ncid, sizeof(ncid));
+    gs_write(dir, "ncid", gs_quic_rec_len(sizeof(ncid)));
+
+    gs_quic_rec(gs_buf, 0, 12, close_ping, sizeof(close_ping));
+    gs_write(dir, "close_ping", gs_quic_rec_len(sizeof(close_ping)));
+
+    /* three records in one input: the ping, the ack of it, then the
+     * stream data, the stateful sequence the harness keeps a context
+     * across */
+
+    p = gs_buf;
+    n = 0;
+
+    gs_quic_rec(p, 0, 0, ping, sizeof(ping));
+    p += gs_quic_rec_len(sizeof(ping));
+    n += gs_quic_rec_len(sizeof(ping));
+
+    gs_quic_rec(p, 0, 1, ack_one, sizeof(ack_one));
+    p += gs_quic_rec_len(sizeof(ack_one));
+    n += gs_quic_rec_len(sizeof(ack_one));
+
+    gs_quic_rec(p, 0, 4, stream_hello, sizeof(stream_hello));
+    n += gs_quic_rec_len(sizeof(stream_hello));
+
+    gs_write(dir, "multi_stateful", n);
+}
+
 int
 main(int argc, char *const *argv)
 {
@@ -564,6 +771,10 @@ main(int argc, char *const *argv)
     snprintf(dir, sizeof(dir), "%s/message", root);
     gs_dir(dir);
     gs_message(dir);
+
+    snprintf(dir, sizeof(dir), "%s/quic_state", root);
+    gs_dir(dir);
+    gs_quic(dir);
 
     return gs_failures != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
