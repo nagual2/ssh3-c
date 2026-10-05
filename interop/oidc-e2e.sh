@@ -62,7 +62,9 @@ wait_listen() {
 }
 
 port_of() {
-    grep -oE 'port=[0-9]+' "$1" | cut -d= -f2
+    # -a: a log may carry the sparse holes of a predecessor still
+    # draining, grep would call the file binary and lose the port
+    grep -a -oE 'port=[0-9]+' "$1" | cut -d= -f2
 }
 
 # wait_oidc_url LOG TIMEOUT_S: prints the authorize url once the
@@ -196,37 +198,44 @@ PYEOF
 )
     fi
 
+    # the per-case logs: a predecessor still draining writes its tail
+    # at its own offset, a shared name would grow the sparse holes
+    # into the fresh log (grep turns binary, the port gets lost)
+
+    SRV_LOG=$WORK/neg-srv-$name.log
+    CLI_LOG=$WORK/neg-cli-$name.log
+
     setsid nohup env $SRV_ENV "$SERVER" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
         -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
-        > "$WORK/neg-srv.log" 2>&1 < /dev/null &
+        > "$SRV_LOG" 2>&1 < /dev/null &
 
-    if ! wait_listen "$WORK/neg-srv.log"; then
+    if ! wait_listen "$SRV_LOG"; then
         echo "   FAIL ($name): the C server did not start"
         FAILURES=$((FAILURES + 1))
         return
     fi
 
-    PORT=$(port_of "$WORK/neg-srv.log")
+    PORT=$(port_of "$SRV_LOG")
 
     timeout 30 "$CLIENT" -3 -C -S exec --oidc-token "$tok" \
         -a "127.0.0.1:$PORT" -t 20000 \
-        > "$WORK/neg-cli.log" 2>&1
+        > "$CLI_LOG" 2>&1
 
-    if grep -q "INTEROP-AUTH-OK" "$WORK/neg-srv.log"; then
+    if grep -qa "INTEROP-AUTH-OK" "$SRV_LOG"; then
         echo "   FAIL ($name): the server accepted the bad token"
         FAILURES=$((FAILURES + 1))
 
-    elif ! grep -q "INTEROP-H3-REJECT code=401" "$WORK/neg-srv.log"; then
+    elif ! grep -qa "INTEROP-H3-REJECT code=401" "$SRV_LOG"; then
         echo "   FAIL ($name): the expected 401 is missing"
-        tail -5 "$WORK/neg-srv.log" | sed 's/^/   /'
+        tail -5 "$SRV_LOG" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
 
-    elif ! grep -q "rejected:$expect" "$WORK/neg-srv.log"; then
+    elif ! grep -qa "rejected:$expect" "$SRV_LOG"; then
         echo "   FAIL ($name): the reject reason is not$expect"
-        tail -5 "$WORK/neg-srv.log" | sed 's/^/   /'
+        tail -5 "$SRV_LOG" | sed 's/^/   /'
         FAILURES=$((FAILURES + 1))
 
-    elif grep -q "INTEROP-EXEC-OK exit=0" "$WORK/neg-cli.log"; then
+    elif grep -qa "INTEROP-EXEC-OK exit=0" "$CLI_LOG"; then
         echo "   FAIL ($name): the client ran the session over the rejection"
         FAILURES=$((FAILURES + 1))
 
