@@ -30,7 +30,7 @@
 #define S3_SSH3_SFTP_INIT           1
 #define S3_SSH3_SFTP_VERSION        2
 #define S3_SSH3_SFTP_OPEN           3
-#define S3_SSH3_SFTP_CLOSE          8
+#define S3_SSH3_SFTP_CLOSE          4
 #define S3_SSH3_SFTP_READ           5
 #define S3_SSH3_SFTP_WRITE          6
 #define S3_SSH3_SFTP_LSTAT          7
@@ -46,6 +46,7 @@
 #define S3_SSH3_SFTP_STAT           17
 #define S3_SSH3_SFTP_RENAME         18
 #define S3_SSH3_SFTP_READLINK       19
+#define S3_SSH3_SFTP_SYMLINK        20
 #define S3_SSH3_SFTP_STATUS         101
 #define S3_SSH3_SFTP_HANDLE         102
 #define S3_SSH3_SFTP_DATA           103
@@ -56,13 +57,13 @@
 
 /* the status codes of the STATUS reply */
 
-#define S3_SSH3_SFTP_FX_OK               0
-#define S3_SSH3_SFTP_FX_EOF              1
-#define S3_SSH3_SFTP_FX_NO_SUCH_FILE     2
+#define S3_SSH3_SFTP_FX_OK                0
+#define S3_SSH3_SFTP_FX_EOF               1
+#define S3_SSH3_SFTP_FX_NO_SUCH_FILE      2
 #define S3_SSH3_SFTP_FX_PERMISSION_DENIED 3
-#define S3_SSH3_SFTP_FX_FAILURE          4
-#define S3_SSH3_SFTP_FX_BAD_MESSAGE      5
-#define S3_SSH3_SFTP_FX_OP_UNSUPPORTED   8
+#define S3_SSH3_SFTP_FX_FAILURE           4
+#define S3_SSH3_SFTP_FX_BAD_MESSAGE       5
+#define S3_SSH3_SFTP_FX_OP_UNSUPPORTED    8
 
 /* the pflags of OPEN */
 

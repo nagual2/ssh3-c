@@ -38,9 +38,9 @@ struct s3_ssh3_session_srv_s {
 
     /* the extra environment entries, "NAME=VALUE", the pool owns them */
 
-    char  **env;
-    size_t  env_len;
-    size_t  env_cap;
+    char **env;
+    size_t env_len;
+    size_t env_cap;
 
     unsigned pty : 1;
     unsigned open : 1; /* LARVAL : OPEN */

@@ -40,6 +40,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,7 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_agent.h>
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_dgram.h>
@@ -64,6 +66,7 @@
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_srv.h>
+#include <s3_ssh3_sftp_srv.h>
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
@@ -94,6 +97,12 @@ static unsigned s3_interop_h3_mode;
  * Basic credentials against its user:secret lines
  */
 static const char *s3_interop_passfile;
+
+/*
+ * the sftp jail override (-H): the harness scenarios point it into
+ * their workdir so the runs do not touch the real home
+ */
+static char s3_interop_sftp_home[512];
 
 static void
 s3_interop_log_init(void)
@@ -440,6 +449,7 @@ static size_t  s3_interop_h3_cap;
 static size_t  s3_interop_h3_len;
 
 static s3_connection_t *s3_interop_h3_sc;
+static s3_connection_t *s3_interop_h3_pc; /* the quic conn of the CONNECT */
 static unsigned         s3_interop_h3_responded;
 
 static u_char s3_interop_h3_method[32];
@@ -494,9 +504,10 @@ struct s3_interop_h3_channel_s {
      * target socket (-1 when the channel is not a forward), the
      * pending buffers decouple the quic stream from the socket and
      * the 50 ms timer pumps the remaining directions - the same
-     * harness scheme as the session pump above
+     * harness scheme as the session pump above; the AGENT kind reuses
+     * the tcp pump against the accepted agent socket
      */
-    unsigned           fwd_kind; /* S3_INTEROP_FWD_NONE/TCP/UDP */
+    unsigned           fwd_kind; /* S3_INTEROP_FWD_NONE/TCP/UDP/AGENT */
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
     struct sockaddr_in fwd_sa;
@@ -509,13 +520,34 @@ struct s3_interop_h3_channel_s {
     size_t             fwd_frame_sent; /* the partial 94 frame in flight */
     size_t             fwd_frame_total;
     s3_event_t         fwd_timer;
+
+    /*
+     * the sftp side ("sftp" channels): the pool owns the request
+     * server, the 94 payloads feed s3_ssh3_sftp_srv_input and the 50
+     * ms timer drains s3_ssh3_sftp_srv_output into the 94 direction
+     */
+    s3_pool_t          *sftp_pool;
+    s3_ssh3_sftp_srv_t *sftp;
+
+    /*
+     * the agent side of a session channel: the listener appears on
+     * the forward-agent LARVAL marker, the path rides the child env,
+     * the timer accepts the connections and opens one server-initiated
+     * "agent-connection" channel per socket
+     */
+    s3_pool_t                *agent_pool;
+    s3_ssh3_agent_listener_t *agent_l;
+    char                      agent_path[128];
+    unsigned                  agent_requested;
+    s3_event_t                agent_timer;
 };
 
 /* the kinds of the forward channels */
 
-#define S3_INTEROP_FWD_NONE 0
-#define S3_INTEROP_FWD_TCP  1
-#define S3_INTEROP_FWD_UDP  2
+#define S3_INTEROP_FWD_NONE  0
+#define S3_INTEROP_FWD_TCP   1
+#define S3_INTEROP_FWD_UDP   2
+#define S3_INTEROP_FWD_AGENT 3
 
 /*
  * the frame buffer of the socket->channel direction: one 94 frame
@@ -526,6 +558,16 @@ struct s3_interop_h3_channel_s {
 
 /* the teardown of the session side, the channel free calls it first */
 static void s3_interop_session_teardown(s3_interop_h3_channel_t *ch);
+
+/* the sftp and the agent wiring of the wave 2, defined below */
+
+static void s3_interop_sftp_pump(s3_interop_h3_channel_t *ch);
+
+static void s3_interop_agent_accept_timer(s3_event_t *ev);
+
+static s3_interop_h3_channel_t *s3_interop_h3_channel_alloc(s3_connection_t *sc);
+
+static void s3_interop_h3_channel_read(s3_event_t *ev);
 
 static s3_interop_h3_channel_t s3_interop_h3_channels[S3_INTEROP_TRACKED];
 
@@ -951,7 +993,28 @@ s3_interop_h3_channel_free(s3_interop_h3_channel_t *ch)
         s3_event_del_timer(&ch->fwd_timer);
     }
 
+    if (ch->agent_timer.timer_set) {
+        s3_event_del_timer(&ch->agent_timer);
+    }
+
     s3_interop_session_teardown(ch);
+
+    /* the agent listener dies with its pool: the cleanup unlinks the
+     * socket and removes the private directory */
+
+    if (ch->agent_pool != NULL) {
+        s3_destroy_pool(ch->agent_pool);
+        ch->agent_pool = NULL;
+        ch->agent_l = NULL;
+    }
+
+    /* the sftp request server lives in its pool alone */
+
+    if (ch->sftp_pool != NULL) {
+        s3_destroy_pool(ch->sftp_pool);
+        ch->sftp_pool = NULL;
+        ch->sftp = NULL;
+    }
 
     if (ch->fwd_fd >= 0) {
         (void)close(ch->fwd_fd);
@@ -976,6 +1039,30 @@ s3_interop_h3_channel_of(s3_connection_t *sc)
     for (i = 0; i < S3_INTEROP_TRACKED; i++) {
 
         if (s3_interop_h3_channels[i].sc == sc) {
+            return &s3_interop_h3_channels[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * the slot of a fresh channel (the accept path and the
+ * server-initiated agent connections share it); NULL when the table
+ * is full, the caller tears the stream down
+ */
+
+static s3_interop_h3_channel_t *
+s3_interop_h3_channel_alloc(s3_connection_t *sc)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_INTEROP_TRACKED; i++) {
+
+        if (s3_interop_h3_channels[i].sc == NULL) {
+            s3_memzero(&s3_interop_h3_channels[i], sizeof(s3_interop_h3_channels[i]));
+            s3_interop_h3_channels[i].sc = sc;
+            s3_interop_h3_channels[i].fwd_fd = -1;
             return &s3_interop_h3_channels[i];
         }
     }
@@ -1098,6 +1185,16 @@ s3_interop_session_start(s3_interop_h3_channel_t *ch)
         s3_destroy_pool(ch->sess_pool);
         ch->sess_pool = NULL;
         return S3_ERROR;
+    }
+
+    /*
+     * the agent path of the forward-agent marker rides the child env
+     * (the reference setupEnv), the spawn is still ahead
+     */
+
+    if (ch->agent_l != NULL &&
+        s3_ssh3_session_srv_env(ch->sess, "SSH_AUTH_SOCK", ch->agent_path) != S3_OK) {
+        fprintf(stderr, "interop-server: SSH_AUTH_SOCK env failed\n");
     }
 
     return S3_OK;
@@ -1442,7 +1539,7 @@ s3_interop_fwd_socket_flush(s3_interop_h3_channel_t *ch)
 
         ssize_t m;
 
-        if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+        if (ch->fwd_kind == S3_INTEROP_FWD_TCP || ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
             m = send(ch->fwd_fd, ch->fwd_in, ch->fwd_in_len, 0);
 
         } else {
@@ -1516,6 +1613,20 @@ s3_interop_fwd_flush(s3_interop_h3_channel_t *ch)
         m = s3_quic_stream_send(ch->sc, frame + ch->fwd_frame_sent,
                                 ch->fwd_frame_total - ch->fwd_frame_sent);
 
+        if (getenv("S3SFTPSRV") != NULL) {
+
+            size_t z;
+
+            fprintf(stderr, "sftpsrv send %ld:", (long)(ch->fwd_frame_total - ch->fwd_frame_sent));
+
+            for (z = ch->fwd_frame_sent; z < ch->fwd_frame_total && z < ch->fwd_frame_sent + 24;
+                 z++) {
+                fprintf(stderr, " %02x", frame[z]);
+            }
+
+            fprintf(stderr, "\n");
+        }
+
         if (m == (ssize_t)S3_AGAIN) {
             /* the window reopens on the next pump tick */
             return;
@@ -1560,13 +1671,17 @@ s3_interop_fwd_pump(s3_interop_h3_channel_t *ch)
     /* the pending channel bytes ride the socket first */
     s3_interop_fwd_socket_flush(ch);
 
-    if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+    if (ch->fwd_kind == S3_INTEROP_FWD_TCP || ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
 
         if (!ch->fwd_eof) {
 
             for (;;) {
 
                 n = recv(ch->fwd_fd, buf, sizeof(buf), 0);
+
+                if (getenv("S3AGENTDBG") != NULL && ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
+                    fprintf(stderr, "agdbg srv pump fd=%d n=%ld\n", ch->fwd_fd, (long)n);
+                }
 
                 if (n > 0) {
 
@@ -1636,12 +1751,21 @@ s3_interop_fwd_timer(s3_event_t *ev)
 
     ev->timedout = 0;
 
-    s3_interop_fwd_pump(ch);
+    if (getenv("S3AGENTDBG") != NULL && ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
+        fprintf(stderr, "agdbg fwd tick eof=%u\n", (unsigned)ch->fwd_eof);
+    }
+
+    if (ch->sftp != NULL) {
+        s3_interop_sftp_pump(ch);
+
+    } else {
+        s3_interop_fwd_pump(ch);
+    }
 
     /* the pump stops once the channel is gone (the free zeroes the
      * struct), a live forward keeps ticking */
 
-    if (ch->sc != NULL && ch->fwd_kind != S3_INTEROP_FWD_NONE) {
+    if (ch->sc != NULL && (ch->fwd_kind != S3_INTEROP_FWD_NONE || ch->sftp != NULL)) {
         s3_event_add_timer(ev, 50);
     }
 }
@@ -1658,6 +1782,267 @@ s3_interop_fwd_arm(s3_interop_h3_channel_t *ch)
     ch->fwd_timer.handler = s3_interop_fwd_timer;
 
     s3_event_add_timer(&ch->fwd_timer, 50);
+}
+
+/*
+ * the sftp subsystem of the "sftp" channel (the wave 2): the request
+ * server jails itself into the session user's home, the timer drains
+ * the replies into the 94 direction
+ */
+
+static s3_int_t
+s3_interop_sftp_start(s3_interop_h3_channel_t *ch)
+{
+    s3_str_t       home;
+    struct passwd *pw;
+
+    if (s3_interop_sftp_home[0] != '\0') {
+
+        home.data = (u_char *)s3_interop_sftp_home;
+        home.len = strlen(s3_interop_sftp_home);
+
+    } else {
+
+        pw = getpwuid(getuid());
+
+        home.data = NULL;
+        home.len = 0;
+
+        if (pw != NULL && pw->pw_dir != NULL && *pw->pw_dir != '\0') {
+            home.data = (u_char *)pw->pw_dir;
+            home.len = strlen(pw->pw_dir);
+
+        } else {
+
+            const char *env_home = getenv("HOME");
+
+            if (env_home == NULL || *env_home == '\0') {
+                fprintf(stderr, "interop-server: sftp: no home directory\n");
+                return S3_ERROR;
+            }
+
+            home.data = (u_char *)env_home;
+            home.len = strlen(env_home);
+        }
+    }
+
+    ch->sftp_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_interop_log);
+
+    if (ch->sftp_pool == NULL) {
+        return S3_ERROR;
+    }
+
+    ch->sftp = s3_pcalloc(ch->sftp_pool, sizeof(s3_ssh3_sftp_srv_t));
+
+    if (ch->sftp == NULL ||
+        s3_ssh3_sftp_srv_init(ch->sftp, ch->sftp_pool, &home, getuid(), getgid()) != S3_OK) {
+        s3_destroy_pool(ch->sftp_pool);
+        ch->sftp_pool = NULL;
+        return S3_ERROR;
+    }
+
+    printf("INTEROP-SFTP-OPEN home=%.*s\n", (int)home.len, (const char *)home.data);
+    fflush(stdout);
+
+    s3_interop_fwd_arm(ch);
+
+    return S3_OK;
+}
+
+/* one drained reply batch rides the pending 94 out-buffer */
+
+static void
+s3_interop_sftp_pump(s3_interop_h3_channel_t *ch)
+{
+    u_char  buf[16384];
+    ssize_t n;
+
+    if (ch->sftp == NULL) {
+        return;
+    }
+
+    if (ch->sftp->protocol_error) {
+        s3_interop_h3_channel_cancel(ch, "sftp protocol error");
+        return;
+    }
+
+    for (;;) {
+
+        n = s3_ssh3_sftp_srv_output(ch->sftp, buf, sizeof(buf));
+
+        if (n <= 0) {
+            break;
+        }
+
+        if (s3_interop_fwd_append(&ch->fwd_out, &ch->fwd_out_cap, &ch->fwd_out_len, buf,
+                                  (size_t)n) != S3_OK) {
+            fprintf(stderr, "interop-server: sftp reply buffer growth failed\n");
+            s3_interop_h3_channel_free(ch);
+            return;
+        }
+    }
+
+    s3_interop_fwd_flush(ch);
+}
+
+/*
+ * the agent bridge of the wave 2 (the reference cmd/ssh3-server.go
+ * openAgentSocketAndForwardAgent): the forward-agent marker creates
+ * the listening socket, every accepted connection opens one
+ * server-initiated "agent-connection" channel towards the client
+ */
+
+static s3_int_t
+s3_interop_agent_listen(s3_interop_h3_channel_t *ch)
+{
+    s3_str_t path;
+    s3_int_t rc;
+
+    if (ch->agent_l != NULL) {
+        return S3_OK;
+    }
+
+    ch->agent_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_interop_log);
+
+    if (ch->agent_pool == NULL) {
+        return S3_ERROR;
+    }
+
+    rc = s3_ssh3_agent_listen(ch->agent_pool, &ch->agent_l, &path);
+
+    if (rc != S3_OK) {
+        s3_destroy_pool(ch->agent_pool);
+        ch->agent_pool = NULL;
+        ch->agent_l = NULL;
+        return S3_ERROR;
+    }
+
+    if (path.len >= sizeof(ch->agent_path)) {
+        s3_destroy_pool(ch->agent_pool);
+        ch->agent_pool = NULL;
+        ch->agent_l = NULL;
+        return S3_ERROR;
+    }
+
+    s3_memcpy(ch->agent_path, path.data, path.len);
+    ch->agent_path[path.len] = '\0';
+
+    printf("INTEROP-AGENT-READY sock=%s\n", ch->agent_path);
+    fflush(stdout);
+
+    ch->agent_timer.data = ch;
+    ch->agent_timer.log = &s3_interop_log;
+    ch->agent_timer.handler = s3_interop_agent_accept_timer;
+
+    s3_event_add_timer(&ch->agent_timer, 50);
+
+    return S3_OK;
+}
+
+/*
+ * one accepted agent socket rides a fresh server-initiated channel:
+ * the header quotes the CONNECT stream id, the AGENT kind of the pump
+ * relays the bytes both ways (the tcp pump against the socket fd)
+ */
+
+static void
+s3_interop_agent_conn_open(s3_interop_h3_channel_t *sess_ch, int fd)
+{
+    s3_connection_t         *pc, *nsc;
+    s3_interop_h3_channel_t *nch;
+    s3_quic_stream_t        *qs;
+    s3_ssh3_channel_t        hdr;
+    u_char                   frame[64];
+    u_char                  *p;
+    size_t                   total;
+    ssize_t                  m;
+    s3_event_t              *rev;
+
+    pc = ((s3_quic_stream_t *)sess_ch->sc->data)->parent;
+
+    nsc = s3_quic_open_stream(pc, 1);
+
+    if (nsc == NULL) {
+        fprintf(stderr, "interop-server: agent channel open_stream failed\n");
+        s3_ssh3_agent_close_fd(fd);
+        return;
+    }
+
+    nch = s3_interop_h3_channel_alloc(nsc);
+
+    if (nch == NULL) {
+        fprintf(stderr, "interop-server: agent channel table is full\n");
+        (void)s3_quic_cancelable_stream(nsc);
+        (void)s3_quic_shutdown_stream(nsc, S3_RDWR_SHUTDOWN);
+        s3_ssh3_agent_close_fd(fd);
+        return;
+    }
+
+    /*
+     * the opener side: no channel header comes back, the confirm step
+     * of the read path must not run (the 91 of the acceptor rides the
+     * message loop instead)
+     */
+    nch->confirmed = 1;
+
+    nch->fwd_fd = fd;
+    nch->fwd_kind = S3_INTEROP_FWD_AGENT;
+
+    rev = nsc->read;
+    rev->handler = s3_interop_h3_channel_read;
+    rev->data = nsc;
+    rev->active = 1;
+
+    s3_memzero(&hdr, sizeof(hdr));
+
+    hdr.conversation_stream_id = s3_interop_h3_conv_id;
+    hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+    hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_AGENT;
+    hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_AGENT);
+
+    p = frame;
+    p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+    total = (size_t)(p - frame);
+
+    m = s3_quic_stream_send(nsc, frame, total);
+
+    if (m != (ssize_t)total) {
+        fprintf(stderr, "interop-server: agent channel header send failed\n");
+        s3_interop_h3_channel_free(nch);
+        return;
+    }
+
+    qs = nsc->data;
+
+    printf("INTEROP-AGENT-CONN id=%llu\n", (unsigned long long)qs->id);
+    fflush(stdout);
+
+    s3_interop_fwd_arm(nch);
+}
+
+static void
+s3_interop_agent_accept_timer(s3_event_t *ev)
+{
+    s3_interop_h3_channel_t *ch = ev->data;
+    int                      fd;
+
+    ev->timedout = 0;
+
+    for (;;) {
+
+        fd = s3_ssh3_agent_accept(ch->agent_l);
+
+        if (fd < 0) {
+            /* S3_AGAIN or a failed accept: the next tick retries */
+            break;
+        }
+
+        s3_interop_agent_conn_open(ch, fd);
+    }
+
+    if (ch->sc != NULL && ch->agent_l != NULL) {
+        s3_event_add_timer(ev, 50);
+    }
 }
 
 /* the runner marker on the open target */
@@ -1903,6 +2288,18 @@ s3_interop_h3_channel_confirm(s3_interop_h3_channel_t *ch)
         }
 
         s3_interop_fwd_arm(ch);
+
+    } else if (s3_interop_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SFTP)) {
+
+        /*
+         * the sftp subsystem: the request server jails into the home,
+         * the replies ride the 94 direction through the pump timer
+         */
+
+        if (s3_interop_sftp_start(ch) != S3_OK) {
+            s3_interop_h3_channel_cancel(ch, "sftp subsystem failed");
+            return S3_ERROR;
+        }
     }
 
     printf("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s\n", (unsigned long long)qs->id,
@@ -1956,6 +2353,14 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
         if (n == 0) {
 
+            if (ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
+
+                /* the client side of the agent bridge is gone */
+
+                s3_interop_h3_channel_free(ch);
+                return;
+            }
+
             if (ch->fwd_kind != S3_INTEROP_FWD_NONE) {
 
                 /*
@@ -1969,6 +2374,17 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                     s3_interop_fwd_pump(ch);
                     return;
                 }
+
+                s3_interop_h3_channel_free(ch);
+                return;
+            }
+
+            if (ch->sftp != NULL) {
+
+                /* the transfer peer closed: the subsystem goes with it */
+
+                printf("SFTP-SRV-DONE\n");
+                fflush(stdout);
 
                 s3_interop_h3_channel_free(ch);
                 return;
@@ -2046,9 +2462,10 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                     break;
                 }
 
-                if (ch->fwd_kind == S3_INTEROP_FWD_TCP) {
+                if (ch->fwd_kind == S3_INTEROP_FWD_TCP || ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
 
-                    /* the relay: the payload rides the target socket */
+                    /* the relay: the payload rides the target socket
+                     * (the tcp target or the accepted agent socket) */
 
                     if (s3_interop_fwd_append(&ch->fwd_in, &ch->fwd_in_cap, &ch->fwd_in_len,
                                               msg_data.data.data, msg_data.data.len) != S3_OK) {
@@ -2069,25 +2486,73 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                     return;
                 }
 
-                if (ch->sess_intent) {
+                if (ch->sftp != NULL) {
 
-                    if (ch->sess != NULL && ch->sess->open) {
+                    /* the sftp payloads feed the request server */
 
-                        if (s3_ssh3_session_srv_input(ch->sess, msg_data.data.data,
-                                                      msg_data.data.len) != S3_OK) {
-                            fprintf(stderr, "interop-server: session input failed\n");
+                    if (getenv("S3SFTPSRV") != NULL) {
+
+                        size_t z;
+
+                        fprintf(stderr, "sftpsrv in %zu:", msg_data.data.len);
+
+                        for (z = 0; z < msg_data.data.len && z < 24; z++) {
+                            fprintf(stderr, " %02x", msg_data.data.data[z]);
                         }
 
-                    } else {
-
-                        /*
-                         * the LARVAL data of a session channel drops
-                         * (the forward-agent marker of the reference
-                         * is out of the harness scope)
-                         */
-                        fprintf(stderr, "interop-server: session data before the spawn dropped\n");
+                        fprintf(stderr, "\n");
                     }
 
+                    if (s3_ssh3_sftp_srv_input(ch->sftp, msg_data.data.data, msg_data.data.len) !=
+                        S3_OK) {
+                        fprintf(stderr, "interop-server: sftp input failed\n");
+                    }
+
+                    s3_interop_sftp_pump(ch);
+
+                    if (ch->sc == NULL) {
+                        /* the pump freed the channel (a protocol error) */
+                        return;
+                    }
+
+                    continue;
+                }
+
+                if (!ch->sess_intent) {
+
+                    /*
+                     * the LARVAL data of a session channel: only the
+                     * forward-agent marker is defined (the reference
+                     * trigger, cmd/ssh3-server.go), the listener
+                     * appears and the path rides the child env at the
+                     * spawn; everything else falls through to the echo
+                     * (the plain -C ping)
+                     */
+
+                    if (msg_data.data.len == strlen(S3_SSH3_AGENT_TRIGGER) &&
+                        s3_memcmp(msg_data.data.data, S3_SSH3_AGENT_TRIGGER, msg_data.data.len) ==
+                            0) {
+
+                        if (s3_interop_agent_listen(ch) != S3_OK) {
+                            fprintf(stderr, "interop-server: agent listen failed\n");
+                        }
+
+                        continue;
+                    }
+                }
+
+                else if (ch->sess != NULL && ch->sess->open) {
+
+                    if (s3_ssh3_session_srv_input(ch->sess, msg_data.data.data,
+                                                  msg_data.data.len) != S3_OK) {
+                        fprintf(stderr, "interop-server: session input failed\n");
+                    }
+
+                    continue;
+                }
+
+                else {
+                    fprintf(stderr, "interop-server: session data before the spawn dropped\n");
                     continue;
                 }
 
@@ -2269,6 +2734,24 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                 continue;
             }
 
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION &&
+                ch->fwd_kind == S3_INTEROP_FWD_AGENT) {
+
+                /*
+                 * the 91 of the acceptor side on the server-initiated
+                 * agent channels: consume and move on
+                 */
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                continue;
+            }
+
             s3_interop_h3_channel_cancel(ch, "unknown channel message");
             return;
         }
@@ -2382,17 +2865,21 @@ s3_interop_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
         return;
     }
 
-    if (s3_interop_h3_sc != NULL) {
+    if (s3_interop_h3_sc != NULL && pc == s3_interop_h3_pc) {
 
         /*
          * every bidi stream after the CONNECT is an ssh3 channel
-         * (docs/P4-WIRE.md 1, the server dispatch rule)
+         * (docs/P4-WIRE.md 1, the server dispatch rule); the pc
+         * check keeps a SECOND client connection on the fresh
+         * CONNECT path below - the harness serves them one after
+         * another out of one process (the sftp put/get pair)
          */
         s3_interop_h3_channel_accept(sc);
         return;
     }
 
     s3_interop_h3_sc = sc;
+    s3_interop_h3_pc = pc;
     s3_interop_h3_conv_id = qs->id;
     s3_interop_h3_responded = 0;
     s3_interop_h3_len = 0;
@@ -2495,7 +2982,7 @@ s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s -l addr:port -c cert.pem -k key.pem [-3] [-A alpn] [-d dg_size]"
-            " [-P pwfile]\n"
+            " [-P pwfile] [-H dir]\n"
             "  -l  UDP listen address, port 0 picks an ephemeral one\n"
             "  -c  certificate PEM file\n"
             "  -k  private key PEM file\n"
@@ -2503,7 +2990,9 @@ s3_interop_usage(const char *prog)
             "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
             "  -d  max_datagram_frame_size transport parameter, default 1200\n"
             "  -P  password file: the CONNECT passes only with the Basic"
-            " user:secret (h3 mode)\n",
+            " user:secret (h3 mode)\n"
+            "  -H  the sftp jail directory override, default the user's home"
+            " (h3 mode)\n",
             prog);
 }
 
@@ -2528,7 +3017,7 @@ main(int argc, char **argv)
 
     s3_interop_log_init();
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:P:3h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:P:H:3h")) != -1) {
 
         switch (opt) {
 
@@ -2558,6 +3047,10 @@ main(int argc, char **argv)
 
         case 'P':
             s3_interop_passfile = optarg;
+            break;
+
+        case 'H':
+            snprintf(s3_interop_sftp_home, sizeof(s3_interop_sftp_home), "%s", optarg);
             break;
 
         case '3':

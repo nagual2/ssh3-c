@@ -26,6 +26,7 @@ static int s3_test_failures = 0;
     int main(void)                                                                                 \
     {                                                                                              \
         int failures;                                                                              \
+        setvbuf(stdout, NULL, _IONBF, 0);                                                          \
         failures = name();                                                                         \
         if (failures == 0) {                                                                       \
             printf("OK\n");                                                                        \

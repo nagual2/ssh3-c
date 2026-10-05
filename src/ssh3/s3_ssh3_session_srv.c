@@ -218,11 +218,11 @@ s3_ssh3_session_close_fds(s3_ssh3_session_srv_t *s)
 static s3_int_t
 s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
 {
-    int     in_pipe[2], out_pipe[2], err_pipe[2];
-    int     master;
-    pid_t   pid;
-    char   *envp[S3_SSH3_SESSION_ENVP_MAX];
-    char  **env;
+    int    in_pipe[2], out_pipe[2], err_pipe[2];
+    int    master;
+    pid_t  pid;
+    char  *envp[S3_SSH3_SESSION_ENVP_MAX];
+    char **env;
 
     env = s->env_len ? s3_ssh3_session_envp(s, envp, S3_SSH3_SESSION_ENVP_MAX) : NULL;
 

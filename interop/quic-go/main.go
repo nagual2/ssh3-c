@@ -13,6 +13,10 @@
 //	harness -h3-session-client -a 127.0.0.1:4433 [-cmd 'printf s3-exec-ok'] [-kill]
 //	harness -h3-forward-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
 //	harness -h3-forward-client -a 127.0.0.1:4433 -fwd-tcp 13456/127.0.0.1@19999
+//	harness -h3-sftp-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
+//	harness -h3-sftp-client -a 127.0.0.1:4433 -sftp-op put:./local.bin:remote.bin
+//	harness -h3-agent-server -addr 127.0.0.1:4433 -cert cert.pem -key key.pem
+//	harness -h3-agent-client -a 127.0.0.1:4433 [-cmd 'printf s3-exec-ok']
 //
 // The server accepts QUIC connections and echoes every received
 // DATAGRAM back; in addition it echoes every accepted stream.  The
@@ -47,6 +51,21 @@
 // one direct-tcp channel each.  The UDP client side is not
 // implemented: only the server side of direct-udp exists here.
 //
+// The -h3-sftp-* modes run the minimal SFTP v3 subsystem
+// (draft-ietf-secsh-filexfer-02) over the "sftp" channel: the server
+// jails every path to the home directory with the reference
+// resolveJailed semantics and chowns the created inodes back to the
+// current user; the client (-sftp-op put|get:local:remote) streams the
+// file in 32768-byte chunks and verifies the copy with a sha256
+// read-back.
+//
+// The -h3-agent-* modes run the agent forwarding (the reference LARVAL
+// trigger): a 94 data frame "forward-agent" before the exec makes the
+// server listen on a temp-dir unix socket (SSH_AUTH_SOCK of the exec
+// env) and open one server-initiated "agent-connection" channel per
+// accepted connection; the client bridges every such channel to its
+// local SSH_AUTH_SOCK.
+//
 // Machine-readable lines on stdout (the runner greps them):
 //
 //	INTEROP-LISTEN port=N
@@ -62,6 +81,10 @@
 //	INTEROP-GO-FWD-TCP-OPEN target=<host:port>
 //	INTEROP-GO-FWD-UDP-OPEN target=<host:port>
 //	INTEROP-GO-FWD-LISTEN port=<port>
+//	SFTP-GO-SUBSYSTEM-READY home=<jail>
+//	SFTP-GO-CLIENT-DONE op=<put|get> bytes=<n>
+//	AGENT-GO-SOCKET-READY sock=<path>
+//	AGENT-GO-BRIDGE
 package main
 
 import (
@@ -69,18 +92,22 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +156,16 @@ func main() {
 		"HTTP/3 client forwarding a local TCP listener through a direct-tcp channel")
 	fwdTCP := flag.String("fwd-tcp", "",
 		"h3-forward-client: localport/remoteip@remoteport, e.g. 13456/127.0.0.1@19999")
+	h3SFTPServer := flag.Bool("h3-sftp-server", false,
+		"HTTP/3 server serving the minimal SFTP v3 subsystem over \"sftp\" channels")
+	h3SFTPClient := flag.Bool("h3-sftp-client", false,
+		"HTTP/3 client running a minimal SFTP v3 put/get over an \"sftp\" channel")
+	sftpOp := flag.String("sftp-op", "",
+		"h3-sftp-client: put|get:local:remote, e.g. put:./data.bin:remote.bin")
+	h3AgentServer := flag.Bool("h3-agent-server", false,
+		"HTTP/3 server with session channels and the forward-agent LARVAL trigger")
+	h3AgentClient := flag.Bool("h3-agent-client", false,
+		"HTTP/3 client running the session exec plus the agent bridge")
 	flag.Parse()
 
 	if !*streams && *size > 1100 {
@@ -139,14 +176,16 @@ func main() {
 
 	modes := 0
 	for _, m := range []*bool{server, client, h3Server, h3Client, h3SessionServer,
-		h3SessionClient, h3ForwardServer, h3ForwardClient} {
+		h3SessionClient, h3ForwardServer, h3ForwardClient,
+		h3SFTPServer, h3SFTPClient, h3AgentServer, h3AgentClient} {
 		if *m {
 			modes++
 		}
 	}
 	if modes > 1 {
 		fatalf("-server, -client, -h3-server, -h3-client, -h3-session-server, " +
-			"-h3-session-client, -h3-forward-server and -h3-forward-client " +
+			"-h3-session-client, -h3-forward-server, -h3-forward-client, " +
+			"-h3-sftp-server, -h3-sftp-client, -h3-agent-server and -h3-agent-client " +
 			"are mutually exclusive")
 	}
 
@@ -162,6 +201,16 @@ func main() {
 
 	if *h3SessionServer {
 		runH3SessionServer(*addr, *certFile, *keyFile)
+		return
+	}
+
+	if *h3SFTPServer {
+		runH3SFTPServer(*addr, *certFile, *keyFile)
+		return
+	}
+
+	if *h3AgentServer {
+		runH3AgentServer(*addr, *certFile, *keyFile)
 		return
 	}
 
@@ -194,6 +243,24 @@ func main() {
 			target = *addrShort
 		}
 		runH3SessionClient(target, *timeout, *command, *kill)
+		return
+	}
+
+	if *h3SFTPClient {
+		target := *addr
+		if *addrShort != "" {
+			target = *addrShort
+		}
+		runH3SFTPClient(target, *sftpOp, *timeout)
+		return
+	}
+
+	if *h3AgentClient {
+		target := *addr
+		if *addrShort != "" {
+			target = *addrShort
+		}
+		runH3AgentClient(target, *timeout, *command)
 		return
 	}
 
@@ -888,23 +955,17 @@ func s3ReadSSHString(r io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-// runH3SessionServer serves the ssh3 session scenarios: the RFC 9220
-// extended CONNECT is answered through the http3 stack (the same
-// h3ConnectHandler as the -h3-server mode), but the raw server API
-// (http3.Server.NewRawServerConn) keeps the bidi dispatch here: the
-// first bidi stream of a connection is the CONNECT (the conversation
-// control stream), every later bidi is an ssh3 session channel
-// (docs/P4-WIRE.md 1, the reference server dispatch rule).  The plain
-// http3.Server accept loop parses every bidi as an HTTP request, so it
-// cannot be used for the channels.
-//
-// Each channel runs on its own goroutine with per-channel exec state;
-// the harness peers use one channel per connection in practice.  Only
-// exec, signal and exit-status requests exist on this server (the PIN:
-// wantReply is ignored, the 92/93/96/97/99/100 messages do not exist).
-func runH3SessionServer(addr, certFile, keyFile string) {
+// s3RunRawH3Server is the common listener of the channel-flavored h3
+// modes (session, sftp, agent): the RFC 9220 extended CONNECT is
+// answered through the http3 stack (the same h3ConnectHandler as the
+// -h3-server mode), the raw bidi dispatch belongs to the serve
+// callback (http3.Server.NewRawServerConn keeps it here: the plain
+// http3.Server accept loop parses every bidi as an HTTP request)
+func s3RunRawH3Server(addr, certFile, keyFile, mode string,
+	serve func(*http3.Server, *quic.Conn),
+) {
 	if certFile == "" || keyFile == "" {
-		fatalf("h3-session-server mode needs -cert and -key")
+		fatalf("%s mode needs -cert and -key", mode)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -944,15 +1005,19 @@ func runH3SessionServer(addr, certFile, keyFile string) {
 			fatalf("accept: %v", err)
 		}
 
-		go serveSessionConn(server, conn)
+		go serve(server, conn)
 	}
 }
 
-// serveSessionConn runs one accepted QUIC connection: the h3 layer
-// (the peer's control/QPACK uni streams and the CONNECT request) is
-// fed through the raw server conn, every bidi stream after the first
-// is handled as an ssh3 session channel
-func serveSessionConn(server *http3.Server, conn *quic.Conn) {
+// s3ServeChannels runs one accepted QUIC connection of a channel mode:
+// the h3 layer (the peer's control/QPACK uni streams and the CONNECT
+// request) is fed through the raw server conn, the first bidi stream
+// is the CONNECT (its StreamID is the conversationStreamID the
+// channels quote in their headers, docs/P4-WIRE.md 1, the reference
+// server dispatch rule) and every later bidi goes to the handler.
+// Each channel runs on its own goroutine with per-channel state; the
+// harness peers use one channel per connection in practice.
+func s3ServeChannels(server *http3.Server, conn *quic.Conn, handle func(*quic.Stream, uint64)) {
 	raw, err := server.NewRawServerConn(conn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "harness: raw server conn: %v\n", err)
@@ -982,9 +1047,6 @@ func serveSessionConn(server *http3.Server, conn *quic.Conn) {
 		}
 
 		if !haveConv {
-			// the first bidi stream is the RFC 9220 extended CONNECT,
-			// its StreamID is the conversationStreamID the channels
-			// must quote in their headers
 			convID = uint64(str.StreamID())
 			haveConv = true
 
@@ -992,8 +1054,19 @@ func serveSessionConn(server *http3.Server, conn *quic.Conn) {
 			continue
 		}
 
-		go s3HandleSessionChannel(str, convID)
+		go handle(str, convID)
 	}
+}
+
+// runH3SessionServer serves the ssh3 session scenarios: only exec,
+// signal and exit-status requests exist on this server (the PIN:
+// wantReply is ignored, the 92/93/96/97/99/100 messages do not exist)
+func runH3SessionServer(addr, certFile, keyFile string) {
+	s3RunRawH3Server(addr, certFile, keyFile, "h3-session-server", serveSessionConn)
+}
+
+func serveSessionConn(server *http3.Server, conn *quic.Conn) {
+	s3ServeChannels(server, conn, s3HandleSessionChannel)
 }
 
 // s3HandleSessionChannel runs one accepted ssh3 session channel: the
@@ -1107,25 +1180,8 @@ func s3HandleSessionChannel(str *quic.Stream, convID uint64) {
 					return
 				}
 
-				c := exec.Command("sh", "-c", string(command))
-
-				cin, err := c.StdinPipe()
-				if err != nil {
-					return
-				}
-
-				cout, err := c.StdoutPipe()
-				if err != nil {
-					return
-				}
-
-				cerr, err := c.StderrPipe()
-				if err != nil {
-					return
-				}
-
-				if err := c.Start(); err != nil {
-					fmt.Fprintf(os.Stderr, "harness: exec start: %v\n", err)
+				c, cin, ok := s3SpawnExec(str, &wmu, string(command), nil)
+				if !ok {
 					continue
 				}
 
@@ -1133,46 +1189,6 @@ func s3HandleSessionChannel(str *quic.Stream, convID uint64) {
 				cmd = c
 				stdin = cin
 				wmu.Unlock()
-
-				fmt.Println("INTEROP-GO-SESSION-EXEC")
-
-				// the stdout rides as 94, the stderr as 95 with
-				// dataType 1 (docs/P4-WIRE.md 3.1); both pumps must
-				// drain before the exit-status goes out, otherwise the
-				// client stops reading at the verdict and loses the
-				// command output tail
-				var pumps sync.WaitGroup
-
-				pumps.Add(2)
-
-				go func() {
-					defer pumps.Done()
-					s3PumpToChannel(str, &wmu, cout, false)
-				}()
-
-				go func() {
-					defer pumps.Done()
-					s3PumpToChannel(str, &wmu, cerr, true)
-				}()
-
-				go func() {
-					pumps.Wait() // the pipes hit EOF, Wait() is safe now
-
-					code := s3ExitCode(c)
-
-					frame := s3AppendVarint(nil, 98)
-					frame = s3AppendSSHString(frame, []byte("exit-status"))
-					frame = append(frame, 0) // want_reply = 0
-					frame = s3AppendVarint(frame, code)
-
-					wmu.Lock()
-					_, _ = str.Write(frame)
-					wmu.Unlock()
-
-					fmt.Printf("INTEROP-GO-SESSION-EXIT code=%d\n", code)
-
-					_ = str.Close() // the channel FIN, like channel.Close()
-				}()
 
 			case "signal":
 				name, err := s3ReadSSHString(br)
@@ -1216,6 +1232,86 @@ func s3HandleSessionChannel(str *quic.Stream, convID uint64) {
 			return
 		}
 	}
+}
+
+// s3SpawnExec starts the sh -c command of an exec request, pumps the
+// process output through the channel as 94/95 frames and closes the
+// channel behind the 98 exit-status (the docs/P4-WIRE.md 6 flow both
+// session flavors share); extraEnv rides the process env.  The command
+// and its stdin pipe come back for the signal/stdin handling of the
+// caller.
+func s3SpawnExec(str *quic.Stream, wmu *sync.Mutex, command string,
+	extraEnv []string,
+) (*exec.Cmd, io.WriteCloser, bool) {
+	c := exec.Command("sh", "-c", command)
+
+	if len(extraEnv) > 0 {
+		c.Env = append(os.Environ(), extraEnv...)
+	}
+
+	cin, err := c.StdinPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: exec stdin pipe: %v\n", err)
+		return nil, nil, false
+	}
+
+	cout, err := c.StdoutPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: exec stdout pipe: %v\n", err)
+		return nil, nil, false
+	}
+
+	cerr, err := c.StderrPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: exec stderr pipe: %v\n", err)
+		return nil, nil, false
+	}
+
+	if err := c.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "harness: exec start: %v\n", err)
+		return nil, nil, false
+	}
+
+	fmt.Println("INTEROP-GO-SESSION-EXEC")
+
+	// the stdout rides as 94, the stderr as 95 with dataType 1
+	// (docs/P4-WIRE.md 3.1); both pumps must drain before the
+	// exit-status goes out, otherwise the client stops reading at the
+	// verdict and loses the command output tail
+	var pumps sync.WaitGroup
+
+	pumps.Add(2)
+
+	go func() {
+		defer pumps.Done()
+		s3PumpToChannel(str, wmu, cout, false)
+	}()
+
+	go func() {
+		defer pumps.Done()
+		s3PumpToChannel(str, wmu, cerr, true)
+	}()
+
+	go func() {
+		pumps.Wait() // the pipes hit EOF, Wait() is safe now
+
+		code := s3ExitCode(c)
+
+		frame := s3AppendVarint(nil, 98)
+		frame = s3AppendSSHString(frame, []byte("exit-status"))
+		frame = append(frame, 0) // want_reply = 0
+		frame = s3AppendVarint(frame, code)
+
+		wmu.Lock()
+		_, _ = str.Write(frame)
+		wmu.Unlock()
+
+		fmt.Printf("INTEROP-GO-SESSION-EXIT code=%d\n", code)
+
+		_ = str.Close() // the channel FIN, like channel.Close()
+	}()
+
+	return c, cin, true
 }
 
 // s3PumpToChannel forwards one process output pipe to the channel as
@@ -1277,17 +1373,14 @@ func s3ExitCode(c *exec.Cmd) uint64 {
 	return 1
 }
 
-// runH3SessionClient dials, opens the extended CONNECT and then one
-// ssh3 session channel: the exec request runs -cmd with the fin right
-// behind it and the verdict is the 98 exit-status (zero plus the
-// s3-exec-ok marker in the output).  With -kill the client keeps the
-// stream writable, signals KILL right after the 91 confirmation and
-// expects the exit-status 137 (128 + SIGKILL)
-func runH3SessionClient(target string, timeout time.Duration, command string, kill bool) {
-	if target == "" {
-		fatalf("h3-session-client mode needs -a host:port")
-	}
-
+// s3DialAndConnect dials the QUIC target, opens the RFC 9220 extended
+// CONNECT (the low-level NewClientConn API, the conversation control
+// stream) with the harness user-agent and token and returns the
+// connection with the request stream once the 200 came back; any other
+// status ends the process
+func s3DialAndConnect(target string, ctx context.Context,
+	timeout time.Duration,
+) (*quic.Conn, *http3.RequestStream) {
 	tlsCfg := &tls.Config{
 		NextProtos:         []string{http3.NextProtoH3},
 		InsecureSkipVerify: true, // the harness runs against self-signed certs
@@ -1300,19 +1393,13 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 
 	tr := &quic.Transport{Conn: udpConn}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
 	conn, err := tr.Dial(ctx, udpAddr(target), tlsCfg, &quic.Config{
 		MaxIdleTimeout: 60 * time.Second,
 	})
 	if err != nil {
 		fatalf("dial: %v", err)
 	}
-	defer conn.CloseWithError(0, "")
 
-	// the extended CONNECT opens the conversation control stream, the
-	// low-level API like in runH3Client (RFC 9220)
 	cc := (&http3.Transport{}).NewClientConn(conn)
 
 	str, err := cc.OpenRequestStream(ctx)
@@ -1347,6 +1434,26 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 	if resp.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}
+
+	return conn, str
+}
+
+// runH3SessionClient dials, opens the extended CONNECT and then one
+// ssh3 session channel: the exec request runs -cmd with the fin right
+// behind it and the verdict is the 98 exit-status (zero plus the
+// s3-exec-ok marker in the output).  With -kill the client keeps the
+// stream writable, signals KILL right after the 91 confirmation and
+// expects the exit-status 137 (128 + SIGKILL)
+func runH3SessionClient(target string, timeout time.Duration, command string, kill bool) {
+	if target == "" {
+		fatalf("h3-session-client mode needs -a host:port")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, str := s3DialAndConnect(target, ctx, timeout)
+	defer conn.CloseWithError(0, "")
 
 	// the channel: a fresh bidi stream, the header quotes the control
 	// stream id (ChannelID == StreamID, docs/P4-WIRE.md 2)
@@ -1383,6 +1490,32 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 		}
 	}
 
+	code, out := s3SessionExecRead(ch, kill)
+
+	if kill {
+		if code == 137 {
+			fmt.Println("INTEROP-GO-KILL-OK exit=137")
+			return
+		}
+
+		fmt.Printf("INTEROP-GO-KILL-FAIL exit=%d\n", code)
+		os.Exit(1)
+	}
+
+	if code == 0 && bytes.Contains(out, []byte("s3-exec-ok")) {
+		fmt.Println("INTEROP-GO-EXEC-OK exit=0")
+		return
+	}
+
+	fmt.Printf("INTEROP-GO-EXEC-FAIL exit=%d\n", code)
+	os.Exit(1)
+}
+
+// s3SessionExecRead consumes the channel messages of one exec session:
+// the 91 confirmation must come first (the -kill run signals KILL
+// right behind it), then the 94/95 output accumulates until the 98
+// exit-status verdict arrives
+func s3SessionExecRead(ch *quic.Stream, kill bool) (uint64, []byte) {
 	br := bufio.NewReader(ch)
 
 	var out []byte
@@ -1451,6 +1584,8 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 				fatalf("read request: %v", err)
 			}
 
+			_ = wantReply
+
 			if string(rtype) != "exit-status" {
 				fatalf("unexpected request %q", rtype)
 			}
@@ -1460,23 +1595,7 @@ func runH3SessionClient(target string, timeout time.Duration, command string, ki
 				fatalf("read exit status: %v", err)
 			}
 
-			if kill {
-				if code == 137 {
-					fmt.Println("INTEROP-GO-KILL-OK exit=137")
-					return
-				}
-
-				fmt.Printf("INTEROP-GO-KILL-FAIL exit=%d\n", code)
-				os.Exit(1)
-			}
-
-			if code == 0 && bytes.Contains(out, []byte("s3-exec-ok")) {
-				fmt.Println("INTEROP-GO-EXEC-OK exit=0")
-				return
-			}
-
-			fmt.Printf("INTEROP-GO-EXEC-FAIL exit=%d\n", code)
-			os.Exit(1)
+			return code, out
 
 		default:
 			fatalf("unexpected channel message %d", typ)
@@ -1933,65 +2052,11 @@ func runH3ForwardClient(target, fwd string, timeout time.Duration) {
 		fatalf("bad -fwd-tcp %q: %v", fwd, err)
 	}
 
-	tlsCfg := &tls.Config{
-		NextProtos:         []string{http3.NextProtoH3},
-		InsecureSkipVerify: true, // the harness runs against self-signed certs
-	}
-
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
-	if err != nil {
-		fatalf("local udp: %v", err)
-	}
-
-	tr := &quic.Transport{Conn: udpConn}
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	conn, err := tr.Dial(ctx, udpAddr(target), tlsCfg, &quic.Config{
-		MaxIdleTimeout: 60 * time.Second,
-	})
-	if err != nil {
-		fatalf("dial: %v", err)
-	}
+	conn, str := s3DialAndConnect(target, ctx, timeout)
 	defer conn.CloseWithError(0, "")
-
-	// the extended CONNECT opens the conversation control stream, the
-	// low-level API like in runH3Client (RFC 9220)
-	cc := (&http3.Transport{}).NewClientConn(conn)
-
-	str, err := cc.OpenRequestStream(ctx)
-	if err != nil {
-		fatalf("open request stream: %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodConnect, "https://"+target+"/ssh3-term", nil)
-	if err != nil {
-		fatalf("build connect request: %v", err)
-	}
-
-	req.Proto = "ssh3"
-	req.Header.Set("User-Agent", s3VersionString)
-	req.Header.Set("Authorization", "test-token")
-
-	if err := str.SendRequestHeader(req); err != nil {
-		fatalf("send connect: %v", err)
-	}
-
-	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
-		fatalf("set stream deadline: %v", err)
-	}
-
-	resp, err := str.ReadResponse()
-	if err != nil {
-		fatalf("read response: %v", err)
-	}
-
-	fmt.Printf("INTEROP-H3-STATUS %d\n", resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		os.Exit(1)
-	}
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)))
 	if err != nil {
@@ -2131,6 +2196,2094 @@ func s3OpenDirectTCPChannel(conn *quic.Conn, convID uint64, host string, port in
 	}
 
 	s3PipeTCPThroughChannel(str, br, local)
+}
+
+// === SFTP v3 (draft-ietf-secsh-filexfer-02), the -h3-sftp-* modes ===
+//
+// A minimal request server and client over the "sftp" channel: the
+// byte stream the 94 payloads feed carries length-prefixed packets
+// (uint32 big-endian length, type byte, [uint32 id,] payload).  The
+// server jails every path to the home directory of the current user
+// with the reference sftp_subsystem.go resolveJailed semantics and
+// chowns the created inodes back to the current uid/gid (a no-op for a
+// non-root harness, the reference behavior when it runs as root).
+
+const sftpMaxFrame = 256 * 1024 // the largest frame the server accepts
+
+// SFTP v3 packet types (draft-ietf-secsh-filexfer-02 section 3)
+const (
+	sftpPktInit     = 1
+	sftpPktVersion  = 2
+	sftpPktOpen     = 3
+	sftpPktClose    = 4
+	sftpPktRead     = 5
+	sftpPktWrite    = 6
+	sftpPktLstat    = 7
+	sftpPktSetstat  = 9
+	sftpPktFsetstat = 10
+	sftpPktOpendir  = 11
+	sftpPktReaddir  = 12
+	sftpPktRemove   = 13
+	sftpPktMkdir    = 14
+	sftpPktRmdir    = 15
+	sftpPktRealpath = 16
+	sftpPktStat     = 17
+	sftpPktRename   = 18
+	sftpPktStatus   = 101
+	sftpPktHandle   = 102
+	sftpPktData     = 103
+	sftpPktName     = 104
+	sftpPktAttrs    = 105
+	sftpPktExtended = 200
+)
+
+// SFTP v3 status codes
+const (
+	sftpFxOK               = 0
+	sftpFxEOF              = 1
+	sftpFxNoSuchFile       = 2
+	sftpFxPermissionDenied = 3
+	sftpFxFailure          = 4
+	sftpFxBadMessage       = 5
+	sftpFxOpUnsupported    = 8
+)
+
+// SFTP v3 OPEN pflags (SSH_FXF_*)
+const (
+	sftpFlagRead   = 0x00000001
+	sftpFlagWrite  = 0x00000002
+	sftpFlagCreate = 0x00000008
+	sftpFlagTrunc  = 0x00000010
+)
+
+// SFTP v3 attribute flags; the server reports SIZE|PERMISSIONS|ACMODTIME
+const (
+	sftpAttrSize      = 0x00000001
+	sftpAttrUIDGID    = 0x00000002
+	sftpAttrPerms     = 0x00000004
+	sftpAttrACModTime = 0x00000008
+	sftpAttrExtended  = 0x80000000
+)
+
+func sftpAppendU32(b []byte, v uint32) []byte {
+	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
+
+func sftpAppendU64(b []byte, v uint64) []byte {
+	return append(b, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+		byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
+
+func sftpAppendStr(b []byte, s string) []byte {
+	b = sftpAppendU32(b, uint32(len(s)))
+	return append(b, s...)
+}
+
+// sftpBody walks the payload of one SFTP packet
+type sftpBody struct{ b []byte }
+
+func (r *sftpBody) u32() (uint32, error) {
+	if len(r.b) < 4 {
+		return 0, errors.New("sftp packet truncated")
+	}
+
+	v := binary.BigEndian.Uint32(r.b)
+	r.b = r.b[4:]
+
+	return v, nil
+}
+
+func (r *sftpBody) u64() (uint64, error) {
+	if len(r.b) < 8 {
+		return 0, errors.New("sftp packet truncated")
+	}
+
+	v := binary.BigEndian.Uint64(r.b)
+	r.b = r.b[8:]
+
+	return v, nil
+}
+
+func (r *sftpBody) str() (string, error) {
+	n, err := r.u32()
+	if err != nil {
+		return "", err
+	}
+
+	if uint64(len(r.b)) < uint64(n) {
+		return "", errors.New("sftp packet truncated")
+	}
+
+	s := string(r.b[:n])
+	r.b = r.b[n:]
+
+	return s, nil
+}
+
+// s3SFTPFrameReader reassembles the length-prefixed SFTP frames out of
+// the raw byte stream the channel 94 payloads feed
+type s3SFTPFrameReader struct {
+	buf []byte
+}
+
+// next returns one complete frame; ok=false means more bytes are
+// needed, an error means the framing is broken (the channel closes)
+func (fr *s3SFTPFrameReader) next() (typ byte, body []byte, ok bool, err error) {
+	if len(fr.buf) < 5 {
+		return 0, nil, false, nil
+	}
+
+	n := binary.BigEndian.Uint32(fr.buf[:4])
+	if n < 1 || n > sftpMaxFrame {
+		return 0, nil, false, fmt.Errorf("sftp frame length %d out of bounds", n)
+	}
+
+	if uint64(len(fr.buf)) < 4+uint64(n) {
+		return 0, nil, false, nil
+	}
+
+	typ = fr.buf[4]
+	body = fr.buf[5 : 4+n]
+	fr.buf = fr.buf[4+n:]
+
+	return typ, body, true, nil
+}
+
+// sftpErrCode maps an OS error to the SFTP status code
+func sftpErrCode(err error) uint32 {
+	if errors.Is(err, os.ErrNotExist) {
+		return sftpFxNoSuchFile
+	}
+
+	if errors.Is(err, os.ErrPermission) {
+		return sftpFxPermissionDenied
+	}
+
+	return sftpFxFailure
+}
+
+// sftpHandleBytes is the 8-byte big-endian form of one handle value
+func sftpHandleBytes(h uint64) string {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, h)
+	return string(b)
+}
+
+// sftpHandleValue parses the 8-byte handle back
+func sftpHandleValue(h string) (uint64, bool) {
+	if len(h) != 8 {
+		return 0, false
+	}
+
+	return binary.BigEndian.Uint64([]byte(h)), true
+}
+
+// sftpAppendAttrs encodes SIZE|PERMISSIONS|ACMODTIME out of a FileInfo
+// (the POSIX file type bits ride the permission word)
+func sftpAppendAttrs(b []byte, fi fs.FileInfo) []byte {
+	b = sftpAppendU32(b, sftpAttrSize|sftpAttrPerms|sftpAttrACModTime)
+	b = sftpAppendU64(b, uint64(fi.Size()))
+
+	mode := fi.Mode()
+	perms := uint32(mode.Perm())
+
+	switch {
+	case mode.IsDir():
+		perms |= 0x4000 // S_IFDIR
+	case mode&fs.ModeSymlink != 0:
+		perms |= 0xA000 // S_IFLNK
+	default:
+		perms |= 0x8000 // S_IFREG
+	}
+
+	b = sftpAppendU32(b, perms)
+
+	mtime := fi.ModTime().Unix()
+	b = sftpAppendU32(b, uint32(mtime)) // atime
+	b = sftpAppendU32(b, uint32(mtime)) // mtime
+
+	return b
+}
+
+// sftpLongname renders the ls-like longname of one directory entry
+// (any string is legal on the wire, the ls shape keeps the C peers
+// parsing it the same way)
+func sftpLongname(name string, fi fs.FileInfo) string {
+	kind := byte('-')
+
+	if fi.IsDir() {
+		kind = 'd'
+	}
+
+	perm := fi.Mode().Perm()
+
+	ls := make([]byte, 9)
+	mask := uint32(0400)
+
+	for i := 0; i < 9; i++ {
+		if uint32(perm)&mask != 0 {
+			ls[i] = "rwxrwxrwx"[i]
+		} else {
+			ls[i] = '-'
+		}
+
+		mask >>= 1
+	}
+
+	return fmt.Sprintf("%c%s 1 0 0 %d %s", kind, ls, fi.Size(), name)
+}
+
+// sftpDirHandle holds the entries of one open directory: the first
+// READDIR carries them all in one NAME, the next ones answer EOF
+type sftpDirHandle struct {
+	infos []fs.FileInfo
+	sent  bool
+}
+
+// sftpServer is the request server of one "sftp" channel: the jail
+// root, the open file and directory handles, the maxPacketSize the
+// peer announced in the channel header (one DATA reply never exceeds
+// it) and the write mutex of the channel stream
+type sftpServer struct {
+	str *quic.Stream
+	wmu *sync.Mutex
+
+	root    string
+	uid     int
+	gid     int
+	peerMax uint64
+
+	files map[uint64]*os.File
+	dirs  map[uint64]*sftpDirHandle
+	next  uint64
+}
+
+// s3HandleSFTPChannel runs one accepted "sftp" channel: after the
+// header check and the 91 confirmation the SFTP request loop drives
+// until the peer closes the channel or a broken frame arrives
+func s3HandleSFTPChannel(str *quic.Stream, convID uint64) {
+	br := bufio.NewReader(str)
+
+	ftype, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	convid, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	ctype, err := s3ReadSSHString(br)
+	if err != nil {
+		return
+	}
+
+	peerMax, err := s3ReadVarint(br) // maxPacketSize
+	if err != nil {
+		return
+	}
+
+	if ftype != s3SSHFrameType || convid != convID || string(ctype) != "sftp" {
+		// the reference answer to a bad channel is cancel(0)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	// the 91 confirmation with our maxPacketSize, like confirmChannel()
+	if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+		return
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: sftp: no home directory: %v\n", err)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	root, err := filepath.Abs(home)
+	if err != nil {
+		root = home
+	}
+
+	fmt.Printf("SFTP-GO-SUBSYSTEM-READY home=%s\n", root)
+
+	s := &sftpServer{
+		str:     str,
+		wmu:     &sync.Mutex{},
+		root:    root,
+		uid:     os.Getuid(),
+		gid:     os.Getgid(),
+		peerMax: peerMax,
+		files:   make(map[uint64]*os.File),
+		dirs:    make(map[uint64]*sftpDirHandle),
+	}
+	defer s.closeAll()
+
+	fr := &s3SFTPFrameReader{}
+
+	for {
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			return // the channel is over
+		}
+
+		switch typ {
+		case 94: // SSH_MSG_CHANNEL_DATA: the sftp byte stream
+			data, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			fr.buf = append(fr.buf, data...)
+
+			for {
+				ptyp, pbody, ok, perr := fr.next()
+				if perr != nil {
+					// a crooked frame: the channel goes away
+					fmt.Fprintf(os.Stderr, "harness: sftp: %v\n", perr)
+					str.CancelRead(0)
+					str.CancelWrite(0)
+					return
+				}
+
+				if !ok {
+					break
+				}
+
+				if !s.dispatch(ptyp, pbody) {
+					str.CancelRead(0)
+					str.CancelWrite(0)
+					return
+				}
+			}
+
+		case 95: // SSH_MSG_CHANNEL_EXTENDED_DATA: drained
+			if _, err := s3ReadVarint(br); err != nil { // data type
+				return
+			}
+
+			if _, err := s3ReadSSHString(br); err != nil {
+				return
+			}
+
+		case 98: // SSH_MSG_CHANNEL_REQUEST: nothing but exit-status here
+			rtype, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			var wantReply [1]byte
+
+			if _, err := io.ReadFull(br, wantReply[:]); err != nil {
+				return
+			}
+
+			_ = wantReply
+
+			if string(rtype) != "exit-status" {
+				str.CancelRead(42)
+				str.CancelWrite(42)
+				return
+			}
+
+			if _, err := s3ReadVarint(br); err != nil {
+				return
+			}
+
+		default:
+			str.CancelRead(42)
+			str.CancelWrite(42)
+			return
+		}
+	}
+}
+
+func (s *sftpServer) closeAll() {
+	for h, f := range s.files {
+		delete(s.files, h)
+		_ = f.Close()
+	}
+}
+
+// send writes one SFTP packet to the channel as a 94 frame; the uint32
+// big-endian length prefix of the packet is added here, pkt carries
+// the type byte with the payload
+func (s *sftpServer) send(pkt []byte) bool {
+	full := make([]byte, 4, 4+len(pkt))
+	binary.BigEndian.PutUint32(full, uint32(len(pkt)))
+	full = append(full, pkt...)
+
+	frame := s3AppendVarint(nil, 94)
+	frame = s3AppendSSHString(frame, full)
+
+	s.wmu.Lock()
+	_, err := s.str.Write(frame)
+	s.wmu.Unlock()
+
+	return err == nil
+}
+
+func (s *sftpServer) status(id, code uint32, msg string) bool {
+	pkt := []byte{sftpPktStatus}
+	pkt = sftpAppendU32(pkt, id)
+	pkt = sftpAppendU32(pkt, code)
+	pkt = sftpAppendStr(pkt, msg)
+	pkt = sftpAppendStr(pkt, "en")
+
+	return s.send(pkt)
+}
+
+func (s *sftpServer) ok(id uint32) bool {
+	return s.status(id, sftpFxOK, "ok")
+}
+
+func (s *sftpServer) unsupported(id uint32) bool {
+	return s.status(id, sftpFxOpUnsupported, "operation unsupported")
+}
+
+func (s *sftpServer) sendHandle(id uint32, h uint64) bool {
+	pkt := []byte{sftpPktHandle}
+	pkt = sftpAppendU32(pkt, id)
+	pkt = sftpAppendStr(pkt, sftpHandleBytes(h))
+
+	return s.send(pkt)
+}
+
+func (s *sftpServer) newHandle() uint64 {
+	s.next++
+	return s.next
+}
+
+// resolveJailed maps a client-visible path into the jail with the
+// reference sftp_subsystem.go semantics: jail-relative paths
+// ("docs/f", "/docs/f") resolve under the home directory, absolute
+// paths already inside the jail are honored as-is, everything else is
+// an escape error (SSH_FX_PERMISSION_DENIED for the client)
+func (s *sftpServer) resolveJailed(clientPath string) (string, error) {
+	trimmed := strings.TrimSpace(clientPath)
+	if trimmed == "" {
+		trimmed = "/"
+	}
+
+	if filepath.IsAbs(filepath.FromSlash(trimmed)) {
+		abs := filepath.Clean(filepath.FromSlash(trimmed))
+		if abs == s.root || strings.HasPrefix(abs, s.root+string(filepath.Separator)) {
+			return abs, nil
+		}
+	}
+
+	clean := path.Clean("/" + trimmed)
+	full := filepath.Join(s.root, filepath.FromSlash(clean))
+	if full != s.root && !strings.HasPrefix(full, s.root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes the home directory", clientPath)
+	}
+
+	return full, nil
+}
+
+// chownToUser gives a freshly created inode back to the current user
+func (s *sftpServer) chownToUser(name string) {
+	_ = os.Chown(name, s.uid, s.gid)
+}
+
+// chownToUserRoot fixes the freshly created directories under the jail
+// (MkdirAll may create more than one level), like the reference
+func (s *sftpServer) chownToUserRoot(name string) {
+	for cur := name; cur != s.root && strings.HasPrefix(cur, s.root+string(filepath.Separator)); cur = filepath.Dir(cur) {
+		s.chownToUser(cur)
+	}
+}
+
+// readChunk bounds one DATA payload: the request length, the frame cap
+// and the maxPacketSize the peer announced in the channel header
+func (s *sftpServer) readChunk() int {
+	limit := 32768
+
+	if s.peerMax > 512 && s.peerMax-512 < uint64(limit) {
+		limit = int(s.peerMax - 512)
+	}
+
+	return limit
+}
+
+// dispatch runs one SFTP request; false means the channel must close
+// (a write error or a packet type that cannot be answered)
+func (s *sftpServer) dispatch(typ byte, body []byte) bool {
+	switch typ {
+	case sftpPktInit:
+		// the only version this harness speaks
+		return s.send(append([]byte{sftpPktVersion}, 0, 0, 0, 3))
+
+	case sftpPktOpen:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		pflags, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		return s.open(id, pth, pflags)
+
+	case sftpPktClose:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		handle, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		h, ok := sftpHandleValue(handle)
+		if !ok {
+			return s.status(id, sftpFxFailure, "bad handle")
+		}
+
+		if f, open := s.files[h]; open {
+			delete(s.files, h)
+			_ = f.Close()
+		}
+		delete(s.dirs, h)
+
+		return s.ok(id)
+
+	case sftpPktRead:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		handle, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		offset, err := r.u64()
+		if err != nil {
+			return false
+		}
+
+		length, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		return s.read(id, handle, offset, length)
+
+	case sftpPktWrite:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		handle, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		offset, err := r.u64()
+		if err != nil {
+			return false
+		}
+
+		data, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.write(id, handle, offset, data)
+
+	case sftpPktLstat, sftpPktStat:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.statPath(id, pth, typ == sftpPktLstat)
+
+	case sftpPktOpendir:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.opendir(id, pth)
+
+	case sftpPktReaddir:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		handle, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.readdir(id, handle)
+
+	case sftpPktRemove, sftpPktRmdir:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.removePath(id, pth)
+
+	case sftpPktMkdir:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		// the attrs field is ignored, like the reference
+		return s.mkdir(id, pth)
+
+	case sftpPktRealpath:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		pth, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.realpath(id, pth)
+
+	case sftpPktRename:
+		r := &sftpBody{body}
+
+		id, err := r.u32()
+		if err != nil {
+			return false
+		}
+
+		oldPath, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		newPath, err := r.str()
+		if err != nil {
+			return false
+		}
+
+		return s.rename(id, oldPath, newPath)
+
+	case sftpPktSetstat, sftpPktFsetstat, sftpPktExtended:
+		// the raw attribute blobs and the extended requests stay
+		// unsupported until needed, like the reference Filecmd default
+		var id uint32
+
+		if len(body) >= 4 {
+			id = binary.BigEndian.Uint32(body)
+		}
+
+		return s.unsupported(id)
+
+	default:
+		// server-side reply types and anything unknown: the request
+		// flow cannot continue
+		return false
+	}
+}
+
+func (s *sftpServer) open(id uint32, pth string, pflags uint32) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	flags := os.O_RDONLY
+
+	if pflags&sftpFlagWrite != 0 {
+		if pflags&sftpFlagRead != 0 {
+			flags = os.O_RDWR
+		} else {
+			flags = os.O_WRONLY
+		}
+	}
+
+	if pflags&sftpFlagCreate != 0 {
+		flags |= os.O_CREATE
+	}
+
+	if pflags&sftpFlagTrunc != 0 {
+		flags |= os.O_TRUNC
+	}
+
+	f, err := os.OpenFile(resolved, flags, 0o644)
+	if err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	if flags&os.O_CREATE != 0 {
+		s.chownToUser(resolved)
+	}
+
+	h := s.newHandle()
+	s.files[h] = f
+
+	return s.sendHandle(id, h)
+}
+
+func (s *sftpServer) read(id uint32, handle string, offset uint64, length uint32) bool {
+	h, ok := sftpHandleValue(handle)
+	if !ok {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	f, open := s.files[h]
+	if !open {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	chunk := int(length)
+	if chunk > s.readChunk() {
+		chunk = s.readChunk()
+	}
+
+	buf := make([]byte, chunk)
+
+	n, err := f.ReadAt(buf, int64(offset))
+	if n > 0 {
+		pkt := []byte{sftpPktData}
+		pkt = sftpAppendU32(pkt, id)
+		pkt = sftpAppendStr(pkt, string(buf[:n]))
+
+		return s.send(pkt)
+	}
+
+	if err != nil && !errors.Is(err, io.EOF) {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	return s.status(id, sftpFxEOF, "end of file")
+}
+
+func (s *sftpServer) write(id uint32, handle string, offset uint64, data string) bool {
+	h, ok := sftpHandleValue(handle)
+	if !ok {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	f, open := s.files[h]
+	if !open {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	if _, err := f.WriteAt([]byte(data), int64(offset)); err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	return s.ok(id)
+}
+
+func (s *sftpServer) statPath(id uint32, pth string, lstat bool) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	var fi fs.FileInfo
+
+	if lstat {
+		fi, err = os.Lstat(resolved)
+	} else {
+		fi, err = os.Stat(resolved)
+	}
+
+	if err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	pkt := []byte{sftpPktAttrs}
+	pkt = sftpAppendU32(pkt, id)
+	pkt = sftpAppendAttrs(pkt, fi)
+
+	return s.send(pkt)
+}
+
+func (s *sftpServer) opendir(id uint32, pth string) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	dh := &sftpDirHandle{}
+
+	for _, entry := range entries {
+		info, ierr := entry.Info()
+		if ierr != nil {
+			continue // raced away, like the reference lister
+		}
+
+		dh.infos = append(dh.infos, info)
+	}
+
+	h := s.newHandle()
+	s.dirs[h] = dh
+
+	return s.sendHandle(id, h)
+}
+
+func (s *sftpServer) readdir(id uint32, handle string) bool {
+	h, ok := sftpHandleValue(handle)
+	if !ok {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	dh, open := s.dirs[h]
+	if !open {
+		return s.status(id, sftpFxFailure, "bad handle")
+	}
+
+	if dh.sent {
+		return s.status(id, sftpFxEOF, "end of directory")
+	}
+
+	dh.sent = true
+
+	pkt := []byte{sftpPktName}
+	pkt = sftpAppendU32(pkt, id)
+	pkt = sftpAppendU32(pkt, uint32(len(dh.infos)))
+
+	for _, info := range dh.infos {
+		pkt = sftpAppendStr(pkt, info.Name())
+		pkt = sftpAppendStr(pkt, sftpLongname(info.Name(), info))
+		pkt = sftpAppendAttrs(pkt, info)
+	}
+
+	return s.send(pkt)
+}
+
+func (s *sftpServer) removePath(id uint32, pth string) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	if err := os.Remove(resolved); err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	return s.ok(id)
+}
+
+func (s *sftpServer) mkdir(id uint32, pth string) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	if err := os.MkdirAll(resolved, 0o755); err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	s.chownToUserRoot(resolved)
+
+	return s.ok(id)
+}
+
+func (s *sftpServer) realpath(id uint32, pth string) bool {
+	resolved, err := s.resolveJailed(pth)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	pkt := []byte{sftpPktName}
+	pkt = sftpAppendU32(pkt, id)
+	pkt = sftpAppendU32(pkt, 1)
+	pkt = sftpAppendStr(pkt, resolved)
+	pkt = sftpAppendStr(pkt, resolved)
+
+	if fi, serr := os.Stat(resolved); serr == nil {
+		pkt = sftpAppendAttrs(pkt, fi)
+	} else {
+		pkt = sftpAppendU32(pkt, 0) // no attributes known yet
+	}
+
+	return s.send(pkt)
+}
+
+func (s *sftpServer) rename(id uint32, oldPath, newPath string) bool {
+	resolvedOld, err := s.resolveJailed(oldPath)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	resolvedNew, err := s.resolveJailed(newPath)
+	if err != nil {
+		return s.status(id, sftpFxPermissionDenied, err.Error())
+	}
+
+	if _, err := os.Lstat(resolvedNew); err == nil {
+		return s.status(id, sftpFxFailure, "target exists")
+	}
+
+	if err := os.Rename(resolvedOld, resolvedNew); err != nil {
+		return s.status(id, sftpErrCode(err), err.Error())
+	}
+
+	return s.ok(id)
+}
+
+// runH3SFTPServer serves the SFTP scenarios: every bidi after the
+// CONNECT is expected to be an "sftp" channel
+func runH3SFTPServer(addr, certFile, keyFile string) {
+	s3RunRawH3Server(addr, certFile, keyFile, "h3-sftp-server", serveSFTPConn)
+}
+
+func serveSFTPConn(server *http3.Server, conn *quic.Conn) {
+	s3ServeChannels(server, conn, s3HandleSFTPChannel)
+}
+
+// s3ParseSFTPOp parses the -sftp-op value in the put|get:local:remote form
+func s3ParseSFTPOp(op string) (put bool, local, remote string, err error) {
+	parts := strings.SplitN(op, ":", 3)
+	if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
+		return false, "", "", fmt.Errorf("want put|get:local:remote")
+	}
+
+	switch parts[0] {
+	case "put":
+		put = true
+	case "get":
+		put = false
+	default:
+		return false, "", "", fmt.Errorf("op must be put or get, got %q", parts[0])
+	}
+
+	return put, parts[1], parts[2], nil
+}
+
+// sftpClient is the minimal SFTP v3 driver of the "sftp" channel: the
+// requests run one at a time (id-matched, one in flight), the replies
+// reassemble out of the 94 payload stream
+type sftpClient struct {
+	str *quic.Stream
+	br  *bufio.Reader
+	fr  s3SFTPFrameReader
+	id  uint32
+}
+
+// recv waits for the next complete SFTP packet, pulling the channel
+// messages underneath (the 91 confirmations skipped, the 95 drained)
+func (c *sftpClient) recv() (byte, []byte, error) {
+	for {
+		t, b, ok, ferr := c.fr.next()
+		if ferr != nil {
+			return 0, nil, ferr
+		}
+
+		if ok {
+			return t, b, nil
+		}
+
+		mt, rerr := s3ReadVarint(c.br)
+		if rerr != nil {
+			return 0, nil, rerr
+		}
+
+		switch mt {
+		case 91:
+			if _, err := s3ReadVarint(c.br); err != nil {
+				return 0, nil, err
+			}
+
+		case 94:
+			data, err := s3ReadSSHString(c.br)
+			if err != nil {
+				return 0, nil, err
+			}
+
+			c.fr.buf = append(c.fr.buf, data...)
+
+		case 95:
+			if _, err := s3ReadVarint(c.br); err != nil { // data type
+				return 0, nil, err
+			}
+
+			if _, err := s3ReadSSHString(c.br); err != nil {
+				return 0, nil, err
+			}
+
+		default:
+			return 0, nil, fmt.Errorf("unexpected channel message %d", mt)
+		}
+	}
+}
+
+// call sends one request (the id is prepended here, the payload is the
+// rest of the body) and returns the next reply packet
+func (c *sftpClient) call(typ byte, payload []byte) (byte, []byte, error) {
+	c.id++
+
+	body := make([]byte, 4, 5+len(payload))
+	binary.BigEndian.PutUint32(body, uint32(len(payload)+5))
+	body = append(body, typ)
+	body = sftpAppendU32(body, c.id)
+	body = append(body, payload...)
+
+	frame := s3AppendVarint(nil, 94)
+	frame = s3AppendSSHString(frame, body)
+
+	if _, err := c.str.Write(frame); err != nil {
+		return 0, nil, err
+	}
+
+	return c.recv()
+}
+
+// expectReply validates one reply against the pending id: a STATUS in
+// place of the wanted type becomes the error
+func (c *sftpClient) expectReply(t byte, b []byte, want byte) (*sftpBody, error) {
+	r := &sftpBody{b}
+
+	id, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+
+	if id != c.id {
+		return nil, fmt.Errorf("sftp reply id %d, want %d", id, c.id)
+	}
+
+	if t == sftpPktStatus {
+		code, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+
+		if code != sftpFxOK {
+			return nil, fmt.Errorf("sftp status %d", code)
+		}
+	}
+
+	if t != want {
+		return nil, fmt.Errorf("sftp reply type %d, want %d", t, want)
+	}
+
+	return r, nil
+}
+
+func (c *sftpClient) callHandle(typ byte, payload []byte) (string, error) {
+	t, b, err := c.call(typ, payload)
+	if err != nil {
+		return "", err
+	}
+
+	r, err := c.expectReply(t, b, sftpPktHandle)
+	if err != nil {
+		return "", err
+	}
+
+	return r.str()
+}
+
+func (c *sftpClient) callOK(typ byte, payload []byte) error {
+	t, b, err := c.call(typ, payload)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.expectReply(t, b, sftpPktStatus)
+
+	return err
+}
+
+func (c *sftpClient) callStat(typ byte, payload []byte) (uint64, bool, error) {
+	t, b, err := c.call(typ, payload)
+	if err != nil {
+		return 0, false, err
+	}
+
+	r, err := c.expectReply(t, b, sftpPktAttrs)
+	if err != nil {
+		return 0, false, err
+	}
+
+	return sftpParseAttrsSize(r)
+}
+
+// callRead consumes one READ reply: either DATA or the STATUS EOF
+func (c *sftpClient) callRead(handle string, offset uint64, length uint32) ([]byte, bool, error) {
+	t, b, err := c.call(sftpPktRead, sftpReqRead(handle, offset, length))
+	if err != nil {
+		return nil, false, err
+	}
+
+	r := &sftpBody{b}
+
+	id, err := r.u32()
+	if err != nil {
+		return nil, false, err
+	}
+
+	if id != c.id {
+		return nil, false, fmt.Errorf("sftp reply id %d, want %d", id, c.id)
+	}
+
+	switch t {
+	case sftpPktData:
+		data, err := r.str()
+		return []byte(data), false, err
+
+	case sftpPktStatus:
+		code, err := r.u32()
+		if err != nil {
+			return nil, false, err
+		}
+
+		if code == sftpFxEOF {
+			return nil, true, nil
+		}
+
+		return nil, false, fmt.Errorf("sftp status %d", code)
+
+	default:
+		return nil, false, fmt.Errorf("sftp reply type %d", t)
+	}
+}
+
+func sftpReqOpen(pth string, pflags uint32) []byte {
+	b := sftpAppendStr(nil, pth)
+	b = sftpAppendU32(b, pflags)
+
+	return sftpAppendU32(b, 0) // empty attrs
+}
+
+func sftpReqClose(handle string) []byte {
+	return sftpAppendStr(nil, handle)
+}
+
+func sftpReqRead(handle string, offset uint64, length uint32) []byte {
+	b := sftpAppendStr(nil, handle)
+	b = sftpAppendU64(b, offset)
+
+	return sftpAppendU32(b, length)
+}
+
+func sftpReqWrite(handle string, offset uint64, data []byte) []byte {
+	b := sftpAppendStr(nil, handle)
+	b = sftpAppendU64(b, offset)
+
+	return sftpAppendStr(b, string(data))
+}
+
+func sftpReqStat(pth string) []byte {
+	return sftpAppendStr(nil, pth)
+}
+
+// sftpParseAttrsSize pulls the SIZE attribute out of an ATTRS reply
+// (the other fields are skipped, the EXTENDED pairs ride the end of
+// the self-delimited frame)
+func sftpParseAttrsSize(r *sftpBody) (uint64, bool, error) {
+	flags, err := r.u32()
+	if err != nil {
+		return 0, false, err
+	}
+
+	var (
+		size    uint64
+		hasSize bool
+	)
+
+	if flags&sftpAttrSize != 0 {
+		if size, err = r.u64(); err != nil {
+			return 0, false, err
+		}
+
+		hasSize = true
+	}
+
+	if flags&sftpAttrUIDGID != 0 {
+		if _, err = r.u64(); err != nil {
+			return 0, false, err
+		}
+	}
+
+	if flags&sftpAttrPerms != 0 {
+		if _, err = r.u32(); err != nil {
+			return 0, false, err
+		}
+	}
+
+	if flags&sftpAttrACModTime != 0 {
+		if _, err = r.u64(); err != nil {
+			return 0, false, err
+		}
+	}
+
+	return size, hasSize, nil
+}
+
+// s3SHA256File hashes a local file
+func s3SHA256File(pth string) ([]byte, error) {
+	f, err := os.Open(pth)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+
+	return h.Sum(nil), nil
+}
+
+// s3SFTPHashRemote reads the whole remote file through a fresh READ
+// handle and returns the byte count with the sha256
+func s3SFTPHashRemote(c *sftpClient, remote string) (uint64, []byte, error) {
+	handle, err := c.callHandle(sftpPktOpen, sftpReqOpen(remote, sftpFlagRead))
+	if err != nil {
+		return 0, nil, err
+	}
+
+	hasher := sha256.New()
+
+	var off uint64
+
+	for {
+		data, eof, err := c.callRead(handle, off, 32768)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if eof {
+			break
+		}
+
+		if len(data) == 0 {
+			return 0, nil, errors.New("empty DATA before the EOF status")
+		}
+
+		hasher.Write(data)
+		off += uint64(len(data))
+	}
+
+	if err := c.callOK(sftpPktClose, sftpReqClose(handle)); err != nil {
+		return 0, nil, err
+	}
+
+	return off, hasher.Sum(nil), nil
+}
+
+// s3RunSFTPPut streams the local file into the remote path in 32768
+// WRITE chunks (one request in flight, id-matched), then verifies the
+// remote copy with a sha256 read-back before the verdict
+func s3RunSFTPPut(c *sftpClient, local, remote string) error {
+	src, err := os.Open(local)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	li, err := src.Stat()
+	if err != nil {
+		return err
+	}
+
+	handle, err := c.callHandle(sftpPktOpen,
+		sftpReqOpen(remote, sftpFlagWrite|sftpFlagCreate|sftpFlagTrunc))
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, 32768)
+
+	var off uint64
+
+	for {
+		n, rerr := src.Read(buf)
+
+		if n > 0 {
+			if err := c.callOK(sftpPktWrite, sftpReqWrite(handle, off, buf[:n])); err != nil {
+				return err
+			}
+
+			off += uint64(n)
+		}
+
+		if rerr == io.EOF {
+			break
+		}
+
+		if rerr != nil {
+			return rerr
+		}
+	}
+
+	if err := c.callOK(sftpPktClose, sftpReqClose(handle)); err != nil {
+		return err
+	}
+
+	want, err := s3SHA256File(local)
+	if err != nil {
+		return err
+	}
+
+	got, sum, err := s3SFTPHashRemote(c, remote)
+	if err != nil {
+		return err
+	}
+
+	if got != uint64(li.Size()) || !bytes.Equal(sum, want) {
+		return fmt.Errorf("remote verify mismatch: %d bytes", got)
+	}
+
+	fmt.Printf("SFTP-GO-CLIENT-DONE op=put bytes=%d\n", li.Size())
+
+	return nil
+}
+
+// s3RunSFTPGet streams the remote file into the local path through
+// READ chunks until the EOF status, then verifies the written file
+// against the received sha256 (and the STAT size when it was sent)
+func s3RunSFTPGet(c *sftpClient, local, remote string) error {
+	remoteSize, hasSize, err := c.callStat(sftpPktStat, sftpReqStat(remote))
+	if err != nil {
+		return err
+	}
+
+	handle, err := c.callHandle(sftpPktOpen, sftpReqOpen(remote, sftpFlagRead))
+	if err != nil {
+		return err
+	}
+
+	dst, err := os.Create(local)
+	if err != nil {
+		return err
+	}
+
+	hasher := sha256.New()
+
+	var off uint64
+
+	for {
+		data, eof, err := c.callRead(handle, off, 32768)
+		if err != nil {
+			dst.Close()
+			return err
+		}
+
+		if eof {
+			break
+		}
+
+		if len(data) == 0 {
+			dst.Close()
+			return errors.New("empty DATA before the EOF status")
+		}
+
+		if _, err := dst.Write(data); err != nil {
+			dst.Close()
+			return err
+		}
+
+		hasher.Write(data)
+		off += uint64(len(data))
+	}
+
+	if err := dst.Close(); err != nil {
+		return err
+	}
+
+	if err := c.callOK(sftpPktClose, sftpReqClose(handle)); err != nil {
+		return err
+	}
+
+	lsum, err := s3SHA256File(local)
+	if err != nil {
+		return err
+	}
+
+	if hasSize && off != remoteSize {
+		return fmt.Errorf("remote size %d, got %d", remoteSize, off)
+	}
+
+	if !bytes.Equal(hasher.Sum(nil), lsum) {
+		return errors.New("local verify mismatch")
+	}
+
+	fmt.Printf("SFTP-GO-CLIENT-DONE op=get bytes=%d\n", off)
+
+	return nil
+}
+
+// runH3SFTPClient dials, opens the extended CONNECT and one "sftp"
+// channel, then runs the put/get driver of -sftp-op
+func runH3SFTPClient(target, op string, timeout time.Duration) {
+	if target == "" {
+		fatalf("h3-sftp-client mode needs -a host:port")
+	}
+
+	if op == "" {
+		fatalf("h3-sftp-client mode needs -sftp-op put|get:local:remote")
+	}
+
+	put, local, remote, err := s3ParseSFTPOp(op)
+	if err != nil {
+		fatalf("bad -sftp-op %q: %v", op, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, str := s3DialAndConnect(target, ctx, timeout)
+	defer conn.CloseWithError(0, "")
+
+	// the channel: a fresh bidi stream, the header quotes the control
+	// stream id (ChannelID == StreamID, docs/P4-WIRE.md 2)
+	ch, err := conn.OpenStream()
+	if err != nil {
+		fatalf("open channel stream: %v", err)
+	}
+
+	if err := ch.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set channel deadline: %v", err)
+	}
+
+	header := s3AppendVarint(nil, s3SSHFrameType)
+	header = s3AppendVarint(header, uint64(str.StreamID()))
+	header = s3AppendSSHString(header, []byte("sftp"))
+	header = s3AppendVarint(header, s3ChannelMaxPacket)
+
+	// the INIT rides right behind the header: the server parses the
+	// header first, answers the 91 and then serves the request stream
+	initBody := append([]byte{sftpPktInit}, 0, 0, 0, 3)
+	initPkt := sftpAppendU32(nil, uint32(len(initBody)))
+	initPkt = append(initPkt, initBody...)
+
+	burst := append(header, s3AppendVarint(nil, 94)...)
+	burst = s3AppendSSHString(burst, initPkt)
+
+	if _, err := ch.Write(burst); err != nil {
+		fatalf("write channel: %v", err)
+	}
+
+	c := &sftpClient{str: ch, br: bufio.NewReader(ch)}
+
+	// the handshake: the 91 confirmation, then the VERSION reply
+	typ, err := s3ReadVarint(c.br)
+	if err != nil {
+		fatalf("channel read: %v", err)
+	}
+
+	if typ != 91 {
+		fatalf("expected the 91 confirmation, got %d", typ)
+	}
+
+	if _, err := s3ReadVarint(c.br); err != nil { // maxPacketSize
+		fatalf("read confirmation: %v", err)
+	}
+
+	t, b, err := c.recv()
+	if err != nil {
+		fatalf("read version: %v", err)
+	}
+
+	if t != sftpPktVersion {
+		fatalf("expected the sftp VERSION, got %d", t)
+	}
+
+	vr := &sftpBody{b}
+
+	version, err := vr.u32()
+	if err != nil || version != 3 {
+		fatalf("bad sftp version %d", version)
+	}
+
+	if put {
+		if err := s3RunSFTPPut(c, local, remote); err != nil {
+			fmt.Fprintf(os.Stderr, "harness: sftp put: %v\n", err)
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if err := s3RunSFTPGet(c, local, remote); err != nil {
+		fmt.Fprintf(os.Stderr, "harness: sftp get: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// === agent forwarding, the -h3-agent-* modes ===
+//
+// The reference flow (cmd/ssh3-server.go): a 94 data frame carrying
+// exactly "forward-agent" on a session channel still in LARVAL creates
+// the agent unix socket (a temp dir with agent.<pid>, like
+// unix_util.NewUnixSocketPath); every connection accepted on it opens
+// one server-initiated "agent-connection" channel (maxPacketSize
+// 30000) and the bytes pump both ways as 94 frames.  The exec requests
+// run with SSH_AUTH_SOCK pointing at the socket.  The client accepts
+// those channels, confirms them with 91 and bridges them to its local
+// SSH_AUTH_SOCK.
+
+const (
+	s3AgentTrigger     = "forward-agent"
+	s3AgentChannelType = "agent-connection"
+	s3AgentMaxPacket   = 30000
+	s3AgentPumpChunk   = 16384 // far below the 30000 maxPacketSize
+)
+
+// runH3AgentServer serves the agent scenarios: the session channel
+// machinery of -h3-session-server plus the LARVAL trigger
+func runH3AgentServer(addr, certFile, keyFile string) {
+	s3RunRawH3Server(addr, certFile, keyFile, "h3-agent-server",
+		func(server *http3.Server, conn *quic.Conn) {
+			s3ServeChannels(server, conn, func(str *quic.Stream, convID uint64) {
+				s3HandleAgentSessionChannel(str, conn, convID)
+			})
+		})
+}
+
+// s3HandleAgentSessionChannel runs one accepted session channel of the
+// agent server: the exec/signals flow of the session server plus the
+// LARVAL trigger — a 94 data frame "forward-agent" before the first
+// request creates the agent unix socket, later 94 payloads feed the
+// process stdin
+func s3HandleAgentSessionChannel(str *quic.Stream, conn *quic.Conn, convID uint64) {
+	br := bufio.NewReader(str)
+
+	ftype, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	convid, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	ctype, err := s3ReadSSHString(br)
+	if err != nil {
+		return
+	}
+
+	if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+		return
+	}
+
+	if ftype != s3SSHFrameType || convid != convID || string(ctype) != "session" {
+		// the reference answer to a bad channel is cancel(0)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	// the 91 confirmation with our maxPacketSize, like confirmChannel()
+	if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+		return
+	}
+
+	fmt.Printf("INTEROP-CHANNEL-ACCEPT id=%d type=session\n", str.StreamID())
+
+	var (
+		wmu       sync.Mutex // serializes every write to the channel stream
+		cmd       *exec.Cmd
+		stdin     io.WriteCloser
+		larval    = true
+		agentPath string
+	)
+
+	for {
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			// the stream is over: a client FIN is the process stdin
+			// EOF, the exit goroutine finishes the verdict on its own
+			wmu.Lock()
+
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+
+			wmu.Unlock()
+
+			return
+		}
+
+		switch typ {
+		case 94: // SSH_MSG_CHANNEL_DATA
+			data, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			if larval {
+				// the LARVAL state of the reference: only the
+				// forward-agent marker is legal here
+				if string(data) != s3AgentTrigger {
+					str.CancelRead(42)
+					str.CancelWrite(42)
+					return
+				}
+
+				agentPath = s3StartAgentListener(conn, convID)
+				larval = false
+
+				continue
+			}
+
+			wmu.Lock()
+			w := stdin
+			wmu.Unlock()
+
+			if w != nil {
+				// a dead process: the write fails, the data is drained
+				_, _ = w.Write(data)
+			}
+
+		case 95: // SSH_MSG_CHANNEL_EXTENDED_DATA: drained
+			if _, err := s3ReadVarint(br); err != nil { // data type
+				return
+			}
+
+			if _, err := s3ReadSSHString(br); err != nil {
+				return
+			}
+
+		case 98: // SSH_MSG_CHANNEL_REQUEST
+			rtype, err := s3ReadSSHString(br)
+			if err != nil {
+				return
+			}
+
+			var wantReply [1]byte
+
+			if _, err := io.ReadFull(br, wantReply[:]); err != nil {
+				return
+			}
+
+			_ = wantReply // parsed and ignored, the PIN of the reference
+
+			switch string(rtype) {
+			case "exec":
+				command, err := s3ReadSSHString(br)
+				if err != nil {
+					return
+				}
+
+				var env []string
+
+				if agentPath != "" {
+					env = append(env, "SSH_AUTH_SOCK="+agentPath)
+				}
+
+				c, cin, ok := s3SpawnExec(str, &wmu, string(command), env)
+				if !ok {
+					continue
+				}
+
+				wmu.Lock()
+				cmd = c
+				stdin = cin
+				wmu.Unlock()
+
+			case "signal":
+				name, err := s3ReadSSHString(br)
+				if err != nil {
+					return
+				}
+
+				wmu.Lock()
+				c := cmd
+				wmu.Unlock()
+
+				if c == nil || c.Process == nil {
+					continue // no process: the request is ignored
+				}
+
+				switch string(name) {
+				case "KILL":
+					_ = c.Process.Kill()
+				case "TERM":
+					_ = c.Process.Signal(syscall.SIGTERM)
+				default:
+					// unknown names are ignored, like the reference
+				}
+			case "exit-status":
+				// the server never receives one; the body is one varint
+				if _, err := s3ReadVarint(br); err != nil {
+					return
+				}
+			default:
+				// an unknown request type: its body has no length
+				// prefix on the wire, the message flow is unsynced
+				// from here (the reference cancels such a channel)
+				str.CancelRead(42)
+				str.CancelWrite(42)
+				return
+			}
+
+		default:
+			str.CancelRead(42)
+			str.CancelWrite(42)
+			return
+		}
+	}
+}
+
+// s3StartAgentListener creates the agent unix socket (a temp dir with
+// agent.<pid> like the reference unix_util.NewUnixSocketPath), listens
+// and forwards every accepted connection through one server-initiated
+// "agent-connection" channel; it returns the socket path for the
+// SSH_AUTH_SOCK of the exec env
+func s3StartAgentListener(conn *quic.Conn, convID uint64) string {
+	dir, err := os.MkdirTemp("", "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: agent temp dir: %v\n", err)
+		return ""
+	}
+
+	sockPath := filepath.Join(dir, fmt.Sprintf("agent.%d", os.Getpid()))
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: agent listen: %v\n", err)
+		return ""
+	}
+
+	fmt.Printf("AGENT-GO-SOCKET-READY sock=%s\n", sockPath)
+
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				_ = listener.Close()
+				return
+			}
+
+			go s3HandleAgentSocketConn(c, conn, convID)
+		}
+	}()
+
+	return sockPath
+}
+
+// s3HandleAgentSocketConn pumps one accepted agent socket through one
+// server-initiated "agent-connection" channel (the reference
+// handleAuthAgentSocketConn): the socket reads ride as 94 frames, the
+// channel payloads go back into the socket; the client's 91
+// confirmation on the server-initiated channel is skipped
+func s3HandleAgentSocketConn(sock net.Conn, conn *quic.Conn, convID uint64) {
+	str, err := conn.OpenStream()
+	if err != nil {
+		sock.Close()
+		return
+	}
+
+	header := s3AppendVarint(nil, s3SSHFrameType)
+	header = s3AppendVarint(header, convID)
+	header = s3AppendSSHString(header, []byte(s3AgentChannelType))
+	header = s3AppendVarint(header, s3AgentMaxPacket)
+
+	if _, err := str.Write(header); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		sock.Close()
+		return
+	}
+
+	go s3PumpSocketToChannel(str, sock)
+
+	br := bufio.NewReader(str)
+
+	s3PipeChannelToSocket(str, br, sock)
+}
+
+// s3PumpSocketToChannel forwards one local socket to the channel as 94
+// frames (one per read chunk); the socket EOF closes the stream with
+// the FIN, a write error tears the socket down
+func s3PumpSocketToChannel(str *quic.Stream, sock io.ReadWriteCloser) {
+	buf := make([]byte, s3AgentPumpChunk)
+
+	for {
+		n, err := sock.Read(buf)
+
+		if n > 0 {
+			frame := s3AppendVarint(nil, 94)
+			frame = s3AppendSSHString(frame, buf[:n])
+
+			if _, werr := str.Write(frame); werr != nil {
+				sock.Close()
+				return
+			}
+		}
+
+		if err != nil {
+			_ = str.Close() // the socket EOF: the stream FIN
+			return
+		}
+	}
+}
+
+// s3PipeChannelToSocket drives the inbound side of an agent-connection
+// channel: the 91 confirmations of the peer are skipped, the 94/95
+// payloads ride the local socket (both data kinds, like the reference
+// handleAuthAgentSocketConn); the stream EOF or a foreign message
+// closes both ends
+func s3PipeChannelToSocket(str *quic.Stream, br *bufio.Reader, sock net.Conn) {
+	for {
+		typ, err := s3ReadVarint(br)
+		if err != nil {
+			sock.Close()
+			return
+		}
+
+		switch typ {
+		case 91:
+			if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+				sock.Close()
+				return
+			}
+
+		case 94, 95:
+			if typ == 95 {
+				if _, err := s3ReadVarint(br); err != nil { // data type
+					sock.Close()
+					return
+				}
+			}
+
+			data, err := s3ReadSSHString(br)
+			if err != nil {
+				sock.Close()
+				return
+			}
+
+			if _, err := sock.Write(data); err != nil {
+				str.CancelRead(0)
+				str.CancelWrite(0)
+				return
+			}
+
+		default:
+			str.CancelRead(0)
+			str.CancelWrite(0)
+			sock.Close()
+			return
+		}
+	}
+}
+
+// runH3AgentClient runs the session exec scenario of
+// -h3-session-client plus the agent forwarding: the 94 data frame
+// "forward-agent" rides before the exec request (the LARVAL trigger),
+// the server-initiated "agent-connection" channels are accepted in the
+// background and bridged to the local SSH_AUTH_SOCK
+func runH3AgentClient(target string, timeout time.Duration, command string) {
+	if target == "" {
+		fatalf("h3-agent-client mode needs -a host:port")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, str := s3DialAndConnect(target, ctx, timeout)
+	defer conn.CloseWithError(0, "")
+
+	convID := uint64(str.StreamID())
+
+	// the server-initiated agent channels arrive as peer bidis
+	go func() {
+		for {
+			s, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return
+			}
+
+			go s3HandleAgentConnectionChannel(s, convID, timeout)
+		}
+	}()
+
+	// the session channel burst: the header, the forward-agent marker
+	// (the LARVAL trigger) and the exec
+	ch, err := conn.OpenStream()
+	if err != nil {
+		fatalf("open channel stream: %v", err)
+	}
+
+	if err := ch.SetDeadline(time.Now().Add(timeout)); err != nil {
+		fatalf("set channel deadline: %v", err)
+	}
+
+	header := s3AppendVarint(nil, s3SSHFrameType)
+	header = s3AppendVarint(header, convID)
+	header = s3AppendSSHString(header, []byte("session"))
+	header = s3AppendVarint(header, s3ChannelMaxPacket)
+
+	marker := s3AppendVarint(nil, 94)
+	marker = s3AppendSSHString(marker, []byte(s3AgentTrigger))
+
+	execReq := s3AppendVarint(nil, 98)
+	execReq = s3AppendSSHString(execReq, []byte("exec"))
+	execReq = append(execReq, 1) // want_reply = 1
+	execReq = s3AppendSSHString(execReq, []byte(command))
+
+	burst := append(header, marker...)
+	burst = append(burst, execReq...)
+
+	if _, err := ch.Write(burst); err != nil {
+		fatalf("write channel: %v", err)
+	}
+
+	// the exec carries no stdin: the fin goes out at once (the
+	// receive side stays open), like -h3-session-client
+	if err := ch.Close(); err != nil {
+		fatalf("close channel: %v", err)
+	}
+
+	code, out := s3SessionExecRead(ch, false)
+
+	// the -cmd runs (the agent_probe of the fork) answer with their
+	// own marker, the plain exec wants the printf one
+
+	if code == 0 && (bytes.Contains(out, []byte("s3-exec-ok")) ||
+		bytes.Contains(out, []byte("SSH3_AGENT_PROBE_OK"))) {
+		fmt.Println("INTEROP-GO-EXEC-OK exit=0")
+		return
+	}
+
+	fmt.Printf("INTEROP-GO-EXEC-FAIL exit=%d\n", code)
+	os.Exit(1)
+}
+
+// s3HandleAgentConnectionChannel bridges one server-initiated
+// "agent-connection" channel to the local SSH_AUTH_SOCK: the header is
+// answered with the 91 confirmation (the shape of the server) and the
+// bytes pump both ways until either end closes
+func s3HandleAgentConnectionChannel(str *quic.Stream, convID uint64, timeout time.Duration) {
+	br := bufio.NewReader(str)
+
+	ftype, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	convid, err := s3ReadVarint(br)
+	if err != nil {
+		return
+	}
+
+	ctype, err := s3ReadSSHString(br)
+	if err != nil {
+		return
+	}
+
+	if _, err := s3ReadVarint(br); err != nil { // maxPacketSize
+		return
+	}
+
+	if ftype != s3SSHFrameType || convid != convID || string(ctype) != s3AgentChannelType {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	// the deadline guards the handshake only: an established bridge
+	// may idle as long as the peers keep it
+	if err := str.SetDeadline(time.Now().Add(timeout)); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	if _, err := str.Write(s3AppendVarint(s3AppendVarint(nil, 91), s3ChannelMaxPacket)); err != nil {
+		return
+	}
+
+	sockPath := os.Getenv("SSH_AUTH_SOCK")
+	if sockPath == "" {
+		fmt.Fprintf(os.Stderr, "harness: agent bridge: SSH_AUTH_SOCK is unset\n")
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	sock, err := net.Dial("unix", sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness: agent dial %s: %v\n", sockPath, err)
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		return
+	}
+
+	if err := str.SetDeadline(time.Time{}); err != nil {
+		str.CancelRead(0)
+		str.CancelWrite(0)
+		sock.Close()
+		return
+	}
+
+	fmt.Println("AGENT-GO-BRIDGE")
+
+	go s3PumpSocketToChannel(str, sock)
+
+	s3PipeChannelToSocket(str, br, sock)
 }
 
 // MARKER-TEST

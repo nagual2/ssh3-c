@@ -62,6 +62,10 @@ struct s3_ssh3_sftp_cli_s {
 
     void *op;
 
+    /* the INIT/VERSION exchange of the first operation */
+
+    unsigned negotiated : 1;
+
     s3_ssh3_sftp_cli_progress_pt progress;
     void                        *progress_arg;
 };
@@ -82,11 +86,11 @@ s3_int_t s3_ssh3_sftp_cli_init(s3_ssh3_sftp_cli_t *t, s3_pool_t *pool,
  * local file is missing, the local walk cannot start)
  */
 
-s3_int_t s3_ssh3_sftp_cli_put(s3_ssh3_sftp_cli_t *t, const char *local_path, const char *remote_path,
-                              unsigned resume, unsigned verify);
+s3_int_t s3_ssh3_sftp_cli_put(s3_ssh3_sftp_cli_t *t, const char *local_path,
+                              const char *remote_path, unsigned resume, unsigned verify);
 
-s3_int_t s3_ssh3_sftp_cli_get(s3_ssh3_sftp_cli_t *t, const char *remote_path, const char *local_path,
-                              unsigned resume, unsigned verify);
+s3_int_t s3_ssh3_sftp_cli_get(s3_ssh3_sftp_cli_t *t, const char *remote_path,
+                              const char *local_path, unsigned resume, unsigned verify);
 
 s3_int_t s3_ssh3_sftp_cli_put_r(s3_ssh3_sftp_cli_t *t, const char *local_path,
                                 const char *remote_path, unsigned resume, unsigned verify);

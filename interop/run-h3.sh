@@ -14,6 +14,17 @@
 #  13. our client (-F udp=@port) -> our server: direct-udp forward
 #  14. our client (-F tcp) -> the harness forward-server
 #  15. the harness forward-client -> our server: direct-tcp forward
+#  16. our client (-3 -J put|get) -> our server (-H): the sftp put
+#      and get round trips of a 3 MiB random file, byte-exact
+#  17. our client (-3 -J) -> the harness sftp-server: the C driver
+#      against the go sftp subsystem (the pkg/sftp dialect)
+#  18. the harness sftp-client -> our server: the go client against
+#      the C jail
+#  19. our client (-3 -C -S exec -X -e agent_probe) -> our server:
+#      the agent forwarding, the probe lists and signs through the
+#      real ssh-agent of the client side
+#  20. our client (-X -e agent_probe) -> the harness agent-server
+#  21. the harness agent-client (-cmd agent_probe) -> our server
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -643,6 +654,266 @@ else
 fi
 
 stop_echo
+
+# == the wave 2 scenarios: the sftp transfers and the agent forwarding ==
+#
+#  16. our client (-3 -J put|get) -> our server (-H jail): the sftp
+#      put and get round trips of a 3 MiB random file, byte-exact
+#  17. our client (-3 -J) -> the harness sftp-server: the C driver
+#      against the go sftp subsystem (pkg/sftp wire dialect)
+#  18. the harness sftp-client -> our server: the go sftp client
+#      against the C jail
+#  19. our client (-3 -C -S exec -X -e agent_probe) -> our server:
+#      the agent forwarding, the probe lists and signs through the
+#      real ssh-agent of the client side
+#  20. our client (-X -e agent_probe) -> the harness agent-server
+#  21. the harness agent-client (-cmd agent_probe) -> our server
+
+# the ssh-agent probe binary of the Go fork (the ssh-agent protocol
+# against the bridged socket: lists the identities and signs)
+
+PROBE=$WORK/agent_probe
+
+(cd "$ROOT/../ssh3" && "$GO" build -o "$PROBE" ./internal/interop/agent_probe) \
+    || die "agent_probe build failed"
+
+echo "== scenario 16: C client (-3 -J put|get) -> C server (-H), sftp round trip"
+
+mkdir -p "$WORK/sftp-cc"
+
+dd if=/dev/urandom of="$WORK/sftp-src.bin" bs=1048576 count=3 2>/dev/null
+
+setsid nohup "$BUILD/s3interop_server" -3 -H "$WORK/sftp-cc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/sftp-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/sftp-srv.log"; then
+    PORT=$(port_of "$WORK/sftp-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -J "put:$WORK/sftp-src.bin:s3-p5-cc.bin" \
+        -a "127.0.0.1:$PORT" -t 30000 \
+        > "$WORK/sftp-put.log" 2>&1 \
+        && cmp -s "$WORK/sftp-cc/s3-p5-cc.bin" "$WORK/sftp-src.bin" \
+        && grep -q "INTEROP-SFTP-OK mode=put" "$WORK/sftp-put.log"; then
+        echo "   PASS (put: 3 MiB uploaded byte-exact)"
+    else
+        echo "   FAIL (put)"
+        tail -5 "$WORK/sftp-put.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -J "get:$WORK/sftp-dst.bin:s3-p5-cc.bin" \
+        -a "127.0.0.1:$PORT" -t 30000 \
+        > "$WORK/sftp-get.log" 2>&1 \
+        && cmp -s "$WORK/sftp-dst.bin" "$WORK/sftp-src.bin" \
+        && grep -q "INTEROP-SFTP-OK mode=get" "$WORK/sftp-get.log"; then
+        echo "   PASS (get: downloaded byte-exact, verify checksum on)"
+    else
+        echo "   FAIL (get)"
+        tail -5 "$WORK/sftp-get.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 17: C client (-3 -J put|get) -> harness sftp-server"
+
+mkdir -p "$WORK/sftp-go"
+
+cp "$WORK/sftp-src.bin" "$WORK/sftp-go-src.bin"
+
+setsid nohup env HOME="$WORK/sftp-go" "$HARNESS" -h3-sftp-server -addr 127.0.0.1:0 \
+    -cert "$CERT" -key "$KEY" > "$WORK/gsftp-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gsftp-srv.log"; then
+    PORT=$(port_of "$WORK/gsftp-srv.log")
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -J "put:$WORK/sftp-src.bin:go-p5.bin" \
+        -a "127.0.0.1:$PORT" -t 30000 \
+        > "$WORK/gsftp-put.log" 2>&1 \
+        && cmp -s "$WORK/sftp-go/go-p5.bin" "$WORK/sftp-src.bin" \
+        && grep -q "INTEROP-SFTP-OK mode=put" "$WORK/gsftp-put.log"; then
+        echo "   PASS (put: the C driver against the go sftp subsystem)"
+    else
+        echo "   FAIL (put)"
+        tail -5 "$WORK/gsftp-put.log" | sed 's/^/   /'
+        tail -5 "$WORK/gsftp-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    if timeout 30 "$BUILD/s3interop_client" -3 -J "get:$WORK/gsftp-dst.bin:go-p5.bin" \
+        -a "127.0.0.1:$PORT" -t 30000 \
+        > "$WORK/gsftp-get.log" 2>&1 \
+        && cmp -s "$WORK/gsftp-dst.bin" "$WORK/sftp-src.bin" \
+        && grep -q "INTEROP-SFTP-OK mode=get" "$WORK/gsftp-get.log"; then
+        echo "   PASS (get: downloaded byte-exact from the go subsystem)"
+    else
+        echo "   FAIL (get)"
+        tail -5 "$WORK/gsftp-get.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the harness sftp-server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "h3-sftp-server" 2>/dev/null
+
+echo "== scenario 18: harness sftp-client -> C server (-H), sftp round trip"
+
+mkdir -p "$WORK/sftp-gc"
+
+dd if=/dev/urandom of="$WORK/sftp-gc-src.bin" bs=1048576 count=2 2>/dev/null
+
+setsid nohup "$BUILD/s3interop_server" -3 -H "$WORK/sftp-gc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/gc-sftp-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gc-sftp-srv.log"; then
+    PORT=$(port_of "$WORK/gc-sftp-srv.log")
+
+    if timeout 30 "$HARNESS" -h3-sftp-client -sftp-op "put:$WORK/sftp-gc-src.bin:gc-p5.bin" \
+        -a "127.0.0.1:$PORT" -timeout 20s \
+        > "$WORK/gc-sftp-put.log" 2>&1 \
+        && cmp -s "$WORK/sftp-gc/gc-p5.bin" "$WORK/sftp-gc-src.bin" \
+        && grep -q "SFTP-GO-CLIENT-DONE op=put" "$WORK/gc-sftp-put.log"; then
+        echo "   PASS (put: the go client against the C jail)"
+    else
+        echo "   FAIL (put)"
+        tail -5 "$WORK/gc-sftp-put.log" | sed 's/^/   /'
+        tail -5 "$WORK/gc-sftp-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    if timeout 30 "$HARNESS" -h3-sftp-client -sftp-op "get:$WORK/sftp-gc-dst.bin:gc-p5.bin" \
+        -a "127.0.0.1:$PORT" -timeout 20s \
+        > "$WORK/gc-sftp-get.log" 2>&1 \
+        && cmp -s "$WORK/sftp-gc-dst.bin" "$WORK/sftp-gc-src.bin" \
+        && grep -q "SFTP-GO-CLIENT-DONE op=get" "$WORK/gc-sftp-get.log"; then
+        echo "   PASS (get: downloaded byte-exact from the C jail)"
+    else
+        echo "   FAIL (get)"
+        tail -5 "$WORK/gc-sftp-get.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 19: C client (-X -e agent_probe) -> C server, agent forwarding"
+
+if [ -S "${SSH_AUTH_SOCK:-}" ]; then
+    AGENT_ENV_SOCK=$SSH_AUTH_SOCK
+else
+    # the throwaway agent of the scenario: one fresh ed25519 key
+
+    ssh-keygen -t ed25519 -N "" -f "$WORK/agkey" -C s3interop 2>/dev/null \
+        || die "ssh-keygen failed"
+
+    eval "$(ssh-agent -s)" > /dev/null
+    ssh-add "$WORK/agkey" 2>/dev/null || die "ssh-add failed"
+
+    AGENT_ENV_SOCK=$SSH_AUTH_SOCK
+fi
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/ag-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/ag-srv.log"; then
+    PORT=$(port_of "$WORK/ag-srv.log")
+
+    if SSH_AUTH_SOCK="$AGENT_ENV_SOCK" timeout 30 \
+        "$BUILD/s3interop_client" -3 -C -S exec -X -e "$PROBE" \
+        -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/ag-cli.log" 2>&1 \
+        && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/ag-cli.log" \
+        && grep -q "INTEROP-AGENT-BRIDGE" "$WORK/ag-cli.log" \
+        && grep -q "INTEROP-AGENT-READY sock=" "$WORK/ag-srv.log"; then
+        echo "   PASS (agent: the probe listed and signed through the tunnel)"
+    else
+        echo "   FAIL"
+        tail -8 "$WORK/ag-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/ag-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 20: C client (-X -e agent_probe) -> harness agent-server"
+
+setsid nohup "$HARNESS" -h3-agent-server -addr 127.0.0.1:0 -cert "$CERT" -key "$KEY" \
+    > "$WORK/gag-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/gag-srv.log"; then
+    PORT=$(port_of "$WORK/gag-srv.log")
+
+    if SSH_AUTH_SOCK="$AGENT_ENV_SOCK" timeout 30 \
+        "$BUILD/s3interop_client" -3 -C -S exec -X -e "$PROBE" \
+        -a "127.0.0.1:$PORT" -t 20000 \
+        > "$WORK/gag-cli.log" 2>&1 \
+        && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/gag-cli.log" \
+        && grep -q "AGENT-GO-SOCKET-READY sock=" "$WORK/gag-srv.log"; then
+        echo "   PASS (agent: the C client through the go agent-server)"
+    else
+        echo "   FAIL"
+        tail -8 "$WORK/gag-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/gag-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the harness agent-server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "h3-agent-server" 2>/dev/null
+
+echo "== scenario 21: harness agent-client (-cmd agent_probe) -> C server"
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/cag-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/cag-srv.log"; then
+    PORT=$(port_of "$WORK/cag-srv.log")
+
+    if SSH_AUTH_SOCK="$AGENT_ENV_SOCK" timeout 30 \
+        "$HARNESS" -h3-agent-client -cmd "$PROBE" \
+        -a "127.0.0.1:$PORT" -timeout 15s \
+        > "$WORK/cag-cli.log" 2>&1 \
+        && grep -q "INTEROP-GO-EXEC-OK exit=0" "$WORK/cag-cli.log" \
+        && grep -q "AGENT-GO-BRIDGE" "$WORK/cag-cli.log" \
+        && grep -q "INTEROP-AGENT-READY sock=" "$WORK/cag-srv.log"; then
+        echo "   PASS (agent: the go client through the C agent bridge)"
+    else
+        echo "   FAIL"
+        tail -8 "$WORK/cag-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/cag-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+if [ -n "${SSH_AGENT_PID:-}" ]; then
+    kill "$SSH_AGENT_PID" 2>/dev/null
+fi
 
 rm -rf "$WORK"
 
