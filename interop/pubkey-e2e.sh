@@ -14,6 +14,14 @@ set -u
 ROOT=${1:-/mnt/c/Git/project/ssh3-c}
 GOSSH3=${2:-/tmp/pubkey-e2e/ssh3}
 BUILD=$ROOT/build/linux-release
+# the server binary override (P6.5 wave 2): the ssh3-server daemon
+# replaces the harness server; the daemon speaks the runner markers
+# only under SSH3C_PROTO=1, the harness server ignores the variable
+SERVER=${SSH3C_SERVER_BIN:-$BUILD/s3interop_server}
+SRV_ENV=""
+if [ "${SSH3C_SERVER_BIN:-}" != "" ]; then
+    SRV_ENV="SSH3C_PROTO=1"
+fi
 FAILURES=0
 
 die() {
@@ -30,7 +38,7 @@ pass() {
     echo "   PASS: $1"
 }
 
-[ -x "$BUILD/s3interop_server" ] || die "s3interop_server is not built"
+[ -x "$SERVER" ] || die "the server binary is not built ($SERVER)"
 [ -x "$GOSSH3" ] || die "the go ssh3 client is not built ($GOSSH3)"
 
 W=$(mktemp -d /tmp/pubkey-e2e.XXXXXX)
@@ -70,7 +78,7 @@ ssh-keygen -t ed25519 -N "" -C pubkey-e2e-foreign -f "$W/id_foreign" -q || die "
 
 echo "== 1: the server and the good key"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$W/cert.pem" -k "$W/key.pem" \
+setsid nohup env $SRV_ENV "$SERVER" -3 -l 127.0.0.1:0 -c "$W/cert.pem" -k "$W/key.pem" \
     -K "$W/authorized_keys" > "$SRV" 2>&1 < /dev/null &
 
 SRVPID=$!

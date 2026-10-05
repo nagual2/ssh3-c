@@ -14,8 +14,16 @@
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/build/linux-release}
+# the server binary override (P6.5 wave 2): the ssh3-server daemon
+# replaces the harness server; the daemon speaks the runner markers
+# only under SSH3C_PROTO=1, the harness server ignores the variable
+SERVER=${SSH3C_SERVER_BIN:-$BUILD/s3interop_server}
+SRV_ENV=""
+if [ "${SSH3C_SERVER_BIN:-}" != "" ]; then
+    SRV_ENV="SSH3C_PROTO=1"
+fi
+SRV_PATT="${SERVER##*/}.*--oidc-issuer"
 CLIENT=$BUILD/s3interop_client
-SERVER=$BUILD/s3interop_server
 MOCK=$ROOT/scripts/mock-oidc-issuer.py
 
 FAILURES=0
@@ -36,7 +44,7 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
 fi
 
 cleanup() {
-    pkill -f "s3interop_server.*--oidc-issuer" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
     pkill -f "mock-oidc-issuer.py serv[e]" 2>/dev/null
 }
 trap cleanup EXIT
@@ -119,7 +127,7 @@ fi
 
 ISSUER=$(grep -m1 "MOCK-OIDC-ISSUER" "$WORK/mock.log" | cut -d' ' -f2)
 
-setsid nohup "$SERVER" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+setsid nohup env $SRV_ENV "$SERVER" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
     -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/oidc-srv.log" 2>&1 < /dev/null &
 
@@ -161,7 +169,7 @@ else
     fi
 fi
 
-pkill -f "s3interop_server.*--oidc-issuer" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 sleep 0.3
 
 # the negatives: the raw-token bypass carries the minted token, the
@@ -188,7 +196,7 @@ PYEOF
 )
     fi
 
-    setsid nohup "$SERVER" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+    setsid nohup env $SRV_ENV "$SERVER" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
         -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/neg-srv.log" 2>&1 < /dev/null &
 
@@ -226,7 +234,7 @@ PYEOF
         echo "   PASS ($name: rejected:$expect, 401)"
     fi
 
-    pkill -f "s3interop_server.*--oidc-issuer" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
     sleep 0.3
 }
 
