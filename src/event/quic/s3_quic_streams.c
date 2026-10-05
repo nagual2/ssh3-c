@@ -1610,7 +1610,6 @@ s3_quic_handle_max_streams_frame(s3_connection_t *c, s3_quic_header_t *pkt,
 void
 s3_quic_handle_stream_ack(s3_connection_t *c, s3_quic_frame_t *f)
 {
-    uint64_t              acked;
     s3_quic_stream_t     *qs;
     s3_quic_connection_t *qc;
 
@@ -1640,7 +1639,6 @@ s3_quic_handle_stream_ack(s3_connection_t *c, s3_quic_frame_t *f)
             return;
         }
 
-        acked = qs->acked;
         qs->acked += f->u.stream.length;
 
         if (f->u.stream.fin) {
@@ -1656,8 +1654,15 @@ s3_quic_handle_stream_ack(s3_connection_t *c, s3_quic_frame_t *f)
                       "quic stream id:0x%xL ack len:%uL fin:%d unacked:%uL", qs->id,
                       f->u.stream.length, f->u.stream.fin, qs->sent - qs->acked);
 
-        if (qs->connection && qs->sent - acked == qc->conf->stream_buffer_size &&
-            f->u.stream.length > 0) {
+        if (qs->connection && qs->send_max_data > qs->sent && f->u.stream.length > 0) {
+            /*
+             * the writer is armed while the stream still has peer-granted
+             * window to fill: the previous exact-equality edge only fired
+             * when the whole buffer happened to be unacked before this
+             * frame, so a partially acknowledged buffer left the writer
+             * parked although budget was left
+             */
+
             s3_quic_set_event(qc, qs->connection->write);
         }
 

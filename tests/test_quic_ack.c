@@ -591,12 +591,114 @@ test_max_stream_data_retransmit(void)
     return s3_test_failures;
 }
 
+/*
+ * the write event must be armed while the stream still has peer
+ * granted window to fill, not only on the exact edge where the whole
+ * buffer happens to be unacked before an ack
+ */
+
+static int
+test_stream_ack_arms_writer(void)
+{
+    s3_test_ack_env_t env;
+    s3_connection_t  *sc;
+    s3_quic_stream_t *qs;
+    s3_quic_frame_t   f;
+    uint64_t          budget;
+
+    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env.conn, &env.conf) == S3_OK);
+
+    env.qc = s3_quic_get_connection(env.conn);
+
+    /* flush the handshake flight, then seed the application keys */
+    S3_ASSERT(s3_quic_output(env.conn) == S3_OK);
+
+    s3_test_seed_app(&env);
+
+    /* a client-initiated bidi stream, id 0 */
+    sc = s3_quic_open_stream(env.conn, 1);
+    S3_ASSERT(sc != NULL);
+    S3_ASSERT(sc->data != NULL);
+
+    qs = (s3_quic_stream_t *)sc->data;
+
+    budget = env.conf.stream_buffer_size;
+
+    /*
+     * a partially acknowledged buffer: the unacked tail is deliberately
+     * not equal to the buffer size, while the peer granted window still
+     * leaves room to send
+     */
+
+    qs->acked = 0;
+    qs->sent = budget + 1000;
+    qs->send_max_data = qs->sent + 1000;
+
+    S3_ASSERT(qs->sent - qs->acked != budget);
+    S3_ASSERT(qs->send_max_data > qs->sent);
+
+    /* disarm the writer, so an arm is unambiguous */
+    sc->write->ready = 0;
+
+    s3_memzero(&f, sizeof(s3_quic_frame_t));
+    f.type = S3_QUIC_FT_STREAM;
+    f.u.stream.stream_id = qs->id;
+    f.u.stream.offset = 0;
+    f.u.stream.length = 1000;
+    f.u.stream.fin = 0;
+
+    s3_quic_handle_stream_ack(env.conn, &f);
+
+    S3_ASSERT(qs->acked == 1000);
+    S3_ASSERT(sc->write->ready == 1);
+
+    /* with the granted window consumed the writer is left alone */
+    qs->send_max_data = qs->sent;
+
+    sc->write->ready = 0;
+
+    s3_memzero(&f, sizeof(s3_quic_frame_t));
+    f.type = S3_QUIC_FT_STREAM;
+    f.u.stream.stream_id = qs->id;
+    f.u.stream.offset = 1000;
+    f.u.stream.length = 1000;
+    f.u.stream.fin = 0;
+
+    s3_quic_handle_stream_ack(env.conn, &f);
+
+    S3_ASSERT(qs->acked == 2000);
+    S3_ASSERT(sc->write->ready == 0);
+
+    /*
+     * tear the stream down explicitly: its pool is owned by the
+     * stream, not by the connection pool the fixture destroys, and
+     * the read handler is a stub so the stream is never closed
+     */
+
+    if (sc->read->posted) {
+        s3_delete_posted_event(sc->read);
+    }
+
+    if (sc->write->posted) {
+        s3_delete_posted_event(sc->write);
+    }
+
+    s3_rbtree_delete(&env.qc->streams.tree, &qs->node);
+    s3_close_connection(sc);
+
+    s3_test_env_done(&env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_ack(void)
 {
     test_ack_ranges();
     test_loss_retransmit();
     test_max_stream_data_retransmit();
+    test_stream_ack_arms_writer();
 
     OPENSSL_cleanup();
 
