@@ -103,12 +103,25 @@ HARNESS=${HARNESS:-/tmp/h3harness}
 # a worktree elsewhere overrides it, the build only reads the fork
 GOFORK=${GOFORK:-$ROOT/../ssh3}
 
+# the server binary override (P6.5): the ssh3-server daemon replaces
+# the harness server for every server-side scenario; the daemon
+# speaks the runner markers only under SSH3C_PROTO=1, the harness
+# server ignores the variable
+SERVER_BIN=${SSH3C_SERVER_BIN:-$BUILD/s3interop_server}
+SRV_ENV=""
+SRV_PATT="s3interop_server -3"
+
+if [ "${SSH3C_SERVER_BIN:-}" != "" ]; then
+    SRV_ENV="SSH3C_PROTO=1"
+    SRV_PATT="${SERVER_BIN##*/} -3"
+fi
+
 die() {
     echo "run-h3: $1" >&2
     exit 1
 }
 
-[ -x "$BUILD/s3interop_server" ] || die "s3interop_server is not built (cmake --build $BUILD)"
+[ -x "$SERVER_BIN" ] || die "the server binary is not built: $SERVER_BIN (cmake --build $BUILD)"
 [ -x "$BUILD/s3interop_client" ] || die "s3interop_client is not built"
 
 mkdir -p "$BUILD/interop"
@@ -243,7 +256,7 @@ pkill -f "h3harness -h3-server" 2>/dev/null
 
 echo "== scenario 2: quic-go h3-client -> C server (-3)"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/c-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/c-srv.log"; then
@@ -266,11 +279,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 3: C client (-3) -> C server (-3) (sanity)"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/cc-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/cc-srv.log"; then
@@ -293,11 +306,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 4: quic-go h3-client (unsupported version) -> C server (-3), expect 403"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/cc-rej-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/cc-rej-srv.log"; then
@@ -320,11 +333,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 5: C client (-3) -> C server (-3), session channel echo"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/ch-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/ch-srv.log"; then
@@ -347,11 +360,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 6: C client (-3 -C -S exec) -> C server (-3), exec session"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/exec-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/exec-srv.log"; then
@@ -374,11 +387,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 7: C client (-3 -C -S pty) -> C server (-3), pty + signal session"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/pty-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/pty-srv.log"; then
@@ -401,11 +414,11 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 8: quic-go session-client -> C server (-3), exec session"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/gc-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/gc-srv.log"; then
@@ -429,7 +442,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 9: C client (-3 -C -S exec) -> quic-go session-server, exec session"
 
@@ -489,7 +502,7 @@ echo "== scenario 11: C client (Basic auth) -> C server (-P passfile), exec sess
 
 printf 'tester:secret123\n' > "$WORK/pwfile"
 
-setsid nohup "$BUILD/s3interop_server" -3 -P "$WORK/pwfile" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -P "$WORK/pwfile" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/auth-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/auth-srv.log"; then
@@ -513,7 +526,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 12: C client (-3 -C -F tcp=@19999) -> C server (-3), direct-tcp forward"
 
@@ -521,7 +534,7 @@ start_echo tcp
 
 if wait_echo tcp; then
 
-    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/fwd-tcp-srv.log" 2>&1 < /dev/null &
 
     if wait_listen "$WORK/fwd-tcp-srv.log"; then
@@ -544,7 +557,7 @@ if wait_echo tcp; then
         FAILURES=$((FAILURES + 1))
     fi
 
-    pkill -f "s3interop_server -3" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
 
 else
     echo "   FAIL: the tcp echo service did not start"
@@ -558,7 +571,7 @@ start_echo udp
 
 if wait_echo udp; then
 
-    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/fwd-udp-srv.log" 2>&1 < /dev/null &
 
     if wait_listen "$WORK/fwd-udp-srv.log"; then
@@ -581,7 +594,7 @@ if wait_echo udp; then
         FAILURES=$((FAILURES + 1))
     fi
 
-    pkill -f "s3interop_server -3" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
 
 else
     echo "   FAIL: the udp echo service did not start"
@@ -635,7 +648,7 @@ start_echo tcp
 
 if wait_echo tcp; then
 
-    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/gfwd2-srv.log" 2>&1 < /dev/null &
 
     if wait_listen "$WORK/gfwd2-srv.log"; then
@@ -668,7 +681,7 @@ if wait_echo tcp; then
         FAILURES=$((FAILURES + 1))
     fi
 
-    pkill -f "s3interop_server -3" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
 
 else
     echo "   FAIL: the tcp echo service did not start"
@@ -705,7 +718,7 @@ mkdir -p "$WORK/sftp-cc"
 
 dd if=/dev/urandom of="$WORK/sftp-src.bin" bs=1048576 count=3 2>/dev/null
 
-setsid nohup "$BUILD/s3interop_server" -3 -H "$WORK/sftp-cc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -H "$WORK/sftp-cc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/sftp-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/sftp-srv.log"; then
@@ -740,7 +753,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 17: C client (-3 -J put|get) -> harness sftp-server"
 
@@ -792,7 +805,7 @@ mkdir -p "$WORK/sftp-gc"
 
 dd if=/dev/urandom of="$WORK/sftp-gc-src.bin" bs=1048576 count=2 2>/dev/null
 
-setsid nohup "$BUILD/s3interop_server" -3 -H "$WORK/sftp-gc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -H "$WORK/sftp-gc" -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/gc-sftp-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/gc-sftp-srv.log"; then
@@ -828,7 +841,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 19: C client (-X -e agent_probe) -> C server, agent forwarding"
 
@@ -846,7 +859,7 @@ else
     AGENT_ENV_SOCK=$SSH_AUTH_SOCK
 fi
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/ag-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/ag-srv.log"; then
@@ -872,7 +885,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 20: C client (-X -e agent_probe) -> harness agent-server"
 
@@ -905,7 +918,7 @@ pkill -f "h3-agent-server" 2>/dev/null
 
 echo "== scenario 21: harness agent-client (-cmd agent_probe) -> C server"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/cag-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/cag-srv.log"; then
@@ -931,17 +944,17 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 22: C client (-3 -C -S exec -j) -> two C servers, proxy jump"
 
-setsid nohup "$BUILD/s3interop_server" -3 -d 1352 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -d 1352 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/pj-jump-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/pj-jump-srv.log"; then
     JPORT=$(port_of "$WORK/pj-jump-srv.log")
 
-    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/pj-inner-srv.log" 2>&1 < /dev/null &
 
     if wait_listen "$WORK/pj-inner-srv.log"; then
@@ -976,13 +989,13 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 echo "== scenario 23: control master (-3 -C -M) + two slaves + check + stop"
 
 CM_BASE=$FAILURES
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/cm-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/cm-srv.log"; then
@@ -1104,7 +1117,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 # == the 7a scenarios: the quic-go client sides the harness missed ==
 #
@@ -1123,7 +1136,7 @@ start_echo udp
 
 if wait_echo udp; then
 
-    setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
         > "$WORK/gfwdudp-srv.log" 2>&1 < /dev/null &
 
     if wait_listen "$WORK/gfwdudp-srv.log"; then
@@ -1148,7 +1161,7 @@ if wait_echo udp; then
         FAILURES=$((FAILURES + 1))
     fi
 
-    pkill -f "s3interop_server -3" 2>/dev/null
+    pkill -f "$SRV_PATT" 2>/dev/null
 
 else
     echo "   FAIL: the udp echo service did not start"
@@ -1159,7 +1172,7 @@ stop_echo
 
 echo "== scenario 25: quic-go pty-client -> C server (-3), exec through pty + resize"
 
-setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+setsid nohup env $SRV_ENV "$SERVER_BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
     > "$WORK/gpty-srv.log" 2>&1 < /dev/null &
 
 if wait_listen "$WORK/gpty-srv.log"; then
@@ -1183,7 +1196,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-pkill -f "s3interop_server -3" 2>/dev/null
+pkill -f "$SRV_PATT" 2>/dev/null
 
 if [ -n "${SSH_AGENT_PID:-}" ]; then
     kill "$SSH_AGENT_PID" 2>/dev/null
