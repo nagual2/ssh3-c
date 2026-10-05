@@ -70,23 +70,33 @@ s3_int_t
 s3_ssh3_parse_varint(const u_char **pos, const u_char *end, uint64_t *value)
 {
     const u_char *p = *pos;
-    size_t        len;
+    size_t        form, len;
     uint64_t      v;
 
     if (end - p < 1) {
         return S3_ERROR;
     }
 
-    len = (size_t)1 << ((*p & 0xc0) >> 6);
+    form = (size_t)1 << ((*p & 0xc0) >> 6);
 
-    if ((size_t)(end - p) < len) {
+    if ((size_t)(end - p) < form) {
         return S3_ERROR;
     }
 
+    len = form;
     v = (uint64_t)(*p++ & 0x3f);
 
     while (--len > 0) {
         v = (v << 8) | (uint64_t)*p++;
+    }
+
+    /* the canonical form only: a value that fits a shorter encoding
+     * is a wire violation, the reference Go encoder never produces
+     * it (quicvarint.Append) and QUIC makes the shortest encoding a
+     * MUST for frame types (RFC 9000, 12.4) */
+
+    if (form > s3_ssh3_varint_size(v)) {
+        return S3_ERROR;
     }
 
     *pos = p;
