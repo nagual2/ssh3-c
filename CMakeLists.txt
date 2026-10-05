@@ -105,6 +105,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_sftp_codec.c
     src/ssh3/s3_ssh3_sftp_srv.c
     src/ssh3/s3_ssh3_sftp_cli.c
+    src/ssh3/s3_ssh3_cm.c
 )
 
 add_library(s3core STATIC ${S3_CORE_SOURCES})
@@ -191,6 +192,7 @@ set(S3_TESTS
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
     test_ssh3_sftp_cli
+    test_ssh3_cm
 )
 
 enable_testing()
