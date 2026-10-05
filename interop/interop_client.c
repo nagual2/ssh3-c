@@ -2514,28 +2514,6 @@ s3_interop_cm_runs_live(void)
     return n;
 }
 
-/* frees the codec slot of a finished session, the table stays public */
-
-static void
-s3_interop_cm_slot_release(const u_char token[S3_SSH3_CM_TOKEN_LEN])
-{
-    uint32_t i;
-
-    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
-
-        if (s3_interop_cm_table.sessions[i].used &&
-            s3_memcmp(s3_interop_cm_table.sessions[i].token, token, S3_SSH3_CM_TOKEN_LEN) == 0) {
-
-            /*
-             * the whole slot clears: the codec alloc reuses it for the
-             * next session, the stderr and started flags must not leak
-             */
-            s3_memzero(&s3_interop_cm_table.sessions[i], sizeof(s3_ssh3_cm_sess_t));
-            s3_interop_cm_table.count--;
-        }
-    }
-}
-
 static void
 s3_interop_cm_shutdown(void)
 {
@@ -2838,7 +2816,9 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
         }
     }
 
-    s3_interop_cm_slot_release(run->token);
+    /* the codec slot clears for the reuse, the release is the lib's */
+
+    (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
 
     if (run->chan != NULL) {
         (void)s3_quic_shutdown_stream(run->chan, S3_RDWR_SHUTDOWN);
@@ -3167,6 +3147,26 @@ s3_interop_cm_cb_bridge(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
     }
 }
 
+static void
+s3_interop_cm_cb_bridge_stderr(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    s3_interop_cm_run_t *run = s3_interop_cm_run_by_token(token);
+
+    (void)ctx;
+
+    if (run == NULL) {
+        return;
+    }
+
+    /* the attachment conns own no run yet, the control conns do */
+
+    if (s3_interop_cm_cur != NULL && s3_interop_cm_cur->run == NULL) {
+        run->err = s3_interop_cm_cur;
+        s3_interop_cm_cur->run = run;
+        s3_interop_cm_cur->kind = S3_INTEROP_CM_CONN_STDERR;
+    }
+}
+
 static s3_int_t
 s3_interop_cm_cb_status(void *ctx, s3_ssh3_cm_status_t *st)
 {
@@ -3182,8 +3182,8 @@ s3_interop_cm_cb_status(void *ctx, s3_ssh3_cm_status_t *st)
     return S3_OK;
 }
 
-/* the per-connection read handler: the codec pumps until the bridge
-   owns the io attachment, the stderr flips tag the attachment conns */
+/* the per-connection read handler: the codec pumps until the io or
+   the stderr bridge owns the attachment */
 
 static void
 s3_interop_cm_conn_read(s3_event_t *ev)
@@ -3192,8 +3192,6 @@ s3_interop_cm_conn_read(s3_event_t *ev)
     s3_interop_cm_conn_t *conn = sc->data;
     u_char                buf[16384];
     u_char                obuf[16384];
-    unsigned              prev_stderr[S3_SSH3_CM_SRV_SESSIONS];
-    uint32_t              i;
     ssize_t               n;
 
     for (;;) {
@@ -3217,10 +3215,6 @@ s3_interop_cm_conn_read(s3_event_t *ev)
 
         s3_interop_cm_activity = s3_current_msec;
 
-        for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
-            prev_stderr[i] = s3_interop_cm_table.sessions[i].stderr_attached;
-        }
-
         if (conn->kind != S3_INTEROP_CM_CONN_IO || conn->run == NULL || !conn->run->bridged) {
 
             s3_interop_cm_cur = conn;
@@ -3232,26 +3226,6 @@ s3_interop_cm_conn_read(s3_event_t *ev)
             }
 
             s3_interop_cm_cur = NULL;
-
-            /*
-             * the codec keeps no callback for the stderr attach: the
-             * flags it flipped inside srv_input name the sessions of
-             * this connection
-             */
-            for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
-
-                s3_ssh3_cm_sess_t *s = &s3_interop_cm_table.sessions[i];
-
-                if (s->used && !prev_stderr[i] && s->stderr_attached && conn->run == NULL) {
-                    s3_interop_cm_run_t *run = s3_interop_cm_run_by_token(s->token);
-
-                    if (run != NULL) {
-                        run->err = conn;
-                        conn->run = run;
-                        conn->kind = S3_INTEROP_CM_CONN_STDERR;
-                    }
-                }
-            }
 
             for (;;) {
 
@@ -3326,6 +3300,7 @@ s3_interop_cm_accept(s3_event_t *ev)
     if (cbs.open_session == NULL) {
         cbs.open_session = s3_interop_cm_cb_open_session;
         cbs.bridge = s3_interop_cm_cb_bridge;
+        cbs.bridge_stderr = s3_interop_cm_cb_bridge_stderr;
         cbs.status = s3_interop_cm_cb_status;
     }
 
