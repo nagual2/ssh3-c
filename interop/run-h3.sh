@@ -28,6 +28,10 @@
 #  22. our client (-3 -C -S exec -j jump) -> two C servers: the
 #      proxy jump, the inner exec session tunnels through the
 #      direct-udp channel of the jump conversation
+#  23. our client (-3 -C -M -U sock) -> our server: the control
+#      master, two slave sessions (-U sock -e cmd) run through the
+#      SAME master connection, -O check under a live session shows
+#      it, -O stop closes the master and removes the socket
 #   5. our client (-3) -> our server (-3): after the 200 the client
 #      opens a session channel (header + shell request + ping in one
 #      send), the server confirms (91) and echoes the data (94)
@@ -73,6 +77,9 @@
 #   INTEROP-FWD-UDP-OK       (the C client side, the udp forward echo)
 #   INTEROP-FWD-TCP-OPEN     (the C server side, the tcp target connected)
 #   INTEROP-FWD-UDP-OPEN     (the C server side, the udp target socket up)
+#   S3CM-MASTER-LISTEN       (the C client side, the master serves)
+#   S3CM-SLAVE-OUT           (the C client side, the session stdout of a slave)
+#   S3CM-SLAVE-DONE          (the C client side, the slave session verdict)
 #
 # usage: interop/run-h3.sh
 # requires: the C runners (cmake --build build/linux-release), a Go
@@ -83,6 +90,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/build/linux-release}
 GO=${GO:-$HOME/opt/go1.27.1/bin/go}
 HARNESS=${HARNESS:-/tmp/h3harness}
+# the Go fork sibling of the repo (the agent probe of the scenarios 19-21);
+# a worktree elsewhere overrides it, the build only reads the fork
+GOFORK=${GOFORK:-$ROOT/../ssh3}
 
 die() {
     echo "run-h3: $1" >&2
@@ -677,7 +687,7 @@ stop_echo
 
 PROBE=$WORK/agent_probe
 
-(cd "$ROOT/../ssh3" && "$GO" build -o "$PROBE" ./internal/interop/agent_probe) \
+(cd "$GOFORK" && "$GO" build -o "$PROBE" ./internal/interop/agent_probe) \
     || die "agent_probe build failed"
 
 echo "== scenario 16: C client (-3 -J put|get) -> C server (-H), sftp round trip"
@@ -954,6 +964,134 @@ if wait_listen "$WORK/pj-jump-srv.log"; then
 
 else
     echo "   FAIL: the jump server did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "s3interop_server -3" 2>/dev/null
+
+echo "== scenario 23: control master (-3 -C -M) + two slaves + check + stop"
+
+CM_BASE=$FAILURES
+
+setsid nohup "$BUILD/s3interop_server" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/cm-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/cm-srv.log"; then
+    PORT=$(port_of "$WORK/cm-srv.log")
+    CM_SOCK="$WORK/s3cm.sock"
+
+    setsid nohup "$BUILD/s3interop_client" -3 -C -M -U "$CM_SOCK" -a "127.0.0.1:$PORT" \
+        -t 20000 > "$WORK/cm-master.log" 2>&1 < /dev/null &
+
+    CM_MASTER_PID=$!
+
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if grep -q "S3CM-MASTER-LISTEN" "$WORK/cm-master.log" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if grep -q "S3CM-MASTER-LISTEN" "$WORK/cm-master.log" 2>/dev/null; then
+
+        # two slaves through the SAME master connection, different execs
+
+        if timeout 15 "$BUILD/s3interop_client" -U "$CM_SOCK" -t 10000 \
+            > "$WORK/cm-slave1.log" 2>&1 \
+            && grep -q "S3CM-SLAVE-DONE exit=0" "$WORK/cm-slave1.log" \
+            && grep -q "S3CM-SLAVE-OUT s3-exec-ok" "$WORK/cm-slave1.log"; then
+            : # slave 1 ran through the bridge
+
+        else
+            echo "   FAIL (slave 1)"
+            tail -5 "$WORK/cm-slave1.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        if timeout 15 "$BUILD/s3interop_client" -U "$CM_SOCK" -e "printf s3cm-matrix-two" \
+            -t 10000 > "$WORK/cm-slave2.log" 2>&1 \
+            && grep -q "S3CM-SLAVE-DONE exit=0" "$WORK/cm-slave2.log" \
+            && grep -q "S3CM-SLAVE-OUT s3cm-matrix-two" "$WORK/cm-slave2.log"; then
+            : # slave 2 ran through the same master
+
+        else
+            echo "   FAIL (slave 2)"
+            tail -5 "$WORK/cm-slave2.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        # the check under a live session sees it (the sleep holds it open)
+
+        timeout 15 "$BUILD/s3interop_client" -U "$CM_SOCK" \
+            -e "printf s3cm-matrix-three && sleep 2" -t 10000 > "$WORK/cm-slave3.log" 2>&1 &
+
+        CM_SLAVE3_PID=$!
+        sleep 0.8
+
+        CM_STATUS=$("$BUILD/s3interop_client" -O check -U "$CM_SOCK" 2>/dev/null)
+        CM_CHECK_RC=$?
+
+        if [ "$CM_CHECK_RC" -eq 0 ] && echo "$CM_STATUS" | grep -q "Master running (pid=" \
+            && echo "$CM_STATUS" | grep -q "1 session(s)"; then
+            : # the check shows the live session
+
+        else
+            echo "   FAIL (check: rc=$CM_CHECK_RC status: $CM_STATUS)"
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        wait "$CM_SLAVE3_PID" || {
+            echo "   FAIL (slave 3)"
+            tail -5 "$WORK/cm-slave3.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        }
+
+        # the stop closes the master and removes the socket file
+
+        if "$BUILD/s3interop_client" -O stop -U "$CM_SOCK" > "$WORK/cm-stop.log" 2>&1; then
+            : # stop acknowledged
+
+        else
+            echo "   FAIL (stop)"
+            tail -5 "$WORK/cm-stop.log" | sed 's/^/   /'
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        sleep 0.5
+
+        if kill -0 "$CM_MASTER_PID" 2>/dev/null; then
+            echo "   FAIL (the master still lives)"
+            kill "$CM_MASTER_PID" 2>/dev/null
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        if [ -e "$CM_SOCK" ]; then
+            echo "   FAIL (the socket file stayed)"
+            rm -f "$CM_SOCK"
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        # the dead path fails cleanly (exit non-zero, the error line)
+
+        if "$BUILD/s3interop_client" -O check -U "$CM_SOCK" > "$WORK/cm-dead.log" 2>&1; then
+            echo "   FAIL (the dead path check exited zero)"
+            FAILURES=$((FAILURES + 1))
+        fi
+
+        if [ "$FAILURES" -eq "$CM_BASE" ]; then
+            echo "   PASS (two slaves through one master, check, stop, socket removed)"
+        fi
+
+    else
+        echo "   FAIL: the master did not come up"
+        tail -5 "$WORK/cm-master.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+else
+    echo "   FAIL: the C server did not start"
     FAILURES=$((FAILURES + 1))
 fi
 
