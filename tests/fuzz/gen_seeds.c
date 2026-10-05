@@ -2,7 +2,7 @@
  * Copyright (C) 2026 the ssh3-c authors
  *
  * the fuzz seed corpus generator: writes the hand-built valid frames
- * of the four parser targets, the same shapes the unit tests build
+ * of the five parser targets, the same shapes the unit tests build
  * through the codec encoders; one directory per target under argv[1]
  */
 
@@ -16,6 +16,7 @@
 
 #include <s3_ssh3_cm.h>
 #include <s3_ssh3_forward.h>
+#include <s3_ssh3_message.h>
 #include <s3_ssh3_sftp_codec.h>
 #include <s3_ssh3_wire.h>
 
@@ -429,6 +430,105 @@ gs_wire(const char *dir)
     gs_write(dir, "mixed", (size_t)(p - gs_buf));
 }
 
+static void
+gs_message(const char *dir)
+{
+    static const u_char             ls_body[] = "\x02"
+                                                "ls";
+    u_char                         *p;
+    s3_ssh3_msg_open_confirmation_t oc;
+    s3_ssh3_msg_open_failure_t      of;
+    s3_ssh3_msg_data_t              d;
+    s3_ssh3_msg_extended_data_t     ed;
+    s3_ssh3_msg_request_t           rq;
+
+    /* the open confirmation in the 4-byte and the 2-byte varint form */
+
+    s3_memzero(&oc, sizeof(oc));
+
+    oc.max_packet_size = 32768;
+    p = (u_char *)s3_ssh3_msg_encode_open_confirmation(gs_buf, &oc);
+    gs_write(dir, "openconf_32768", (size_t)(p - gs_buf));
+
+    oc.max_packet_size = 64;
+    p = (u_char *)s3_ssh3_msg_encode_open_confirmation(gs_buf, &oc);
+    gs_write(dir, "openconf_64", (size_t)(p - gs_buf));
+
+    /* the open failure with both strings and with the empty ones */
+
+    s3_memzero(&of, sizeof(of));
+
+    of.reason_code = 1;
+    s3_str_set(&of.error_message, "denied");
+    s3_str_set(&of.language_tag, "en");
+
+    p = (u_char *)s3_ssh3_msg_encode_open_failure(gs_buf, &of);
+    gs_write(dir, "openfailure", (size_t)(p - gs_buf));
+
+    of.reason_code = 2;
+    of.error_message.len = 0;
+    of.language_tag.len = 0;
+
+    p = (u_char *)s3_ssh3_msg_encode_open_failure(gs_buf, &of);
+    gs_write(dir, "openfailure_empty", (size_t)(p - gs_buf));
+
+    /* the data message, the plain and the empty payload */
+
+    s3_memzero(&d, sizeof(d));
+
+    s3_str_set(&d.data, "hello");
+    p = (u_char *)s3_ssh3_msg_encode_data(gs_buf, &d);
+    gs_write(dir, "data_hello", (size_t)(p - gs_buf));
+
+    d.data.len = 0;
+    p = (u_char *)s3_ssh3_msg_encode_data(gs_buf, &d);
+    gs_write(dir, "data_empty", (size_t)(p - gs_buf));
+
+    /* the extended data, the stderr payload */
+
+    s3_memzero(&ed, sizeof(ed));
+
+    ed.data_type = S3_SSH3_EXTENDED_DATA_STDERR;
+    s3_str_set(&ed.data, "err");
+
+    p = (u_char *)s3_ssh3_msg_encode_extended_data(gs_buf, &ed);
+    gs_write(dir, "extdata_stderr", (size_t)(p - gs_buf));
+
+    /* the shell request carries no body, the exec one the raw body
+     * after wantReply */
+
+    s3_memzero(&rq, sizeof(rq));
+
+    s3_str_set(&rq.request_type, "shell");
+    p = (u_char *)s3_ssh3_msg_encode_request(gs_buf, &rq);
+    gs_write(dir, "request_shell", (size_t)(p - gs_buf));
+
+    s3_str_set(&rq.request_type, "exec");
+    rq.want_reply = 1;
+    rq.body.data = (u_char *)ls_body;
+    rq.body.len = sizeof(ls_body) - 1;
+
+    p = (u_char *)s3_ssh3_msg_encode_request(gs_buf, &rq);
+    gs_write(dir, "request_exec", (size_t)(p - gs_buf));
+
+    /* the request envelope alone: the type string plus the wantReply
+     * byte, the body the request module parses stays out; no
+     * dedicated encoder rides this seed */
+
+    p = s3_ssh3_encode_sshstring(gs_buf, "exec", 4);
+    *p++ = 1;
+
+    gs_write(dir, "request_envelope", (size_t)(p - gs_buf));
+
+    /* two data bodies in one chunk, the multi-body walk */
+
+    s3_str_set(&d.data, "hello");
+    p = (u_char *)s3_ssh3_msg_encode_data(gs_buf, &d);
+    p = (u_char *)s3_ssh3_msg_encode_data(p, &d);
+
+    gs_write(dir, "multi", (size_t)(p - gs_buf));
+}
+
 int
 main(int argc, char *const *argv)
 {
@@ -460,6 +560,10 @@ main(int argc, char *const *argv)
     snprintf(dir, sizeof(dir), "%s/wire", root);
     gs_dir(dir);
     gs_wire(dir);
+
+    snprintf(dir, sizeof(dir), "%s/message", root);
+    gs_dir(dir);
+    gs_message(dir);
 
     return gs_failures != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
