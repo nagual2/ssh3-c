@@ -169,7 +169,7 @@ endif()
 # compiler checks keep linking their own main()
 
 if(S3_BUILD_FUZZ)
-    foreach(S3_FUZZ fuzz_sftp_frame fuzz_cm_frame fuzz_forward_target fuzz_wire)
+    foreach(S3_FUZZ fuzz_sftp_frame fuzz_cm_frame fuzz_forward_target fuzz_wire fuzz_message)
         add_executable(${S3_FUZZ} tests/fuzz/${S3_FUZZ}.c)
         target_compile_options(${S3_FUZZ} PRIVATE -Wall -Wextra -Werror)
         target_link_options(${S3_FUZZ} PRIVATE -fsanitize=fuzzer)
