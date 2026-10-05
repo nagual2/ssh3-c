@@ -1457,15 +1457,18 @@ s3_quic_handle_max_stream_data_frame(s3_connection_t *c, s3_quic_header_t *pkt,
         return S3_OK;
     }
 
-    if (qs->send_offset < qs->send_max_data) {
-        /* not blocked on MAX_STREAM_DATA */
-        qs->send_max_data = f->limit;
-        return S3_OK;
-    }
-
     qs->send_max_data = f->limit;
 
-    /* the reference wakes the application writer here as well */
+    /*
+     * The credit granted here may still cover bytes that are already
+     * sitting in qs->send but were never framed: s3_quic_stream_send_chain()
+     * returns early once the send window is exhausted and does not flush,
+     * so qs->send can be non-empty while qs->send_offset has stopped.
+     * Flushing unconditionally hands those bytes to a STREAM frame;
+     * s3_quic_stream_flush() is a no-op when qs->send is empty, and it
+     * stops at the connection and stream limits on its own.  The reference
+     * wakes the application writer here as well.
+     */
 
     s3_quic_set_event(qc, qs->connection->write);
 

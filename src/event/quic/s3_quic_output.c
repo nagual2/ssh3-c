@@ -53,6 +53,7 @@ static s3_udp_listen_t *s3_quic_socket_listener(s3_connection_t *c);
 #endif
 static s3_int_t         s3_quic_create_datagrams(s3_connection_t *c);
 static void             s3_quic_commit_send(s3_connection_t *c);
+static s3_uint_t        s3_quic_streams_pending(s3_quic_connection_t *qc);
 static void             s3_quic_revert_send(s3_connection_t *c,
                                             uint64_t preserved_pnum[S3_QUIC_SEND_CTX_LAST]);
 #if (S3_HAVE_UDP_SEGMENT)
@@ -261,9 +262,55 @@ s3_quic_commit_send(s3_connection_t *c)
         }
     }
 
+    /*
+     * A single max-size datagram (the >=64K stream_buffer_size regime)
+     * swallows the whole application write quantum at once, so the frame
+     * queues above drain completely on every commit and the reference
+     * idle test would report the connection application-limited for the
+     * entire transfer; the congestion window then never leaves its
+     * initial value.  Unframed stream backlog means the application
+     * still has data to give, which is the thing the idle flag is
+     * supposed to express.
+     */
+    if (idle && s3_quic_streams_pending(qc)) {
+        idle = 0;
+    }
+
     s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "quic congestion send if:%uz", cg->in_flight);
 
     s3_quic_congestion_idle(c, idle);
+}
+
+/*
+ * the streams still hold bytes the frame layer has not taken yet
+ * (s3_quic_stream_flush() stopped at the send window); while they last,
+ * the application is not the limiting factor
+ */
+static s3_uint_t
+s3_quic_streams_pending(s3_quic_connection_t *qc)
+{
+    s3_rbtree_t         *tree;
+    s3_rbtree_node_t    *node;
+    s3_quic_stream_t    *qs;
+
+    tree = &qc->streams.tree;
+
+    if (tree->root == tree->sentinel) {
+        return 0;
+    }
+
+    /* s3_rbtree_next() terminates with NULL, not with the sentinel */
+    for (node = s3_rbtree_min(tree->root, tree->sentinel); node != NULL;
+         node = s3_rbtree_next(tree, node))
+    {
+        qs = (s3_quic_stream_t *)node;
+
+        if (qs->send.size > qs->send.offset) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static void
@@ -1315,6 +1362,14 @@ s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_
     pad = 4 - pkt.num_len;
     min_payload = s3_max(min_payload, pad);
 
+    /*
+     * the sample is 16 bytes of ciphertext taken 4 bytes past the packet
+     * number field; a shorter packet cannot be decrypted and the peer
+     * silently drops it, which used to swallow the standalone packets
+     * whole (PTO probes included)
+     */
+    min_payload = s3_max(min_payload, (size_t)(20 - pkt.num_len));
+
     if (min_payload > max_payload) {
         s3_quic_free_frame(c, frame);
         return S3_AGAIN;
@@ -1331,6 +1386,14 @@ s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_
         s3_quic_free_frame(c, frame);
         return S3_ERROR;
     }
+
+    /*
+     * the standalone packets (PTO probes, path validation) carry the
+     * frame's ack-eliciting flag the same way the coalesced packing does
+     * in s3_quic_output_packet(); the flag is copied after the frame is
+     * filled, create_frame() is what sets it
+     */
+    pkt.need_ack = frame->need_ack;
 
     if (len < (ssize_t)min_payload) {
         s3_memset(src + len, S3_QUIC_FT_PADDING, min_payload - len);

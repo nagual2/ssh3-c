@@ -3017,7 +3017,7 @@ main(int argc, char **argv)
 
     s3_interop_log_init();
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:P:H:3h")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:3h")) != -1) {
 
         switch (opt) {
 
@@ -3043,6 +3043,11 @@ main(int argc, char **argv)
 
         case 'i':
             idle_ms = (unsigned)atoi(optarg);
+            break;
+
+        case 'L':
+            s3_interop_log.log_level =
+                (strcmp(optarg, "all") == 0) ? S3_LOG_DEBUG_ALL : (s3_uint_t)atol(optarg);
             break;
 
         case 'P':
