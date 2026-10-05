@@ -190,6 +190,15 @@ if(S3_BUILD_FUZZ)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests/fuzz)
     endforeach()
 
+    # the stateful h3 target (P6.3): one session per exec, the qpack
+    # table and the uni machines live across the input steps
+    add_executable(fuzz_h3_state tests/fuzz/fuzz_h3_state.c)
+    target_compile_options(fuzz_h3_state PRIVATE -Wall -Wextra -Werror)
+    target_link_options(fuzz_h3_state PRIVATE -fsanitize=fuzzer)
+    target_link_libraries(fuzz_h3_state PRIVATE s3core)
+    set_target_properties(fuzz_h3_state PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests/fuzz)
+
     add_executable(s3_fuzz_gen_seeds tests/fuzz/gen_seeds.c)
     target_compile_options(s3_fuzz_gen_seeds PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(s3_fuzz_gen_seeds PRIVATE s3core)
