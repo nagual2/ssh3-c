@@ -18,7 +18,9 @@
 set -u
 
 ROOT=${1:-/mnt/c/Git/project/ssh3-c}
-BUILD=$ROOT/build/linux-release
+# the BUILD override rides the valgrind harness (the wrapper dir), the
+# default is the worktree release build
+BUILD=${BUILD:-$ROOT/build/linux-release}
 FAILURES=0
 
 die() {
