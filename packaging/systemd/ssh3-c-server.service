@@ -17,7 +17,7 @@ Type=exec
 # no -l: under LISTEN_FDS the daemon serves the passed fd and binds
 # nothing; the flags, the env table and the drop-in recipes live in
 # ssh3-server(8)
-ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
+ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/priv.key
 Environment=SSH3_LOG_LEVEL=info
 #
 # PRIVILEGE MODELS (P7.3) - pick exactly one:
@@ -44,7 +44,7 @@ Environment=SSH3_LOG_LEVEL=info
 #      RestrictSUIDSGID=yes
 #      CapabilityBoundingSet=
 #      ExecStart=
-#      ExecStart=/usr/sbin/ssh3-server --run-as-user off -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
+#      ExecStart=/usr/sbin/ssh3-server --run-as-user off -c /etc/ssh3/cert.pem -k /etc/ssh3/priv.key
 #    ...and restore ProtectHome=yes below.  Every session (and the
 #    in-process sftp) then runs as the ssh3 account; per-user
 #    identities and /home access are not available in this model.
