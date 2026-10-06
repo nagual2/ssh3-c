@@ -2896,6 +2896,7 @@ struct s3_interop_cm_run_s {
     unsigned              ch_confirmed : 1;
     unsigned              bridged : 1;
     unsigned              finalized : 1;
+    unsigned              exit_queued : 1;
     uint64_t              exit_code;
     s3_connection_t      *chan;   /* the ssh3 session channel */
     u_char               *ch_buf; /* the channel parse accumulator */
@@ -3294,9 +3295,11 @@ s3_interop_cm_run_send_exit(s3_interop_cm_run_t *run, uint64_t code)
     s3_str_t pl;
     u_char  *p;
 
-    if (run->control == NULL) {
+    if (run->control == NULL || run->exit_queued) {
         return;
     }
+
+    run->exit_queued = 1;
 
     pl.data = es;
     pl.len = sizeof(es);
@@ -3372,6 +3375,18 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
          * control conn live until the bridge arrives or the slave
          * vanishes (the conn close paths answer both)
          */
+
+        if (run->err != NULL) {
+
+            /*
+             * the stderr attach landed before the verdict: its half
+             * close delivers the stream eof the slave waits for, the
+             * io bridge answers the rest from the attach
+             */
+
+            (void)shutdown(run->err->fd, SHUT_WR);
+        }
+
         return;
     }
 
@@ -3387,7 +3402,17 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
         s3_interop_cm_conn_close(run->err);
     }
 
-    s3_interop_cm_run_free(run);
+    if (run->used && run->finalized && run->control == NULL && run->io == NULL &&
+        run->err == NULL) {
+
+        /*
+         * no conn close carried the sweep: the run releases here
+         * (the sweep inside conn_close frees it otherwise)
+         */
+
+        (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
+        s3_interop_cm_run_free(run);
+    }
 }
 
 /* the channel reader: the confirmation, the data dispatch to the
@@ -3724,6 +3749,17 @@ s3_interop_cm_cb_bridge_stderr(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LE
         s3_interop_cm_cur->run = run;
         s3_interop_cm_cur->kind = S3_INTEROP_CM_CONN_STDERR;
     }
+
+    if (run->finalized) {
+
+        /*
+         * the verdict beat the attach and the stderr attach landed
+         * first: the deferred exit rides here (the io bridge skips
+         * it through the exit_queued guard)
+         */
+
+        s3_interop_cm_run_send_exit(run, run->exit_code);
+    }
 }
 
 static s3_int_t
@@ -3801,6 +3837,17 @@ s3_interop_cm_conn_read(s3_event_t *ev)
                 }
             }
 
+            /*
+             * the verdict beat the attach: the attach reply just
+             * drained, the write half-close tells the slave the
+             * stream is over - its own conn closes run the sweep
+             */
+
+            if (conn->run != NULL && conn->run->finalized &&
+                conn->kind != S3_INTEROP_CM_CONN_CONTROL) {
+                (void)shutdown(conn->fd, SHUT_WR);
+            }
+
             if (s3_ssh3_cm_srv_done(&conn->srv)) {
 
                 if (s3_ssh3_cm_srv_shutdown(&conn->srv)) {
@@ -3812,6 +3859,13 @@ s3_interop_cm_conn_read(s3_event_t *ev)
                 return;
             }
 
+        } else if (conn->run->chan == NULL) {
+
+            /*
+             * the verdict beat the attach: the finalized run has no
+             * chan any more, the late stdin has no reader - it drops
+             * like the post-exit stdin of the polling pump did
+             */
         } else {
 
             /* the bridged io attachment feeds the session stdin */
@@ -3829,13 +3883,37 @@ s3_interop_cm_conn_read(s3_event_t *ev)
     if (conn->kind == S3_INTEROP_CM_CONN_IO && conn->run != NULL && conn->run->bridged) {
 
         (void)s3_event_actions.del_event(conn->c->read, S3_READ_EVENT, 0);
-        (void)s3_quic_shutdown_stream(conn->run->chan, S3_WRITE_SHUTDOWN);
+
+        if (conn->run->chan != NULL) {
+            (void)s3_quic_shutdown_stream(conn->run->chan, S3_WRITE_SHUTDOWN);
+
+        } else {
+
+            /*
+             * the verdict beat the attach: the chan is gone, the io
+             * conn has no transport to serve - it closes and the
+             * conn close sweep unwinds the run
+             */
+
+            s3_interop_cm_conn_close(conn);
+        }
 
         return;
     }
 
     if (conn->kind == S3_INTEROP_CM_CONN_STDERR && conn->run != NULL) {
         (void)s3_event_actions.del_event(conn->c->read, S3_READ_EVENT, 0);
+
+        if (conn->run->finalized) {
+
+            /*
+             * the verdict is out, the stderr conn has nothing to
+             * wait for any more - it closes and the sweep unwinds
+             * the run
+             */
+
+            s3_interop_cm_conn_close(conn);
+        }
 
         return;
     }
