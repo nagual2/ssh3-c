@@ -517,7 +517,8 @@ static int
 s3_test_ssh3_auth_jwt(void)
 {
     char      path_a[32], path_ec[32], path_rsa[32], path_multi[32], path_idents[32];
-    char      content[1024], blob[512], blob_b64[800], jti[64], claims[1024];
+    char      path_raw[32], path_stale[32];
+    char      content[4096], blob[512], blob_b64[800], jti[64], claims[1024];
     char      token[2200];
     long long now = (long long)time(NULL);
     EVP_PKEY *ed, *foreign, *ec, *rsa;
@@ -579,6 +580,43 @@ s3_test_ssh3_auth_jwt(void)
              blob_b64);
     s3_tj_keysfile(path_idents, content);
 
+    /* the raw-key line shape of the P7.3 incident: the base64 of the
+     * bare 32-byte key (no ssh wire framing) parses as base64 but the
+     * blob walker reads no keytype string out of it, the line skips
+     * and the verdict stays closed - the reference
+     * ParseAuthorizedIdentitiesFile ignores the unparsable identity
+     * the same way, a raw-key publisher gets the 401, not a session */
+
+    char foreign_b64[800], raw_b64[128];
+
+    blob_len = s3_tj_blob_ed25519(foreign, (u_char *)blob);
+    (void)s3_tj_b64std((const u_char *)blob, blob_len, foreign_b64, 0);
+
+    {
+        u_char raw[64];
+        size_t n = sizeof(raw);
+
+        S3_ASSERT(EVP_PKEY_get_raw_public_key(ed, raw, &n) == 1);
+        S3_ASSERT(n == 32);
+        (void)s3_tj_b64std(raw, n, raw_b64, 0);
+    }
+
+    snprintf(content, sizeof(content), "ssh-ed25519 %s raw-key-no-wire\n", raw_b64);
+    s3_tj_keysfile(path_raw, content);
+
+    /* the stale file of the same incident: the foreign keys of the
+     * earlier runs and the raw-key line sit ahead of the fresh key -
+     * the walk rides over the mismatches and the unparsable line and
+     * the fresh key still decides (the files merge, one dead line
+     * never hides the next one) */
+
+    snprintf(content, sizeof(content),
+             "ssh-ed25519 %s stale-from-earlier-run\n"
+             "ssh-ed25519 %s raw-key-no-wire\n"
+             "ssh-ed25519 %s s3-tj-fresh\n",
+             foreign_b64, raw_b64, blob_b64);
+    s3_tj_keysfile(path_stale, content);
+
     /* the happy paths, one per allowlisted algorithm */
 
     /* the fresh clock: the whole suite runs over 10s under
@@ -606,6 +644,18 @@ s3_test_ssh3_auth_jwt(void)
 
     s3_tj_case("identities directives skip", token, "bob", path_idents, s3_tj_conv,
                sizeof(s3_tj_conv), S3_OK);
+
+    /* the raw-key line of the P7.3 incident: unparsable blob, the
+     * verdict stays closed */
+
+    s3_tj_case("raw key blob line", token, "bob", path_raw, s3_tj_conv, sizeof(s3_tj_conv),
+               S3_DECLINED);
+
+    /* the stale keys and the raw-key line ahead of the fresh key: the
+     * walk rides over them and the fresh key decides */
+
+    s3_tj_case("stale keys then fresh", token, "bob", path_stale, s3_tj_conv, sizeof(s3_tj_conv),
+               S3_OK);
 
     /* the aud array form carries the audience in a member */
 
@@ -787,6 +837,9 @@ s3_test_ssh3_auth_jwt(void)
     S3_ASSERT(unlink(path_ec) == 0);
     S3_ASSERT(unlink(path_rsa) == 0);
     S3_ASSERT(unlink(path_multi) == 0);
+    S3_ASSERT(unlink(path_idents) == 0);
+    S3_ASSERT(unlink(path_raw) == 0);
+    S3_ASSERT(unlink(path_stale) == 0);
 
     EVP_PKEY_free(ed);
     EVP_PKEY_free(foreign);
