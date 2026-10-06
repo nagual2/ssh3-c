@@ -49,6 +49,19 @@ s3_event_ctx_init(s3_event_ctx_t *ctx, s3_log_t *log)
 }
 
 void
+s3_event_ctx_shutdown(s3_event_ctx_t *ctx)
+{
+    if (s3_event_actions.done != NULL) {
+        s3_event_actions.done(ctx);
+    }
+
+    if (ctx->pool != NULL) {
+        s3_destroy_pool(ctx->pool);
+        ctx->pool = NULL;
+    }
+}
+
+void
 s3_process_events_and_timers(s3_event_ctx_t *ctx)
 {
     s3_uint_t flags;

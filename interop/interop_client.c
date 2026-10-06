@@ -1037,6 +1037,20 @@ s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
 static unsigned s3_interop_stall_usec;
 
 /*
+ * the fatal stream error inside a read handler: the connection
+ * finalizes and the main loop exits through the common teardown - the
+ * hard exit here skipped the harness cleanup and left every pool to
+ * the leak check (the P7.2 exit paths)
+ */
+static void
+s3_interop_h3_stream_fatal(s3_connection_t *sc, const char *what)
+{
+    s3_quic_stream_t *qs = sc->data;
+
+    s3_quic_finalize_connection(qs->parent, 0, what);
+}
+
+/*
  * the stream echo verifier: the pattern is a function of the absolute
  * offset, so the reading side checks without sharing state with the
  * writer
@@ -1085,12 +1099,14 @@ s3_interop_stream_echo_read(s3_event_t *ev)
                     "recv_final_size=%llu\n",
                     qs->recv_state, (unsigned long long)qs->recv_offset,
                     (unsigned long long)qs->recv_last, (unsigned long long)qs->recv_final_size);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "stream recv error");
+            return;
         }
 
         if (s3_interop_srecv + (size_t)m > s3_interop_stotal) {
             fprintf(stderr, "interop-client: stream echo overflow\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "stream echo overflow");
+            return;
         }
 
         for (n = 0; n < (size_t)m;) {
@@ -1118,7 +1134,8 @@ s3_interop_stream_echo_read(s3_event_t *ev)
                         s3_interop_sbuf[n], s3_interop_sbuf[n + 1], s3_interop_sbuf[n + 2],
                         s3_interop_sbuf[n + 3], exp[r], exp[r + 1], exp[r + 2], exp[r + 3]);
                 fprintf(stderr, "interop-client: stream mismatch at offset %zu\n", pos);
-                exit(1);
+                s3_interop_h3_stream_fatal(sc, "stream mismatch");
+                return;
             }
 
             n += k;
@@ -1453,12 +1470,14 @@ s3_interop_h3_response_read(s3_event_t *ev)
         if (n == 0) {
             /* the server fin without a status: the CONNECT was refused */
             fprintf(stderr, "interop-client: h3 response stream closed without :status\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "h3 response closed without status");
+            return;
         }
 
         if (n < 0) {
             fprintf(stderr, "interop-client: h3 response recv error\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "h3 response recv error");
+            return;
         }
 
         s3_interop_h3_len += (size_t)n;
@@ -1500,7 +1519,8 @@ s3_interop_h3_response_read(s3_event_t *ev)
                         if (s3_interop_h3_parse.field_rep.field.value.data[i] < '0' ||
                             s3_interop_h3_parse.field_rep.field.value.data[i] > '9') {
                             fprintf(stderr, "interop-client: h3 bad :status value\n");
-                            exit(1);
+                            s3_interop_h3_stream_fatal(sc, "h3 bad status value");
+                            return;
                         }
 
                         code = code * 10 +
@@ -1514,7 +1534,8 @@ s3_interop_h3_response_read(s3_event_t *ev)
                     fflush(stdout);
 
                     if (code != 200) {
-                        exit(1);
+                        s3_interop_h3_stream_fatal(sc, "h3 response status not ok");
+                        return;
                     }
 
                     return;
@@ -1522,14 +1543,16 @@ s3_interop_h3_response_read(s3_event_t *ev)
 
                 if (rc == S3_DONE) {
                     fprintf(stderr, "interop-client: h3 response headers without :status\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "h3 headers without status");
+                    return;
                 }
 
                 continue;
             }
 
             fprintf(stderr, "interop-client: h3 response parse error %d\n", (int)rc);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "h3 response parse error");
+            return;
         }
 
         /* the consumed bytes compact to the front of the receive buffer */
@@ -1582,12 +1605,14 @@ s3_interop_h3_channel_read(s3_event_t *ev)
         if (n == 0) {
             /* the server fin before the ping came back: no verdict */
             fprintf(stderr, "interop-client: channel closed before the ping echo\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "channel closed before the ping echo");
+            return;
         }
 
         if (n < 0) {
             fprintf(stderr, "interop-client: channel recv error\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "channel recv error");
+            return;
         }
 
         s3_interop_h3_ch_len += (size_t)n;
@@ -1610,7 +1635,8 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
                 if (s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: duplicate channel confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "duplicate channel confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
@@ -1627,7 +1653,8 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
                 if (!s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: channel data before confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "channel data before confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
@@ -1650,7 +1677,8 @@ s3_interop_h3_channel_read(s3_event_t *ev)
 
             fprintf(stderr, "interop-client: unexpected channel message %llu\n",
                     (unsigned long long)type);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "unexpected channel message");
+            return;
         }
 
         /* the consumed bytes compact to the front of the receive buffer */
@@ -1707,7 +1735,8 @@ s3_interop_fwd_tcp_write(void)
 
         if (m <= 0) {
             fprintf(stderr, "interop-client: forward channel send failed\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(s3_interop_h3_channel, "forward channel send failed");
+            return;
         }
 
         s3_interop_fwd_frame_sent += (size_t)m;
@@ -1721,7 +1750,8 @@ s3_interop_fwd_tcp_write(void)
 
         if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) != S3_OK) {
             fprintf(stderr, "interop-client: forward channel shutdown failed\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(s3_interop_h3_channel, "forward channel shutdown failed");
+            return;
         }
 
         s3_interop_fwd_fin_sent = 1;
@@ -1775,14 +1805,16 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
             fprintf(stderr, "interop-client: forward channel closed before the echo\n");
             printf("INTEROP-FWD-TCP-FAIL\n");
             fflush(stdout);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "forward channel closed before the echo");
+            return;
         }
 
         if (n < 0) {
             fprintf(stderr, "interop-client: forward channel recv error\n");
             printf("INTEROP-FWD-TCP-FAIL\n");
             fflush(stdout);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "forward channel recv error");
+            return;
         }
 
         s3_interop_h3_ch_len += (size_t)n;
@@ -1813,7 +1845,8 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
 
                 if (s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: duplicate channel confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "duplicate channel confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
@@ -1831,7 +1864,8 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
 
                 if (!s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: channel data before confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "channel data before confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
@@ -1841,14 +1875,16 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
 
                 if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
                     fprintf(stderr, "interop-client: stream data on the udp channel\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "stream data on the udp channel");
+                    return;
                 }
 
                 if (s3_interop_fwd_recv + data.data.len > s3_interop_fwd_payload_len) {
                     fprintf(stderr, "interop-client: forward echo overflow\n");
                     printf("INTEROP-FWD-TCP-FAIL\n");
                     fflush(stdout);
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "forward echo overflow");
+                    return;
                 }
 
                 if (s3_memcmp(s3_interop_fwd_payload + s3_interop_fwd_recv, data.data.data,
@@ -1857,7 +1893,8 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
                             s3_interop_fwd_recv);
                     printf("INTEROP-FWD-TCP-FAIL\n");
                     fflush(stdout);
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "forward echo mismatch");
+                    return;
                 }
 
                 s3_interop_fwd_recv += data.data.len;
@@ -1890,7 +1927,8 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
 
             fprintf(stderr, "interop-client: unexpected channel message %llu\n",
                     (unsigned long long)type);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "unexpected channel message");
+            return;
         }
 
         /* the consumed bytes compact to the front of the receive buffer */
@@ -3028,8 +3066,15 @@ s3_interop_cm_shutdown(void)
         s3_interop_cm_listen_fd = -1;
     }
 
-    /* the clean teardown: no stale socket file */
-    (void)unlink(s3_interop_cm_path);
+    /*
+     * the clean teardown: no stale socket file; only the process that
+     * owned the listening socket unlinks the path, the dup master that
+     * refused the live path must leave its peer's file alone
+     */
+
+    if (s3_interop_cm_listening) {
+        (void)unlink(s3_interop_cm_path);
+    }
 }
 
 /* the append and flush of one connection, the growth pays per size
@@ -4916,12 +4961,14 @@ s3_interop_h3_session_read(s3_event_t *ev)
         if (n == 0) {
             /* the server fin before the exit-status: no verdict */
             fprintf(stderr, "interop-client: channel closed before the session verdict\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "channel closed before the session verdict");
+            return;
         }
 
         if (n < 0) {
             fprintf(stderr, "interop-client: channel recv error\n");
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "channel recv error");
+            return;
         }
 
         s3_interop_h3_ch_len += (size_t)n;
@@ -4944,7 +4991,8 @@ s3_interop_h3_session_read(s3_event_t *ev)
 
                 if (s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: duplicate channel confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "duplicate channel confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
@@ -4962,7 +5010,8 @@ s3_interop_h3_session_read(s3_event_t *ev)
 
                 if (!s3_interop_h3_ch_confirmed) {
                     fprintf(stderr, "interop-client: channel data before confirmation\n");
-                    exit(1);
+                    s3_interop_h3_stream_fatal(sc, "channel data before confirmation");
+                    return;
                 }
 
                 if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
@@ -5043,7 +5092,8 @@ s3_interop_h3_session_read(s3_event_t *ev)
 
             fprintf(stderr, "interop-client: unexpected channel message %llu\n",
                     (unsigned long long)type);
-            exit(1);
+            s3_interop_h3_stream_fatal(sc, "unexpected channel message");
+            return;
         }
 
         /* the consumed bytes compact to the front of the receive buffer */
@@ -5830,6 +5880,7 @@ main(int argc, char **argv)
     s3_uint_t             hs_reported = 0, sfin_sent = 0;
     s3_msec_t             start;
     s3_fd_t               fd;
+    int                   rc = 0;
     struct sockaddr_in    sa;
     s3_event_ctx_t        ctx;
     s3_connection_t      *cli;
@@ -6432,12 +6483,14 @@ main(int argc, char **argv)
 
     cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_interop_log);
     if (cli->pool == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     cli->sockaddr = (struct sockaddr *)s3_palloc(cli->pool, sizeof(sa));
     if (cli->sockaddr == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     s3_memcpy(cli->sockaddr,
@@ -6465,7 +6518,8 @@ main(int argc, char **argv)
     conf.ssl = s3_ssl_client_create(&s3_interop_log, &alpn);
     if (conf.ssl == NULL) {
         fprintf(stderr, "interop-client: ssl init failed\n");
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     conf.gso_enabled = 1;
@@ -6494,17 +6548,20 @@ main(int argc, char **argv)
     }
 
     if (s3_event_actions.add_event(cli->read, S3_READ_EVENT, 0) != S3_OK) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     if (s3_quic_connect(cli, &conf) != S3_OK) {
         fprintf(stderr, "interop-client: connect failed\n");
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     qc = s3_quic_get_connection(cli);
     if (qc == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     /* the shared connection the master sessions open their channels on */
@@ -6530,7 +6587,8 @@ main(int argc, char **argv)
 
         if (qc == NULL) {
             fprintf(stderr, "interop-client: connection is gone\n");
-            return 1;
+            rc = 1;
+            goto teardown;
         }
 
         if (!hs_reported && cli->ssl != NULL && cli->ssl->handshaked) {
@@ -6542,13 +6600,15 @@ main(int argc, char **argv)
             if ((s3_interop_oidc_issuer != NULL || s3_interop_oidc_raw != NULL) &&
                 s3_interop_oidc_acquire(cli->ssl->connection) != S3_OK) {
                 fprintf(stderr, "interop-client: oidc auth failed\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_pubkey_path != NULL &&
                 s3_interop_pubkey_jwt(cli->ssl->connection) != S3_OK) {
                 fprintf(stderr, "interop-client: pubkey jwt failed\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_h3_mode) {
@@ -6560,7 +6620,8 @@ main(int argc, char **argv)
                  */
                 if (s3_h3_get_session(cli) == NULL && s3_h3_init_session(cli) != S3_OK) {
                     fprintf(stderr, "interop-client: h3 init_session failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_memzero(&s3_interop_h3_parse, sizeof(s3_h3_parse_headers_t));
@@ -6568,7 +6629,8 @@ main(int argc, char **argv)
                 s3_interop_h3_stream = s3_quic_open_stream(cli, 1);
                 if (s3_interop_h3_stream == NULL) {
                     fprintf(stderr, "interop-client: open_stream failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_interop_h3_stream->read->handler = s3_interop_h3_response_read;
@@ -6586,7 +6648,8 @@ main(int argc, char **argv)
                 s3_interop_stream = s3_quic_open_stream(cli, 1);
                 if (s3_interop_stream == NULL) {
                     fprintf(stderr, "interop-client: open_stream failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_interop_stream->read->handler = s3_interop_stream_echo_read;
@@ -6596,7 +6659,8 @@ main(int argc, char **argv)
 
             } else if (qc->client_tp_done && qc->ctp.max_datagram_frame_size == 0) {
                 fprintf(stderr, "interop-client: peer does not support datagrams\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
         }
 
@@ -6630,7 +6694,8 @@ main(int argc, char **argv)
 
                 else if (m != (ssize_t)total) {
                     fprintf(stderr, "interop-client: h3 request send failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 else {
@@ -6647,7 +6712,8 @@ main(int argc, char **argv)
                  */
                 if (s3_interop_h3_status_seen && !s3_interop_cm_listening &&
                     s3_interop_cm_listen_open(&ctx) != S3_OK) {
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 if (s3_interop_cm_stop) {
@@ -6669,7 +6735,8 @@ main(int argc, char **argv)
 
                     if (s3_interop_h3_channel == NULL) {
                         fprintf(stderr, "interop-client: channel open_stream failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     s3_interop_fwd_conv_id = ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
@@ -6753,7 +6820,8 @@ main(int argc, char **argv)
 
                         if (inet_pton(AF_INET, "127.0.0.1", target.ip) != 1) {
                             fprintf(stderr, "interop-client: inet_pton failed\n");
-                            return 1;
+                            rc = 1;
+                            goto teardown;
                         }
 
                         target.port = (uint16_t)s3_interop_fwd_port;
@@ -6898,7 +6966,8 @@ main(int argc, char **argv)
 
                     else if (m != (ssize_t)total) {
                         fprintf(stderr, "interop-client: channel send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     else {
@@ -6926,7 +6995,8 @@ main(int argc, char **argv)
                             if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) !=
                                 S3_OK) {
                                 fprintf(stderr, "interop-client: channel shutdown failed\n");
-                                return 1;
+                                rc = 1;
+                                goto teardown;
                             }
                         }
                     }
@@ -6958,7 +7028,8 @@ main(int argc, char **argv)
 
                     } else {
                         fprintf(stderr, "interop-client: forward datagram send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
                 }
 
@@ -6998,7 +7069,8 @@ main(int argc, char **argv)
 
                     else if (m != (ssize_t)total) {
                         fprintf(stderr, "interop-client: signal send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     else {
@@ -7084,7 +7156,8 @@ main(int argc, char **argv)
 
                     if (m <= 0) {
                         fprintf(stderr, "interop-client: stream send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     s3_interop_ssent += (size_t)m;
@@ -7094,7 +7167,8 @@ main(int argc, char **argv)
                 if (s3_interop_ssent == s3_interop_stotal && !sfin_sent) {
                     if (s3_quic_shutdown_stream(s3_interop_stream, S3_WRITE_SHUTDOWN) != S3_OK) {
                         fprintf(stderr, "interop-client: stream shutdown failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     sfin_sent = 1;
@@ -7117,7 +7191,8 @@ main(int argc, char **argv)
 
                 } else {
                     fprintf(stderr, "interop-client: send_datagram failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
             }
 
@@ -7164,7 +7239,8 @@ main(int argc, char **argv)
                             (unsigned long long)s3_interop_jump_recv, s3_interop_bridge_parked);
                 }
 
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_streams_mode) {
@@ -7200,15 +7276,18 @@ main(int argc, char **argv)
                         sent, s3_interop_received, required);
             }
 
-            return 1;
+            rc = 1;
+            goto teardown;
         }
     }
 
     /*
-     * the silent abort runs the full teardown: the ssl shutdown frees
-     * the openssl object, the keys are cleansed and the connection
-     * pool dies with the quic connection in it
+     * the common teardown: the success breaks and every error path
+     * after the connection was created land here, the quic layer and
+     * the harness-owned buffers die before the exit leak check
      */
+
+teardown:
 
     /*
      * the harness-owned streams first: dropping them runs the quic
@@ -7234,7 +7313,43 @@ main(int argc, char **argv)
         s3_interop_cm_shutdown();
     }
 
-    s3_event_process_posted(&ctx, &ctx.posted_events);
+    /*
+     * the close of a peer force-closed us parks on the 3*PTO drain
+     * timer, and the posted passes below do not expire timers - the
+     * timer drops and the resumed close completes inside the drain
+     * (the same exit trick the daemon shutdown tail uses)
+     */
+    qc = s3_quic_get_connection(cli);
+
+    if (qc != NULL && qc->close.timer_set) {
+        s3_event_del_timer(&qc->close);
+        s3_post_event(&qc->close, &ctx.posted_events);
+    }
+
+    if (s3_interop_jump_cli != NULL) {
+        qc = s3_quic_get_connection(s3_interop_jump_cli);
+
+        if (qc != NULL && qc->close.timer_set) {
+            s3_event_del_timer(&qc->close);
+            s3_post_event(&qc->close, &ctx.posted_events);
+        }
+    }
+
+    /*
+     * the posted drain: the force-reset streams run their teardown
+     * handlers, the quic close reposts until the connection pools die
+     */
+
+    for (i = 0; i < 64; i++) {
+
+        if (s3_quic_get_connection(cli) == NULL &&
+            (s3_interop_jump_cli == NULL || s3_quic_get_connection(s3_interop_jump_cli) == NULL) &&
+            s3_queue_empty(&ctx.posted_events)) {
+            break;
+        }
+
+        s3_event_process_posted(&ctx, &ctx.posted_events);
+    }
 
     s3_ssl_free(conf.ssl);
 
@@ -7245,6 +7360,15 @@ main(int argc, char **argv)
     free(s3_interop_expected);
     free(s3_interop_got);
     free(s3_interop_fwd_payload);
+
+    /* the mode-local accumulators grow by realloc, NULL free is fine */
+
+    free(s3_interop_h3_buf);
+    free(s3_interop_h3_ch_buf);
+    free(s3_interop_h3_sess_out);
+    free(s3_interop_sftp_out);
+    free(s3_interop_sftp_buf);
+    free(s3_interop_agent_in);
 
     (void)close(fd);
 
@@ -7260,7 +7384,9 @@ main(int argc, char **argv)
         (void)close(s3_interop_bridge_b);
     }
 
-    s3_destroy_pool(ctx.pool);
+    /* the event method data dies with the pool of the connections */
 
-    return 0;
+    s3_event_ctx_shutdown(&ctx);
+
+    return rc;
 }

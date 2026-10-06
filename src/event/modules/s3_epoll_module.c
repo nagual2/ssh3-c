@@ -7,10 +7,12 @@
 #include <s3_core.h>
 
 #include <sys/epoll.h>
+#include <unistd.h>
 
 #define S3_EPOLL_EVENTS 512
 
 static s3_int_t s3_epoll_init(s3_event_ctx_t *ctx);
+static void     s3_epoll_done(s3_event_ctx_t *ctx);
 static s3_int_t s3_epoll_add_event(s3_event_t *ev, s3_int_t event, s3_uint_t flags);
 static s3_int_t s3_epoll_del_event(s3_event_t *ev, s3_int_t event, s3_uint_t flags);
 static s3_int_t s3_epoll_add_connection(s3_event_ctx_t *ctx, s3_connection_t *c);
@@ -21,8 +23,8 @@ static int                 s3_ep = -1;
 static struct epoll_event *s3_event_list = NULL;
 
 s3_event_actions_t s3_event_actions = {
-    s3_epoll_init,           s3_epoll_add_event,      s3_epoll_del_event,
-    s3_epoll_add_connection, s3_epoll_del_connection, s3_epoll_process_events,
+    s3_epoll_init,           s3_epoll_add_event,      s3_epoll_del_event, s3_epoll_add_connection,
+    s3_epoll_del_connection, s3_epoll_process_events, s3_epoll_done,
 };
 
 static s3_int_t
@@ -47,6 +49,29 @@ s3_epoll_init(s3_event_ctx_t *ctx)
     ctx->impl = (void *)(intptr_t)s3_ep;
 
     return S3_OK;
+}
+
+/*
+ * the exit counterpart of init(): the descriptor and the wait array
+ * are process globals here, one context owns them by construction
+ * (the second ctx_init() reuses them); nothing may poll epoll_wait()
+ * after the call
+ */
+
+static void
+s3_epoll_done(s3_event_ctx_t *ctx)
+{
+    (void)ctx;
+
+    if (s3_ep != -1) {
+        (void)close(s3_ep);
+        s3_ep = -1;
+    }
+
+    if (s3_event_list != NULL) {
+        s3_free(s3_event_list);
+        s3_event_list = NULL;
+    }
 }
 
 static s3_int_t

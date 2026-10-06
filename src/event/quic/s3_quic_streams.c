@@ -264,6 +264,27 @@ s3_quic_close_streams(s3_connection_t *c, s3_quic_connection_t *qc)
 
     s3_event_process_posted(qc->ctx, &posted_events);
 
+    /*
+     * the force tail: an app handler may leave the stream connection
+     * open on the reset (the teardown waits for an event the closing
+     * parent never delivers, the S3_AGAIN above would wedge the
+     * connection close until the process exit); the pool destroy runs
+     * the stream cleanup, the node leaves the tree and the parent
+     * close reposts itself from the cleanup
+     */
+
+    node = (tree->root != tree->sentinel) ? s3_rbtree_min(tree->root, tree->sentinel) : NULL;
+
+    while (node) {
+        qs = (s3_quic_stream_t *)node;
+        node = s3_rbtree_next(tree, node);
+        sc = qs->connection;
+
+        if (sc != NULL) {
+            s3_close_connection(sc);
+        }
+    }
+
     if (tree->root == tree->sentinel) {
         return S3_OK;
     }

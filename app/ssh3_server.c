@@ -387,6 +387,41 @@ s3_srv_event_pass(s3_event_ctx_t *ctx)
     s3_event_process_posted(ctx, &ctx->posted_events);
 }
 
+/*
+ * the exit drain of the close state: the immediate close of a quiet
+ * peer parks on the 3*PTO close timer, the close grace above does not
+ * cover it; the timer drops and the resumed close completes on the
+ * passes below, the tracked connection pools die before the exit
+ */
+static void
+s3_srv_close_drain(s3_event_ctx_t *ctx)
+{
+    s3_msec_t deadline;
+    unsigned  i;
+
+    for (i = 0; i < S3_SRV_TRACKED; i++) {
+        s3_connection_t      *c = s3_srv_conns[i];
+        s3_quic_connection_t *qc;
+
+        if (c == NULL) {
+            continue;
+        }
+
+        qc = s3_quic_get_connection(c);
+
+        if (qc != NULL && qc->close.timer_set) {
+            s3_event_del_timer(&qc->close);
+            s3_post_event(&qc->close, &ctx->posted_events);
+        }
+    }
+
+    deadline = s3_current_msec + S3_SRV_CLOSE_GRACE;
+
+    while (s3_current_msec < deadline && s3_srv_active_conns() > 0) {
+        s3_srv_event_pass(ctx);
+    }
+}
+
 static u_char *
 s3_srv_read_file(const char *path, size_t *len)
 {
@@ -4110,13 +4145,13 @@ main(int argc, char **argv)
         }
 
         /*
-         * a peer gone quiet leaves its connection in the 3*PTO close
-         * state, the streams of a force-reset channel wait for their
-         * posted events - the pools of such a connection die with the
-         * process here, the leak check sees them only as reachable
-         * (the P7 backlog: the app-owned stream teardown on the
-         * forced path)
+         * the streams of a force-reset channel that a handler left
+         * open wait for their posted events, the quic layer force
+         * closes them inside the resumed close; a quiet peer parks on
+         * the 3*PTO close timer, the drain below drops it and lets
+         * every tracked pool complete its teardown before the exit
          */
+        s3_srv_close_drain(&ctx);
     }
 
     s3_srv_teardown_channels();
@@ -4126,13 +4161,19 @@ main(int argc, char **argv)
     s3_ssh3_oidc_verifier_clear(&s3_srv_oidc_ver);
 
     /*
-     * the pools outlive the shutdown tail on purpose: the event ctx
-     * pool and the streams of a connection caught mid-close stay
-     * reachable from the process roots until exit, the kernel
-     * reclaims them - a destroy here would orphan the leftover
-     * connection pools and turn them into definite leaks (the P7
-     * backlog: the app-owned teardown of the forced-close path)
+     * the exit hygiene: the tracked pools died in the tail passes
+     * above (the slot cleanup runs inside the pool destroy, the close
+     * of every connection completes since the quic layer force-closes
+     * the streams the handlers left open on the reset), what is left
+     * here is the process-owned state - the ssl ctx, the h3 request
+     * buffer and the event ctx with the connections and their events
      */
+
+    s3_ssl_free(s3_srv_conf.ssl);
+
+    free(s3_srv_h3_buf);
+
+    s3_event_ctx_shutdown(&ctx);
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "shutdown complete");
 

@@ -83,6 +83,7 @@ typedef struct {
     s3_int_t (*add_connection)(s3_event_ctx_t *ctx, s3_connection_t *c);
     s3_int_t (*del_connection)(s3_event_ctx_t *ctx, s3_connection_t *c);
     s3_int_t (*process_events)(s3_event_ctx_t *ctx, s3_msec_t timer, s3_uint_t flags);
+    void (*done)(s3_event_ctx_t *ctx);
 } s3_event_actions_t;
 
 extern s3_event_actions_t s3_event_actions;
@@ -108,6 +109,14 @@ extern s3_msec_t s3_current_msec;
 void s3_time_update(void);
 
 s3_int_t s3_event_ctx_init(s3_event_ctx_t *ctx, s3_log_t *log);
+
+/*
+ * the exit counterpart of ctx_init(): the event method drops its
+ * implementation data and the pool the connections and their events
+ * were allocated from dies; every connection must be closed by its
+ * owner before the call, the pool destroy does not run the handlers
+ */
+void s3_event_ctx_shutdown(s3_event_ctx_t *ctx);
 
 void s3_process_events_and_timers(s3_event_ctx_t *ctx);
 
