@@ -3676,7 +3676,10 @@ main(int argc, char **argv)
     s3_interop_conf.ctx = &ctx;
     s3_interop_conf.handshake_timeout = 30000;
     s3_interop_conf.idle_timeout = (s3_msec_t)idle_ms;
-    s3_interop_conf.stream_buffer_size = 16384;
+
+    /* the bulk sftp credit: the client trains ride it (see the client conf) */
+
+    s3_interop_conf.stream_buffer_size = 1 << 20;
     s3_interop_conf.max_concurrent_streams_bidi = 16;
     s3_interop_conf.max_concurrent_streams_uni = 16;
     s3_interop_conf.active_connection_id_limit = 8;
