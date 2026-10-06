@@ -27,6 +27,19 @@
 
 #define S3_SSH3_SFTP_CLI_CHECKSUM_AUTO_THRESHOLD (32 * 1024 * 1024)
 
+/* the transfer chunk, the reference copyWithOffset() buffer */
+
+#define S3_SSH3_SFTP_CLI_CHUNK (32 * 1024)
+
+/*
+ * the request window of the streaming phases: the WRITE and READ
+ * trains keep up to this many requests in flight, the replies ride
+ * the channel byte stream in request order (the SFTP server answers
+ * sequentially), so the driver pins the oldest outstanding id
+ */
+
+#define S3_SSH3_SFTP_CLI_INFLIGHT 32
+
 typedef enum {
     S3_SSH3_SFTP_CLI_IDLE = 0,
     S3_SSH3_SFTP_CLI_RUN,  /* an operation is in flight */

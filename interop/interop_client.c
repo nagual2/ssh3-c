@@ -2038,6 +2038,10 @@ static u_char *s3_interop_sftp_out;
 static size_t  s3_interop_sftp_out_cap;
 static size_t  s3_interop_sftp_out_len;
 
+/* the flush parked on the stream window: the retry timer goes short */
+
+static unsigned s3_interop_sftp_parked;
+
 static s3_int_t
 s3_interop_sftp_append(const u_char *data, size_t n)
 {
@@ -2163,7 +2167,12 @@ s3_interop_sftp_pump(void)
                                 s3_interop_sftp_frame_total - s3_interop_sftp_frame_sent);
 
         if (m == (ssize_t)S3_AGAIN) {
-            /* the window reopens on the next timer tick */
+
+            /* the window is closed: the retry rides the short timer,
+             * the reply events wake the pump earlier */
+
+            s3_interop_sftp_parked = 1;
+
             return;
         }
 
@@ -2174,6 +2183,25 @@ s3_interop_sftp_pump(void)
 
         s3_interop_sftp_frame_sent += (size_t)m;
     }
+
+    s3_interop_sftp_parked = 0;
+}
+
+/*
+ * the write readiness of the sftp channel: the quic layer posts this
+ * when the peer reopens the stream window, the pump resumes there
+ */
+
+static void
+s3_interop_sftp_write(s3_event_t *ev)
+{
+    ev->ready = 0;
+
+    if (s3_interop_h3_ch_ok) {
+        return;
+    }
+
+    s3_interop_sftp_pump();
 }
 
 static void
@@ -2188,7 +2216,14 @@ s3_interop_sftp_pump_timer(s3_event_t *ev)
     s3_interop_sftp_pump();
 
     if (!s3_interop_h3_ch_ok) {
-        s3_event_add_timer(ev, 50);
+
+        /*
+         * the parked flush of a closed stream window retries short,
+         * the idle keepalive stays on the slow tick; the reply events
+         * wake the pump through the read path meanwhile
+         */
+
+        s3_event_add_timer(ev, s3_interop_sftp_parked ? 2 : 50);
     }
 }
 
@@ -2230,6 +2265,10 @@ s3_interop_sftp_start(void)
     s3_interop_sftp_timer.handler = s3_interop_sftp_pump_timer;
 
     s3_event_add_timer(&s3_interop_sftp_timer, 50);
+
+    /* the header is already on the stream: the INIT rides at once */
+
+    s3_interop_sftp_pump();
 }
 
 /*
@@ -2335,7 +2374,14 @@ s3_interop_sftp_read(s3_event_t *ev)
 
                 if (s3_ssh3_sftp_cli_finished(&s3_interop_sftp_cli)) {
                     s3_interop_sftp_finish();
+
+                    continue;
                 }
+
+                /* the replies woke the driver: the next train rides
+                 * out at once, not on the timer tick */
+
+                s3_interop_sftp_pump();
 
                 continue;
             }
@@ -6421,7 +6467,11 @@ main(int argc, char **argv)
     conf.ctx = &ctx;
     conf.handshake_timeout = (s3_msec_t)timeout;
     conf.idle_timeout = 60000;
-    conf.stream_buffer_size = 16384;
+    /*
+     * the stream flow credit: the bulk sftp trains ride it, the
+     * 16 KiB default stalls the window per one driver chunk
+     */
+    conf.stream_buffer_size = 1 << 20;
     conf.max_concurrent_streams_bidi = 16;
     conf.max_concurrent_streams_uni = 16;
     conf.active_connection_id_limit = 8;
@@ -6634,6 +6684,21 @@ main(int argc, char **argv)
                      * ready but never posts the stream events
                      */
                     s3_interop_h3_channel->read->active = 1;
+
+                    if (s3_interop_sftp_mode) {
+
+                        /*
+                         * the sftp pump rides the write readiness: the
+                         * quic layer posts the write event when the
+                         * peer reopens the stream window (the
+                         * MAX_STREAM_DATA/MAX_DATA handling), the pump
+                         * resumes the parked frame there
+                         */
+
+                        s3_interop_h3_channel->write->handler = s3_interop_sftp_write;
+                        s3_interop_h3_channel->write->data = s3_interop_h3_channel;
+                        s3_interop_h3_channel->write->active = 1;
+                    }
                 }
 
                 if (!s3_interop_h3_ch_sent) {
@@ -6694,11 +6759,10 @@ main(int argc, char **argv)
                     else if (s3_interop_sftp_mode) {
 
                         /*
-                         * the sftp channel: the driver starts right
-                         * here, its INIT rides the pump timer behind
-                         * the header
+                         * the sftp channel: the driver starts behind
+                         * the header (the start call moved below the
+                         * send), its INIT rides the first pump pass
                          */
-                        s3_interop_sftp_start();
                     }
 
                     else if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC ||
@@ -6834,6 +6898,18 @@ main(int argc, char **argv)
 
                     else {
                         s3_interop_h3_ch_sent = 1;
+
+                        if (s3_interop_sftp_mode) {
+
+                            /*
+                             * the driver rides behind the header: the
+                             * INIT must not precede the channel open
+                             * on the wire, the start drains on the
+                             * first pump pass
+                             */
+
+                            s3_interop_sftp_start();
+                        }
 
                         if (s3_interop_h3_session_mode == S3_INTEROP_SESSION_EXEC) {
                             /*

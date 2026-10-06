@@ -8,17 +8,19 @@
  * channel byte stream, the framing stays in the channel layer
  *
  * the driver never blocks: the requests accumulate in the out
- * buffer, the replies ride in through input(); one request stays in
- * flight at a time (the loopback round trip is zero, the pipeline is
- * not needed), so a reply id must match the last request - a
- * mismatch after the retransmission-free pipeline is a protocol
- * error, like every unbounded frame shape
+ * buffer, the replies ride in through input(); the streaming phases
+ * keep a window of S3_SSH3_SFTP_CLI_INFLIGHT requests in flight, the
+ * SFTP server answers the byte stream sequentially, so every reply
+ * must carry the id of the oldest outstanding request - anything
+ * else after the retransmission-free pipeline is a protocol error,
+ * like every unbounded frame shape
  *
  * one operation runs at a time: the single put/get or the -r walk
  * over the directory tree; the walk keeps the stack of the directory
  * frames in the op context, the per-file transfers reuse the single
  * file phases; a failed file inside the -r walk does not abort it,
- * the reference counts the failures and walks on
+ * the reference counts the failures and walks on (a failure under an
+ * outstanding window kills the operation, the train cannot re-phase)
  *
  * the checksum verification re-reads the remote side through SHA-256
  * and compares it with the local file, on the verify flag or
@@ -34,12 +36,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <stdio.h>
 #include <s3_ssh3_sftp_cli.h>
 #include <s3_ssh3_sftp_codec.h>
 
-/* the transfer chunk, the reference copyWithOffset() buffer */
-
-#define S3_SSH3_SFTP_CLI_CHUNK (32 * 1024)
+/* the transfer chunk lives in the header: the callers size their
+ * drains against it (the reference copyWithOffset() buffer) */
 
 /* the initial capacity of the pending and out buffers, doubled on demand */
 
@@ -125,10 +127,20 @@ typedef struct {
     char *remote_path;
 
     int      fd;        /* the local file of the transfer */
-    uint32_t last_id;   /* the id of the request in flight */
+    uint32_t expect_id; /* the id of the oldest outstanding request */
     uint64_t file_size; /* the local size on put, the remote on get */
-    uint64_t offset;    /* the transfer cursor */
-    uint32_t io_len;    /* the payload of the request in flight */
+    uint64_t offset;    /* the receive cursor (the pwrite position, the progress) */
+    uint64_t emit_off;  /* the wire offset of the next train request */
+    uint32_t inflight;  /* the requests emitted without a reply */
+
+    /*
+     * the payload lens of the outstanding WRITE train, the replies
+     * ride in order so the cursor adds the front entry per STATUS OK
+     */
+
+    uint32_t io_ring[S3_SSH3_SFTP_CLI_INFLIGHT];
+    uint32_t io_head;
+    uint32_t io_tail;
 
     u_char *handle;
     size_t  handle_len;
@@ -170,13 +182,13 @@ typedef uintptr_t (*s3_cli_encode_handle_pt)(u_char *p, uint32_t id, const s3_st
 
 static s3_int_t s3_cli_buf_grow(s3_pool_t *pool, u_char **buf, size_t len, size_t *cap,
                                 size_t need);
-static void     s3_cli_commit(s3_ssh3_sftp_cli_t *t, uintptr_t need);
+static void     s3_cli_commit(s3_ssh3_sftp_cli_t *t, uintptr_t need, unsigned tracked);
 static s3_int_t s3_cli_emit_path(s3_ssh3_sftp_cli_t *t, s3_cli_encode_path_pt encode,
                                  const char *path);
 static s3_int_t s3_cli_emit_handle(s3_ssh3_sftp_cli_t *t, s3_cli_encode_handle_pt encode,
                                    const u_char *handle, size_t handle_len);
 static s3_int_t s3_cli_emit_open(s3_ssh3_sftp_cli_t *t, const char *path, unsigned creat);
-static s3_int_t s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset);
+static s3_int_t s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset, size_t len);
 static s3_int_t s3_cli_emit_write(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len);
 static s3_int_t s3_cli_emit_mkdir(s3_ssh3_sftp_cli_t *t, const char *path, size_t len);
 
@@ -253,15 +265,26 @@ s3_cli_buf_grow(s3_pool_t *pool, u_char **buf, size_t len, size_t *cap, size_t n
 }
 
 static void
-s3_cli_commit(s3_ssh3_sftp_cli_t *t, uintptr_t need)
+s3_cli_commit(s3_ssh3_sftp_cli_t *t, uintptr_t need, unsigned tracked)
 {
     s3_ssh3_sftp_cli_op_t *op = t->op;
 
     t->out_len += need;
 
-    /* the one-request pipeline: the next reply must carry this id */
+    /* the first request of a train pins the reply id, the rest ride
+     * the byte stream in order behind it; the INIT carries no request
+     * id and stays out of the window */
 
-    op->last_id = t->next_id++;
+    if (tracked) {
+
+        if (op->inflight == 0) {
+            op->expect_id = t->next_id;
+        }
+
+        op->inflight++;
+    }
+
+    t->next_id++;
 }
 
 static s3_int_t
@@ -280,7 +303,7 @@ s3_cli_emit_path(s3_ssh3_sftp_cli_t *t, s3_cli_encode_path_pt encode, const char
     }
 
     (void)encode(t->out + t->out_len, t->next_id, &s);
-    s3_cli_commit(t, need);
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
@@ -302,7 +325,7 @@ s3_cli_emit_handle(s3_ssh3_sftp_cli_t *t, s3_cli_encode_handle_pt encode, const 
     }
 
     (void)encode(t->out + t->out_len, t->next_id, &s);
-    s3_cli_commit(t, need);
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
@@ -345,13 +368,13 @@ s3_cli_emit_open(s3_ssh3_sftp_cli_t *t, const char *path, unsigned creat)
     }
 
     (void)s3_ssh3_sftp_encode_open(t->out + t->out_len, t->next_id, &s, pflags, &attrs);
-    s3_cli_commit(t, need);
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
 
 static s3_int_t
-s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset)
+s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset, size_t len)
 {
     s3_ssh3_sftp_cli_op_t *op = t->op;
     s3_str_t               handle;
@@ -360,17 +383,19 @@ s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset)
     handle.len = op->handle_len;
     handle.data = op->handle;
 
-    need = s3_ssh3_sftp_encode_read(NULL, t->next_id, &handle, offset, S3_SSH3_SFTP_CLI_CHUNK);
+    need = s3_ssh3_sftp_encode_read(NULL, t->next_id, &handle, offset, len);
 
     if (s3_cli_buf_grow(t->pool, &t->out, t->out_len, &t->out_cap, need) != S3_OK) {
         return S3_ERROR;
     }
 
-    op->io_len = S3_SSH3_SFTP_CLI_CHUNK;
+    /* the emission cursor moves here, ahead of the outstanding
+     * window; the receive cursor rides the replies */
 
-    (void)s3_ssh3_sftp_encode_read(t->out + t->out_len, t->next_id, &handle, offset,
-                                   S3_SSH3_SFTP_CLI_CHUNK);
-    s3_cli_commit(t, need);
+    op->emit_off = offset + len;
+
+    (void)s3_ssh3_sftp_encode_read(t->out + t->out_len, t->next_id, &handle, offset, len);
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
@@ -388,16 +413,25 @@ s3_cli_emit_write(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len)
     payload.len = len;
     payload.data = (u_char *)data;
 
-    need = s3_ssh3_sftp_encode_write(NULL, t->next_id, &handle, op->offset, &payload);
+    need = s3_ssh3_sftp_encode_write(NULL, t->next_id, &handle, op->emit_off, &payload);
 
     if (s3_cli_buf_grow(t->pool, &t->out, t->out_len, &t->out_cap, need) != S3_OK) {
         return S3_ERROR;
     }
 
-    op->io_len = (uint32_t)len;
+    /* the payload len rides the train ring, the STATUS OK of this
+     * request advances the receive cursor by it; the emission cursor
+     * moves here, ahead of the outstanding window */
 
-    (void)s3_ssh3_sftp_encode_write(t->out + t->out_len, t->next_id, &handle, op->offset, &payload);
-    s3_cli_commit(t, need);
+    op->io_ring[op->io_tail] = (uint32_t)len;
+    op->io_tail = (op->io_tail + 1) % S3_SSH3_SFTP_CLI_INFLIGHT;
+
+    (void)s3_ssh3_sftp_encode_write(t->out + t->out_len, t->next_id, &handle, op->emit_off,
+                                    &payload);
+
+    op->emit_off += len;
+
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
@@ -423,7 +457,7 @@ s3_cli_emit_mkdir(s3_ssh3_sftp_cli_t *t, const char *path, size_t len)
     }
 
     (void)s3_ssh3_sftp_encode_mkdir(t->out + t->out_len, t->next_id, &s, &attrs);
-    s3_cli_commit(t, need);
+    s3_cli_commit(t, need, 1);
 
     return S3_OK;
 }
@@ -559,14 +593,20 @@ s3_cli_file_fail(s3_ssh3_sftp_cli_t *t, uint32_t code)
     op->phase = (op->kind == S3_SSH3_SFTP_CLI_OP_PUT_R) ? PH_PUT_R_WALK : PH_GET_R_WALK;
 }
 
-/* the failure of a per-file transfer, single ops die, the walk goes on */
+/* the failure of a per-file transfer: a train in flight cannot
+ * re-phase (the younger replies would ride into the new phase), so
+ * an outstanding window kills the whole operation, the drained state
+ * keeps the walk-alive semantics of the reference */
 
 static void
 s3_cli_transfer_fail(s3_ssh3_sftp_cli_t *t, uint32_t code)
 {
     s3_ssh3_sftp_cli_op_t *op = t->op;
 
-    if (op->kind == S3_SSH3_SFTP_CLI_OP_PUT || op->kind == S3_SSH3_SFTP_CLI_OP_GET) {
+    if (op->inflight > 0) {
+        s3_cli_fail_op(t, code);
+
+    } else if (op->kind == S3_SSH3_SFTP_CLI_OP_PUT || op->kind == S3_SSH3_SFTP_CLI_OP_GET) {
         s3_cli_fail_op(t, code);
 
     } else {
@@ -1000,6 +1040,7 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
             }
 
             op->offset = 0;
+            op->emit_off = 0;
             op->phase = PH_VERIFY_STAT;
 
             return;
@@ -1017,6 +1058,7 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
     }
 
     op->offset = start;
+    op->emit_off = start;
     op->phase = PH_GET_OPEN;
 }
 
@@ -1141,6 +1183,7 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
         op->remote_path = remote_sub;
         op->file_size = (uint64_t)st.st_size;
         op->offset = 0;
+        op->emit_off = 0;
 
         if (op->resume) {
             op->phase = PH_PUT_STAT;
@@ -1246,7 +1289,7 @@ s3_cli_emit_init(s3_ssh3_sftp_cli_t *t)
     }
 
     (void)s3_ssh3_sftp_encode_init(t->out + t->out_len, S3_SSH3_SFTP_PROTOCOL_VERSION);
-    s3_cli_commit(t, need);
+    s3_cli_commit(t, need, 0);
 
     return S3_OK;
 }
@@ -1287,35 +1330,130 @@ s3_cli_step(s3_ssh3_sftp_cli_t *t)
         case PH_VERIFY_OPEN:
             return s3_cli_emit_open(t, op->remote_path, 0);
 
-        case PH_PUT_WRITE:
+        case PH_PUT_WRITE: {
+
+            size_t len;
+
+            /* the train: the window fills with the whole chunks of the
+             * remaining payload, the replies top it up; the emission
+             * cursor rides ahead of the outstanding window */
+
+            while (op->emit_off < op->file_size && op->inflight < S3_SSH3_SFTP_CLI_INFLIGHT) {
+
+                len = op->file_size - op->emit_off;
+
+                if (len > S3_SSH3_SFTP_CLI_CHUNK) {
+                    len = S3_SSH3_SFTP_CLI_CHUNK;
+                }
+
+                n = pread(op->fd, op->io_buf, len, (off_t)op->emit_off);
+
+                if (n < 0) {
+                    s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+                    return s3_cli_step(t);
+                }
+
+                if (n == 0) {
+
+                    /* the local file shrank under the transfer: the
+                     * train drains first, then the transfer fails */
+
+                    if (op->inflight > 0) {
+                        return S3_OK;
+                    }
+
+                    s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+
+                    return s3_cli_step(t);
+                }
+
+                if (s3_cli_emit_write(t, op->io_buf, (size_t)n) != S3_OK) {
+                    return S3_ERROR;
+                }
+            }
 
             if (op->offset >= op->file_size) {
+
+                /* the tail replies of the train ride out before the
+                 * close (a phase switch under a window mis-frames) */
+
+                if (op->inflight > 0) {
+                    return S3_OK;
+                }
+
                 op->phase = PH_PUT_CLOSE;
+
                 continue;
             }
 
-            n = pread(op->fd, op->io_buf, S3_SSH3_SFTP_CLI_CHUNK, (off_t)op->offset);
+            return S3_OK;
+        }
 
-            if (n < 0) {
-                s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
-                return s3_cli_step(t);
+        case PH_GET_READ: {
+
+            size_t len;
+
+            /* the train: the reads stay inside the stat size, the
+             * replies cannot hit the EOF mid-window on a stable file */
+
+            while (op->emit_off < op->file_size && op->inflight < S3_SSH3_SFTP_CLI_INFLIGHT) {
+
+                len = op->file_size - op->emit_off;
+
+                if (len > S3_SSH3_SFTP_CLI_CHUNK) {
+                    len = S3_SSH3_SFTP_CLI_CHUNK;
+                }
+
+                if (s3_cli_emit_read(t, op->emit_off, len) != S3_OK) {
+                    return S3_ERROR;
+                }
             }
 
-            if (n == 0) {
+            if (op->offset >= op->file_size) {
 
-                /* the file shrank under the transfer: close what rode */
+                if (op->inflight > 0) {
+                    return S3_OK;
+                }
 
-                op->phase = PH_PUT_CLOSE;
+                op->phase = PH_GET_CLOSE;
+
                 continue;
             }
 
-            return s3_cli_emit_write(t, op->io_buf, (size_t)n);
+            return S3_OK;
+        }
 
-        case PH_GET_READ:
-            return s3_cli_emit_read(t, op->offset);
+        case PH_VERIFY_READ: {
 
-        case PH_VERIFY_READ:
-            return s3_cli_emit_read(t, op->hash_len);
+            size_t len;
+
+            while (op->emit_off < op->file_size && op->inflight < S3_SSH3_SFTP_CLI_INFLIGHT) {
+
+                len = op->file_size - op->emit_off;
+
+                if (len > S3_SSH3_SFTP_CLI_CHUNK) {
+                    len = S3_SSH3_SFTP_CLI_CHUNK;
+                }
+
+                if (s3_cli_emit_read(t, op->emit_off, len) != S3_OK) {
+                    return S3_ERROR;
+                }
+            }
+
+            if (op->hash_len >= op->file_size) {
+
+                if (op->inflight > 0) {
+                    return S3_OK;
+                }
+
+                s3_cli_digest_final(t);
+                op->phase = PH_VERIFY_CLOSE;
+
+                continue;
+            }
+
+            return S3_OK;
+        }
 
         case PH_PUT_CLOSE:
         case PH_GET_CLOSE:
@@ -1443,6 +1581,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             /* any miss reads as the missing remote: the fresh open */
 
             op->offset = 0;
+            op->emit_off = 0;
             op->trunc = 1;
             op->phase = PH_PUT_OPEN;
 
@@ -1475,6 +1614,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
         }
 
         op->offset = attrs.size;
+        op->emit_off = attrs.size;
         op->trunc = 0;
         op->phase = PH_PUT_OPEN;
 
@@ -1521,7 +1661,12 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             return s3_cli_step(t);
         }
 
-        op->offset += op->io_len;
+        /* the cursor rides the train ring: the reply of the oldest
+         * outstanding WRITE carries its payload len */
+
+        op->offset += op->io_ring[op->io_head];
+        op->io_head = (op->io_head + 1) % S3_SSH3_SFTP_CLI_INFLIGHT;
+
         s3_cli_progress(t, op->offset, op->file_size);
 
         return s3_cli_step(t);
@@ -1658,9 +1803,16 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
             /* the pkg/sftp dialect reads short at will: only the empty
              * payload or the explicit STATUS EOF end the stream, the
-             * next READ keeps going otherwise */
+             * next READ keeps going otherwise; a mid-window end means
+             * the remote size died under the outstanding train */
 
             if (body.len == 0) {
+
+                if (op->inflight > 0) {
+                    s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+                    return s3_cli_step(t);
+                }
+
                 op->phase = PH_GET_CLOSE;
             }
 
@@ -1740,6 +1892,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
                 }
 
                 op->hash_len = 0;
+                op->emit_off = 0;
                 op->phase = PH_VERIFY_OPEN;
 
                 return s3_cli_step(t);
@@ -1803,9 +1956,17 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             op->hash_len += body.len;
 
             /* the pkg/sftp dialect reads short at will: only the empty
-             * payload or the explicit STATUS EOF end the stream */
+             * payload or the explicit STATUS EOF end the stream; the
+             * size-capped train never ends it mid-window on a stable
+             * file, an early end fails the digest honestly */
 
             if (body.len == 0) {
+
+                if (op->inflight > 0) {
+                    s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+                    return s3_cli_step(t);
+                }
+
                 s3_cli_digest_final(t);
                 op->phase = PH_VERIFY_CLOSE;
             }
@@ -1822,8 +1983,15 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
         }
 
         if (code == S3_SSH3_SFTP_FX_EOF) {
+
+            if (op->inflight > 0) {
+                s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+                return s3_cli_step(t);
+            }
+
             s3_cli_digest_final(t);
             op->phase = PH_VERIFY_CLOSE;
+
             return s3_cli_step(t);
         }
 
@@ -2297,9 +2465,10 @@ s3_ssh3_sftp_cli_get_r(s3_ssh3_sftp_cli_t *t, const char *remote_path, const cha
 s3_int_t
 s3_ssh3_sftp_cli_input(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len)
 {
-    s3_ssh3_sftp_pkt_t pkt;
-    const u_char      *p, *end, *msg;
-    s3_int_t           rc;
+    s3_ssh3_sftp_cli_op_t *op;
+    s3_ssh3_sftp_pkt_t     pkt;
+    const u_char          *p, *end, *msg;
+    s3_int_t               rc;
 
     if (t == NULL || (data == NULL && len > 0)) {
         return S3_ERROR;
@@ -2322,11 +2491,22 @@ s3_ssh3_sftp_cli_input(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len)
 
     while (p < end) {
 
-        /* the verdict left the RUN state: the rest is unsolicited */
-
         if (t->state != S3_SSH3_SFTP_CLI_RUN) {
+
+            /*
+             * the verdict left the RUN state: the replies of the dead
+             * train ride the drain, the frames outside an operation
+             * stay unsolicited
+             */
+
+            if (t->state == S3_SSH3_SFTP_CLI_DONE || t->state == S3_SSH3_SFTP_CLI_FAIL) {
+                break;
+            }
+
             return S3_ERROR;
         }
+
+        op = t->op;
 
         msg = p;
 
@@ -2356,11 +2536,19 @@ s3_ssh3_sftp_cli_input(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len)
             continue;
         }
 
-        /* the pin: one request in flight, the reply id must match */
+        /* the pin: the replies ride the byte stream in request order,
+         * the id must match the oldest outstanding request; a reply
+         * with nothing outstanding is a protocol violation too */
 
-        if (!pkt.has_id || pkt.request_id != ((s3_ssh3_sftp_cli_op_t *)t->op)->last_id) {
+        if (op->inflight == 0 || !pkt.has_id || pkt.request_id != op->expect_id) {
             return S3_ERROR;
         }
+
+        /* the reply consumes the oldest request before the dispatch:
+         * the phase switches inside see the drained window */
+
+        op->inflight--;
+        op->expect_id++;
 
         if (s3_cli_dispatch(t, &pkt) != S3_OK) {
             return S3_ERROR;
