@@ -390,7 +390,12 @@ s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset, size_t len)
     }
 
     /* the emission cursor moves here, ahead of the outstanding
-     * window; the receive cursor rides the replies */
+     * window; the receive cursor rides the replies.  The requested
+     * len rides the train ring like the WRITE one: the DATA reply is
+     * checked against it */
+
+    op->io_ring[op->io_tail] = (uint32_t)len;
+    op->io_tail = (op->io_tail + 1) % S3_SSH3_SFTP_CLI_INFLIGHT;
 
     op->emit_off = offset + len;
 
@@ -1394,14 +1399,17 @@ s3_cli_step(s3_ssh3_sftp_cli_t *t)
             size_t len;
 
             /* the train: the reads stay inside the stat size, the
-             * replies cannot hit the EOF mid-window on a stable file */
+             * replies cannot hit the EOF mid-window on a stable file;
+             * the chunk rides the read bound (the channel
+             * maxPacketSize minus the reply reserve), so the replies
+             * of a dialect server never go short */
 
             while (op->emit_off < op->file_size && op->inflight < S3_SSH3_SFTP_CLI_INFLIGHT) {
 
                 len = op->file_size - op->emit_off;
 
-                if (len > S3_SSH3_SFTP_CLI_CHUNK) {
-                    len = S3_SSH3_SFTP_CLI_CHUNK;
+                if (len > t->read_bound) {
+                    len = t->read_bound;
                 }
 
                 if (s3_cli_emit_read(t, op->emit_off, len) != S3_OK) {
@@ -1431,8 +1439,8 @@ s3_cli_step(s3_ssh3_sftp_cli_t *t)
 
                 len = op->file_size - op->emit_off;
 
-                if (len > S3_SSH3_SFTP_CLI_CHUNK) {
-                    len = S3_SSH3_SFTP_CLI_CHUNK;
+                if (len > t->read_bound) {
+                    len = t->read_bound;
                 }
 
                 if (s3_cli_emit_read(t, op->emit_off, len) != S3_OK) {
@@ -1784,8 +1792,24 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
         if (pkt->type == S3_SSH3_SFTP_DATA) {
 
+            /* the requested len of the served slot rides the train
+             * ring: a reply shorter than it mis-phases the positional
+             * window, the transfer fails honestly (the read bound
+             * keeps a dialect server out of this path) */
+
+            uint32_t want = op->io_ring[op->io_head];
+
+            op->io_head = (op->io_head + 1) % S3_SSH3_SFTP_CLI_INFLIGHT;
+
             if (s3_cli_parse_data_body(&pkt->body, &body) != S3_OK) {
                 return S3_ERROR;
+            }
+
+            if (body.len > 0 && (size_t)body.len < want) {
+
+                s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+
+                return s3_cli_step(t);
             }
 
             if (body.len > 0) {
@@ -1945,8 +1969,23 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
         if (pkt->type == S3_SSH3_SFTP_DATA) {
 
+            /* the same train-ring pin as the payload read: a reply
+             * shorter than the requested chunk mis-phases the window,
+             * the digest would lie, the transfer fails honestly */
+
+            uint32_t want = op->io_ring[op->io_head];
+
+            op->io_head = (op->io_head + 1) % S3_SSH3_SFTP_CLI_INFLIGHT;
+
             if (s3_cli_parse_data_body(&pkt->body, &body) != S3_OK) {
                 return S3_ERROR;
+            }
+
+            if (body.len > 0 && (size_t)body.len < want) {
+
+                s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
+
+                return s3_cli_step(t);
             }
 
             if (body.len > 0 && EVP_DigestUpdate(op->md, body.data, body.len) != 1) {
@@ -2249,10 +2288,29 @@ s3_ssh3_sftp_cli_init(s3_ssh3_sftp_cli_t *t, s3_pool_t *pool, s3_ssh3_sftp_cli_p
     t->pool = pool;
     t->state = S3_SSH3_SFTP_CLI_IDLE;
     t->status = S3_SSH3_SFTP_FX_OK;
+    t->read_bound = S3_SSH3_SFTP_CLI_CHUNK;
     t->progress = progress;
     t->progress_arg = progress_arg;
 
     return S3_OK;
+}
+
+void
+s3_ssh3_sftp_cli_channel_max_packet(s3_ssh3_sftp_cli_t *t, uint64_t max_packet)
+{
+    uint64_t bound;
+
+    if (t == NULL || max_packet <= S3_SSH3_SFTP_CLI_PACKET_RESERVE) {
+        return;
+    }
+
+    bound = max_packet - S3_SSH3_SFTP_CLI_PACKET_RESERVE;
+
+    if (bound > S3_SSH3_SFTP_CLI_CHUNK) {
+        bound = S3_SSH3_SFTP_CLI_CHUNK;
+    }
+
+    t->read_bound = (uint32_t)bound;
 }
 
 s3_int_t
