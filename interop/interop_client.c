@@ -2244,6 +2244,11 @@ s3_interop_sftp_start(void)
         exit(1);
     }
 
+    /* the READ bound follows the channel maxPacketSize this side
+     * announced: the DATA replies of the peer stay under it */
+
+    s3_ssh3_sftp_cli_channel_max_packet(&s3_interop_sftp_cli, S3_INTEROP_CHANNEL_MAX_PACKET);
+
     if (s3_interop_sftp_mode == S3_INTEROP_SFTP_PUT) {
         rc = s3_ssh3_sftp_cli_put(&s3_interop_sftp_cli, s3_interop_sftp_local,
                                   s3_interop_sftp_remote, 0, 1);

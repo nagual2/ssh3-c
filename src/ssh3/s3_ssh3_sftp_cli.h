@@ -32,6 +32,16 @@
 #define S3_SSH3_SFTP_CLI_CHUNK (32 * 1024)
 
 /*
+ * the reply bound reserve: a READ request never asks for more than
+ * maxPacketSize - this, so the DATA reply (the 94 frame plus the
+ * SFTP DATA header) stays under the channel maxPacketSize this side
+ * announced and a dialect server never truncates the reply (the
+ * harness readChunk() caps at the same maxPacketSize - 512)
+ */
+
+#define S3_SSH3_SFTP_CLI_PACKET_RESERVE 512
+
+/*
  * the request window of the streaming phases: the WRITE and READ
  * trains keep up to this many requests in flight, the replies ride
  * the channel byte stream in request order (the SFTP server answers
@@ -58,6 +68,15 @@ struct s3_ssh3_sftp_cli_s {
     uint32_t                 status; /* the last SSH_FX_* verdict, FX_OK on DONE */
 
     uint32_t next_id; /* the growing request id */
+
+    /*
+     * the READ request bound on the wire: S3_SSH3_SFTP_CLI_CHUNK
+     * until the channel maxPacketSize of this side is announced (the
+     * 91 confirmation carries it), then the bound that keeps every
+     * DATA reply under that maxPacketSize
+     */
+
+    uint32_t read_bound;
 
     /* the receive tail: the bytes of an incomplete frame */
 
@@ -90,6 +109,15 @@ struct s3_ssh3_sftp_cli_s {
 
 s3_int_t s3_ssh3_sftp_cli_init(s3_ssh3_sftp_cli_t *t, s3_pool_t *pool,
                                s3_ssh3_sftp_cli_progress_pt progress, void *progress_arg);
+
+/*
+ * announces the channel maxPacketSize this side declared in the
+ * channel open (the driver reads are bounded to keep the DATA
+ * replies of the peer under it); a value at or under the reply
+ * reserve keeps the default chunk
+ */
+
+void s3_ssh3_sftp_cli_channel_max_packet(s3_ssh3_sftp_cli_t *t, uint64_t max_packet);
 
 /*
  * starts one upload (local file to remote path) or download; the -r
