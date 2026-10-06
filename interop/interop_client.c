@@ -3171,6 +3171,18 @@ s3_interop_cm_conn_close(s3_interop_cm_conn_t *conn)
         if (run->err == conn) {
             run->err = NULL;
         }
+
+        if (run->finalized && run->control == NULL && run->io == NULL && run->err == NULL) {
+
+            /*
+             * the finished run whose conns all left: the late slave
+             * read its verdict or died before the attach either way,
+             * the token slot frees
+             */
+            (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
+
+            s3_interop_cm_run_free(run);
+        }
     }
 
     sc = conn->c;
@@ -3267,14 +3279,35 @@ s3_interop_cm_run_stdin(s3_interop_cm_run_t *run, const u_char *data, size_t len
 /* the session teardown: the attach data drains first, the exit status
    rides the control conn, the codec slot frees and the channel shuts */
 
+/* the exit status of the verdict, queued on the control conn */
+
 static void
-s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
+s3_interop_cm_run_send_exit(s3_interop_cm_run_t *run, uint64_t code)
 {
     u_char   es[8];
     u_char   fr[S3_SSH3_CM_HEADER_LEN + sizeof(es)];
     s3_str_t pl;
     u_char  *p;
 
+    if (run->control == NULL) {
+        return;
+    }
+
+    pl.data = es;
+    pl.len = sizeof(es);
+    (void)s3_ssh3_cm_encode_exit_status(es, code);
+
+    p = fr;
+    p = (u_char *)s3_ssh3_cm_encode_frame(p, S3_SSH3_CM_MSG_EXIT_STATUS, &pl);
+
+    if (s3_interop_cm_conn_send(run->control, fr, (size_t)(p - fr)) != S3_OK) {
+        s3_interop_cm_conn_close(run->control);
+    }
+}
+
+static void
+s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
+{
     if (run->finalized) {
         return;
     }
@@ -3290,23 +3323,26 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
         s3_interop_cm_conn_close(run->err);
     }
 
-    if (run->control != NULL) {
+    /*
+     * the exit status rides the control conn only after the attach:
+     * the slave codec accepts the replies alone while it awaits, an
+     * early verdict frame would kill the protocol - the un-bridged
+     * verdict waits for the bridge and answers from there
+     */
 
-        pl.data = es;
-        pl.len = sizeof(es);
-        (void)s3_ssh3_cm_encode_exit_status(es, code);
-
-        p = fr;
-        p = (u_char *)s3_ssh3_cm_encode_frame(p, S3_SSH3_CM_MSG_EXIT_STATUS, &pl);
-
-        if (s3_interop_cm_conn_send(run->control, fr, (size_t)(p - fr)) != S3_OK) {
-            s3_interop_cm_conn_close(run->control);
-        }
+    if (run->bridged) {
+        s3_interop_cm_run_send_exit(run, code);
     }
 
-    /* the codec slot clears for the reuse, the release is the lib's */
+    /*
+     * the slot release waits for the attach: the event-driven server
+     * finishes a session faster than the slave attaches, the token
+     * must stay attachable until the bridge (or the slave conns die)
+     */
 
-    (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
+    if (run->bridged) {
+        (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
+    }
 
     if (run->chan != NULL) {
 
@@ -3321,6 +3357,19 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
         run->chan = NULL;
     }
 
+    printf("S3CM-MASTER-SESSION-DONE exit=%llu\n", (unsigned long long)code);
+    fflush(stdout);
+
+    if (!run->bridged) {
+
+        /*
+         * the attach is still ahead: the run, the token slot and the
+         * control conn live until the bridge arrives or the slave
+         * vanishes (the conn close paths answer both)
+         */
+        return;
+    }
+
     if (run->control != NULL) {
         s3_interop_cm_conn_close(run->control);
     }
@@ -3332,9 +3381,6 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
     if (run->err != NULL) {
         s3_interop_cm_conn_close(run->err);
     }
-
-    printf("S3CM-MASTER-SESSION-DONE exit=%llu\n", (unsigned long long)code);
-    fflush(stdout);
 
     s3_interop_cm_run_free(run);
 }
@@ -3641,6 +3687,17 @@ s3_interop_cm_cb_bridge(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
         run->io = s3_interop_cm_cur;
         s3_interop_cm_cur->run = run;
         s3_interop_cm_cur->kind = S3_INTEROP_CM_CONN_IO;
+    }
+
+    if (run->finalized) {
+
+        /*
+         * the verdict beat the attach: the attach replies are on the
+         * wire already, the exit status rides after them, the run
+         * unwinds when the slave conns close (the conn close sweep)
+         */
+
+        s3_interop_cm_run_send_exit(run, run->exit_code);
     }
 }
 

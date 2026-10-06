@@ -51,6 +51,39 @@ static const struct {
 #define S3_SSH3_SESSION_NIGNALS                                                                    \
     (sizeof(s3_ssh3_session_signals) / sizeof(s3_ssh3_session_signals[0]))
 
+/* the read window of the pump drain, pool-owned and reused */
+
+#define S3_SSH3_SESSION_DRAIN_SIZE 16384
+
+/*
+ * the verdict watchdog: when every process fd hit the eof before the
+ * child exited, no readiness wake carries the reap any more, this
+ * slow timer delivers it; the transport path never waits for it
+ */
+
+#define S3_SSH3_SESSION_REAP_WATCHDOG_MS 100
+
+/*
+ * the watch connection of the pump: the connection rides first so
+ * the connection pointer casts back to the watch, the free list
+ * below recycles them without a per-session allocation; the instance
+ * flips on every reuse and the stale wake-ups of the old fd die on
+ * the epoll check
+ */
+typedef struct s3_ssh3_session_watch_s s3_ssh3_session_watch_t;
+
+struct s3_ssh3_session_watch_s {
+    s3_connection_t          conn; /* the cast anchor, must stay first */
+    s3_event_t               rev;
+    s3_event_t               wev;
+    s3_ssh3_session_watch_t *next; /* the free list */
+};
+
+static s3_ssh3_session_watch_t *s3_ssh3_session_watch_free;
+
+static void s3_ssh3_session_unwatch_fd(s3_connection_t **watch, int fd);
+static void s3_ssh3_session_reap_timer(s3_event_t *ev);
+
 static const char *
 s3_ssh3_session_signal_name(int number)
 {
@@ -84,6 +117,16 @@ s3_ssh3_session_srv_init(s3_ssh3_session_srv_t *s, s3_pool_t *pool)
     s->stdout_fd = S3_SSH3_SESSION_INVALID_FD;
     s->stderr_fd = S3_SSH3_SESSION_INVALID_FD;
     s->pty_master = S3_SSH3_SESSION_INVALID_FD;
+
+    /* the pump drain: one read window per session, reused across the reads */
+
+    s->drain = s3_pnalloc(pool, S3_SSH3_SESSION_DRAIN_SIZE);
+
+    if (s->drain == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memzero(&s->reap_timer, sizeof(s3_event_t));
 
     return S3_OK;
 }
@@ -723,6 +766,374 @@ ssize_t
 s3_ssh3_session_srv_read_stderr(s3_ssh3_session_srv_t *s, u_char *buf, size_t size)
 {
     return s3_ssh3_session_read_fd(s->stderr_fd, 0, buf, size);
+}
+
+/*
+ * the event-driven pump (P7.2): the process fds are watched in the
+ * event context, the readiness runs the pump of the caller, the eof
+ * disarms the watch - no polling timer rides the session any more,
+ * the output answers within one event loop pass
+ */
+
+/* the stale wake-up of a disarmed watch: the closed flag stops it */
+
+static void
+s3_ssh3_session_watch_ready(s3_event_t *ev)
+{
+    s3_connection_t       *c = ev->data;
+    s3_ssh3_session_srv_t *s;
+
+    if (c->read->closed) {
+        return;
+    }
+
+    s = c->data;
+
+    if (s->pump_cb != NULL) {
+        s->pump_cb(s->pump_ctx);
+    }
+}
+
+/*
+ * the verdict watchdog: the fds are gone but the child still runs,
+ * the pump of the caller reaps it on this slow beat; the pump rearms
+ * while the verdict is pending
+ */
+
+static void
+s3_ssh3_session_reap_timer(s3_event_t *ev)
+{
+    s3_ssh3_session_srv_t *s = ev->data;
+
+    ev->timedout = 0;
+
+    if (s->verdict_sent || s->pump_cb == NULL) {
+        return;
+    }
+
+    s->pump_cb(s->pump_ctx);
+}
+
+static s3_connection_t *
+s3_ssh3_session_watch_conn(s3_ssh3_session_srv_t *s)
+{
+    s3_ssh3_session_watch_t *w;
+    s3_connection_t         *c;
+    s3_event_t              *rev, *wev;
+
+    w = s3_ssh3_session_watch_free;
+
+    if (w != NULL) {
+        s3_ssh3_session_watch_free = w->next;
+
+        /*
+         * the reuse flips the instances, the stale epoll entries of
+         * the previous fd epoch die on the instance check
+         */
+
+        w->conn.read->instance ^= 1;
+        w->conn.write->instance ^= 1;
+
+    } else {
+        w = (s3_ssh3_session_watch_t *)s3_alloc(sizeof(s3_ssh3_session_watch_t), s->watch_log);
+
+        if (w == NULL) {
+            return NULL;
+        }
+
+        s3_memzero(w, sizeof(s3_ssh3_session_watch_t));
+    }
+
+    c = &w->conn;
+    rev = &w->rev;
+    wev = &w->wev;
+
+    /*
+     * the field shape of s3_get_connection(): the watch connection is
+     * not ctx-owned, the fd close stays with the session teardown
+     */
+
+    c->read = rev;
+    c->write = wev;
+    c->fd = s->stdout_fd;
+    c->data = s;
+    c->log = s->watch_log;
+
+    rev->data = c;
+    wev->data = c;
+
+    wev->write = 1;
+
+    rev->log = s->watch_log;
+    wev->log = s->watch_log;
+
+    rev->handler = s3_ssh3_session_watch_ready;
+
+    /*
+     * the transient flags of the previous epoch leave: the fresh fd
+     * rides EPOLL_CTL_ADD (active 0), the closed flag of the unwatch
+     * must not silence the next handler, the readiness bits and the
+     * parked post of the old fd are stale by definition
+     */
+
+    rev->active = 0;
+    wev->active = 0;
+
+    rev->closed = 0;
+    wev->closed = 0;
+
+    rev->ready = 0;
+    wev->ready = 0;
+
+    rev->pending_eof = 0;
+    rev->eof = 0;
+    rev->error = 0;
+    rev->timedout = 0;
+    rev->posted = 0;
+
+    wev->pending_eof = 0;
+    wev->eof = 0;
+    wev->error = 0;
+    wev->timedout = 0;
+    wev->posted = 0;
+
+    return c;
+}
+
+static void
+s3_ssh3_session_unwatch_fd(s3_connection_t **watch, int fd)
+{
+    s3_connection_t          *c = *watch;
+    s3_ssh3_session_watch_t  *w;
+
+    if (c == NULL) {
+        return;
+    }
+
+    *watch = NULL;
+
+    /* the wake-ups parked in the posted queue leave before the pool */
+
+    if (c->read->posted) {
+        s3_delete_posted_event(c->read);
+    }
+
+    if (c->write->posted) {
+        s3_delete_posted_event(c->write);
+    }
+
+    /*
+     * the still-open fd keeps its kernel interest: an eof-ed pipe
+     * stays readable forever and would spin the loop, the filter
+     * leaves explicitly; the closed fd needs nothing, the kernel
+     * dropped the interest on the close; the closed flag stops the
+     * wake-ups already parked in this event batch
+     */
+
+    if (c->read->active && fd != S3_SSH3_SESSION_INVALID_FD) {
+        (void)s3_event_actions.del_event(c->read, S3_READ_EVENT, 0);
+    }
+
+    c->read->closed = 1;
+    c->write->closed = 1;
+
+    w = (s3_ssh3_session_watch_t *)c;
+    w->next = s3_ssh3_session_watch_free;
+    s3_ssh3_session_watch_free = w;
+}
+
+/* the verdict watchdog arms only when no readiness wake can come */
+
+static void
+s3_ssh3_session_watchdog_arm(s3_ssh3_session_srv_t *s)
+{
+    if (s->verdict_sent || s->pump_cb == NULL || s->reap_timer.timer_set) {
+        return;
+    }
+
+    if (s->out_watch != NULL || s->err_watch != NULL) {
+        return;
+    }
+
+    if (s->reap_timer.data == NULL) {
+        s->reap_timer.data = s;
+        s->reap_timer.log = s->watch_log;
+        s->reap_timer.handler = s3_ssh3_session_reap_timer;
+    }
+
+    s3_event_add_timer(&s->reap_timer, S3_SSH3_SESSION_REAP_WATCHDOG_MS);
+}
+
+s3_int_t
+s3_ssh3_session_srv_watch(s3_ssh3_session_srv_t *s, s3_pool_t *watch_pool, s3_log_t *log,
+                          s3_ssh3_session_pump_pt pump, void *pump_ctx)
+{
+    if (s == NULL || watch_pool == NULL || log == NULL || pump == NULL) {
+        return S3_ERROR;
+    }
+
+    s->watch_log = log;
+    s->pump_cb = pump;
+    s->pump_ctx = pump_ctx;
+
+    if (s->stdout_fd != S3_SSH3_SESSION_INVALID_FD && s->out_watch == NULL) {
+
+        s->out_watch = s3_ssh3_session_watch_conn(s);
+
+        if (s->out_watch == NULL
+            || s3_event_actions.add_event(s->out_watch->read, S3_READ_EVENT, 0) != S3_OK) {
+            /* the watch recycles, the session stays unwatched */
+
+            s3_ssh3_session_unwatch_fd(&s->out_watch, s->stdout_fd);
+            return S3_ERROR;
+        }
+    }
+
+    if (s->stderr_fd != S3_SSH3_SESSION_INVALID_FD && s->err_watch == NULL) {
+
+        s->err_watch = s3_ssh3_session_watch_conn(s);
+
+        if (s->err_watch == NULL) {
+            return S3_ERROR;
+        }
+
+        s->err_watch->fd = s->stderr_fd;
+
+        if (s3_event_actions.add_event(s->err_watch->read, S3_READ_EVENT, 0) != S3_OK) {
+            s3_ssh3_session_unwatch_fd(&s->err_watch, s->stderr_fd);
+            return S3_ERROR;
+        }
+    }
+
+    /* a verdict already pending without any fd ride rearms the watchdog */
+
+    s3_ssh3_session_watchdog_arm(s);
+
+    return S3_OK;
+}
+
+void
+s3_ssh3_session_srv_unwatch(s3_ssh3_session_srv_t *s)
+{
+    if (s == NULL) {
+        return;
+    }
+
+    if (s->reap_timer.timer_set) {
+        s3_event_del_timer(&s->reap_timer);
+    }
+
+    s3_ssh3_session_unwatch_fd(&s->out_watch, s->stdout_fd);
+    s3_ssh3_session_unwatch_fd(&s->err_watch, s->stderr_fd);
+}
+
+s3_int_t
+s3_ssh3_session_srv_pump(s3_ssh3_session_srv_t *s, const s3_ssh3_session_srv_io_t *io)
+{
+    ssize_t n;
+
+    if (s == NULL || io == NULL || io->output == NULL || io->exit == NULL) {
+        return S3_ERROR;
+    }
+
+    /* the stdout rides as 94, the pty merges everything into it */
+
+    for (;;) {
+
+        n = s3_ssh3_session_read_fd(s->stdout_fd, s->pty, s->drain, S3_SSH3_SESSION_DRAIN_SIZE);
+
+        if (n > 0) {
+
+            if (io->output(io->ctx, s->drain, (size_t)n) != S3_OK) {
+                s3_ssh3_session_watchdog_arm(s);
+                return S3_ERROR;
+            }
+
+            continue;
+        }
+
+        if (n == 0) {
+            /* the eof: the watch leaves, the child may still run */
+
+            s3_ssh3_session_unwatch_fd(&s->out_watch, s->stdout_fd);
+        }
+
+        /* S3_AGAIN or a read error: the verdict still answers below */
+        break;
+    }
+
+    /* the stderr pipe of the pipe sessions, 95 with dataType 1 */
+
+    for (;;) {
+
+        n = s3_ssh3_session_read_fd(s->stderr_fd, 0, s->drain, S3_SSH3_SESSION_DRAIN_SIZE);
+
+        if (n > 0) {
+
+            if (io->err != NULL && io->err(io->ctx, s->drain, (size_t)n) != S3_OK) {
+                s3_ssh3_session_watchdog_arm(s);
+                return S3_ERROR;
+            }
+
+            continue;
+        }
+
+        if (n == 0) {
+            s3_ssh3_session_unwatch_fd(&s->err_watch, s->stderr_fd);
+        }
+
+        break;
+    }
+
+    /* the verdict, once: the code is cached for the retry of a failed sink */
+
+    if (!s->verdict_sent) {
+
+        uint64_t code;
+        s3_str_t name;
+        unsigned core;
+
+        s3_str_null(&name);
+
+        if (!s->exited) {
+
+            s3_int_t rc = s3_ssh3_session_srv_reap(s, &code, &name, &core);
+
+            if (rc != S3_OK) {
+
+                /*
+                 * S3_AGAIN: the process still runs, the eof-ed fds
+                 * carry no wake any more, the slow watchdog rearms
+                 * until the verdict is out
+                 */
+
+                s3_ssh3_session_watchdog_arm(s);
+
+                return rc;
+            }
+
+            s->exit_code = code;
+        }
+
+        if (io->exit(io->ctx, s->exit_code) != S3_OK) {
+            /* the cached code rides the watchdog rearms to the retry */
+
+            s3_ssh3_session_watchdog_arm(s);
+            return S3_ERROR;
+        }
+
+        s->verdict_sent = 1;
+
+        if (s->reap_timer.timer_set) {
+            s3_event_del_timer(&s->reap_timer);
+        }
+
+        /* the transport is over, the watches leave with the fds */
+        s3_ssh3_session_unwatch_fd(&s->out_watch, s->stdout_fd);
+        s3_ssh3_session_unwatch_fd(&s->err_watch, s->stderr_fd);
+    }
+
+    return S3_OK;
 }
 
 s3_int_t
