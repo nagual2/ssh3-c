@@ -131,6 +131,15 @@ static s3_msec_t             s3_srv_drain_deadline;
 static s3_msec_t             s3_srv_drain_ms = 5000;
 
 /*
+ * the drain deadline wake: the event-driven session pump removed the
+ * periodic transport tick, a conversation can sit with no timers and
+ * no socket events at all (a wedged exec writes nothing), the loop
+ * would sleep in epoll past the deadline - this one-shot timer is
+ * the wake the drain timeout check rides
+ */
+static s3_event_t s3_srv_drain_timer;
+
+/*
  * the runner protocol markers (INTEROP-*) ride stdout under
  * SSH3C_PROTO=1 only; the production runs log one-liners instead
  */
@@ -342,11 +351,30 @@ s3_srv_active_conns(void)
     return n;
 }
 
+/* the drain deadline expiry: the state machine between passes acts */
+
+static void
+s3_srv_drain_timer_handler(s3_event_t *ev)
+{
+    ev->timedout = 0;
+}
+
 static void
 s3_srv_drain_start(void)
 {
     s3_srv_draining = 1;
     s3_srv_drain_deadline = s3_current_msec + s3_srv_drain_ms;
+
+    if (!s3_srv_drain_timer.timer_set) {
+
+        if (s3_srv_drain_timer.data == NULL) {
+            s3_srv_drain_timer.data = &s3_srv_drain_timer;
+            s3_srv_drain_timer.log = &s3_srv_log;
+            s3_srv_drain_timer.handler = s3_srv_drain_timer_handler;
+        }
+
+        s3_event_add_timer(&s3_srv_drain_timer, s3_srv_drain_ms);
+    }
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
                  "shutdown signal received: no longer accepting new connections");
@@ -2007,8 +2035,8 @@ s3_srv_session_pump_cb(void *ctx)
 static void
 s3_srv_session_arm(s3_srv_h3_channel_t *ch)
 {
-    if (s3_ssh3_session_srv_watch(ch->sess, ch->sess_pool, &s3_srv_log, s3_srv_session_pump_cb, ch)
-        != S3_OK) {
+    if (s3_ssh3_session_srv_watch(ch->sess, ch->sess_pool, &s3_srv_log, s3_srv_session_pump_cb,
+                                  ch) != S3_OK) {
         fprintf(stderr, "ssh3-server: session watch failed\n");
     }
 }
