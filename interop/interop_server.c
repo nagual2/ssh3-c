@@ -1518,6 +1518,20 @@ s3_interop_h3_channel_of(s3_connection_t *sc)
  * is full, the caller tears the stream down
  */
 
+/*
+ * the identity snapshot of the CONNECT (P7.3): the verdict serialized
+ * the username, the session spawns from the channel copy - the static
+ * verdict buffer may move on with the next CONNECT; the accept paths
+ * (the channel alloc and the inline stream accept) ride it
+ */
+static void
+s3_interop_channel_user_snapshot(s3_interop_h3_channel_t *ch)
+{
+    if (s3_interop_auth_user[0] != '\0') {
+        snprintf(ch->sess_user, sizeof(ch->sess_user), "%s", s3_interop_auth_user);
+    }
+}
+
 static s3_interop_h3_channel_t *
 s3_interop_h3_channel_alloc(s3_connection_t *sc)
 {
@@ -1530,16 +1544,7 @@ s3_interop_h3_channel_alloc(s3_connection_t *sc)
             s3_interop_h3_channels[i].sc = sc;
             s3_interop_h3_channels[i].fwd_fd = -1;
 
-            /*
-             * the identity snapshot of the CONNECT (P7.3): the verdict
-             * serialized the username, the session spawns from the
-             * channel copy - the static verdict buffer may move on
-             * with the next CONNECT
-             */
-            if (s3_interop_auth_user[0] != '\0') {
-                snprintf(s3_interop_h3_channels[i].sess_user,
-                         sizeof(s3_interop_h3_channels[i].sess_user), "%s", s3_interop_auth_user);
-            }
+            s3_interop_channel_user_snapshot(&s3_interop_h3_channels[i]);
 
             return &s3_interop_h3_channels[i];
         }
@@ -3320,6 +3325,10 @@ s3_interop_h3_channel_accept(s3_connection_t *sc)
     s3_memzero(ch, sizeof(*ch));
     ch->sc = sc;
     ch->fwd_fd = -1;
+
+    /* the session identity of the conversation (P7.3) */
+
+    s3_interop_channel_user_snapshot(ch);
 
     rev = sc->read;
 
