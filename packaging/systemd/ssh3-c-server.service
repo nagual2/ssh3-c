@@ -8,7 +8,7 @@ Documentation=man:ssh3-server(8)
 # - which is exactly what allows the hardening below: a root-bound
 # daemon would have to keep privileges and NewPrivileges, this unit
 # does not.
-Requires=ssh3-server.socket
+Requires=ssh3-c-server.socket
 After=network.target
 
 [Service]
@@ -40,7 +40,7 @@ UMask=0077
 # account - the shipped daemon has no per-user setuid yet - so no /home
 # access is intended; a home-jailed deployment widens it from a
 # drop-in:
-#   systemctl edit ssh3-server.service
+#   systemctl edit ssh3-c-server.service
 #   [Service]
 #   ProtectHome=read-only
 NoNewPrivileges=yes
@@ -69,5 +69,5 @@ RestrictAddressFamilies=AF_INET AF_UNIX
 CapabilityBoundingSet=
 
 # socket-activated only: enabling the unit is
-#   systemctl enable --now ssh3-server.socket
+#   systemctl enable --now ssh3-c-server.socket
 # and the service comes up on the first packet

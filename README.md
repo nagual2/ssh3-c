@@ -65,18 +65,18 @@ cmake --preset linux-release && cmake --build --preset linux-release
 ## systemd (socket activation)
 
 The shipped pair splits the privilege: the root-owned
-`ssh3-server.socket` binds UDP/443 and systemd hands the ready
-datagram fd to `ssh3-server.service`, which runs as the unprivileged
+`ssh3-c-server.socket` binds UDP/443 and systemd hands the ready
+datagram fd to `ssh3-c-server.service`, which runs as the unprivileged
 `ssh3` user and needs **no** `CAP_NET_BIND_SERVICE` (the daemon takes
 the passed fd, it never calls `bind()`):
 
 ```ini
-# ssh3-server.socket (excerpt)
+# ssh3-c-server.socket (excerpt)
 [Socket]
 ListenDatagram=0.0.0.0:443
 FreeBind=yes
 
-# ssh3-server.service (excerpt)
+# ssh3-c-server.service (excerpt)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
 User=ssh3
@@ -87,13 +87,13 @@ PrivateTmp=yes
 ```
 
 ```bash
-sudo systemctl enable --now ssh3-server.socket
+sudo systemctl enable --now ssh3-c-server.socket
 ```
 
 Port variation goes through a drop-in, not an edit of the unit:
 
 ```bash
-sudo systemctl edit ssh3-server.socket
+sudo systemctl edit ssh3-c-server.socket
 # [Socket]
 # ListenDatagram=0.0.0.0:8443
 ```

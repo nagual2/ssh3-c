@@ -64,19 +64,19 @@ cmake --preset linux-release && cmake --build --preset linux-release
 
 ## systemd (socket-активация)
 
-Пара юнитов делит привилегии: root-овый `ssh3-server.socket` биндит
-UDP/443, а systemd передаёт готовый datagram-fd в `ssh3-server.service`,
+Пара юнитов делит привилегии: root-овый `ssh3-c-server.socket` биндит
+UDP/443, а systemd передаёт готовый datagram-fd в `ssh3-c-server.service`,
 который работает от непривилегированного пользователя `ssh3` и не
 требует `CAP_NET_BIND_SERVICE` (демон берёт переданный fd и сам
 `bind()` не вызывает):
 
 ```ini
-# ssh3-server.socket (фрагмент)
+# ssh3-c-server.socket (фрагмент)
 [Socket]
 ListenDatagram=0.0.0.0:443
 FreeBind=yes
 
-# ssh3-server.service (фрагмент)
+# ssh3-c-server.service (фрагмент)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
 User=ssh3
@@ -87,13 +87,13 @@ PrivateTmp=yes
 ```
 
 ```bash
-sudo systemctl enable --now ssh3-server.socket
+sudo systemctl enable --now ssh3-c-server.socket
 ```
 
 Смена порта — через drop-in, без правки самого юнита:
 
 ```bash
-sudo systemctl edit ssh3-server.socket
+sudo systemctl edit ssh3-c-server.socket
 # [Socket]
 # ListenDatagram=0.0.0.0:8443
 ```

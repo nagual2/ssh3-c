@@ -14,7 +14,7 @@ Documentation=man:ssh3-server(8)
 ListenDatagram=0.0.0.0:443
 #
 # Binding as root here is the whole point of the socket activation:
-# the bound fd is handed to ssh3-server.service, which runs
+# the bound fd is handed to ssh3-c-server.service, which runs
 # unprivileged and needs no CAP_NET_BIND_SERVICE at all.
 #
 # Bind even while the address is not yet assigned to the interface
@@ -23,7 +23,7 @@ FreeBind=yes
 #
 # Port variation: override the line above from a drop-in, do not edit
 # this file:
-#   systemctl edit ssh3-server.socket
+#   systemctl edit ssh3-c-server.socket
 #   [Socket]
 #   ListenDatagram=0.0.0.0:8443
 

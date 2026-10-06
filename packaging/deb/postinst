@@ -16,13 +16,19 @@ case "$1" in
         chown ssh3:ssh3 /var/lib/ssh3
         chmod 0750 /var/lib/ssh3
 
-        # integration block: the systemd unit wiring (packaging/systemd/)
-        # is added here at the integration step - do not duplicate the
-        # unit files in this hook.
-        #if [ -x /usr/bin/systemctl ]; then
-        #    systemctl daemon-reload || true
-        #    systemctl enable ssh3-server.service || true
-        #fi
+        # the systemd units shipped in /usr/lib/systemd/system: the
+        # socket carries the UDP listener, the service starts on the
+        # first packet (socket activation, no capabilities needed).
+        # deb-systemd-helper keeps the admin enable state across
+        # upgrades; the reload only runs on a booted systemd
+        if [ -x /usr/bin/deb-systemd-helper ]; then
+            deb-systemd-helper enable ssh3-c-server.socket >/dev/null || true
+            deb-systemd-helper enable ssh3-c-server.service >/dev/null || true
+            deb-systemd-helper was-enabled ssh3-c-server.socket >/dev/null 2>&1 || true
+        fi
+        if [ -d /run/systemd/system ] && [ -x /usr/bin/systemctl ]; then
+            systemctl daemon-reload || true
+        fi
 
         printf 'ssh3-server: configured via env/CLI (see ssh3-server -h);\n'
         printf '  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN.\n'

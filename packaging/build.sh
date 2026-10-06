@@ -22,6 +22,7 @@ REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 BIN_DIR="$REPO_DIR/build/linux-release"
 BIN="$BIN_DIR/ssh3-server"
 OUT_DIR="$SCRIPT_DIR/_build"
+mkdir -p "$OUT_DIR"
 STAGE_ROOT=$(mktemp -d /tmp/ssh3-pkg.XXXXXX)
 PKG_RELEASE=1
 trap 'rm -rf "$STAGE_ROOT"' EXIT
@@ -72,6 +73,11 @@ build_deb() {
     install -m 0644 "$SCRIPT_DIR/deb/copyright" "$stage/usr/share/doc/ssh3-server/copyright"
     install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" \
         "$stage/usr/share/doc/ssh3-server/THIRD-PARTY-NOTICES"
+    mkdir -p "$stage/usr/lib/systemd/system"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-c-server.socket" \
+        "$stage/usr/lib/systemd/system/ssh3-c-server.socket"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-c-server.service" \
+        "$stage/usr/lib/systemd/system/ssh3-c-server.service"
     dpkg-deb --root-owner-group --build "$stage" \
         "$OUT_DIR/ssh3-server_${debver}_amd64.deb"
 }
