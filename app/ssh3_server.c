@@ -131,6 +131,15 @@ static s3_msec_t             s3_srv_drain_deadline;
 static s3_msec_t             s3_srv_drain_ms = 5000;
 
 /*
+ * the drain deadline wake: the event-driven session pump removed the
+ * periodic transport tick, a conversation can sit with no timers and
+ * no socket events at all (a wedged exec writes nothing), the loop
+ * would sleep in epoll past the deadline - this one-shot timer is
+ * the wake the drain timeout check rides
+ */
+static s3_event_t s3_srv_drain_timer;
+
+/*
  * the runner protocol markers (INTEROP-*) ride stdout under
  * SSH3C_PROTO=1 only; the production runs log one-liners instead
  */
@@ -342,11 +351,30 @@ s3_srv_active_conns(void)
     return n;
 }
 
+/* the drain deadline expiry: the state machine between passes acts */
+
+static void
+s3_srv_drain_timer_handler(s3_event_t *ev)
+{
+    ev->timedout = 0;
+}
+
 static void
 s3_srv_drain_start(void)
 {
     s3_srv_draining = 1;
     s3_srv_drain_deadline = s3_current_msec + s3_srv_drain_ms;
+
+    if (!s3_srv_drain_timer.timer_set) {
+
+        if (s3_srv_drain_timer.data == NULL) {
+            s3_srv_drain_timer.data = &s3_srv_drain_timer;
+            s3_srv_drain_timer.log = &s3_srv_log;
+            s3_srv_drain_timer.handler = s3_srv_drain_timer_handler;
+        }
+
+        s3_event_add_timer(&s3_srv_drain_timer, s3_srv_drain_ms);
+    }
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
                  "shutdown signal received: no longer accepting new connections");
@@ -692,17 +720,16 @@ struct s3_srv_h3_channel_s {
 
     /*
      * the session side: the pool owns the session struct and its
-     * command copy, the 50 ms timer pumps the process fds between
-     * the channel events (a channel that never speaks would stall
-     * the output otherwise - the event ctx has no per-fd watches
-     * outside the quic sockets)
+     * command copy, the process fds ride the event-driven pump of
+     * s3_ssh3_session_srv_watch() - the readiness of the process
+     * output runs the pump, the verdict watchdog covers the eof
+     * without the child exit
      */
     s3_pool_t             *sess_pool;
     s3_ssh3_session_srv_t *sess;
     unsigned               sess_intent; /* a pty-req or an exec announced the session */
     unsigned               sess_exit_sent;
     unsigned               sess_peer_fin;
-    s3_event_t             sess_timer;
 
     /*
      * the forward side (direct-tcp / direct-udp): fwd_fd is the
@@ -1560,10 +1587,6 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
 {
     /* the pump timers must leave the rbtree before the memory goes */
 
-    if (ch->sess_timer.timer_set) {
-        s3_event_del_timer(&ch->sess_timer);
-    }
-
     if (ch->fwd_timer.timer_set) {
         s3_event_del_timer(&ch->fwd_timer);
     }
@@ -1785,6 +1808,10 @@ s3_srv_session_teardown(s3_srv_h3_channel_t *ch)
         return;
     }
 
+    /* the watches and the verdict watchdog leave before the pool */
+
+    s3_ssh3_session_srv_unwatch(s);
+
     /* the client may vanish mid-session: the process dies here */
 
     if (s->pid > 0) {
@@ -1945,92 +1972,83 @@ s3_srv_session_send_exit(s3_connection_t *sc, uint64_t code)
     return S3_OK;
 }
 
-static void
-s3_srv_session_pump(s3_srv_h3_channel_t *ch)
+/*
+ * the io sinks of the event-driven pump: the wire framing stays here,
+ * the module owns the fds and the drain; a stalled send loses the
+ * chunk exactly like the polling pump did
+ */
+
+static s3_int_t
+s3_srv_session_out_sink(void *ctx, const u_char *data, size_t len)
 {
-    static u_char out[16384];
+    s3_srv_h3_channel_t *ch = ctx;
 
-    s3_connection_t *sc;
-    ssize_t          n;
-    s3_int_t         rc;
-    uint64_t         code;
-    s3_str_t         name;
-    unsigned         core;
-
-    if (ch->sess == NULL) {
-        return;
+    if (s3_srv_h3_channel_echo(ch->sc, data, len) != S3_OK) {
+        fprintf(stderr, "ssh3-server: session output send stalled\n");
+        return S3_ERROR;
     }
 
-    sc = ch->sc;
+    return S3_OK;
+}
 
-    /* the stdout rides as 94, the pty merges everything into it */
+static s3_int_t
+s3_srv_session_err_sink(void *ctx, const u_char *data, size_t len)
+{
+    s3_srv_h3_channel_t *ch = ctx;
 
-    for (;;) {
-
-        n = s3_ssh3_session_srv_read_output(ch->sess, out, sizeof(out));
-
-        if (n <= 0) {
-            break;
-        }
-
-        if (s3_srv_h3_channel_echo(sc, out, (size_t)n) != S3_OK) {
-            fprintf(stderr, "ssh3-server: session output send stalled\n");
-            return;
-        }
+    if (s3_srv_h3_channel_send_extended(ch->sc, data, len) != S3_OK) {
+        fprintf(stderr, "ssh3-server: session stderr send stalled\n");
+        return S3_ERROR;
     }
 
-    /* the stderr pipe of the pipe sessions, 95 with dataType 1 */
+    return S3_OK;
+}
 
-    if (ch->sess->stderr_fd != S3_SSH3_SESSION_INVALID_FD) {
+static s3_int_t
+s3_srv_session_exit_sink(void *ctx, uint64_t code)
+{
+    s3_srv_h3_channel_t *ch = ctx;
 
-        for (;;) {
-
-            n = s3_ssh3_session_srv_read_stderr(ch->sess, out, sizeof(out));
-
-            if (n <= 0) {
-                break;
-            }
-
-            if (s3_srv_h3_channel_send_extended(sc, out, (size_t)n) != S3_OK) {
-                fprintf(stderr, "ssh3-server: session stderr send stalled\n");
-                return;
-            }
-        }
-    }
-
-    if (ch->sess_exit_sent) {
-        return;
-    }
-
-    s3_str_null(&name);
-
-    rc = s3_ssh3_session_srv_reap(ch->sess, &code, &name, &core);
-
-    if (rc != S3_OK) {
-        /* S3_AGAIN: the process still runs, the pump comes back */
-        return;
-    }
-
-    if (s3_srv_session_send_exit(sc, code) != S3_OK) {
+    if (s3_srv_session_send_exit(ch->sc, code) != S3_OK) {
         fprintf(stderr, "ssh3-server: exit-status send failed\n");
-        return;
+        return S3_ERROR;
     }
 
     /* the reference shuts the channel send side after the verdict */
 
-    (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+    (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
 
     ch->sess_exit_sent = 1;
 
     s3_srv_report("INTEROP-SESSION-EXIT code=%u\n", (unsigned)code);
 
-    if (ch->sess_peer_fin) {
+    return S3_OK;
+}
+
+static void
+s3_srv_session_pump(s3_srv_h3_channel_t *ch)
+{
+    s3_ssh3_session_srv_io_t io;
+
+    if (ch->sess == NULL) {
+        return;
+    }
+
+    io.ctx = ch;
+    io.output = s3_srv_session_out_sink;
+    io.err = s3_srv_session_err_sink;
+    io.exit = s3_srv_session_exit_sink;
+
+    (void)s3_ssh3_session_srv_pump(ch->sess, &io);
+
+    if (ch->sess_exit_sent && ch->sess_peer_fin && ch->sc != NULL) {
 
         /*
          * the peer drained to fin before the verdict: the fin was the
          * last byte this channel carries, the drop runs the quic
          * stream cleanup (the retire queues MAX_STREAMS) and the slot
-         * frees for the next session
+         * frees for the next session; the free stays out of the sinks
+         * - the module pump still holds the session on its way back
          */
         s3_close_connection(ch->sc);
         ch->sc = NULL;
@@ -2039,37 +2057,23 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
     }
 }
 
+/* the watch entry of the module, the readiness runs this pump */
+
 static void
-s3_srv_session_timer(s3_event_t *ev)
+s3_srv_session_pump_cb(void *ctx)
 {
-    s3_srv_h3_channel_t *ch = ev->data;
-
-    ev->timedout = 0;
-
-    s3_srv_session_pump(ch);
-
-    /* the timer disarms once the verdict is out, the flow ends by
-     * the peer fin on the already drained stream */
-
-    if (ch->sess != NULL && !ch->sess_exit_sent) {
-        s3_event_add_timer(ev, 50);
-    }
+    s3_srv_session_pump((s3_srv_h3_channel_t *)ctx);
 }
 
-/* the timer arms at the spawn, the pump rides it until the verdict */
+/* the fd watches arm at the spawn, the readiness pumps the session */
 
 static void
 s3_srv_session_arm(s3_srv_h3_channel_t *ch)
 {
-    if (ch->sess_timer.timer_set) {
-        return;
+    if (s3_ssh3_session_srv_watch(ch->sess, ch->sess_pool, &s3_srv_log, s3_srv_session_pump_cb,
+                                  ch) != S3_OK) {
+        fprintf(stderr, "ssh3-server: session watch failed\n");
     }
-
-    ch->sess_timer.data = ch;
-    ch->sess_timer.log = &s3_srv_log;
-    ch->sess_timer.handler = s3_srv_session_timer;
-
-    s3_event_add_timer(&ch->sess_timer, 50);
 }
 
 /*
@@ -3350,7 +3354,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
         /*
          * the session output rides along: the input just fed may have
          * woken the process, the pump answers with the fresh bytes
-         * (the second trigger is the 50 ms timer armed at the spawn)
+         * (the fd watches armed at the spawn answer the rest)
          */
         s3_srv_session_pump(ch);
     }

@@ -25,6 +25,10 @@
 
 #define S3_SSH3_SESSION_ENVP_MAX 128
 
+/* the pump entry of the caller, the watch handler runs it on any readiness */
+
+typedef void (*s3_ssh3_session_pump_pt)(void *ctx);
+
 typedef struct s3_ssh3_session_srv_s s3_ssh3_session_srv_t;
 
 struct s3_ssh3_session_srv_s {
@@ -45,6 +49,22 @@ struct s3_ssh3_session_srv_s {
     unsigned pty : 1;
     unsigned open : 1; /* LARVAL : OPEN */
     unsigned exited : 1;
+
+    /*
+     * the event-driven pump state (P7.2): the watch connections ride
+     * a process-wide free list, the drain buffer is a pool-owned read
+     * window reused across the reads (no per-message allocation), the
+     * verdict is cached for the retry of a failed exit sink
+     */
+    s3_connection_t        *out_watch; /* the stdout/pty master watch */
+    s3_connection_t        *err_watch; /* the stderr watch, NULL on a pty */
+    s3_log_t               *watch_log;
+    s3_ssh3_session_pump_pt pump_cb;
+    void                   *pump_ctx;
+    s3_event_t              reap_timer; /* the verdict watchdog, never a transport tick */
+    uint64_t                exit_code;
+    u_char                 *drain;
+    unsigned                verdict_sent : 1;
 };
 
 /*
@@ -114,5 +134,49 @@ ssize_t s3_ssh3_session_srv_read_stderr(s3_ssh3_session_srv_t *s, u_char *buf, s
 
 s3_int_t s3_ssh3_session_srv_reap(s3_ssh3_session_srv_t *s, uint64_t *exit_status,
                                   s3_str_t *signal_name, unsigned *core_dumped);
+
+/*
+ * the event-driven pump core (P7.2): the module owns the fd watches
+ * and the drain, the wire framing stays with the caller through the
+ * io sinks; a sink mirrors the channel echo contract - S3_OK or the
+ * hard error, a stalled send loses the chunk exactly like the old
+ * polling pump did
+ */
+
+typedef s3_int_t (*s3_ssh3_session_sink_pt)(void *ctx, const u_char *data, size_t len);
+
+typedef struct {
+    void                   *ctx;
+    s3_ssh3_session_sink_pt output;             /* the 94 direction, the pty merges into it */
+    s3_ssh3_session_sink_pt err;                /* the 95 direction, NULL keeps it dropped */
+    s3_int_t (*exit)(void *ctx, uint64_t code); /* the verdict, once */
+} s3_ssh3_session_srv_io_t;
+
+/*
+ * one pump pass: drains the readable output and the stderr pipe into
+ * the sinks, reaps the verdict and reports it once through io->exit;
+ * S3_AGAIN while the process runs, S3_OK once the verdict went out,
+ * S3_ERROR when a sink failed (a retry answers with the cached code)
+ */
+
+s3_int_t s3_ssh3_session_srv_pump(s3_ssh3_session_srv_t *s, const s3_ssh3_session_srv_io_t *io);
+
+/*
+ * registers the read watches over the process fds (the stdout/pty
+ * master and the stderr pipe, when it exists); the watch connections
+ * live in a process-wide free list, the fd close stays with the
+ * teardown; the pump runs from the event machine context
+ */
+
+s3_int_t s3_ssh3_session_srv_watch(s3_ssh3_session_srv_t *s, s3_pool_t *watch_pool, s3_log_t *log,
+                                   s3_ssh3_session_pump_pt pump, void *pump_ctx);
+
+/*
+ * disarms the watches: the posted wake-ups leave the queue, the
+ * closed flag stops the stale ones; must run before the watch pool
+ * and the session fds die
+ */
+
+void s3_ssh3_session_srv_unwatch(s3_ssh3_session_srv_t *s);
 
 #endif /* _S3_SSH3_SESSION_SRV_H_INCLUDED_ */

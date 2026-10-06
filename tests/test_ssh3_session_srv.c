@@ -494,6 +494,399 @@ s3_test_session_pty_exec_signal(void)
     return s3_test_failures;
 }
 
+/*
+ * the event-driven pump rig: the io sinks collect the streams and the
+ * verdict, the pump callback counts the wake-ups - the timer must
+ * never take part, the counters answer the "the events replaced the
+ * transport tick" question
+ */
+typedef struct {
+    s3_ssh3_session_srv_t   *s;
+    u_char                   out[4096];
+    size_t                   out_len;
+    u_char                   err[1024];
+    size_t                   err_len;
+    unsigned                 pump_count;
+    unsigned                 exit_count;
+    uint64_t                 exit_code;
+    s3_ssh3_session_srv_io_t io;
+} s3_test_pump_env_t;
+
+static s3_int_t
+s3_test_pump_sink(u_char *acc, size_t *len, size_t cap, const u_char *data, size_t n)
+{
+    if (*len + n > cap) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(acc + *len, data, n);
+    *len += n;
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_test_pump_out(void *ctx, const u_char *data, size_t len)
+{
+    s3_test_pump_env_t *env = ctx;
+
+    return s3_test_pump_sink(env->out, &env->out_len, sizeof(env->out), data, len);
+}
+
+static s3_int_t
+s3_test_pump_err(void *ctx, const u_char *data, size_t len)
+{
+    s3_test_pump_env_t *env = ctx;
+
+    return s3_test_pump_sink(env->err, &env->err_len, sizeof(env->err), data, len);
+}
+
+static s3_int_t
+s3_test_pump_exit(void *ctx, uint64_t code)
+{
+    s3_test_pump_env_t *env = ctx;
+
+    env->exit_code = code;
+    env->exit_count++;
+
+    return S3_OK;
+}
+
+/* the watch wake-up: the pump runs from the event, no timer around */
+
+static void
+s3_test_pump_run(void *ctx)
+{
+    s3_test_pump_env_t *env = ctx;
+
+    env->pump_count++;
+
+    (void)s3_ssh3_session_srv_pump(env->s, &env->io);
+}
+
+static int
+s3_test_pump_accumulated(const u_char *acc, size_t len, const char *needle)
+{
+    size_t n = s3_strlen(needle);
+
+    if (len < n) {
+        return 0;
+    }
+
+    return s3_memcmp(acc + len - n, needle, n) == 0;
+}
+
+/*
+ * the monotonic milliseconds of the run: the event answer must land
+ * far under the 50 ms transport tick of the polling pump
+ */
+static int64_t
+s3_test_now_ms(void)
+{
+    struct timespec ts;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * runs the event machine until stop() answers true or the deadline
+ * passes; each cycle waits at most slice_ms inside the epoll, the
+ * timers expire and the posted queue drains like the server loops do
+ */
+static void
+s3_test_pump_loop(s3_event_ctx_t *ctx, s3_test_pump_env_t *env, int (*stop)(s3_test_pump_env_t *),
+                  int deadline_ms)
+{
+    int64_t start = s3_test_now_ms();
+
+    env->io.ctx = env;
+    env->io.output = s3_test_pump_out;
+    env->io.err = s3_test_pump_err;
+    env->io.exit = s3_test_pump_exit;
+
+    while (s3_test_now_ms() - start < deadline_ms) {
+
+        s3_time_update();
+        (void)s3_event_actions.process_events(ctx, 10, S3_UPDATE_TIME);
+        s3_event_expire_timers(ctx);
+        s3_event_process_posted(ctx, &ctx->posted_events);
+
+        if (stop(env)) {
+            return;
+        }
+    }
+}
+
+static int
+s3_test_pump_got_exit(s3_test_pump_env_t *env)
+{
+    return env->exit_count > 0;
+}
+
+static int
+s3_test_pump_got_err(s3_test_pump_env_t *env, const char *needle)
+{
+    return s3_test_pump_accumulated(env->err, env->err_len, needle);
+}
+
+/* the pty stream carries the echo and the CR-LF, the probe rides anywhere */
+
+static int
+s3_test_pump_contains(const u_char *acc, size_t len, const char *needle)
+{
+    size_t n = s3_strlen(needle);
+    size_t i;
+
+    if (len < n) {
+        return 0;
+    }
+
+    for (i = 0; i + n <= len; i++) {
+
+        if (s3_memcmp(acc + i, needle, n) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int
+s3_test_pump_got_pty_probe(s3_test_pump_env_t *env)
+{
+    return s3_test_pump_contains(env->out, env->out_len, "s3-pty-ev");
+}
+
+static int
+s3_test_pump_got_ev_probe(s3_test_pump_env_t *env)
+{
+    return s3_test_pump_contains(env->out, env->out_len, "s3-ev");
+}
+
+/*
+ * the core of the P7.2 wave: the output of `printf` must reach the
+ * sink through the fd watch alone - no timer armed, the epoll slice
+ * is 10 ms, so anything above ~45 ms would mean a transport tick is
+ * still in the way; the verdict rides the eof wake of the same watch
+ */
+static int
+s3_test_session_pump_events(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_event_ctx_t        ctx;
+    s3_ssh3_session_srv_t s;
+    s3_test_pump_env_t    env;
+    static const s3_str_t cmd = s3_string("printf s3-ev");
+    int64_t               t0, dt;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+    S3_ASSERT(s3_event_ctx_init(&ctx, &log) == S3_OK);
+
+    s3_memzero(&env, sizeof(env));
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_exec(&s, "/bin/sh", &cmd) == S3_OK);
+
+    env.s = &s;
+
+    S3_ASSERT(s3_ssh3_session_srv_watch(&s, pool, &log, s3_test_pump_run, &env) == S3_OK);
+    S3_ASSERT(s.out_watch != NULL);
+    S3_ASSERT(s.err_watch != NULL);
+
+    /*
+     * the transport answer: the output must land through the fd watch
+     * alone and far under the 50 ms tick of the polling pump; the
+     * spawn and the reap ride the same loop but the latency contract
+     * of the wave is about the data, the verdict gets the deadline
+     */
+
+    t0 = s3_test_now_ms();
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_ev_probe, S3_TEST_DEADLINE_MS);
+    dt = s3_test_now_ms() - t0;
+
+    S3_ASSERT(env.pump_count > 0);
+    S3_ASSERT(s3_test_pump_contains(env.out, env.out_len, "s3-ev"));
+    S3_ASSERT(dt < 45);
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_exit, S3_TEST_DEADLINE_MS);
+
+    S3_ASSERT(env.exit_count == 1);
+    S3_ASSERT(env.exit_code == 0);
+
+    /* the watch disarms with the verdict, the second pump is silent */
+
+    S3_ASSERT(s.out_watch == NULL);
+    S3_ASSERT(s.err_watch == NULL);
+    S3_ASSERT(s3_ssh3_session_srv_pump(&s, &env.io) == S3_OK);
+    S3_ASSERT(env.exit_count == 1);
+
+    s3_ssh3_session_srv_unwatch(&s);
+    s3_destroy_pool(ctx.pool);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/* the stderr pipe rides the 95 sink through its own watch */
+
+static int
+s3_test_session_pump_stderr(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_event_ctx_t        ctx;
+    s3_ssh3_session_srv_t s;
+    s3_test_pump_env_t    env;
+    static const s3_str_t cmd = s3_string("printf s3-er >&2");
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+    S3_ASSERT(s3_event_ctx_init(&ctx, &log) == S3_OK);
+
+    s3_memzero(&env, sizeof(env));
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_exec(&s, "/bin/sh", &cmd) == S3_OK);
+
+    env.s = &s;
+
+    S3_ASSERT(s3_ssh3_session_srv_watch(&s, pool, &log, s3_test_pump_run, &env) == S3_OK);
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_exit, S3_TEST_DEADLINE_MS);
+
+    S3_ASSERT(s3_test_pump_got_err(&env, "s3-er"));
+    S3_ASSERT(env.exit_count == 1);
+    S3_ASSERT(env.exit_code == 0);
+
+    s3_ssh3_session_srv_unwatch(&s);
+    s3_destroy_pool(ctx.pool);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/* the pty merges the streams on the master, the watch answers it too */
+
+static int
+s3_test_session_pump_pty(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_event_ctx_t        ctx;
+    s3_ssh3_session_srv_t s;
+    s3_test_pump_env_t    env;
+    static const s3_str_t term = s3_string("xterm");
+    static const s3_str_t modes = s3_string("");
+    u_char                probe[64];
+    size_t                probe_len;
+
+    probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "echo s3-pty-ev\n");
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+    S3_ASSERT(s3_event_ctx_init(&ctx, &log) == S3_OK);
+
+    s3_memzero(&env, sizeof(env));
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_pty_req(&s, &term, 80, 24, 0, 0, &modes) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_shell(&s, "/bin/sh") == S3_OK);
+
+    env.s = &s;
+
+    /* a pty has no stderr pipe: the watch rides the master alone */
+
+    S3_ASSERT(s3_ssh3_session_srv_watch(&s, pool, &log, s3_test_pump_run, &env) == S3_OK);
+    S3_ASSERT(s.out_watch != NULL);
+    S3_ASSERT(s.err_watch == NULL);
+
+    S3_ASSERT(s3_ssh3_session_srv_input(&s, probe, probe_len) == S3_OK);
+
+    /*
+     * the pty echoes the input back and translates the newline, so
+     * the probe rides anywhere in the stream, the suffix checks of
+     * the pipe runs do not fit here
+     */
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_pty_probe, S3_TEST_DEADLINE_MS);
+
+    S3_ASSERT(s3_test_pump_contains(env.out, env.out_len, "s3-pty-ev"));
+
+    /* the shell quits itself: the verdict rides the eof of the same watch */
+
+    probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "exit\n");
+
+    S3_ASSERT(s3_ssh3_session_srv_input(&s, probe, probe_len) == S3_OK);
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_exit, S3_TEST_DEADLINE_MS);
+
+    S3_ASSERT(env.exit_count == 1);
+    S3_ASSERT(env.exit_code == 0);
+
+    s3_ssh3_session_srv_unwatch(&s);
+    s3_destroy_pool(ctx.pool);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
+ * the child that leaves no transport at all (the stdout and the
+ * stderr closed, the process alive): both watches disarm on the eof,
+ * the readiness can wake nothing any more and the verdict watchdog
+ * takes over - no spin, no loss, no transport tick
+ */
+static int
+s3_test_session_pump_no_eof_verdict(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_event_ctx_t        ctx;
+    s3_ssh3_session_srv_t s;
+    s3_test_pump_env_t    env;
+    static const s3_str_t cmd = s3_string("exec 1>&- 2>&-; sleep 1");
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+    S3_ASSERT(s3_event_ctx_init(&ctx, &log) == S3_OK);
+
+    s3_memzero(&env, sizeof(env));
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_exec(&s, "/bin/sh", &cmd) == S3_OK);
+
+    env.s = &s;
+
+    S3_ASSERT(s3_ssh3_session_srv_watch(&s, pool, &log, s3_test_pump_run, &env) == S3_OK);
+
+    /* the eof of both fds arrives fast, the process still sleeps */
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_exit, 300);
+
+    S3_ASSERT(env.pump_count > 0);
+    S3_ASSERT(env.exit_count == 0);
+    S3_ASSERT(s.out_watch == NULL);
+    S3_ASSERT(s.err_watch == NULL);
+
+    /* the watchdog delivers the verdict on its slow beat, no fd wake
+     * exists any more - the loop must answer without a manual pump */
+
+    s3_test_pump_loop(&ctx, &env, s3_test_pump_got_exit, S3_TEST_DEADLINE_MS);
+
+    S3_ASSERT(env.exit_count == 1);
+    S3_ASSERT(env.exit_code == 0);
+
+    s3_ssh3_session_srv_unwatch(&s);
+    s3_destroy_pool(ctx.pool);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_ssh3_session_srv(void)
 {
@@ -503,6 +896,10 @@ s3_test_ssh3_session_srv(void)
     (void)s3_test_session_signal_term();
     (void)s3_test_session_pty_shell();
     (void)s3_test_session_pty_exec_signal();
+    (void)s3_test_session_pump_events();
+    (void)s3_test_session_pump_stderr();
+    (void)s3_test_session_pump_pty();
+    (void)s3_test_session_pump_no_eof_verdict();
 
     return s3_test_failures;
 }
