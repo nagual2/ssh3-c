@@ -3263,7 +3263,16 @@ s3_interop_cm_run_finalize(s3_interop_cm_run_t *run, uint64_t code)
     (void)s3_ssh3_cm_sessions_release(&s3_interop_cm_table, run->token);
 
     if (run->chan != NULL) {
-        (void)s3_quic_shutdown_stream(run->chan, S3_RDWR_SHUTDOWN);
+
+        /*
+         * the drop runs the quic stream cleanup (fin + close): the
+         * retire lifts the client open credit and queues MAX_STREAMS,
+         * the next session channel opens without the 16-stream cap;
+         * a fin the peer has not sent yet retires the stream later,
+         * from the frame and ack paths (the connection is NULL then)
+         */
+        s3_close_connection(run->chan);
+        run->chan = NULL;
     }
 
     if (run->control != NULL) {

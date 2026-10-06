@@ -350,6 +350,120 @@ s3_test_cli_reader(s3_event_t *ev)
     }
 }
 
+/*
+ * the stream retire regression: sequential session channels ride one
+ * connection, every channel ends with the full fin exchange and the
+ * app drops the stream connection - the pool cleanup runs the quic
+ * stream cleanup, the retire lifts the open limit and queues
+ * MAX_STREAMS.  Without the retire the 17th open hits the initial
+ * max_concurrent_streams_bidi credit and fails (the P7.1 CM defect:
+ * 15 mux sessions then "too many client bidi streams")
+ */
+
+#define S3_TEST_RETIRE_SESSIONS 20
+#define S3_TEST_RETIRE_LEN      24
+
+static u_char           s3_test_retire_out[S3_TEST_RETIRE_LEN];
+static size_t           s3_test_retire_out_len;
+static s3_connection_t *s3_test_retire_srv_sc;
+
+static size_t s3_test_retire_sent;
+static size_t s3_test_retire_got;
+static int    s3_test_retire_cli_done;
+
+static void
+s3_test_retire_read(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    ssize_t          n;
+
+    for (;;) {
+
+        n = sc->recv(sc, s3_test_retire_out + s3_test_retire_out_len,
+                     sizeof(s3_test_retire_out) - s3_test_retire_out_len);
+
+        if (n == (ssize_t)S3_AGAIN || n < 0) {
+            return;
+        }
+
+        if (n == 0) {
+
+            ssize_t m;
+
+            /* the peer fin: the echo rides out, the send side shuts
+               and the stream conn retires like the session servers
+               do on the drained channel */
+
+            m = s3_quic_stream_send(sc, s3_test_retire_out, s3_test_retire_out_len);
+            S3_ASSERT(m == (ssize_t)s3_test_retire_out_len);
+
+            (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+
+            s3_close_connection(sc);
+            s3_test_retire_srv_sc = NULL;
+
+            return;
+        }
+
+        s3_test_retire_out_len += (size_t)n;
+    }
+}
+
+static void
+s3_test_retire_accept(s3_connection_t *c, s3_quic_stream_t *qs)
+{
+    s3_event_t *rev;
+
+    (void)c;
+
+    S3_ASSERT(s3_test_retire_srv_sc == NULL);
+
+    s3_test_retire_srv_sc = qs->connection;
+    s3_test_retire_out_len = 0;
+
+    rev = qs->connection->read;
+    rev->handler = s3_test_retire_read;
+    rev->data = qs->connection;
+    rev->active = 1;
+
+    if (rev->ready) {
+        rev->handler(rev);
+    }
+}
+
+static void
+s3_test_retire_cli_read(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    u_char           chunk[64];
+    ssize_t          n;
+
+    for (;;) {
+
+        n = sc->recv(sc, chunk, sizeof(chunk));
+
+        if (n == (ssize_t)S3_AGAIN || n < 0) {
+            return;
+        }
+
+        if (n == 0) {
+            /* the server fin after the echo */
+            s3_test_retire_cli_done = 1;
+            return;
+        }
+
+        {
+            ssize_t j;
+
+            for (j = 0; j < n; j++) {
+                S3_ASSERT(chunk[j] == s3_test_echo_byte(s3_test_retire_got + (size_t)j));
+            }
+        }
+
+        s3_test_retire_got += (size_t)n;
+    }
+}
+
 static s3_int_t
 s3_test_env_init(s3_test_e2e_env_t *env)
 {
@@ -682,6 +796,95 @@ s3_test_quic_e2e_run(void)
         S3_ASSERT(s3_test_cli_done == 1);
         S3_ASSERT(s3_test_cli_sent == S3_TEST_ECHO_TOTAL);
         S3_ASSERT(s3_test_cli_got == S3_TEST_ECHO_TOTAL);
+    }
+
+    /*
+     * the stream retire regression: 20 sequential channels against the
+     * 16-stream initial credit, each with a full fin exchange and the
+     * app-level drop of the stream conn on both ends; the open credit
+     * must come back with every retire, the 17th open included
+     */
+    {
+        s3_connection_t *sc;
+        u_char           payload[S3_TEST_RETIRE_LEN];
+        ssize_t          m;
+        int              i, j;
+
+        s3_test_retire_sent = 0;
+        s3_test_retire_got = 0;
+
+        env->srv_conf.stream_handler = s3_test_retire_accept;
+
+        for (i = 0; i < S3_TEST_RETIRE_SESSIONS; i++) {
+
+            sc = s3_quic_open_stream(env->cli, 1);
+
+            if (sc == NULL) {
+                S3_ASSERT(0); /* the open credit never came back */
+                break;
+            }
+
+            for (j = 0; j < S3_TEST_RETIRE_LEN; j++) {
+                payload[j] = s3_test_echo_byte(s3_test_retire_sent + (size_t)j);
+            }
+
+            m = s3_quic_stream_send(sc, payload, sizeof(payload));
+            S3_ASSERT(m == (ssize_t)sizeof(payload));
+
+            s3_test_retire_sent += sizeof(payload);
+
+            S3_ASSERT(s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN) == S3_OK);
+
+            s3_test_retire_cli_done = 0;
+
+            sc->read->handler = s3_test_retire_cli_read;
+            sc->read->data = sc;
+            sc->read->active = 1;
+
+            for (j = 0; j < S3_TEST_STREAM_PUMP_LIMIT && !s3_test_retire_cli_done; j++) {
+                s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+                s3_process_events_and_timers(&env->ctx);
+            }
+
+            S3_ASSERT(s3_test_retire_cli_done == 1);
+            S3_ASSERT(s3_test_retire_got == s3_test_retire_sent);
+
+            /* the app drops the stream conn: the cleanup retires the
+               quic stream and the ack lifts the open credit */
+
+            s3_close_connection(sc);
+
+            for (j = 0; j < S3_TEST_STREAM_PUMP_LIMIT; j++) {
+
+                if (qc->streams.client_max_streams_bidi >= (uint64_t)(17 + i)) {
+                    break;
+                }
+
+                s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+                s3_process_events_and_timers(&env->ctx);
+            }
+
+            S3_ASSERT(qc->streams.client_max_streams_bidi == (uint64_t)(17 + i));
+        }
+
+        /*
+         * every server-side stream retired too: each retire queues
+         * MAX_STREAMS, so the client sees its peer-initiated open
+         * credit grow from 16 by the session count (the echo stream
+         * from the scenario above legitimately stays in the tree)
+         */
+
+        for (j = 0; j < S3_TEST_STREAM_PUMP_LIMIT; j++) {
+
+            if (qc->streams.server_max_streams_bidi >= (uint64_t)(16 + S3_TEST_RETIRE_SESSIONS)) {
+                break;
+            }
+
+            s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+            s3_process_events_and_timers(&env->ctx);
+        }
+
+        S3_ASSERT(qc->streams.server_max_streams_bidi == (uint64_t)(16 + S3_TEST_RETIRE_SESSIONS));
     }
 
     s3_test_env_done(env);

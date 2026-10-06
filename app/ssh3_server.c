@@ -1988,6 +1988,20 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
     ch->sess_exit_sent = 1;
 
     s3_srv_report("INTEROP-SESSION-EXIT code=%u\n", (unsigned)code);
+
+    if (ch->sess_peer_fin) {
+
+        /*
+         * the peer drained to fin before the verdict: the fin was the
+         * last byte this channel carries, the drop runs the quic
+         * stream cleanup (the retire queues MAX_STREAMS) and the slot
+         * frees for the next session
+         */
+        s3_close_connection(ch->sc);
+        ch->sc = NULL;
+
+        s3_srv_h3_channel_free(ch);
+    }
 }
 
 static void
@@ -2945,7 +2959,16 @@ s3_srv_h3_channel_read(s3_event_t *ev)
             }
 
             if (ch->sess != NULL) {
-                /* the verdict is out and the peer closed its side */
+
+                /*
+                 * the verdict is out and the peer closed its side: the
+                 * recv drained to eof (that is why the read returned
+                 * 0), the drop retires the quic stream - the MAX_STREAMS
+                 * back to the peer lift its open credit
+                 */
+                s3_close_connection(ch->sc);
+                ch->sc = NULL;
+
                 s3_srv_h3_channel_free(ch);
                 return;
             }
