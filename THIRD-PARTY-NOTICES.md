@@ -63,3 +63,25 @@ protocol (`SSH 3.0 alpha-00`) and its reference implementation:
 ssh3-c is an independent C17 implementation of the protocol (no source
 transplanted); this notice credits the specification and the reference
 behavior the implementation was verified against.
+
+## OpenSSL 3.5 (bundled shared libraries)
+
+The deb package ships the unmodified shared libraries `libssl.so.3` and
+`libcrypto.so.3` of OpenSSL 3.5.7, taken verbatim from the official
+Debian 13 (trixie) package `libssl3t64` (3.5.7-1~deb13u3) and installed
+under the private `/usr/lib/ssh3-c/lib/` (RUNPATH-pinned to the
+ssh3-server binary; the system OpenSSL is not replaced or modified).
+
+OpenSSL 3.x is licensed under the Apache License 2.0. The full license
+text travels inside the package as
+`/usr/share/doc/ssh3-server/openssl-copyright` (the copyright file of
+the Debian `libssl3t64` package); the notice below is reproduced per
+that license.
+
+```
+  OpenSSL Notice
+  --------------
+
+  This product includes software developed by the OpenSSL Project for
+  use in the OpenSSL Toolkit. (https://www.openssl.org/)
+```

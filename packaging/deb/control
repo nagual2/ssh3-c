@@ -4,11 +4,15 @@ Architecture: amd64
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: net
 Priority: optional
-Depends: libc6, libssl3t64 (>= 3.5) | libssl3 (>= 3.5), adduser
+Depends: libc6, zlib1g, libzstd1, adduser
 Description: SSH3 server - SSH over QUIC/HTTP3 transport
  SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
- implemented in C in the nginx style on top of the OpenSSL QUIC TLS API
- (OpenSSL >= 3.5 required at build and run time).
+ implemented in C in the nginx style on top of the OpenSSL QUIC TLS API.
+ .
+ OpenSSL 3.5 ships inside the package: the unmodified Debian 13 shared
+ libraries (libssl.so.3, libcrypto.so.3) live in the private
+ /usr/lib/ssh3-c/lib/ and the binary RUNPATH pins them there, so the
+ system libssl (any version) is neither required nor touched.
  .
  The daemon is configured through environment variables (SSH3_LOG_LEVEL,
  SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN) and command-line flags (ssh3-server -h);
