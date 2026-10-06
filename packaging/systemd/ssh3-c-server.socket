@@ -14,8 +14,12 @@ Documentation=man:ssh3-server(8)
 ListenDatagram=0.0.0.0:443
 #
 # Binding as root here is the whole point of the socket activation:
-# the bound fd is handed to ssh3-c-server.service, which runs
-# unprivileged and needs no CAP_NET_BIND_SERVICE at all.
+# the bound fd is handed to ssh3-c-server.service, so the service
+# itself needs no CAP_NET_BIND_SERVICE.  Since P7.3 the service runs
+# as root with the per-session setuid (see the PRIVILEGE MODELS note
+# in ssh3-c-server.service): the bounding set of the service keeps
+# only the identity-switch capabilities, the port privilege stays in
+# this unit either way.
 #
 # Bind even while the address is not yet assigned to the interface
 # (anycast/VIP failover setups, late network bring-up).

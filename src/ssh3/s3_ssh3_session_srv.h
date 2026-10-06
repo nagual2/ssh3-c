@@ -46,6 +46,20 @@ struct s3_ssh3_session_srv_s {
     size_t env_len;
     size_t env_cap;
 
+    /*
+     * the per-session identity transition (P7.3): the privileged
+     * server resolves the authenticated name before the spawn, the
+     * child drops onto it right before the exec (initgroups, setgid,
+     * setuid, chdir to the home); a NULL name keeps the daemon
+     * identity - the unprivileged run and the CONNECTs without a
+     * session username ride it
+     */
+    char *run_as_name;  /* the authenticated name, the pool owns it */
+    char *run_as_home;  /* pw_dir of the resolved user, NULL when empty */
+    char *run_as_shell; /* pw_shell of the resolved user, NULL when empty */
+    uid_t run_as_uid;
+    gid_t run_as_gid;
+
     unsigned pty : 1;
     unsigned open : 1; /* LARVAL : OPEN */
     unsigned exited : 1;
@@ -84,6 +98,33 @@ s3_int_t s3_ssh3_session_srv_init(s3_ssh3_session_srv_t *s, s3_pool_t *pool);
  */
 
 s3_int_t s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *value);
+
+/*
+ * the identity transition of the session (P7.3): resolves the
+ * authenticated name through the passwd database and quotes the
+ * reference env block on top of the inherited environment (HOME,
+ * SHELL, USER, LOGNAME of the resolved user, the setupEnv shape);
+ * the spawn drops the child onto the identity before the exec
+ *
+ * S3_OK once resolved; S3_DECLINED for the NULL or the empty name,
+ * a name outside the plain guard (the alphanumerics, ".", "_", "-",
+ * no leading dot - the session name of the reference), an unknown
+ * user and a live session (the spawn already happened); S3_PERM
+ * without the privilege to drop (the daemon euid is not 0) - the
+ * lookup runs first, so the unprivileged caller still sees the
+ * unknown-user refusal of the same rule; S3_ERROR when the pool is
+ * exhausted
+ */
+
+s3_int_t s3_ssh3_session_srv_run_as(s3_ssh3_session_srv_t *s, const char *username);
+
+/*
+ * the login shell of the resolved user (pw_shell), the spawn program
+ * of the shell/exec requests when the transition is set; NULL keeps
+ * the caller's shell choice (the $SHELL of the daemon identity)
+ */
+
+const char *s3_ssh3_session_srv_login_shell(const s3_ssh3_session_srv_t *s);
 
 /*
  * the channel requests (the 98 bodies, s3_ssh3_request_t); shell and

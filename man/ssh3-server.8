@@ -21,6 +21,7 @@
 .Op Fl -oidc-issuer Ar url
 .Op Fl -oidc-audience Ar id
 .Op Fl -oidc-jwks-ttl Ar seconds
+.Op Fl -run-as-user Cm on | off
 .Op Fl v
 .Op Fl V
 .Op Fl h
@@ -131,7 +132,9 @@ the username and does not affect the route.
 Opt into the Basic password method
 .Pq the reference enablePasswordLogin .
 .It Fl H Ar dir
-SFTP jail directory override (the default is the user's home).
+SFTP jail directory override (the default resolves from the daemon
+identity, see
+.Sx PRIVILEGE MODEL ) .
 .It Fl -oidc-issuer Ar url
 OIDC mode: the CONNECT passes only with a Bearer id_token of that
 provider.  The discovery document and the first key set are fetched
@@ -151,7 +154,64 @@ Print the usage summary.
 .It Fl 3
 Accepted for compatibility with the interop harness; the SSH3 route
 is the only mode of the daemon, the flag does nothing.
+.It Fl -run-as-user Cm on | off
+Per-session setuid of the root daemon, default
+.Cm on
+when the euid is 0 (see
+.Sx PRIVILEGE MODEL ) .
+When enabled, every session with a resolvable CONNECT username drops
+onto that identity before the spawn; a user without a passwd entry
+answers 401 at the CONNECT, a CONNECT without a session username
+keeps the daemon identity.
+An explicit
+.Cm on
+without the root privilege logs a warning and the daemon serves as
+before.
 .El
+.Sh PRIVILEGE MODEL
+Two deployment shapes are supported.
+.Pp
+Root daemon with per-session setuid (the OpenSSH/sshd and reference
+Go-server shape; the default of
+.Nm
+when the euid is 0):
+the daemon stays privileged, after the CONNECT verdict resolves the
+authenticated username through the passwd database and the session
+spawn runs
+.Fn initgroups ,
+.Fn setgid ,
+.Fn setuid
+and
+.Fn chdir
+to the user's home in the child, right before the exec; the login
+shell comes from the passwd entry and
+.Ev HOME ,
+.Ev SHELL ,
+.Ev USER ,
+.Ev LOGNAME
+ride the child environment.
+The slave side of a pty is chowned to the session user first (the
+sshd pty ownership), so a pty-req followed by the drop works.
+A failed drop answers the exit code 126.
+Sessions on a CONNECT without a username (no
+.Cm ?user=
+in the path, the OIDC identity) and sessions of an unprivileged run
+keep the daemon identity; a single-identity hardening or a username
+mapping is required when that is not acceptable.
+.Pp
+Single-identity unprivileged daemon (the P7.2 shape): run
+.Nm
+as a service account (the packaged unit drop-in, see
+.Pa ssh3-c-server.service )
+with
+.Fl -run-as-user off ;
+every session and the in-process SFTP server then run as that
+account, per-user identities and /home access are not available.
+.Pp
+The in-process SFTP server always keeps the daemon identity (it
+never forks); point
+.Fl H
+at the intended jail in either model.
 .Sh ENVIRONMENT
 .Bl -tag -width "SSH3_SHUTDOWN_DRAIN"
 .It Ev SSH3_LOG_LEVEL
@@ -200,11 +260,11 @@ Second file of the default identities chain, the sshd shape.
 .It Pa /etc/ssh3/cert.pem
 TLS certificate (packaged default of
 .Fl c ,
-read by the service account).
+read by the service).
 .It Pa /etc/ssh3/key.pem
 TLS private key (packaged default of
 .Fl k ,
-mode 0640 root:ssh3).
+mode 0640, owner-readable by the service only).
 .It Pa /etc/ssh3/authorized_keys
 Authorized keys (typical
 .Fl K
@@ -213,8 +273,8 @@ target).
 .Sh SOCKET ACTIVATION
 The packaged
 .Pa ssh3-c-server.socket
-binds UDP/443 and systemd passes the ready datagram socket to the
-service:
+binds UDP/443 as root and systemd passes the ready datagram socket to
+the service:
 .Nm
 takes the fds at fd 3 upward, one or two serve.  A bare
 .Li ListenDatagram=443
@@ -234,7 +294,12 @@ is never called; the IPv6 mode of the unit
 is served as handed over and logged.
 No capability
 .Pq CAP_NET_BIND_SERVICE
-is needed by the service.
+is needed by the service; under the default privilege model the
+service is root with a minimal bounding set (the per-session setuid
+capabilities only), see
+.Sx PRIVILEGE MODEL
+and
+.Pa ssh3-c-server.service .
 An fd of the wrong type or family, or more than two, stops the daemon
 with an error instead of falling back to a second bind.
 The listener address and port are owned by the socket unit

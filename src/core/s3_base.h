@@ -34,6 +34,7 @@ typedef int s3_err_t;
 #define S3_ABORT    -4
 #define S3_DECLINED -5
 #define S3_DONE     -6
+#define S3_PERM     -7
 
 #define S3_INVALID_FILE -1
 

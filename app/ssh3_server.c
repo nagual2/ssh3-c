@@ -183,6 +183,24 @@ static char   s3_srv_url_path[256] = "/ssh3-term";
 static size_t s3_srv_url_path_len = sizeof("/ssh3-term") - 1;
 
 /*
+ * the per-session setuid mode (P7.3, --run-as-user on|off): the
+ * privileged daemon drops every session with a resolvable CONNECT
+ * username onto that identity (the OpenSSH/Go shape); on by default
+ * for the euid 0, the unprivileged run keeps the daemon identity
+ */
+static unsigned s3_srv_run_as;
+static unsigned s3_srv_run_as_set; /* the explicit on|off of the CLI */
+
+/*
+ * the authenticated username of the current CONNECT: the verdict
+ * snapshot fills it (the resolution gate answers the 401 there), the
+ * session channels spawn from it; empty keeps the daemon identity -
+ * the CONNECTs without a session user (the harness shapes, the oidc
+ * identity) ride it
+ */
+static char s3_srv_auth_user[128];
+
+/*
  * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
  * the Bearer id_token of that provider, the audience is the client
  * id of the token, the nonce binds the token to the conversation
@@ -804,6 +822,15 @@ struct s3_srv_h3_channel_s {
     unsigned               sess_peer_fin;
 
     /*
+     * the authenticated username of the conversation (P7.3), the
+     * snapshot of the CONNECT verdict: the session spawns with it
+     * under the per-session setuid mode, empty keeps the daemon
+     * identity (the request streams are serialized by the harness,
+     * the same shape the static verdict buffers ride)
+     */
+    char sess_user[128];
+
+    /*
      * the forward side (direct-tcp / direct-udp): fwd_fd is the
      * target socket (-1 when the channel is not a forward), the
      * pending buffers decouple the quic stream from the socket and
@@ -1122,6 +1149,36 @@ s3_srv_h3_send_status(unsigned code)
 }
 
 /*
+ * the identity gate of the CONNECT (P7.3): the authenticated name
+ * must resolve through the passwd database before the CONNECT passes
+ * - the 401 lands here, far before any spawn (the session module
+ * refuses the unknown user the same way, this is the earlier verdict
+ * of the same rule; the plain-name guard itself lives in the module,
+ * the authoritative refusal of the spawn); S3_OK once the name is
+ * snapshotted for the session channels
+ */
+static s3_int_t
+s3_srv_auth_user_gate(const s3_str_t *user)
+{
+    s3_srv_auth_user[0] = '\0';
+
+    if (user == NULL || user->data == NULL || user->len == 0 ||
+        user->len >= sizeof(s3_srv_auth_user)) {
+        return S3_DECLINED;
+    }
+
+    s3_memcpy(s3_srv_auth_user, user->data, user->len);
+    s3_srv_auth_user[user->len] = '\0';
+
+    if (getpwnam(s3_srv_auth_user) == NULL) {
+        s3_srv_auth_user[0] = '\0';
+        return S3_DECLINED;
+    }
+
+    return S3_OK;
+}
+
+/*
  * the Basic verdict against the -P password file (docs/P4-WIRE.md 7,
  * the Basic step of the reference chain): the credentials decode from
  * the authorization header, the username comes from the CONNECT
@@ -1162,6 +1219,15 @@ s3_srv_h3_basic_verdict(void)
     if (rc != S3_OK) {
         fprintf(stderr, "ssh3-server: basic auth: user=%.*s rejected rc=%d\n", (int)user.len,
                 (const char *)user.data, (int)rc);
+        return 401;
+    }
+
+    /* the setuid gate of the session identity (P7.3): the name that
+     * no passwd entry backs never spawns, the CONNECT refuses */
+
+    if (s3_srv_run_as && s3_srv_auth_user_gate(&user) != S3_OK) {
+        fprintf(stderr, "ssh3-server: run-as user=%.*s does not resolve\n", (int)user.len,
+                (const char *)user.data);
         return 401;
     }
 
@@ -1353,6 +1419,15 @@ s3_srv_h3_jwt_verdict(void)
         return 401;
     }
 
+    /* the setuid gate of the session identity (P7.3), the Basic
+     * verdict note applies verbatim */
+
+    if (s3_srv_run_as && s3_srv_auth_user_gate(&user) != S3_OK) {
+        fprintf(stderr, "ssh3-server: run-as user=%.*s does not resolve\n", (int)user.len,
+                (const char *)user.data);
+        return 401;
+    }
+
     s3_srv_report("INTEROP-AUTH-OK user=%.*s\n", (int)user.len, (const char *)user.data);
 
     return 200;
@@ -1481,6 +1556,13 @@ s3_srv_h3_respond(s3_connection_t *pc)
     if (s3_srv_h3_responded) {
         return;
     }
+
+    /* the identity snapshot rides the verdicts that carry a session
+     * username (the Basic and the pubkey gates); the oidc and the
+     * no-auth shapes answer without one - the sessions keep the
+     * daemon identity there */
+
+    s3_srv_auth_user[0] = '\0';
 
     /* RFC 9220: :protocol marks an extended CONNECT, the :path route
      * is the configured --url-path (the reference -url-path); the
@@ -1772,6 +1854,20 @@ s3_srv_h3_channel_of(s3_connection_t *sc)
  * is full, the caller tears the stream down
  */
 
+/*
+ * the identity snapshot of the CONNECT (P7.3): the verdict serialized
+ * the username, the session spawns from the channel copy - the static
+ * verdict buffer may move on with the next CONNECT; the accept paths
+ * (the channel alloc and the inline stream accept) ride it
+ */
+static void
+s3_srv_channel_user_snapshot(s3_srv_h3_channel_t *ch)
+{
+    if (s3_srv_auth_user[0] != '\0') {
+        snprintf(ch->sess_user, sizeof(ch->sess_user), "%s", s3_srv_auth_user);
+    }
+}
+
 static s3_srv_h3_channel_t *
 s3_srv_h3_channel_alloc(s3_connection_t *sc)
 {
@@ -1783,6 +1879,9 @@ s3_srv_h3_channel_alloc(s3_connection_t *sc)
             s3_memzero(&s3_srv_h3_channels[i], sizeof(s3_srv_h3_channels[i]));
             s3_srv_h3_channels[i].sc = sc;
             s3_srv_h3_channels[i].fwd_fd = -1;
+
+            s3_srv_channel_user_snapshot(&s3_srv_h3_channels[i]);
+
             return &s3_srv_h3_channels[i];
         }
     }
@@ -1886,6 +1985,29 @@ s3_srv_session_shell(void)
     return (shell != NULL && *shell != '\0') ? shell : "/bin/sh";
 }
 
+/*
+ * the spawn program of the session: the login shell of the resolved
+ * user under the per-session setuid (the OpenSSH shape - the user's
+ * passwd shell, not the daemon's), the $SHELL of the daemon identity
+ * otherwise
+ */
+static const char *
+s3_srv_session_shell_of(s3_srv_h3_channel_t *ch)
+{
+    const char *shell;
+
+    if (ch->sess != NULL) {
+
+        shell = s3_ssh3_session_srv_login_shell(ch->sess);
+
+        if (shell != NULL) {
+            return shell;
+        }
+    }
+
+    return s3_srv_session_shell();
+}
+
 static s3_int_t
 s3_srv_session_start(s3_srv_h3_channel_t *ch)
 {
@@ -1904,6 +2026,24 @@ s3_srv_session_start(s3_srv_h3_channel_t *ch)
     if (ch->sess == NULL || s3_ssh3_session_srv_init(ch->sess, ch->sess_pool) != S3_OK) {
         s3_destroy_pool(ch->sess_pool);
         ch->sess_pool = NULL;
+        return S3_ERROR;
+    }
+
+    /*
+     * the per-session identity (P7.3): the authenticated name of the
+     * conversation resolves before any pty or spawn - the pty of the
+     * root-opened session gets its ownership and the child drops
+     * onto the user at the spawn; a CONNECT without a session
+     * username (the drain harness, the oidc identity) keeps the
+     * daemon identity - the unprivileged shape of the run
+     */
+
+    if (s3_srv_run_as && ch->sess_user[0] != '\0' &&
+        s3_ssh3_session_srv_run_as(ch->sess, ch->sess_user) != S3_OK) {
+        fprintf(stderr, "ssh3-server: run-as %s refused\n", ch->sess_user);
+        s3_destroy_pool(ch->sess_pool);
+        ch->sess_pool = NULL;
+        ch->sess = NULL;
         return S3_ERROR;
     }
 
@@ -3375,7 +3515,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 case S3_SSH3_REQ_EXEC:
 
                     if (s3_srv_session_start(ch) != S3_OK ||
-                        s3_ssh3_session_srv_exec(ch->sess, s3_srv_session_shell(),
+                        s3_ssh3_session_srv_exec(ch->sess, s3_srv_session_shell_of(ch),
                                                  &req.u.exec.command) != S3_OK) {
                         fprintf(stderr, "ssh3-server: exec failed\n");
                         break;
@@ -3405,7 +3545,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     }
 
                     if (s3_srv_session_start(ch) != S3_OK ||
-                        s3_ssh3_session_srv_shell(ch->sess, s3_srv_session_shell()) != S3_OK) {
+                        s3_ssh3_session_srv_shell(ch->sess, s3_srv_session_shell_of(ch)) != S3_OK) {
                         fprintf(stderr, "ssh3-server: shell failed\n");
                         break;
                     }
@@ -3510,6 +3650,10 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
     ch->sc = sc;
     ch->pc = ((s3_quic_stream_t *)sc->data)->parent;
     ch->fwd_fd = -1;
+
+    /* the session identity of the conversation (P7.3) */
+
+    s3_srv_channel_user_snapshot(ch);
 
     rev = sc->read;
 
@@ -3944,6 +4088,15 @@ s3_srv_usage(const char *prog)
             "  --oidc-jwks-ttl seconds: the key set lifetime of the oidc"
             " provider, default\n"
             "      3600, the timer rotates the set in the background\n"
+            "  --run-as-user on|off: the per-session setuid of the root"
+            " daemon, default\n"
+            "      on for the euid 0: every session with a resolvable"
+            " CONNECT user drops\n"
+            "      onto it (initgroups, setgid, setuid, the home"
+            " chdir) before the spawn;\n"
+            "      a user without a passwd entry answers 401 before any"
+            " spawn, a CONNECT\n"
+            "      without a user keeps the daemon identity\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
@@ -4041,6 +4194,22 @@ main(int argc, char **argv)
 
                 s3_srv_password_enabled = 1;
                 drop = 1;
+
+            } else if (strcmp(argv[n], "--run-as-user") == 0 && n + 1 < argc) {
+
+                /* the on|off form: anything else stays in the argv
+                 * for the getopt loop to reject with the usage */
+
+                if (strcmp(argv[n + 1], "on") == 0) {
+                    s3_srv_run_as = 1;
+                    s3_srv_run_as_set = 1;
+                    value = argv[n + 1];
+
+                } else if (strcmp(argv[n + 1], "off") == 0) {
+                    s3_srv_run_as = 0;
+                    s3_srv_run_as_set = 1;
+                    value = argv[n + 1];
+                }
             }
 
             if (value != NULL) {
@@ -4146,6 +4315,30 @@ main(int argc, char **argv)
             s3_srv_usage(argv[0]);
             return 1;
         }
+    }
+
+    /*
+     * the per-session setuid mode (P7.3): on by default for the root
+     * daemon, the unprivileged run keeps the daemon identity - the
+     * explicit --run-as-user on|off overrides both; a run-as request
+     * without the privilege answers the warning of the flag parity
+     * and serves as before
+     */
+
+    if (!s3_srv_run_as_set) {
+        s3_srv_run_as = (geteuid() == 0);
+    }
+
+    if (s3_srv_run_as && geteuid() != 0) {
+
+        s3_srv_run_as = 0;
+
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "run-as-user requested without the root privilege,"
+                     " sessions keep the daemon identity");
+
+    } else if (s3_srv_run_as) {
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "per-session setuid enabled");
     }
 
     if (cert_path == NULL || key_path == NULL) {

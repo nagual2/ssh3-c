@@ -21,13 +21,25 @@
 #define _XOPEN_SOURCE 700
 #endif
 
+/*
+ * the identity drop of the session (P7.3) needs the BSD surface of
+ * <grp.h>: initgroups() hides behind __USE_MISC, the build pins
+ * _POSIX_C_SOURCE on the command line
+ */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include <s3_core.h>
 
 #include <s3_ssh3_session_srv.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -192,6 +204,124 @@ s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *
     return S3_OK;
 }
 
+const char *
+s3_ssh3_session_srv_login_shell(const s3_ssh3_session_srv_t *s)
+{
+    if (s == NULL) {
+        return NULL;
+    }
+
+    return s->run_as_shell;
+}
+
+/*
+ * the identity transition of the session (P7.3): the authenticated
+ * name resolves here, before any pty or spawn, the spawn drops the
+ * child onto it; the refusal order is the contract - the name shapes
+ * and the passwd lookup first (the 401 of the server verdict is the
+ * earlier answer of the same unknown-user rule), the privilege check
+ * second, so an unprivileged caller still sees which rule refused
+ */
+s3_int_t
+s3_ssh3_session_srv_run_as(s3_ssh3_session_srv_t *s, const char *username)
+{
+    struct passwd *pw;
+    size_t         i, n;
+
+    if (s == NULL || s->pid != 0 || username == NULL || *username == '\0') {
+        return S3_DECLINED;
+    }
+
+    /* the plain session name of the reference: the alphanumerics,
+     * ".", "_" and "-", no leading dot (the traversal guard) */
+
+    n = s3_strlen(username);
+
+    if (username[0] == '.') {
+        return S3_DECLINED;
+    }
+
+    for (i = 0; i < n; i++) {
+
+        u_char c = (u_char)username[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-')) {
+            return S3_DECLINED;
+        }
+    }
+
+    pw = getpwnam(username);
+
+    if (pw == NULL) {
+        return S3_DECLINED;
+    }
+
+    if (geteuid() != 0) {
+        return S3_PERM;
+    }
+
+    /* the passwd entry is a static buffer: the pool copies outlive
+     * the lookup and ride the child spawn */
+
+    s->run_as_name = s3_palloc(s->pool, n + 1);
+
+    if (s->run_as_name == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(s->run_as_name, username, n + 1);
+
+    s->run_as_uid = pw->pw_uid;
+    s->run_as_gid = pw->pw_gid;
+
+    if (pw->pw_dir != NULL && *pw->pw_dir != '\0') {
+
+        size_t len = s3_strlen(pw->pw_dir);
+
+        s->run_as_home = s3_palloc(s->pool, len + 1);
+
+        if (s->run_as_home == NULL) {
+            return S3_ERROR;
+        }
+
+        s3_memcpy(s->run_as_home, pw->pw_dir, len + 1);
+    }
+
+    if (pw->pw_shell != NULL && *pw->pw_shell != '\0') {
+
+        size_t len = s3_strlen(pw->pw_shell);
+
+        s->run_as_shell = s3_palloc(s->pool, len + 1);
+
+        if (s->run_as_shell == NULL) {
+            return S3_ERROR;
+        }
+
+        s3_memcpy(s->run_as_shell, pw->pw_shell, len + 1);
+    }
+
+    /*
+     * the env block of the reference setupEnv: the identity fields
+     * ride on top of the inherited environment (a repeated name
+     * keeps the last one); the child must not exec with the daemon
+     * HOME, so a failed quote refuses the whole transition
+     */
+
+    if (s3_ssh3_session_srv_env(s, "USER", s->run_as_name) != S3_OK ||
+        s3_ssh3_session_srv_env(s, "LOGNAME", s->run_as_name) != S3_OK ||
+        (s->run_as_home != NULL && s3_ssh3_session_srv_env(s, "HOME", s->run_as_home) != S3_OK) ||
+        (s->run_as_shell != NULL &&
+         s3_ssh3_session_srv_env(s, "SHELL", s->run_as_shell) != S3_OK)) {
+
+        s->run_as_name = s->run_as_home = s->run_as_shell = NULL;
+
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
 /*
  * the envp of the child: the inherited environment plus the quoted
  * extras; the array lives in the caller frame, the child execs
@@ -274,6 +404,27 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
     }
 
     master = s->pty_master;
+
+    /*
+     * the slave of a root-opened pty belongs to the daemon identity
+     * (the devpts owner is the opener of the master): the child
+     * opens it by name after the drop, the chown hands the device to
+     * the session user first (the OpenSSH pty ownership); the master
+     * side of the caller stays untouched
+     */
+
+    if (s->pty && s->run_as_name != NULL) {
+
+        char        path[128];
+        const char *named;
+
+        named = ptsname(master);
+
+        if (named == NULL || s3_strlen(named) >= sizeof(path) ||
+            chown(named, s->run_as_uid, s->run_as_gid) != 0) {
+            return S3_ERROR;
+        }
+    }
 
     if (!s->pty) {
 
@@ -392,6 +543,40 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
 
             if (err_pipe[1] > 2) {
                 (void)close(err_pipe[1]);
+            }
+        }
+
+        /*
+         * the identity drop of the session (P7.3): after the fds are
+         * wired, before the exec; the supplementary groups first
+         * (initgroups needs the root euid), the group and the user
+         * next; the 126 verdict is the shell convention of a found
+         * but not executable command - the drop failure is the same
+         * class, the shell cannot run under the requested identity
+         */
+        if (s->run_as_name != NULL) {
+
+            if (initgroups(s->run_as_name, s->run_as_gid) != 0 || setgid(s->run_as_gid) != 0 ||
+                setuid(s->run_as_uid) != 0) {
+                _exit(126);
+            }
+
+            /*
+             * the home of the session user (the OpenSSH chdir): a
+             * failed chdir is not fatal, the message rides the
+             * session stream itself (the pty or the 95 pipe) and the
+             * shell starts from the root
+             */
+            if (s->run_as_home != NULL && chdir(s->run_as_home) != 0) {
+                int root_chdir;
+
+                fprintf(stderr, "ssh3-server: chdir(%s) failed\n", s->run_as_home);
+
+                root_chdir = chdir("/");
+
+                /* nothing to fall back to: the parent cwd serves */
+
+                (void)root_chdir;
             }
         }
 
