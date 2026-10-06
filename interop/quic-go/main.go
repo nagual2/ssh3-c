@@ -1020,6 +1020,7 @@ func s3RunRawH3Server(addr, certFile, keyFile, mode string,
 		},
 		QUICConfig: &quic.Config{
 			MaxIdleTimeout: 60 * time.Second,
+			Tracer:         qlog.DefaultConnectionTracer, /* QLOGDIR-gated, debug */
 		},
 		Handler: http.HandlerFunc(h3ConnectHandler),
 	}
@@ -2832,6 +2833,8 @@ type sftpServer struct {
 	str *quic.Stream
 	wmu *sync.Mutex
 
+	hdbgSent int64 /* the S3SFTPHDBG diagnostic counter */
+
 	root    string
 	uid     int
 	gid     int
@@ -3003,6 +3006,12 @@ func (s *sftpServer) send(pkt []byte) bool {
 
 	frame := s3AppendVarint(nil, 94)
 	frame = s3AppendSSHString(frame, full)
+
+	if os.Getenv("S3SFTPHDBG") != "" {
+		s.hdbgSent += int64(len(frame))
+		fmt.Fprintf(os.Stderr, "harness-sftpdbg: sent=%d pkt=%d type=%d\n",
+			s.hdbgSent, len(pkt), pkt[0])
+	}
 
 	s.wmu.Lock()
 	_, err := s.str.Write(frame)
