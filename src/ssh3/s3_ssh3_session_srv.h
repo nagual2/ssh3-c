@@ -147,9 +147,9 @@ typedef s3_int_t (*s3_ssh3_session_sink_pt)(void *ctx, const u_char *data, size_
 
 typedef struct {
     void                   *ctx;
-    s3_ssh3_session_sink_pt output; /* the 94 direction, the pty merges into it */
-    s3_ssh3_session_sink_pt err;    /* the 95 direction, NULL keeps it dropped */
-    s3_int_t              (*exit)(void *ctx, uint64_t code); /* the verdict, once */
+    s3_ssh3_session_sink_pt output;             /* the 94 direction, the pty merges into it */
+    s3_ssh3_session_sink_pt err;                /* the 95 direction, NULL keeps it dropped */
+    s3_int_t (*exit)(void *ctx, uint64_t code); /* the verdict, once */
 } s3_ssh3_session_srv_io_t;
 
 /*

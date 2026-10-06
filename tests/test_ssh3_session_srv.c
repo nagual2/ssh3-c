@@ -501,14 +501,14 @@ s3_test_session_pty_exec_signal(void)
  * transport tick" question
  */
 typedef struct {
-    s3_ssh3_session_srv_t *s;
-    u_char                 out[4096];
-    size_t                 out_len;
-    u_char                 err[1024];
-    size_t                 err_len;
-    unsigned               pump_count;
-    unsigned               exit_count;
-    uint64_t               exit_code;
+    s3_ssh3_session_srv_t   *s;
+    u_char                   out[4096];
+    size_t                   out_len;
+    u_char                   err[1024];
+    size_t                   err_len;
+    unsigned                 pump_count;
+    unsigned                 exit_count;
+    uint64_t                 exit_code;
     s3_ssh3_session_srv_io_t io;
 } s3_test_pump_env_t;
 
@@ -674,13 +674,13 @@ s3_test_pump_got_ev_probe(s3_test_pump_env_t *env)
 static int
 s3_test_session_pump_events(void)
 {
-    s3_log_t                 log;
-    s3_pool_t               *pool;
-    s3_event_ctx_t           ctx;
-    s3_ssh3_session_srv_t    s;
-    s3_test_pump_env_t       env;
-    static const s3_str_t    cmd = s3_string("printf s3-ev");
-    int64_t                  t0, dt;
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_event_ctx_t        ctx;
+    s3_ssh3_session_srv_t s;
+    s3_test_pump_env_t    env;
+    static const s3_str_t cmd = s3_string("printf s3-ev");
+    int64_t               t0, dt;
 
     pool = s3_test_make_pool(&log);
     S3_ASSERT(pool != NULL);

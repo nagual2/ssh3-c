@@ -1858,8 +1858,7 @@ static void
 s3_interop_session_arm(s3_interop_h3_channel_t *ch)
 {
     if (s3_ssh3_session_srv_watch(ch->sess, ch->sess_pool, &s3_interop_log,
-                                  s3_interop_session_pump_cb, ch)
-        != S3_OK) {
+                                  s3_interop_session_pump_cb, ch) != S3_OK) {
         fprintf(stderr, "interop-server: session watch failed\n");
     }
 }

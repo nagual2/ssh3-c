@@ -903,8 +903,8 @@ s3_ssh3_session_watch_conn(s3_ssh3_session_srv_t *s)
 static void
 s3_ssh3_session_unwatch_fd(s3_connection_t **watch, int fd)
 {
-    s3_connection_t          *c = *watch;
-    s3_ssh3_session_watch_t  *w;
+    s3_connection_t         *c = *watch;
+    s3_ssh3_session_watch_t *w;
 
     if (c == NULL) {
         return;
@@ -980,8 +980,8 @@ s3_ssh3_session_srv_watch(s3_ssh3_session_srv_t *s, s3_pool_t *watch_pool, s3_lo
 
         s->out_watch = s3_ssh3_session_watch_conn(s);
 
-        if (s->out_watch == NULL
-            || s3_event_actions.add_event(s->out_watch->read, S3_READ_EVENT, 0) != S3_OK) {
+        if (s->out_watch == NULL ||
+            s3_event_actions.add_event(s->out_watch->read, S3_READ_EVENT, 0) != S3_OK) {
             /* the watch recycles, the session stays unwatched */
 
             s3_ssh3_session_unwatch_fd(&s->out_watch, s->stdout_fd);
