@@ -50,3 +50,16 @@ noted in code):
 
 Each adapted file retains the original `Copyright (C) Nginx, Inc.` header
 followed by the ssh3-c project copyright line.
+
+## SSH3 protocol reference
+
+The wire protocol and the authorization scheme of ssh3-c follow the SSH3
+protocol (`SSH 3.0 alpha-00`) and its reference implementation:
+
+| Project | License | Role |
+|---------|---------|------|
+| francoismichel/ssh3 (protocol spec and Go implementation) | Apache-2.0 | the protocol reference: h3 extended CONNECT routing, message types, auth schemes (password/pubkey-JWT/OIDC, the TLS-exporter conversation id) |
+
+ssh3-c is an independent C17 implementation of the protocol (no source
+transplanted); this notice credits the specification and the reference
+behavior the implementation was verified against.
