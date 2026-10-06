@@ -16,6 +16,10 @@
 #   6. the s3key leg: the pubkey JWT of the second user, the exec
 #      `test "$(whoami)" = s3key` - the drop follows the auth
 #      identity, not the first user
+#   7. the s3key leg: the pubkey JWT pty session lives under the drop
+#      (the P7.3 regression: the runner resizes to 100x40, waits for
+#      the resized geometry behind the stty probe and signals KILL -
+#      the 137 exit is the signal teardown, not a crash)
 #
 # the verdicts: SETUID-E2E OK / FAILED, the INTEROP-* markers of the
 # C runners on the way
@@ -113,7 +117,7 @@ printf 'ssh-ed25519 %s setuid-e2e-c\n' "$BLOB" > "$WORK/authorized_keys"
 # the explicit flag rides to prove the wiring
 
 sudo -n env SSH3C_PROTO=1 "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
-    -P "$WORK/passfile" -K "$WORK/authorized_keys" --run-as-user on \
+    -P "$WORK/passfile" --enable-password-login -K "$WORK/authorized_keys" --run-as-user on \
     > "$WORK/srv.log" 2>&1 < /dev/null &
 SRVPID=$!
 
@@ -188,6 +192,24 @@ if [ $? -eq 0 ] && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/leg4.log"; then
     pass "the key-auth session runs as s3key"
 else
     fail "the second-user leg failed: $(tail -3 "$WORK/leg4.log")"
+fi
+
+echo "== leg 5: the pubkey pty session of s3key lives under the drop"
+
+# the P7.3 shape: the JWT identity + pty + shell against the root
+# daemon with --run-as-user on - the runner drives the shell through
+# the resize/probe/KILL round-trip, the 137 exit is the signal
+# teardown of the living session (a 401 here would be the verdict of
+# a broken keys file or verifier, never of the drop)
+
+HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S pty -K "$WORK/id_c.pem" -U "$S3KEY" \
+    -a "127.0.0.1:$PORT" -t 20000 > "$WORK/leg5.log" 2>&1
+
+if [ $? -eq 0 ] && grep -q "INTEROP-PTY-SIGNAL-OK exit=137" "$WORK/leg5.log" &&
+    grep -q "INTEROP-SESSION-PTY" "$WORK/srv.log"; then
+    pass "the key-auth pty session lives as s3key"
+else
+    fail "the pty leg failed: $(tail -3 "$WORK/leg5.log")"
 fi
 
 if [ "$FAILURES" -eq 0 ]; then
