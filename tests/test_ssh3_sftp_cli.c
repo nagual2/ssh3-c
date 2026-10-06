@@ -54,8 +54,9 @@ typedef struct {
     s3_test_node_t   nodes[S3_TEST_MAX_NODES];
     int              node_count;
     s3_test_handle_t handles[S3_TEST_MAX_HANDLES];
-    long             corrupt; /* the WRITE byte to flip, -1 off */
-    long             shrink;  /* the READ offset whose serve truncates the node, -1 off */
+    long             corrupt;  /* the WRITE byte to flip, -1 off */
+    long             shrink;   /* the READ offset whose serve truncates the node, -1 off */
+    long             read_cap; /* the DATA payload cap per READ reply, -1 off */
 } s3_test_fs_t;
 
 typedef struct {
@@ -513,6 +514,14 @@ s3_test_srv_reply(s3_test_fs_t *fs, s3_ssh3_sftp_pkt_t *pkt, u_char *w)
             count = avail < (size_t)len ? (uint32_t)avail : len;
         }
 
+        /* the read_cap hook of the short-read scenarios: the server
+         * answers under the peer's channel packet bound, like the
+         * harness readChunk() capping at maxPacketSize - 512 */
+
+        if (fs->read_cap >= 0 && count > (size_t)fs->read_cap) {
+            count = (size_t)fs->read_cap;
+        }
+
         data.len = count;
         data.data = n->data + offset;
 
@@ -792,6 +801,7 @@ s3_test_cli_lifecycle(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
     S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_IDLE);
@@ -866,6 +876,7 @@ s3_test_cli_put_roundtrip(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
     s3_memzero(&prog, sizeof(prog));
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, s3_test_progress, &prog) == S3_OK);
@@ -941,6 +952,7 @@ s3_test_cli_get_roundtrip(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/get.bin", data, sizeof(data)) != NULL);
 
@@ -990,6 +1002,7 @@ s3_test_cli_resume_put(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, 60000) != NULL);
 
@@ -1043,6 +1056,7 @@ s3_test_cli_resume_put_equal(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, sizeof(data)) != NULL);
 
@@ -1094,6 +1108,7 @@ s3_test_cli_resume_put_larger(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, sizeof(data)) != NULL);
     S3_ASSERT(s3_test_node_write(s3_test_node_find(&fs, "/cont.bin"), sizeof(data), extra,
@@ -1151,6 +1166,7 @@ s3_test_cli_verify(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
     fs.corrupt = S3_TEST_CORRUPT_AT;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1168,6 +1184,7 @@ s3_test_cli_verify(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
     fs.corrupt = S3_TEST_CORRUPT_AT;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1185,6 +1202,7 @@ s3_test_cli_verify(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
     S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/v3.bin", 0, 1) == S3_OK);
@@ -1219,6 +1237,7 @@ s3_test_cli_get_missing(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1291,6 +1310,7 @@ s3_test_cli_put_r(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1416,6 +1436,7 @@ s3_test_cli_get_r(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
     s3_test_seed_tree(&fs);
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1468,6 +1489,7 @@ s3_test_cli_bad_id(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     s3_test_fill(rep, 16, 5);
     S3_ASSERT(s3_test_fs_seed(&fs, "/f.bin", rep, 16) != NULL);
@@ -1543,6 +1565,7 @@ s3_test_cli_put_pipeline(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1604,6 +1627,7 @@ s3_test_cli_get_pipeline(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/one.bin", data, len) != NULL);
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1673,6 +1697,7 @@ s3_test_cli_train_tails(void)
         s3_memzero(&fs, sizeof(fs));
         fs.corrupt = -1;
         fs.shrink = -1;
+        fs.read_cap = -1;
 
         S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1769,6 +1794,119 @@ s3_test_cli_get_shrunk_midtrain(void)
 }
 
 /*
+ * the short-read server under the announced bound: the READ requests
+ * stay under maxPacketSize - 512, so the capped replies of the
+ * dialect server (the harness readChunk()) never go short and the
+ * download lands byte-exact
+ */
+
+static int
+s3_test_cli_get_short_reads(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char            *data, *back;
+    char               dir[64], local[160];
+    size_t             len = 100000;
+
+    data = s3_alloc(len, NULL);
+    back = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL && back != NULL);
+
+    s3_test_fill(data, len, 41);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = 29488; /* the 30000 packet bound minus the 512 reserve */
+
+    S3_ASSERT(s3_test_fs_seed(&fs, "/short.bin", data, len) != NULL);
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+    s3_ssh3_sftp_cli_channel_max_packet(&cli, 30000);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/short.bin", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/short.bin", local, 0, 0) == S3_OK);
+
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    s3_test_read_local(local, back, len);
+    S3_ASSERT(s3_memcmp(back, data, len) == 0);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+    s3_free(back);
+
+    return s3_test_failures;
+}
+
+/*
+ * the short-reply pin: a DATA reply shorter than the requested chunk
+ * of the drained train means the positional window mis-phased, the
+ * transfer fails honestly instead of hanging (the bound keeps a
+ * dialect server out of this path)
+ */
+
+static int
+s3_test_cli_short_reply_fails(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char            *data;
+    char               dir[64], local[160];
+    size_t             len = 100000;
+
+    data = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL);
+
+    s3_test_fill(data, len, 43);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = 29488; /* the default 32K READs all go short */
+
+    S3_ASSERT(s3_test_fs_seed(&fs, "/short.bin", data, len) != NULL);
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/short.bin", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/short.bin", local, 0, 0) == S3_OK);
+
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_finished(&cli) == 1);
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
+    S3_ASSERT(cli.status == S3_SSH3_SFTP_FX_FAILURE);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+
+    return s3_test_failures;
+}
+
+/*
  * the pin of the train: the reply of a request that has not flown
  * (the id behind the oldest outstanding) is a protocol error
  */
@@ -1804,6 +1942,7 @@ s3_test_cli_train_bad_id(void)
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
     fs.shrink = -1;
+    fs.read_cap = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1897,6 +2036,8 @@ s3_test_ssh3_sftp_cli(void)
     (void)s3_test_cli_get_pipeline();
     (void)s3_test_cli_train_tails();
     (void)s3_test_cli_get_shrunk_midtrain();
+    (void)s3_test_cli_get_short_reads();
+    (void)s3_test_cli_short_reply_fails();
     (void)s3_test_cli_train_bad_id();
 
     return s3_test_failures;
