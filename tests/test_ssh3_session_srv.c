@@ -11,6 +11,7 @@
 #include <s3_core.h>
 
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -835,6 +836,112 @@ s3_test_session_pump_pty(void)
 }
 
 /*
+ * the refusal branches of the per-session identity transition (P7.3):
+ * the suite never runs privileged, so only the refusals are proven
+ * here - the unknown user, the unparsable name, the missing privilege
+ * and the post-spawn call; the full drop (the child runs as the
+ * resolved user) rides the privileged e2e of the harness
+ */
+
+static int
+s3_test_session_run_as_refusal(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_ssh3_session_srv_t s;
+    static const s3_str_t cmd = s3_string("id -u");
+    u_char                buf[32];
+    ssize_t               n;
+    int                   ms;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+
+    /* no transition resolved yet: no login shell comes from the module */
+
+    S3_ASSERT(s3_ssh3_session_srv_login_shell(&s) == NULL);
+
+    /* the absent and the empty names decline before any lookup */
+
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, NULL) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "") == S3_DECLINED);
+
+    /* the traversal shapes stay outside the plain-name guard */
+
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "../root") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, ".hidden") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "bad name") == S3_DECLINED);
+
+    /*
+     * the unknown user is refused before any spawn - the 401 of the
+     * server verdict is the earlier answer of the same rule
+     */
+
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "s3-no-such-user-xz") == S3_DECLINED);
+    S3_ASSERT(s.pid == 0);
+    S3_ASSERT(s.open == 0);
+
+    /*
+     * a resolving name under a non-privileged daemon: the refusal of
+     * the missing privilege; conditional so the branch stays proven
+     * without the root assumption of the suite
+     */
+
+    if (geteuid() != 0) {
+        S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "root") == S3_PERM);
+        S3_ASSERT(s.pid == 0);
+        S3_ASSERT(s.open == 0);
+    }
+
+    /* the refusals leave no state: the spawn still runs as the daemon
+     * user (the unprivileged warning path, the identity is unchanged) */
+
+    S3_ASSERT(s3_ssh3_session_srv_exec(&s, "/bin/sh", &cmd) == S3_OK);
+
+    /* the second run_as of a live session declines */
+
+    S3_ASSERT(s3_ssh3_session_srv_run_as(&s, "root") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_session_srv_login_shell(&s) == NULL);
+
+    /* the uid of the child: the pipe read polls with the deadline of
+     * the suite, a wedged child cannot hang it */
+
+    for (n = 0, ms = 0; n <= 0 && ms < S3_TEST_DEADLINE_MS; ms += 10) {
+
+        n = s3_ssh3_session_srv_read_output(&s, buf, sizeof(buf) - 1);
+
+        if (n == (ssize_t)S3_AGAIN || n == (ssize_t)S3_ERROR) {
+            n = 0;
+        }
+
+        if (n == 0) {
+            s3_test_sleep_ms(10);
+        }
+    }
+
+    S3_ASSERT(n > 0);
+
+    buf[n] = '\0';
+
+    S3_ASSERT((uid_t)atoi((const char *)buf) == getuid());
+
+    {
+        uint64_t code = 1;
+        s3_str_t name;
+        unsigned core;
+
+        S3_ASSERT(s3_test_reap_wait(&s, &code, &name, &core) == 0);
+        S3_ASSERT(code == 0);
+    }
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
  * the child that leaves no transport at all (the stdout and the
  * stderr closed, the process alive): both watches disarm on the eof,
  * the readiness can wake nothing any more and the verdict watchdog
@@ -896,6 +1003,7 @@ s3_test_ssh3_session_srv(void)
     (void)s3_test_session_signal_term();
     (void)s3_test_session_pty_shell();
     (void)s3_test_session_pty_exec_signal();
+    (void)s3_test_session_run_as_refusal();
     (void)s3_test_session_pump_events();
     (void)s3_test_session_pump_stderr();
     (void)s3_test_session_pump_pty();
