@@ -77,6 +77,11 @@
 
 #include <time.h>
 
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
@@ -351,6 +356,39 @@ static const char *s3_interop_oidc_raw;
 static char        s3_interop_oidc_bearer[256 + S3_SSH3_OIDC_CLI_TOKEN_MAX];
 
 /*
+ * the pubkey mode (-K privkey.pem): the client signs the Bearer JWT
+ * itself and the CONNECT rides it instead of test-token.  The claim
+ * set follows the reference BuildJWTBearerToken() (client_auth.go):
+ * iss = the -U username, iat = now, exp = now + 10, sub = "ssh3",
+ * aud = "unused", client_id = "ssh3-<user>", jti = the standard
+ * base64 of the 32 EXPORTER-SSH3 exporter bytes (the conversation
+ * id).  The key file is PEM (PKCS#8/PKCS#1/SEC1, the openssl
+ * genpkey shape; the OpenSSH container format stays with the Go
+ * client), the algorithm follows the key type: EdDSA (ed25519),
+ * ES256 (P-256) or RS256 (RSA) — the server verifier allowlist.
+ * The -K name mirrors the server side: the authorized_keys there,
+ * the signing identity here
+ */
+static const char *s3_interop_pubkey_path;
+static char        s3_interop_h3_bearer[2048];
+
+/* the -U value, the identity of every auth mode (the Basic
+ * user:pass, the pubkey username, the cm socket path) */
+static const char *s3_interop_u_raw;
+
+/* the std base64 lives below, the JWT jti borrows it */
+static void s3_interop_base64(const u_char *src, size_t len, char *dst);
+
+/*
+ * the expired-exp negative (S3_JWT_EXP_PAST=<seconds>): the env
+ * shifts exp into the past, the server verifier declines with 401
+ */
+#define S3_INTEROP_JWT_EXP_FRESH 10
+
+/* the ES256 signature is the raw r||s pair, 32 bytes each */
+#define S3_INTEROP_ES256_HALF 32
+
+/*
  * the flow of the reference auth/oidc/openid_connect.go Connect():
  * the conversation nonce derives from the live TLS session (the
  * reference ConversationID), the loopback listener takes the
@@ -444,12 +482,312 @@ s3_interop_oidc_acquire(SSL *ssl)
 }
 
 /*
+ * the base64url of RFC 4648 without the padding: the JWT segment
+ * shape (RFC 7515), the server decoder accepts both alphabets
+ */
+static void
+s3_interop_b64url(const u_char *src, size_t len, char *dst)
+{
+    static const char tab[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                "abcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t            i, o = 0;
+
+    for (i = 0; i + 3 <= len; i += 3) {
+        unsigned v = ((unsigned)src[i] << 16) | ((unsigned)src[i + 1] << 8) | src[i + 2];
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+        dst[o++] = tab[(v >> 6) & 0x3f];
+        dst[o++] = tab[v & 0x3f];
+    }
+
+    if (len - i == 1) {
+        unsigned v = (unsigned)src[i] << 16;
+
+        /* the unpadded tail of RFC 4648: one byte keeps two chars */
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+
+    } else if (len - i == 2) {
+        unsigned v = ((unsigned)src[i] << 16) | ((unsigned)src[i + 1] << 8);
+
+        /* two bytes keep three chars */
+
+        dst[o++] = tab[(v >> 18) & 0x3f];
+        dst[o++] = tab[(v >> 12) & 0x3f];
+        dst[o++] = tab[(v >> 6) & 0x3f];
+    }
+
+    dst[o] = '\0';
+}
+
+/*
+ * the signature over the signing input, the key type decides the
+ * shape: the ed25519 signs PureEdDSA one-shot, the P-256 signs
+ * ECDSA-SHA256 into the raw r||s pair the server verifier expects
+ * (no DER wrapper), the RSA signs RSASSA-PKCS1-v1_5-SHA256
+ */
+static s3_int_t
+s3_interop_jwt_sign(EVP_PKEY *key, const char *alg, const u_char *msg, size_t msglen, u_char *sig,
+                    size_t *siglen)
+{
+    EVP_MD_CTX *md;
+    s3_int_t    rc = S3_ERROR;
+
+    md = EVP_MD_CTX_new();
+
+    if (md == NULL) {
+        return S3_ERROR;
+    }
+
+    if (strcmp(alg, "EdDSA") == 0) {
+
+        if (EVP_DigestSignInit(md, NULL, NULL, NULL, key) != 1) {
+            goto done;
+        }
+
+    } else {
+
+        if (EVP_DigestSignInit(md, NULL, EVP_sha256(), NULL, key) != 1) {
+            goto done;
+        }
+    }
+
+    if (EVP_DigestSign(md, sig, siglen, msg, msglen) != 1) {
+        goto done;
+    }
+
+    if (strcmp(alg, "ES256") == 0) {
+
+        /* the DER ECDSA-SIG comes back, the verifier wants r||s */
+
+        const unsigned char *der = sig;
+        ECDSA_SIG           *ec = d2i_ECDSA_SIG(NULL, &der, (long)*siglen);
+        const BIGNUM        *r, *s;
+
+        if (ec == NULL) {
+            goto done;
+        }
+
+        ECDSA_SIG_get0(ec, &r, &s);
+
+        if (BN_bn2binpad(r, sig, S3_INTEROP_ES256_HALF) != S3_INTEROP_ES256_HALF ||
+            BN_bn2binpad(s, sig + S3_INTEROP_ES256_HALF, S3_INTEROP_ES256_HALF) !=
+                S3_INTEROP_ES256_HALF) {
+            ECDSA_SIG_free(ec);
+            goto done;
+        }
+
+        ECDSA_SIG_free(ec);
+        *siglen = 2 * S3_INTEROP_ES256_HALF;
+    }
+
+    rc = S3_OK;
+
+done:
+
+    EVP_MD_CTX_free(md);
+
+    return rc;
+}
+
+/*
+ * the Bearer JWT of the pubkey mode, built once after the handshake
+ * (the jti binds the live TLS exporter) and before the CONNECT: the
+ * key loads from the -K PEM file, the algorithm follows the key
+ * type, the claim set is the reference one (see the -K statics).
+ * The verdict rides s3_interop_h3_auth_value like the Basic and the
+ * OIDC modes
+ */
+static int
+s3_interop_pubkey_jwt(SSL *ssl)
+{
+    static const char label[] = "EXPORTER-SSH3";
+
+    char        header[64], payload[512], seg[1024], jti[64], tok[1200];
+    u_char      conv[32], sig[1024];
+    BIO        *bio;
+    EVP_PKEY   *key = NULL;
+    const char *alg, *skew;
+    long long   iat, exp;
+    long        past = 0;
+    size_t      hlen, plen, tlen, siglen;
+    size_t      i, ulen;
+
+    bio = BIO_new_file(s3_interop_pubkey_path, "r");
+
+    if (bio == NULL) {
+        fprintf(stderr, "interop-client: pubkey jwt: cannot open %s\n", s3_interop_pubkey_path);
+        return S3_ERROR;
+    }
+
+    key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+
+    if (key == NULL) {
+        fprintf(stderr, "interop-client: pubkey jwt: %s is not a PEM private key\n",
+                s3_interop_pubkey_path);
+        return S3_ERROR;
+    }
+
+    switch (EVP_PKEY_get_base_id(key)) {
+
+    case EVP_PKEY_ED25519:
+        alg = "EdDSA";
+        break;
+
+    case EVP_PKEY_RSA:
+        alg = "RS256";
+        break;
+
+    case EVP_PKEY_EC:
+
+    {
+        char grp[64];
+
+        if (EVP_PKEY_get_group_name(key, grp, sizeof(grp), NULL) != 1 ||
+            (strcmp(grp, "prime256v1") != 0 && strcmp(grp, "P-256") != 0)) {
+            fprintf(stderr, "interop-client: pubkey jwt: the EC key wants P-256\n");
+            EVP_PKEY_free(key);
+            return S3_ERROR;
+        }
+    }
+
+        alg = "ES256";
+        break;
+
+    default:
+        fprintf(stderr, "interop-client: pubkey jwt: unsupported key type\n");
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    if ((size_t)EVP_PKEY_get_size(key) > sizeof(sig)) {
+        fprintf(stderr, "interop-client: pubkey jwt: the key is too large\n");
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    ulen = strlen(s3_interop_u_raw);
+
+    for (i = 0; i < ulen; i++) {
+
+        u_char ch = (u_char)s3_interop_u_raw[i];
+
+        /* the JSON-safe username: the claim set embeds it verbatim */
+
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+              ch == '.' || ch == '_' || ch == '@' || ch == '-')) {
+            fprintf(stderr, "interop-client: pubkey jwt: bad username byte %c\n", ch);
+            EVP_PKEY_free(key);
+            return S3_ERROR;
+        }
+    }
+
+    if (ssl == NULL || SSL_export_keying_material(ssl, conv, sizeof(conv), label, sizeof(label) - 1,
+                                                  NULL, 0, 0) != 1) {
+        fprintf(stderr, "interop-client: pubkey jwt: exporter failed\n");
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    /* the jti of the reference: base64.StdEncoding of the conv id */
+
+    s3_interop_base64(conv, sizeof(conv), jti);
+
+    skew = getenv("S3_JWT_EXP_PAST");
+
+    if (skew != NULL && atol(skew) > 0) {
+        past = atol(skew);
+    }
+
+    iat = (long long)time(NULL);
+    exp = iat + S3_INTEROP_JWT_EXP_FRESH - past;
+
+    hlen = (size_t)snprintf(header, sizeof(header), "{\"alg\":\"%s\",\"typ\":\"JWT\"}", alg);
+    plen = (size_t)snprintf(payload, sizeof(payload),
+                            "{\"iss\":\"%s\",\"iat\":%lld,\"exp\":%lld,\"sub\":\"ssh3\","
+                            "\"aud\":\"unused\",\"client_id\":\"ssh3-%s\",\"jti\":\"%s\"}",
+                            s3_interop_u_raw, iat, exp, s3_interop_u_raw, jti);
+
+    if (hlen >= sizeof(header) || plen >= sizeof(payload)) {
+        fprintf(stderr, "interop-client: pubkey jwt: claim buffers overflow\n");
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    /* the signing input: the two url segments joined by the dot */
+
+    s3_interop_b64url((const u_char *)header, hlen, seg);
+    tlen = strlen(seg);
+    seg[tlen++] = '.';
+
+    s3_interop_b64url((const u_char *)payload, plen, seg + tlen);
+    tlen += strlen(seg + tlen);
+
+    siglen = sizeof(sig);
+
+    if (s3_interop_jwt_sign(key, alg, (const u_char *)seg, tlen, sig, &siglen) != S3_OK) {
+        fprintf(stderr, "interop-client: pubkey jwt: signing failed (%s)\n", alg);
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    EVP_PKEY_free(key);
+
+    if (tlen + 1 + siglen * 4 / 3 + 4 >= sizeof(tok)) {
+        fprintf(stderr, "interop-client: pubkey jwt: token buffer overflow\n");
+        return S3_ERROR;
+    }
+
+    s3_memcpy((u_char *)tok, seg, tlen);
+    tok[tlen++] = '.';
+    s3_interop_b64url(sig, siglen, tok + tlen);
+
+    /* the token dump for the e2e debugging, S3SFTPDBG style */
+
+    if (getenv("S3_JWTDBG") != NULL) {
+        fprintf(stderr, "jwtdbg alg=%s %s\n", alg, tok);
+    }
+
+    snprintf(s3_interop_h3_bearer, sizeof(s3_interop_h3_bearer), "Bearer %s", tok);
+    s3_interop_h3_auth_value = s3_interop_h3_bearer;
+
+    return S3_OK;
+}
+
+/*
  * the CONNECT target: "/ssh3-term" by default, the -U user rides in
  * the query (the reference auth chain takes the username from there,
  * docs/P4-WIRE.md 7 step 3)
  */
 static const char *s3_interop_h3_path_value = "/ssh3-term";
 static char        s3_interop_h3_path_buf[512];
+
+/*
+ * the username into the CONNECT target (?user=): the reference auth
+ * chain takes the session username from there (docs/P4-WIRE.md 7
+ * step 3); the Basic and the pubkey modes share the builder
+ */
+static s3_int_t
+s3_interop_h3_path_user(const char *user)
+{
+    size_t ul = strlen(user);
+
+    if (ul > sizeof(s3_interop_h3_path_buf) - sizeof("/ssh3-term?user=")) {
+        fprintf(stderr, "interop-client: -U user too long\n");
+        return S3_ERROR;
+    }
+
+    memcpy(s3_interop_h3_path_buf, "/ssh3-term?user=", sizeof("/ssh3-term?user=") - 1);
+    memcpy(s3_interop_h3_path_buf + sizeof("/ssh3-term?user=") - 1, user, ul);
+    s3_interop_h3_path_buf[sizeof("/ssh3-term?user=") - 1 + ul] = '\0';
+
+    s3_interop_h3_path_value = s3_interop_h3_path_buf;
+
+    return S3_OK;
+}
 
 static s3_h3_parse_headers_t s3_interop_h3_parse;
 static u_char               *s3_interop_h3_buf;
@@ -2527,7 +2865,6 @@ static unsigned    s3_interop_cm_master;
 static const char *s3_interop_cm_path;
 static const char *s3_interop_cm_op;
 static long        s3_interop_cm_idle_ms = 5000;
-static const char *s3_interop_u_raw; /* the -U of both meanings */
 
 static s3_ssh3_cm_sessions_t s3_interop_cm_table;
 static s3_interop_cm_run_t   s3_interop_cm_runs[S3_SSH3_CM_SRV_SESSIONS];
@@ -5350,7 +5687,7 @@ s3_interop_usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s -a addr:port [-3] [-C] [-S] [-F tcp=@port|udp=@port] [-n count] [-s size]"
-            " [-m min] [-t ms] [-A alpn] [-U user:pass] [-X] [-e cmd]"
+            " [-m min] [-t ms] [-A alpn] [-U user:pass] [-K privkey.pem] [-X] [-e cmd]"
             " [-J put|get:local:remote (get too: local first)] [-j jump-addr:port]"
             " [-M [-i ms]] [-O op] (cm modes: -U is the socket path)\n"
             "     [--oidc-issuer url --oidc-audience id | --oidc-token raw]\n"
@@ -5389,6 +5726,11 @@ s3_interop_usage(const char *prog)
             "  -U  the Basic auth of the CONNECT (RFC 7617), user:pass;\n"
             "      without it the Authorization is test-token; in the cm modes\n"
             "      (-M, -O, the slave without -3) it is the control socket path\n"
+            "  -K  the pubkey mode: sign the Bearer JWT with the PEM private\n"
+            "      key (ed25519, P-256 or RSA), -U carries the bare username;\n"
+            "      the claims follow the reference BuildJWTBearerToken(), the\n"
+            "      server -K authorized_keys verifies (S3_JWT_EXP_PAST shifts\n"
+            "      exp into the past for the negative runs)\n"
             "  -n  datagrams to send (stream: count chunks), default 8\n"
             "  -s  datagram payload size (stream: chunk size), default 512\n"
             "  -m  require at least this many echoes, default all (RFC 9221 loss runs)\n"
@@ -5482,7 +5824,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:F:e:J:S:j:O:i:3CMTSXh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:3CMTSXh")) != -1) {
 
         switch (opt) {
 
@@ -5509,6 +5851,10 @@ main(int argc, char **argv)
 
         case 'i':
             s3_interop_cm_idle_ms = atol(optarg);
+            break;
+
+        case 'K':
+            s3_interop_pubkey_path = optarg;
             break;
 
         case 'J':
@@ -5735,14 +6081,30 @@ main(int argc, char **argv)
     }
 
     /*
-     * the two meanings of -U: the Basic auth of the CONNECT in the h3
-     * runs, the control socket path in the cm modes (the master, the
-     * control ops and the slave that never touches quic)
+     * the meanings of -U: the Basic auth of the CONNECT in the h3
+     * runs, the bare username in the pubkey mode (-K), the control
+     * socket path in the cm modes (the master, the control ops and
+     * the slave that never touches quic)
      */
     if (s3_interop_u_raw != NULL) {
 
         if (s3_interop_cm_master || s3_interop_cm_op != NULL || !s3_interop_h3_mode) {
             s3_interop_cm_path = s3_interop_u_raw;
+
+        } else if (s3_interop_pubkey_path != NULL) {
+
+            /* the pubkey mode: -U is the bare username (the iss of
+             * the JWT and the ?user= of the path), the Bearer JWT
+             * replaces the Basic scheme */
+
+            if (strchr(s3_interop_u_raw, ':') != NULL) {
+                fprintf(stderr, "interop-client: -K wants the bare -U username\n");
+                return 1;
+            }
+
+            if (s3_interop_h3_path_user(s3_interop_u_raw) != S3_OK) {
+                return 1;
+            }
 
         } else {
 
@@ -5775,23 +6137,37 @@ main(int argc, char **argv)
                 /* the username goes into the query for the auth chain */
 
                 {
-                    size_t ul = (size_t)(colon - s3_interop_u_raw);
+                    char user[512];
 
-                    if (ul > sizeof(s3_interop_h3_path_buf) - sizeof("/ssh3-term?user=")) {
+                    if ((size_t)(colon - s3_interop_u_raw) >= sizeof(user)) {
                         fprintf(stderr, "interop-client: -U user too long\n");
                         return 1;
                     }
 
-                    memcpy(s3_interop_h3_path_buf,
-                           "/ssh3-term?user=", sizeof("/ssh3-term?user=") - 1);
-                    memcpy(s3_interop_h3_path_buf + sizeof("/ssh3-term?user=") - 1,
-                           s3_interop_u_raw, ul);
-                    s3_interop_h3_path_buf[sizeof("/ssh3-term?user=") - 1 + ul] = '\0';
+                    memcpy(user, s3_interop_u_raw, (size_t)(colon - s3_interop_u_raw));
+                    user[colon - s3_interop_u_raw] = '\0';
 
-                    s3_interop_h3_path_value = s3_interop_h3_path_buf;
+                    if (s3_interop_h3_path_user(user) != S3_OK) {
+                        return 1;
+                    }
                 }
             }
         }
+    }
+
+    /*
+     * the pubkey mode rides the h3 CONNECT: the JWT needs the live
+     * TLS exporter and the -U username; the cm modes keep the other
+     * meaning of -U and never mix, the OIDC owns the Bearer scheme
+     * alone, the proxy jump would carry a token bound to the outer
+     * exporter into the inner conversation
+     */
+    if (s3_interop_pubkey_path != NULL &&
+        (!s3_interop_h3_mode || s3_interop_u_raw == NULL || s3_interop_cm_master ||
+         s3_interop_cm_op != NULL || s3_interop_jump_phase || s3_interop_oidc_issuer != NULL ||
+         s3_interop_oidc_raw != NULL)) {
+        s3_interop_usage(argv[0]);
+        return 1;
     }
 
     /* the master rides the channel phase of the h3 mode */
@@ -6102,6 +6478,12 @@ main(int argc, char **argv)
             if ((s3_interop_oidc_issuer != NULL || s3_interop_oidc_raw != NULL) &&
                 s3_interop_oidc_acquire(cli->ssl->connection) != S3_OK) {
                 fprintf(stderr, "interop-client: oidc auth failed\n");
+                return 1;
+            }
+
+            if (s3_interop_pubkey_path != NULL &&
+                s3_interop_pubkey_jwt(cli->ssl->connection) != S3_OK) {
+                fprintf(stderr, "interop-client: pubkey jwt failed\n");
                 return 1;
             }
 
