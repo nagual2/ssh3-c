@@ -5,8 +5,9 @@
  * fake server parses the drained requests through the codec and
  * answers from an in-memory table of the files, the loopback round
  * trip is synchronous; the scenarios pin the round trips of put and
- * get, the resume, the checksum verification, the recursive walks
- * and the protocol pins of the one-request pipeline
+ * get, the resume, the checksum verification, the recursive walks,
+ * the in-flight window of the streaming trains and the protocol
+ * pins of the ordered reply pipeline
  */
 
 #include <s3_core.h>
@@ -54,6 +55,7 @@ typedef struct {
     int              node_count;
     s3_test_handle_t handles[S3_TEST_MAX_HANDLES];
     long             corrupt; /* the WRITE byte to flip, -1 off */
+    long             shrink;  /* the READ offset whose serve truncates the node, -1 off */
 } s3_test_fs_t;
 
 typedef struct {
@@ -495,6 +497,14 @@ s3_test_srv_reply(s3_test_fs_t *fs, s3_ssh3_sftp_pkt_t *pkt, u_char *w)
 
         n = &fs->nodes[h->node];
 
+        /* the shrink hook of the mid-train scenario: the node vanishes
+         * under the served READ, the reply rides empty (or EOF-shaped
+         * empty) while the younger reads of the train stay in flight */
+
+        if (fs->shrink >= 0 && (uint64_t)fs->shrink == offset) {
+            n->len = 0;
+        }
+
         if (offset >= n->len) {
             count = 0;
 
@@ -584,26 +594,88 @@ s3_test_srv_reply(s3_test_fs_t *fs, s3_ssh3_sftp_pkt_t *pkt, u_char *w)
     }
 }
 
-/* the fake server drains the requests and builds the reply batch */
+/*
+ * the request side of the loopback: the pending output drains into
+ * the carry (a window drain slices the frame tail), the whole frames
+ * answer into the bounded reply buffer and the counts land in the
+ * optional meters; an unanswered tail rides the next round
+ */
 
 static void
-s3_test_srv_feed(s3_test_fs_t *fs, const u_char *data, size_t len, u_char *out, size_t *out_len)
+s3_test_cli_drain(s3_test_fs_t *fs, s3_ssh3_sftp_cli_t *cli, u_char *carry, size_t *carry_len,
+                  unsigned *writes, unsigned *reads, unsigned *frames, u_char *rep, size_t rep_cap,
+                  size_t *rep_len)
 {
     s3_ssh3_sftp_pkt_t pkt;
-    const u_char      *p = data, *end = data + len;
-    u_char            *w = out;
+    const u_char      *p, *end, *msg;
+    size_t             cap = (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * (S3_SSH3_SFTP_CLI_CHUNK + 512);
+    ssize_t            n;
+    u_char            *w;
+
+    while (*carry_len < cap &&
+           (n = s3_ssh3_sftp_cli_output(cli, carry + *carry_len, cap - *carry_len)) > 0) {
+        *carry_len += (size_t)n;
+    }
+
+    p = carry;
+    end = carry + *carry_len;
+    w = rep + *rep_len;
 
     while (p < end) {
 
+        msg = p;
+
+        /* the S3_AGAIN of the codec reads as the partial tail here */
+
         if (s3_ssh3_sftp_codec_frame(&p, end, &pkt) != S3_OK) {
-            S3_ASSERT(!"the fake server got a broken frame");
+            p = msg;
+            break;
+        }
+
+        if ((size_t)(w - rep) + S3_SSH3_SFTP_CLI_CHUNK + 512 > rep_cap) {
+
+            /* the reply budget is out: the frame stays for the next
+             * round, the caller feeds what rode already */
+
+            p = msg;
             break;
         }
 
         w = s3_test_srv_reply(fs, &pkt, w);
+
+        if (writes != NULL && pkt.type == S3_SSH3_SFTP_WRITE) {
+            (*writes)++;
+        }
+
+        if (reads != NULL && pkt.type == S3_SSH3_SFTP_READ) {
+            (*reads)++;
+        }
+
+        if (frames != NULL) {
+            (*frames)++;
+        }
     }
 
-    *out_len = (size_t)(w - out);
+    *rep_len = (size_t)(w - rep);
+
+    *carry_len = (size_t)(end - p);
+
+    if (*carry_len > 0) {
+        s3_memmove(carry, p, *carry_len);
+    }
+}
+
+/* the heap buffer of one loopback side, the drain cap */
+
+static u_char *
+s3_test_cli_side_buf(void)
+{
+    u_char *buf =
+        s3_alloc((size_t)S3_SSH3_SFTP_CLI_INFLIGHT * (S3_SSH3_SFTP_CLI_CHUNK + 512), NULL);
+
+    S3_ASSERT(buf != NULL);
+
+    return buf;
 }
 
 /*
@@ -614,19 +686,73 @@ s3_test_srv_feed(s3_test_fs_t *fs, const u_char *data, size_t len, u_char *out, 
 static void
 s3_test_cli_run(s3_test_fs_t *fs, s3_ssh3_sftp_cli_t *cli)
 {
-    u_char  req[65536];
-    u_char  rep[65536];
-    size_t  rep_len;
-    ssize_t n;
+    u_char *carry = s3_test_cli_side_buf();
+    u_char *rep = s3_test_cli_side_buf();
+    size_t  carry_len = 0, rep_len;
 
     rep_len = 0;
 
     while (!s3_ssh3_sftp_cli_finished(cli)) {
 
-        n = s3_ssh3_sftp_cli_output(cli, req, sizeof(req));
+        s3_test_cli_drain(fs, cli, carry, &carry_len, NULL, NULL, NULL, rep,
+                          (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * (S3_SSH3_SFTP_CLI_CHUNK + 512),
+                          &rep_len);
 
-        if (n > 0) {
-            s3_test_srv_feed(fs, req, (size_t)n, rep, &rep_len);
+        if (rep_len > 0) {
+            S3_ASSERT(s3_ssh3_sftp_cli_input(cli, rep, rep_len) == S3_OK);
+            rep_len = 0;
+            continue;
+        }
+
+        S3_ASSERT(!"the driver stalled with no request in flight");
+        break;
+    }
+
+    s3_free(carry);
+    s3_free(rep);
+}
+
+static void
+s3_test_fill(u_char *buf, size_t len, uint32_t seed)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        buf[i] = (u_char)(s3_test_next_rand(&seed) & 0xff);
+    }
+}
+
+/*
+ * the pipeline probe: the loopback round trip of s3_test_cli_run with
+ * the burst metering — the frames of one drain pass are the in-flight
+ * window, the WRITE/READ totals land in the out parameters, the stall
+ * assert of the base loop holds
+ */
+
+static void
+s3_test_cli_probe(s3_test_fs_t *fs, s3_ssh3_sftp_cli_t *cli, unsigned *max_burst, unsigned *writes,
+                  unsigned *reads)
+{
+    u_char  *carry = s3_test_cli_side_buf();
+    u_char  *rep = s3_test_cli_side_buf();
+    size_t   carry_len = 0, rep_len;
+    size_t   cap = (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * (S3_SSH3_SFTP_CLI_CHUNK + 512);
+    unsigned frames;
+
+    *max_burst = 0;
+    *writes = 0;
+    *reads = 0;
+
+    rep_len = 0;
+
+    while (!s3_ssh3_sftp_cli_finished(cli)) {
+
+        frames = 0;
+
+        s3_test_cli_drain(fs, cli, carry, &carry_len, writes, reads, &frames, rep, cap, &rep_len);
+
+        if (frames > *max_burst) {
+            *max_burst = frames;
         }
 
         if (rep_len > 0) {
@@ -638,16 +764,9 @@ s3_test_cli_run(s3_test_fs_t *fs, s3_ssh3_sftp_cli_t *cli)
         S3_ASSERT(!"the driver stalled with no request in flight");
         break;
     }
-}
 
-static void
-s3_test_fill(u_char *buf, size_t len, uint32_t seed)
-{
-    size_t i;
-
-    for (i = 0; i < len; i++) {
-        buf[i] = (u_char)(s3_test_next_rand(&seed) & 0xff);
-    }
+    s3_free(carry);
+    s3_free(rep);
 }
 
 /*
@@ -672,6 +791,7 @@ s3_test_cli_lifecycle(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
     S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_IDLE);
@@ -745,6 +865,7 @@ s3_test_cli_put_roundtrip(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
     s3_memzero(&prog, sizeof(prog));
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, s3_test_progress, &prog) == S3_OK);
@@ -819,6 +940,7 @@ s3_test_cli_get_roundtrip(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/get.bin", data, sizeof(data)) != NULL);
 
@@ -867,6 +989,7 @@ s3_test_cli_resume_put(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, 60000) != NULL);
 
@@ -919,6 +1042,7 @@ s3_test_cli_resume_put_equal(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, sizeof(data)) != NULL);
 
@@ -969,6 +1093,7 @@ s3_test_cli_resume_put_larger(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, sizeof(data)) != NULL);
     S3_ASSERT(s3_test_node_write(s3_test_node_find(&fs, "/cont.bin"), sizeof(data), extra,
@@ -1025,6 +1150,7 @@ s3_test_cli_verify(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
     fs.corrupt = S3_TEST_CORRUPT_AT;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1041,6 +1167,7 @@ s3_test_cli_verify(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
     fs.corrupt = S3_TEST_CORRUPT_AT;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1057,6 +1184,7 @@ s3_test_cli_verify(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
     S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/v3.bin", 0, 1) == S3_OK);
@@ -1090,6 +1218,7 @@ s3_test_cli_get_missing(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1161,6 +1290,7 @@ s3_test_cli_put_r(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1285,6 +1415,7 @@ s3_test_cli_get_r(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
     s3_test_seed_tree(&fs);
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
@@ -1336,6 +1467,7 @@ s3_test_cli_bad_id(void)
 
     s3_memzero(&fs, sizeof(fs));
     fs.corrupt = -1;
+    fs.shrink = -1;
 
     s3_test_fill(rep, 16, 5);
     S3_ASSERT(s3_test_fs_seed(&fs, "/f.bin", rep, 16) != NULL);
@@ -1382,6 +1514,371 @@ s3_test_cli_bad_id(void)
     return s3_test_failures;
 }
 
+/*
+ * the upload window: one MiB rides the INFLIGHT train, the burst
+ * metering pins the window and the landing stays byte-exact
+ */
+
+static int
+s3_test_cli_put_pipeline(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    s3_test_node_t    *n;
+    u_char            *data;
+    char               dir[64], local[160];
+    size_t             len = (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * S3_SSH3_SFTP_CLI_CHUNK;
+    unsigned           burst, writes, reads;
+
+    data = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL);
+
+    s3_test_fill(data, len, 4242);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/one.bin", dir);
+    s3_test_write_local(local, data, len);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/one.bin", 0, 0) == S3_OK);
+
+    s3_test_cli_probe(&fs, &cli, &burst, &writes, &reads);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(cli.status == S3_SSH3_SFTP_FX_OK);
+
+    /* the window rides full: the whole train left before the first
+     * reply round (the init and the open ride alone) */
+
+    S3_ASSERT(burst == S3_SSH3_SFTP_CLI_INFLIGHT);
+    S3_ASSERT(writes == S3_SSH3_SFTP_CLI_INFLIGHT);
+    S3_ASSERT(reads == 0);
+
+    n = s3_test_node_find(&fs, "/one.bin");
+    S3_ASSERT(n != NULL);
+    S3_ASSERT(n->len == len);
+    S3_ASSERT(s3_memcmp(n->data, data, len) == 0);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+
+    return s3_test_failures;
+}
+
+/* the download window: the same pins on the READ train */
+
+static int
+s3_test_cli_get_pipeline(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char            *data, *back;
+    char               dir[64], local[160];
+    size_t             len = (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * S3_SSH3_SFTP_CLI_CHUNK;
+    unsigned           burst, writes, reads;
+
+    data = s3_alloc(len, NULL);
+    back = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL && back != NULL);
+
+    s3_test_fill(data, len, 777);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+
+    S3_ASSERT(s3_test_fs_seed(&fs, "/one.bin", data, len) != NULL);
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/one.bin", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/one.bin", local, 0, 0) == S3_OK);
+
+    s3_test_cli_probe(&fs, &cli, &burst, &writes, &reads);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(cli.status == S3_SSH3_SFTP_FX_OK);
+
+    S3_ASSERT(burst == S3_SSH3_SFTP_CLI_INFLIGHT);
+    S3_ASSERT(writes == 0);
+    S3_ASSERT(reads == S3_SSH3_SFTP_CLI_INFLIGHT);
+
+    s3_test_read_local(local, back, len);
+    S3_ASSERT(s3_memcmp(back, data, len) == 0);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+    s3_free(back);
+
+    return s3_test_failures;
+}
+
+/*
+ * the train tails: the chunks land exactly, the partial tail keeps
+ * its size, a whole-chunk file sends no empty tail, an empty file
+ * sends no WRITE at all
+ */
+
+static int
+s3_test_cli_train_tails(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    s3_test_node_t    *n;
+    u_char            *data;
+    char               dir[64], local[160];
+    size_t             len = 2 * S3_SSH3_SFTP_CLI_CHUNK + 17;
+    size_t             sizes[] = {S3_SSH3_SFTP_CLI_CHUNK - 1, S3_SSH3_SFTP_CLI_CHUNK,
+                                  (size_t)(S3_SSH3_SFTP_CLI_CHUNK + 1), 0};
+    unsigned           burst, writes, reads, want, i;
+
+    data = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL);
+
+    s3_test_fill(data, len, 99);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/tail.bin", dir);
+
+    for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+
+        s3_memzero(&fs, sizeof(fs));
+        fs.corrupt = -1;
+        fs.shrink = -1;
+
+        S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+        s3_test_write_local(local, data, sizes[i]);
+
+        S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/tail.bin", 0, 0) == S3_OK);
+
+        s3_test_cli_probe(&fs, &cli, &burst, &writes, &reads);
+
+        S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+        S3_ASSERT(cli.status == S3_SSH3_SFTP_FX_OK);
+
+        /* the chunk count only: ceil(size / CHUNK) WRITEs, no empty
+         * tail request, the whole window never leaves for the tails */
+
+        want = (unsigned)((sizes[i] + S3_SSH3_SFTP_CLI_CHUNK - 1) / S3_SSH3_SFTP_CLI_CHUNK);
+        S3_ASSERT(writes == want);
+        S3_ASSERT(reads == 0);
+        S3_ASSERT(burst <= S3_SSH3_SFTP_CLI_INFLIGHT);
+
+        n = s3_test_node_find(&fs, "/tail.bin");
+        S3_ASSERT(n != NULL);
+        S3_ASSERT(n->len == sizes[i]);
+
+        if (sizes[i] > 0) {
+            S3_ASSERT(s3_memcmp(n->data, data, sizes[i]) == 0);
+        }
+
+        /* the node payloads of this iteration die here: the next one
+         * memzeros the table (the sanitizer counts every byte) */
+
+        s3_test_fs_free(&fs);
+    }
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+
+    return s3_test_failures;
+}
+
+/*
+ * the mid-train end of the stream: the remote size dies under an
+ * outstanding window, the empty reply of the served READ fails the
+ * transfer honestly (the younger replies cannot re-phase)
+ */
+
+static int
+s3_test_cli_get_shrunk_midtrain(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char            *data;
+    char               dir[64], local[160];
+    size_t             len = 3 * S3_SSH3_SFTP_CLI_CHUNK;
+    unsigned           burst, writes, reads;
+
+    data = s3_alloc(len, NULL);
+    S3_ASSERT(data != NULL);
+
+    s3_test_fill(data, len, 31);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = S3_SSH3_SFTP_CLI_CHUNK; /* the second READ of the train kills the node */
+
+    S3_ASSERT(s3_test_fs_seed(&fs, "/f.bin", data, len) != NULL);
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/f.bin", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/f.bin", local, 0, 0) == S3_OK);
+
+    s3_test_cli_probe(&fs, &cli, &burst, &writes, &reads);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_finished(&cli) == 1);
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
+    S3_ASSERT(cli.status == S3_SSH3_SFTP_FX_FAILURE);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+
+    return s3_test_failures;
+}
+
+/*
+ * the pin of the train: the reply of a request that has not flown
+ * (the id behind the oldest outstanding) is a protocol error
+ */
+
+static int
+s3_test_cli_train_bad_id(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    s3_ssh3_sftp_pkt_t pkt;
+    s3_str_t           handle;
+    u_char            *data, *req;
+    u_char             rep[128];
+    const u_char      *p, *end;
+    char               dir[64], local[160];
+    size_t             data_len = 2 * S3_SSH3_SFTP_CLI_CHUNK;
+    size_t             req_cap = (size_t)S3_SSH3_SFTP_CLI_INFLIGHT * (S3_SSH3_SFTP_CLI_CHUNK + 512);
+    uintptr_t          len;
+    ssize_t            n, total;
+    uint32_t           skip_id;
+
+    data = s3_alloc(data_len, NULL);
+    req = s3_alloc(req_cap, NULL);
+    S3_ASSERT(data != NULL && req != NULL);
+
+    s3_test_fill(data, data_len, 3);
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/f.bin", dir);
+    s3_test_write_local(local, data, data_len);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/f.bin", 0, 0) == S3_OK);
+
+    /* the init round */
+
+    n = s3_ssh3_sftp_cli_output(&cli, req, req_cap);
+    S3_ASSERT(n > 0);
+
+    len = s3_ssh3_sftp_encode_version(NULL, S3_SSH3_SFTP_PROTOCOL_VERSION);
+    S3_ASSERT(len <= sizeof(rep));
+    (void)s3_ssh3_sftp_encode_version(rep, S3_SSH3_SFTP_PROTOCOL_VERSION);
+    S3_ASSERT(s3_ssh3_sftp_cli_input(&cli, rep, (size_t)len) == S3_OK);
+
+    /* the open round: the handle wakes the WRITE train */
+
+    n = s3_ssh3_sftp_cli_output(&cli, req, req_cap);
+    S3_ASSERT(n > 0);
+
+    p = req;
+    end = req + (size_t)n;
+    S3_ASSERT(s3_ssh3_sftp_codec_frame(&p, end, &pkt) == S3_OK);
+    S3_ASSERT(pkt.type == S3_SSH3_SFTP_OPEN);
+
+    handle.len = 2;
+    handle.data = (u_char *)"h0";
+
+    len = s3_ssh3_sftp_encode_handle(NULL, pkt.request_id, &handle);
+    S3_ASSERT(len <= sizeof(rep));
+    (void)s3_ssh3_sftp_encode_handle(rep, pkt.request_id, &handle);
+    S3_ASSERT(s3_ssh3_sftp_cli_input(&cli, rep, (size_t)len) == S3_OK);
+
+    /* the train: both WRITEs ride one drain, the reply of the first
+     * rides in, the reply of the second answers the id behind it:
+     * the pin refuses the request that has not flown */
+
+    total = 0;
+
+    while ((n = s3_ssh3_sftp_cli_output(&cli, req + total, req_cap - (size_t)total)) > 0) {
+        total += n;
+    }
+
+    S3_ASSERT(total > 0);
+
+    p = req;
+    end = req + (size_t)total;
+    S3_ASSERT(s3_ssh3_sftp_codec_frame(&p, end, &pkt) == S3_OK);
+    S3_ASSERT(pkt.type == S3_SSH3_SFTP_WRITE);
+
+    len = (uintptr_t)(s3_test_srv_status(rep, pkt.request_id, S3_SSH3_SFTP_FX_OK) - rep);
+    S3_ASSERT(s3_ssh3_sftp_cli_input(&cli, rep, (size_t)len) == S3_OK);
+
+    S3_ASSERT(s3_ssh3_sftp_codec_frame(&p, end, &pkt) == S3_OK);
+    S3_ASSERT(pkt.type == S3_SSH3_SFTP_WRITE);
+
+    skip_id = pkt.request_id + 1;
+
+    len = (uintptr_t)(s3_test_srv_status(rep, skip_id, S3_SSH3_SFTP_FX_OK) - rep);
+    S3_ASSERT(s3_ssh3_sftp_cli_input(&cli, rep, (size_t)len) == S3_ERROR);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+    s3_destroy_pool(pool);
+    s3_free(data);
+    s3_free(req);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_ssh3_sftp_cli(void)
 {
@@ -1396,6 +1893,11 @@ s3_test_ssh3_sftp_cli(void)
     (void)s3_test_cli_put_r();
     (void)s3_test_cli_get_r();
     (void)s3_test_cli_bad_id();
+    (void)s3_test_cli_put_pipeline();
+    (void)s3_test_cli_get_pipeline();
+    (void)s3_test_cli_train_tails();
+    (void)s3_test_cli_get_shrunk_midtrain();
+    (void)s3_test_cli_train_bad_id();
 
     return s3_test_failures;
 }
