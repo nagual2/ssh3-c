@@ -110,6 +110,17 @@ static const char *s3_interop_passfile;
 static const char *s3_interop_keyfile;
 
 /*
+ * the synthetic 0-RTT probe (S3_H3_FORCE_EARLY): no shipped client
+ * sends TLS 0-RTT early data yet (the server never advertises
+ * max_early_data, the session resumption is not wired), so the RFC
+ * 8470 425 gate has no natural trigger.  The env drives the gate
+ * once — the first CONNECT draws the 425 and the retry after the
+ * handshake lands on the normal chain, the e2e covers the verdict
+ * shape and the client-side 425 handling
+ */
+static int s3_interop_force_early;
+
+/*
  * the sftp jail override (-H): the harness scenarios point it into
  * their workdir so the runs do not touch the real home
  */
@@ -1162,13 +1173,16 @@ s3_interop_h3_respond(s3_connection_t *pc)
 
             code = 403;
 
-        } else if (pc->ssl == NULL || !pc->ssl->handshaked) {
+        } else if (pc->ssl == NULL || !pc->ssl->handshaked || s3_interop_force_early) {
 
             /* RFC 8470: a request that arrived in early data may be
              * replayed, the reference answers 425 until the handshake
-             * is done (go_server: TLS handshake incomplete) */
+             * is done (go_server: TLS handshake incomplete).  The
+             * S3_H3_FORCE_EARLY probe spends itself on the first
+             * CONNECT, the retry rides the normal chain */
 
             code = 425;
+            s3_interop_force_early = 0;
 
         } else if (s3_interop_oidc_issuer != NULL) {
 
@@ -3401,6 +3415,8 @@ main(int argc, char **argv)
     s3_udp_listen_t    ul;
 
     s3_interop_log_init();
+
+    s3_interop_force_early = (getenv("S3_H3_FORCE_EARLY") != NULL);
 
     /*
      * the OIDC options ride the long form (the daemon keeps the
