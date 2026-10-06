@@ -1,0 +1,21 @@
+# the apk-tools v2 control file, as abuild writes it: a tar.gz stream whose
+# members all start with a dot (here just .PKGINFO). the version, the build
+# date and the installed size are substituted by packaging/build.sh; the
+# package file is the two concatenated tar.gz streams control + data.
+#
+# NOTE on dependencies: the shipped binary must be built against musl inside
+# an alpine (3.22+) environment - the stock alpine userland has no glibc.
+# so:libssl.so.3 / so:libcrypto.so.3 are satisfied by openssl 3.5 (the QUIC
+# API); the musl libc dependency line belongs to the alpine-built binary and
+# is intentionally not hardcoded here.
+pkgname = ssh3-server
+pkgver = @VERSION@-r0
+pkgdesc = SSH3 server - SSH over QUIC/HTTP3 transport
+builddate = @BUILDDATE@
+size = @SIZE@
+arch = x86_64
+origin = ssh3-server
+packager = ssh3-c maintainers <maintainers@example.com>
+license = BSD-2-Clause
+depend = so:libssl.so.3
+depend = so:libcrypto.so.3

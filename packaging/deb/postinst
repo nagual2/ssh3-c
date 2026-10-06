@@ -1,0 +1,32 @@
+#!/bin/sh
+# postinst for ssh3-server: create the system service user and the state
+# directory. there is no conffile yet - the daemon is configured through
+# environment variables and command-line flags only.
+set -e
+
+case "$1" in
+    configure)
+        # the unprivileged service account running the daemon
+        if ! getent passwd ssh3 >/dev/null; then
+            adduser --system --group --home /var/lib/ssh3 --quiet ssh3
+        fi
+        if [ ! -d /var/lib/ssh3 ]; then
+            mkdir -p /var/lib/ssh3
+        fi
+        chown ssh3:ssh3 /var/lib/ssh3
+        chmod 0750 /var/lib/ssh3
+
+        # integration block: the systemd unit wiring (packaging/systemd/)
+        # is added here at the integration step - do not duplicate the
+        # unit files in this hook.
+        #if [ -x /usr/bin/systemctl ]; then
+        #    systemctl daemon-reload || true
+        #    systemctl enable ssh3-server.service || true
+        #fi
+
+        printf 'ssh3-server: configured via env/CLI (see ssh3-server -h);\n'
+        printf '  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN.\n'
+        ;;
+esac
+
+exit 0
