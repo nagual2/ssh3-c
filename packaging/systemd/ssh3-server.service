@@ -1,0 +1,73 @@
+[Unit]
+Description=SSH3 server (sessions and forwards over HTTP/3, RFC 9220)
+Documentation=man:ssh3-server(8)
+# The socket unit owns UDP/443: systemd binds it as root and hands the
+# ready fd to the service (the sd_listen_fds(3) protocol, the daemon
+# logs "socket-activated").  The service therefore never binds and
+# needs NO capability - no CAP_NET_BIND_SERVICE, no AmbientCapabilities
+# - which is exactly what allows the hardening below: a root-bound
+# daemon would have to keep privileges and NewPrivileges, this unit
+# does not.
+Requires=ssh3-server.socket
+After=network.target
+
+[Service]
+# exec: the failure of the binary itself (bad key paths, the
+# socket-activation guard) must fail the unit, not hang "simple"
+Type=exec
+ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
+# no -l: under LISTEN_FDS the daemon serves the passed fd and binds
+# nothing; the flags, the env table and the drop-in recipes live in
+# ssh3-server(8)
+Environment=SSH3_LOG_LEVEL=info
+User=ssh3
+Group=ssh3
+# the writable state of the shipped single-uid daemon (sftp jail via
+# the -H override, session artifacts) lives here, not under /home -
+# see the ProtectHome note below
+StateDirectory=ssh3
+RuntimeDirectory=ssh3
+# the daemon drains the active conversations on SIGTERM (default 5s,
+# SSH3_SHUTDOWN_DRAIN), 30s leaves it one drain plus the close grace
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+
+# Hardening.  The daemon is a plain C17 binary (no JIT, no runtime
+# code loading): MemoryDenyWriteExecute is safe.  The session children
+# (the user shells and the sftp request server) run as the ssh3
+# account - the shipped daemon has no per-user setuid yet - so no /home
+# access is intended; a home-jailed deployment widens it from a
+# drop-in:
+#   systemctl edit ssh3-server.service
+#   [Service]
+#   ProtectHome=read-only
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# QUIC is IPv4 UDP; the forward-agent bridge talks AF_UNIX (the agent
+# listener per session), the direct-tcp forwards AF_INET - the
+# session shells need nothing beyond the two
+RestrictAddressFamilies=AF_INET AF_UNIX
+# the service binds nothing of its own: an empty bounding set states
+# that and keeps future edits honest (no AmbientCapabilities line on
+# purpose - the port is bound by the root-owned .socket unit)
+CapabilityBoundingSet=
+
+# socket-activated only: enabling the unit is
+#   systemctl enable --now ssh3-server.socket
+# and the service comes up on the first packet
