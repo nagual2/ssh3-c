@@ -152,12 +152,35 @@ static unsigned s3_srv_proto_mode;
 static const char *s3_srv_passfile;
 
 /*
- * the authorized_keys file (-K): the CONNECT passes only with a
- * Bearer JWT signed by one of its keys; a %u token is the session
- * username (the sshd AuthorizedKeysFile shape), a path without it is
- * one file for every user
+ * the password file (-P): the CONNECT passes only with the correct
+ * Basic credentials against its user:secret lines; the method itself
+ * stays off until the password login is opted into
+ * (--enable-password-login or SSH3_ENABLE_PASSWORD_LOGIN=1, the
+ * reference enablePasswordLogin default)
  */
-static const char *s3_srv_keyfile;
+static const char *s3_srv_passfile;
+static unsigned    s3_srv_password_enabled;
+
+/*
+ * the authorized_keys files (-K, repeatable): the CONNECT passes only
+ * with a Bearer JWT signed by one of their keys; a %u token is the
+ * session username (the sshd AuthorizedKeysFile shape), a path
+ * without it is one file for every user; without any -K the Bearer
+ * JWT verifies against the default chain of the session user
+ * (~/.ssh3/authorized_identities then ~/.ssh/authorized_keys, the
+ * reference DefaultIdentitiesFileNames())
+ */
+#define S3_SRV_KEYFILES_MAX 8
+
+static const char *s3_srv_keyfiles[S3_SRV_KEYFILES_MAX];
+static unsigned    s3_srv_keyfiles_n;
+
+/*
+ * the CONNECT route (--url-path): the reference -url-path default,
+ * the query part after it carries the auth username
+ */
+static char   s3_srv_url_path[256] = "/ssh3-term";
+static size_t s3_srv_url_path_len = sizeof("/ssh3-term") - 1;
 
 /*
  * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
@@ -498,16 +521,64 @@ s3_srv_read_file(const char *path, size_t *len)
     return buf;
 }
 
+/*
+ * the -l address: "a.b.c.d:port" (IPv4) or "[v6]:port" (IPv6, the
+ * bracket form of the reference -bind, whose default "[::]:443" is
+ * the dual-stack wildcard); the v6 host may itself carry colons, so
+ * the port splits at the colon behind the closing bracket; the
+ * numeric forms only (inet_pton), the names resolve in the unit
+ */
 static s3_int_t
-s3_srv_parse_addr(const char *text, struct sockaddr_in *sa)
+s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *sslen)
 {
-    char           host[64];
-    const char    *colon;
-    size_t         n;
-    unsigned       port;
-    struct in_addr addr;
+    char        host[64];
+    const char *colon, *end_bracket;
+    size_t      n;
+    unsigned    port;
 
     colon = strchr(text, ':');
+
+    if (text[0] == '[') {
+
+        /* the IPv6 bracket form */
+
+        end_bracket = strchr(text, ']');
+
+        if (end_bracket == NULL || end_bracket[1] != ':' || end_bracket[2] == '\0') {
+            return S3_ERROR;
+        }
+
+        n = (size_t)(end_bracket - text) - 1;
+
+        if (n == 0 || n >= sizeof(host)) {
+            return S3_ERROR;
+        }
+
+        memcpy(host, text + 1, n);
+        host[n] = '\0';
+
+        colon = end_bracket + 1;
+
+        port = (unsigned)atoi(colon + 1);
+
+        if (port > 65535) {
+            return S3_ERROR;
+        }
+
+        s3_memzero(ss, sizeof(*ss));
+
+        ((struct sockaddr_in6 *)ss)->sin6_family = AF_INET6;
+        ((struct sockaddr_in6 *)ss)->sin6_port = htons((uint16_t)port);
+
+        if (inet_pton(AF_INET6, host, &((struct sockaddr_in6 *)ss)->sin6_addr) != 1) {
+            return S3_ERROR;
+        }
+
+        *sslen = sizeof(struct sockaddr_in6);
+
+        return S3_OK;
+    }
+
     if (colon == NULL) {
         return S3_ERROR;
     }
@@ -520,20 +591,21 @@ s3_srv_parse_addr(const char *text, struct sockaddr_in *sa)
     memcpy(host, text, n);
     host[n] = '\0';
 
-    if (inet_pton(AF_INET, host, &addr) != 1) {
-        return S3_ERROR;
-    }
-
     port = (unsigned)atoi(colon + 1);
     if (port > 65535) {
         return S3_ERROR;
     }
 
-    s3_memzero(sa, sizeof(struct sockaddr_in));
+    s3_memzero(ss, sizeof(*ss));
 
-    sa->sin_family = AF_INET;
-    sa->sin_port = htons((uint16_t)port);
-    sa->sin_addr = addr;
+    ((struct sockaddr_in *)ss)->sin_family = AF_INET;
+    ((struct sockaddr_in *)ss)->sin_port = htons((uint16_t)port);
+
+    if (inet_pton(AF_INET, host, &((struct sockaddr_in *)ss)->sin_addr) != 1) {
+        return S3_ERROR;
+    }
+
+    *sslen = sizeof(struct sockaddr_in);
 
     return S3_OK;
 }
@@ -1004,14 +1076,16 @@ s3_srv_h3_send_status(unsigned code)
     p = sec;
     p = s3_srv_h3_put_status(p, code);
 
-    if (code == 200) {
+    /*
+     * the Server field of the reference rides EVERY response: the
+     * handler sets it before any verdict (w.Header().Set("Server",
+     * GetCurrentVersionString()), server_auth/auth.go), so the client
+     * parses a version string out of the refusals too - a missing
+     * field reads as an empty version and the client reports the
+     * misleading "bad SSH version fields" instead of the verdict
+     */
 
-        /*
-         * the Server field of the reference (w.Header().Set("Server",
-         * GetCurrentVersionString())), the client parses it before it
-         * opens the conversation
-         */
-
+    {
         s3_str_t name = s3_string("server");
         s3_str_t value = s3_string(S3_SSH3_VERSION_STRING);
 
@@ -1178,20 +1252,27 @@ s3_srv_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, s
 }
 
 /*
- * the Bearer JWT verdict against the -K authorized_keys file (the
+ * the Bearer JWT verdict against the -K authorized_keys files (the
  * pubkey step of the reference chain): the username comes from the
  * CONNECT target (?user=), the jti binding rides the TLS exporter
  * ("EXPORTER-SSH3", the conversation id the reference signs into the
- * token)
+ * token).  The files walk in order, the first key that verifies
+ * wins; without any -K the default chain of the session user serves
+ * (the reference GetAuthorizedIdentities(): both files merge, so a
+ * file without the matching key never hides the next one - the walk
+ * keeps going after a missing or unreadable file)
  */
 
 static unsigned
 s3_srv_h3_jwt_verdict(void)
 {
-    s3_str_t header, path, user;
-    u_char   conv[32];
-    char     keys[512];
-    s3_int_t rc;
+    s3_str_t    header, path, user;
+    u_char      conv[32];
+    char        expanded[S3_SRV_KEYFILES_MAX][512];
+    char        chain[1024];
+    const char *files[S3_SRV_KEYFILES_MAX];
+    unsigned    nfiles = 0, i;
+    s3_int_t    rc;
 
     header.data = s3_srv_h3_auth;
     header.len = s3_srv_h3_auth_len;
@@ -1208,19 +1289,37 @@ s3_srv_h3_jwt_verdict(void)
         return 401;
     }
 
-    if (strchr(s3_srv_keyfile, '%') != NULL) {
+    if (s3_srv_keyfiles_n > 0) {
 
-        rc = s3_srv_keyfile_user_path(s3_srv_keyfile, &user, keys, sizeof(keys));
+        for (i = 0; i < s3_srv_keyfiles_n; i++) {
 
-        if (rc != S3_OK) {
-            fprintf(stderr, "ssh3-server: pubkey auth: bad keys path for user=%.*s\n",
-                    (int)user.len, (const char *)user.data);
-            return 401;
+            if (strchr(s3_srv_keyfiles[i], '%') != NULL) {
+
+                rc = s3_srv_keyfile_user_path(s3_srv_keyfiles[i], &user, expanded[i],
+                                              sizeof(expanded[i]));
+
+                if (rc != S3_OK) {
+                    fprintf(stderr, "ssh3-server: pubkey auth: bad keys path for user=%.*s\n",
+                            (int)user.len, (const char *)user.data);
+                    return 401;
+                }
+
+                files[nfiles++] = expanded[i];
+
+            } else {
+                files[nfiles++] = s3_srv_keyfiles[i];
+            }
         }
 
     } else {
 
-        snprintf(keys, sizeof(keys), "%s", s3_srv_keyfile);
+        rc = s3_ssh3_auth_default_chain(&user, chain, sizeof(chain), files, &nfiles);
+
+        if (rc != S3_OK) {
+            fprintf(stderr, "ssh3-server: pubkey auth: no default chain for user=%.*s\n",
+                    (int)user.len, (const char *)user.data);
+            return 401;
+        }
     }
 
     if (s3_srv_h3_pc == NULL || s3_srv_h3_pc->ssl == NULL ||
@@ -1231,7 +1330,22 @@ s3_srv_h3_jwt_verdict(void)
         return 401;
     }
 
-    rc = s3_ssh3_auth_jwt_verify(&header, &user, keys, conv, sizeof(conv));
+    rc = S3_DECLINED;
+
+    for (i = 0; i < nfiles && rc != S3_OK; i++) {
+
+        rc = s3_ssh3_auth_jwt_verify(&header, &user, files[i], conv, sizeof(conv));
+
+        if (rc == S3_ERROR) {
+
+            /* the unreadable file walks on: the reference skips the
+             * missing one the same way, the remaining files decide */
+
+            fprintf(stderr, "ssh3-server: pubkey auth: keys file %s unreadable\n", files[i]);
+
+            rc = S3_DECLINED;
+        }
+    }
 
     if (rc != S3_OK) {
         fprintf(stderr, "ssh3-server: pubkey auth: user=%.*s rejected rc=%d\n", (int)user.len,
@@ -1368,14 +1482,16 @@ s3_srv_h3_respond(s3_connection_t *pc)
         return;
     }
 
-    /* RFC 9220: :protocol marks an extended CONNECT, ssh3 is our
-     * route; the query part of the path carries the auth username
-     * (docs/P4-WIRE.md 7 step 3) and does not affect the route */
+    /* RFC 9220: :protocol marks an extended CONNECT, the :path route
+     * is the configured --url-path (the reference -url-path); the
+     * query part carries the auth username (docs/P4-WIRE.md 7 step 3)
+     * and does not affect the route */
 
     if (s3_srv_h3_method_len == 7 && s3_memcmp(s3_srv_h3_method, "CONNECT", 7) == 0 &&
         s3_srv_h3_protocol_len == 4 && s3_memcmp(s3_srv_h3_protocol, "ssh3", 4) == 0 &&
-        s3_srv_h3_path_len >= 10 && s3_memcmp(s3_srv_h3_path, "/ssh3-term", 10) == 0 &&
-        (s3_srv_h3_path_len == 10 || s3_srv_h3_path[10] == '?')) {
+        s3_srv_h3_path_len >= s3_srv_url_path_len &&
+        s3_memcmp(s3_srv_h3_path, s3_srv_url_path, s3_srv_url_path_len) == 0 &&
+        (s3_srv_h3_path_len == s3_srv_url_path_len || s3_srv_h3_path[s3_srv_url_path_len] == '?')) {
 
         /* RFC 9114, 4.4: the extended CONNECT carries :scheme and
          * :authority next to :method, :protocol and :path */
@@ -1406,35 +1522,41 @@ s3_srv_h3_respond(s3_connection_t *pc)
              * decides, the conversation nonce binds it */
             code = s3_srv_h3_oidc_verdict(pc);
 
-        } else if (s3_srv_keyfile != NULL && s3_srv_h3_auth_len > 0) {
+        } else {
 
             s3_str_t header;
 
             header.data = s3_srv_h3_auth;
             header.len = s3_srv_h3_auth_len;
 
-            if (s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+            if (s3_srv_h3_auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
 
-                /* the pubkey mode: the Bearer token decides */
+                /* the pubkey step: the Bearer token verifies against
+                 * the -K files, or against the default identities
+                 * chain of the session user when none is given (the
+                 * reference always runs it) */
 
                 code = s3_srv_h3_jwt_verdict();
 
             } else if (s3_srv_passfile != NULL) {
 
-                /* the Basic credentials still speak when -P rides along */
+                /* the Basic step: the password file decides, but the
+                 * method itself stays off until the login is opted
+                 * into (the reference enablePasswordLogin default) */
 
-                code = s3_srv_h3_basic_verdict();
+                code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict() : 401;
+
+            } else if (s3_srv_keyfiles_n == 0) {
+
+                /* the open harness mode: no auth mechanism is wired,
+                 * any authorization header passes (the interop
+                 * fixtures send a filler token) */
+
+                code = s3_srv_h3_auth_len ? 200 : 401;
 
             } else {
                 code = 401;
             }
-
-        } else if (s3_srv_passfile == NULL) {
-            code = s3_srv_h3_auth_len ? 200 : 401;
-
-        } else {
-            /* the password file mode: the Basic credentials decide */
-            code = s3_srv_h3_basic_verdict();
         }
 
     } else {
@@ -3552,22 +3674,38 @@ s3_srv_accept(s3_connection_t *c)
  * the systemd socket activation, the sd_listen_fds(3) protocol: the
  * passing process leaves the LISTEN_PID/LISTEN_FDS markers and the
  * ready listening sockets at fd 3 upward (SD_LISTEN_FDS_START).  The
- * claimed fd returns ready for the listener table, the local address
- * rides *sa out (getsockname() doubles as the family guard), -1 means
- * no activation here and the plain -l path runs.  A present but
- * unusable fd is a unit misconfiguration: the daemon stops instead of
- * falling back to -l - a silent second bind behind the unit's socket
- * would only move the failure from the startup to the first packet
+ * claimed fds return ready for the listener table and the local
+ * addresses ride sa[]/salen[] out (getsockname() doubles as the
+ * family guard).  One or two datagram sockets serve: a bare
+ * ListenDatagram=port hands over ONE dual-stack IPv6 socket
+ * (BindIPv6Only=default), a v4+v6 unit pair hands over TWO - each fd
+ * becomes its own listener, a connection stays on the fd it arrived
+ * on.  Both families serve (the IPv4-only guard died with the
+ * dual-stack bind of the reference).  A present but unusable fd is a
+ * unit misconfiguration: the daemon stops instead of falling back to
+ * -l - a silent second bind behind the unit's socket would only move
+ * the failure from the startup to the first packet
  */
 #define S3_SRV_SD_LISTEN_FDS 3 /* SD_LISTEN_FDS_START of sd_listen_fds(3) */
+#define S3_SRV_SD_LISTEN_MAX 2
+#define S3_SRV_LISTENERS_MAX S3_SRV_SD_LISTEN_MAX
+
+/* the per-socket listener state, one slot per served fd */
+
+static s3_udp_listen_t s3_srv_uls[S3_SRV_LISTENERS_MAX];
 
 static int
-s3_srv_sd_listen_fd(struct sockaddr_in *sa)
+s3_srv_sd_listen_fds(int                     fds[S3_SRV_SD_LISTEN_MAX],
+                     struct sockaddr_storage sa[S3_SRV_SD_LISTEN_MAX],
+                     socklen_t salen[S3_SRV_SD_LISTEN_MAX], unsigned *count)
 {
     const char *pid, *nfds;
-    int         fd, type;
+    int         type, v6only;
     socklen_t   sl;
     long        n;
+    unsigned    i;
+
+    *count = 0;
 
     pid = getenv("LISTEN_PID");
 
@@ -3583,49 +3721,81 @@ s3_srv_sd_listen_fd(struct sockaddr_in *sa)
         return -1;
     }
 
-    fd = S3_SRV_SD_LISTEN_FDS;
-
-    /* the guard: a datagram socket bound to an IPv4 address only */
-
-    sl = sizeof(type);
-
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &sl) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
-                     "getsockopt(SO_TYPE) of the socket-activated fd %d failed", fd);
-        exit(1);
-    }
-
-    if (type != SOCK_DGRAM) {
+    if (n > S3_SRV_SD_LISTEN_MAX) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
-                     "socket-activated fd %d is not a datagram socket (type %d)", fd, type);
+                     "socket activation passed %ld fds, at most %d serve", n, S3_SRV_SD_LISTEN_MAX);
         exit(1);
     }
 
-    sl = sizeof(*sa);
+    for (i = 0; i < (unsigned)n; i++) {
 
-    if (getsockname(fd, (struct sockaddr *)sa, &sl) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
-                     "getsockname() of the socket-activated fd %d failed", fd);
-        exit(1);
-    }
+        fds[i] = S3_SRV_SD_LISTEN_FDS + (int)i;
 
-    if (sa->sin_family != AF_INET) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
-                     "socket-activated fd %d is not an IPv4 socket (family %d),"
-                     " the daemon serves IPv4 only",
-                     fd, (int)sa->sin_family);
-        exit(1);
-    }
+        /* the guard: a datagram socket of either family */
 
-    /*
-     * the same listener hygiene as the -l path: nonblocking for the
-     * event loop, close-on-exec so the session children never hold
-     * the listening socket
-     */
-    if (s3_nonblocking(fd) != S3_OK || fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
-                     "socket-activated fd %d: hygiene failed", fd);
-        exit(1);
+        sl = sizeof(type);
+
+        if (getsockopt(fds[i], SOL_SOCKET, SO_TYPE, &type, &sl) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                         "getsockopt(SO_TYPE) of the socket-activated fd %d failed", fds[i]);
+            exit(1);
+        }
+
+        if (type != SOCK_DGRAM) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                         "socket-activated fd %d is not a datagram socket (type %d)", fds[i], type);
+            exit(1);
+        }
+
+        sl = sizeof(sa[i]);
+
+        if (getsockname(fds[i], (struct sockaddr *)&sa[i], &sl) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                         "getsockname() of the socket-activated fd %d failed", fds[i]);
+            exit(1);
+        }
+
+        salen[i] = sl;
+
+        if (sa[i].ss_family != AF_INET && sa[i].ss_family != AF_INET6) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                         "socket-activated fd %d has an unsupported family %d", fds[i],
+                         (int)sa[i].ss_family);
+            exit(1);
+        }
+
+        if (sa[i].ss_family == AF_INET6) {
+
+            /* the unit owns the mode: both (the default) or v6-only,
+             * the state is served as handed over and logged */
+
+            v6only = 0;
+            sl = sizeof(v6only);
+
+            if (getsockopt(fds[i], IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &sl) == -1) {
+                s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                             "getsockopt(IPV6_V6ONLY) of the socket-activated fd %d failed",
+                             fds[i]);
+                exit(1);
+            }
+
+            s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "socket-activated fd %d: IPv6 socket, %s",
+                         fds[i], v6only ? "v6-only per the unit" : "dual-stack");
+        }
+
+        /*
+         * the same listener hygiene as the -l path: nonblocking for
+         * the event loop, close-on-exec so the session children never
+         * hold the listening socket
+         */
+        if (s3_nonblocking(fds[i]) != S3_OK || fcntl(fds[i], F_SETFD, FD_CLOEXEC) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                         "socket-activated fd %d: hygiene failed", fds[i]);
+            exit(1);
+        }
+
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "socket-activated: serving the UDP fd %d",
+                     fds[i]);
     }
 
     /*
@@ -3636,9 +3806,101 @@ s3_srv_sd_listen_fd(struct sockaddr_in *sa)
     (void)unsetenv("LISTEN_PID");
     (void)unsetenv("LISTEN_FDS");
 
-    s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "socket-activated: serving the UDP fd %d", fd);
+    *count = (unsigned)n;
 
-    return fd;
+    return 0;
+}
+
+/* the host-order port of a listener address */
+
+static in_port_t
+s3_srv_port_of(const struct sockaddr_storage *ss)
+{
+    if (ss->ss_family == AF_INET) {
+        return ntohs(((const struct sockaddr_in *)ss)->sin_port);
+    }
+
+    return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+}
+
+/* the printable form of a listener address: v6 rides in brackets */
+
+static const char *
+s3_srv_addr_text(const struct sockaddr_storage *ss, char *buf, size_t size)
+{
+    const void *addr;
+    int         family = ss->ss_family;
+
+    if (family == AF_INET) {
+        addr = &((const struct sockaddr_in *)ss)->sin_addr;
+    } else if (family == AF_INET6) {
+        addr = &((const struct sockaddr_in6 *)ss)->sin6_addr;
+    } else {
+        snprintf(buf, size, "family-%d", family);
+        return buf;
+    }
+
+    if (inet_ntop(family, addr, buf, (socklen_t)size) == NULL) {
+        snprintf(buf, size, "unprintable");
+    }
+
+    return buf;
+}
+
+/*
+ * one listening socket: the connection object, its local address and
+ * the per-socket listener state (the rbtree of the quic sockets); a
+ * connection stays on the fd it arrived on, so a v4+v6 pair runs two
+ * independent listener states behind one accept handler
+ */
+static s3_connection_t *
+s3_srv_listener_add(s3_event_ctx_t *ctx, s3_fd_t fd, const struct sockaddr_storage *sa,
+                    socklen_t salen, unsigned idx)
+{
+    s3_connection_t *listener;
+    s3_udp_listen_t *ul;
+    s3_int_t         rc;
+
+    listener = s3_get_connection(ctx, fd);
+
+    if (listener == NULL) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "connection alloc failed");
+        return NULL;
+    }
+
+    listener->sockaddr = (struct sockaddr *)s3_palloc(ctx->pool, salen);
+
+    if (listener->sockaddr == NULL) {
+        return NULL;
+    }
+
+    s3_memcpy(listener->sockaddr, sa, salen);
+    listener->socklen = salen;
+
+    ul = &s3_srv_uls[idx];
+
+    s3_memzero(ul, sizeof(*ul));
+
+    ul->connection = listener;
+    ul->ctx = ctx;
+    ul->handler = s3_srv_accept;
+    ul->quic = 1;
+
+    /* the quic listener: the rbtree is keyed by the packet dcid */
+
+    s3_rbtree_init(&ul->rbtree, &ul->sentinel, s3_quic_rbtree_insert_socket);
+
+    listener->data = ul;
+    listener->read->handler = s3_event_recvmsg;
+
+    rc = s3_event_actions.add_event(listener->read, S3_READ_EVENT, 0);
+
+    if (rc != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "add_event failed");
+        return NULL;
+    }
+
+    return listener;
 }
 
 static void
@@ -3647,9 +3909,12 @@ s3_srv_usage(const char *prog)
     fprintf(stderr,
             "usage: %s [-l addr:port] -c cert.pem -k key.pem [-A alpn] [-d dg_size]"
             " [-i idle_ms] [-L level] [-P pwfile] [-H dir] [-v] [-V]\n"
-            "  -l  UDP listen address, port 0 picks an ephemeral one; omitted under"
-            " systemd socket\n"
-            "      activation (LISTEN_FDS): the passed fd serves, no bind happens\n"
+            "  -l  UDP listen address: a.b.c.d:port or [v6]:port ([::] serves both"
+            " families, the\n"
+            "      reference -bind default); port 0 picks an ephemeral one; omitted"
+            " under systemd\n"
+            "      socket activation (LISTEN_FDS): the passed fd(s) serve, no bind"
+            " happens\n"
             "  -c  certificate PEM file\n"
             "  -k  private key PEM file\n"
             "  -A  ALPN name, default h3 (RFC 9220 extended CONNECT, ssh3)\n"
@@ -3657,10 +3922,20 @@ s3_srv_usage(const char *prog)
             "  -i  quic idle timeout, milliseconds, default 60000\n"
             "  -L  log level: a name (debug|info|warn|error) or an s3 numeric\n"
             "  -P  password file: the CONNECT passes only with the Basic"
-            " user:secret\n"
-            "  -K  authorized_keys file: the CONNECT passes only with a Bearer JWT"
-            " signed by\n"
-            "      one of its keys; %%u in the path is the session username\n"
+            " user:secret AND the\n"
+            "      password login opted into (--enable-password-login or"
+            " SSH3_ENABLE_PASSWORD_LOGIN=1,\n"
+            "      the reference default is off)\n"
+            "  -K  authorized_keys file, repeatable: the CONNECT passes only with a"
+            " Bearer JWT\n"
+            "      signed by one of their keys; %%u in the path is the session"
+            " username; without\n"
+            "      -K the default chain of the session user serves"
+            " (~/.ssh3/authorized_identities\n"
+            "      then ~/.ssh/authorized_keys, the reference"
+            " DefaultIdentitiesFileNames)\n"
+            "  --url-path p: the CONNECT route, default /ssh3-term (the reference"
+            " -url-path)\n"
             "  -H  the sftp jail directory override, default the user's home\n"
             "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
             " with the Bearer\n"
@@ -3674,30 +3949,33 @@ s3_srv_usage(const char *prog)
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
             "      default 5, 0 closes the connections immediately),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
-            "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,\n"
-            "      the passed UDP fd serves and -l is not required\n",
+            "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
+            " the passed UDP\n"
+            "      fd(s) serve and -l is not required; one dual-stack fd (the"
+            " bare\n"
+            "      ListenDatagram=port) or the v4+v6 pair serve\n",
             prog);
 }
 
 int
 main(int argc, char **argv)
 {
-    char               opt;
-    const char        *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
-    const char        *alpn_name = "h3";
-    unsigned           dg_size = 1200, idle_ms = 60000;
-    u_char            *cert, *key, alpn_wire[256];
-    size_t             cert_len = 0, key_len = 0;
-    s3_str_t           alpn;
-    s3_int_t           rc;
-    s3_uint_t          i;
-    s3_fd_t            fd;
-    struct sockaddr_in sa;
-    socklen_t          sa_len;
-    s3_event_ctx_t     ctx;
-    s3_connection_t   *listener;
-    s3_udp_listen_t    ul;
-    struct sigaction   act;
+    char                    opt;
+    const char             *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
+    const char             *alpn_name = "h3";
+    const char             *url_path_arg = NULL;
+    unsigned                dg_size = 1200, idle_ms = 60000;
+    u_char                 *cert, *key, alpn_wire[256];
+    size_t                  cert_len = 0, key_len = 0;
+    s3_str_t                alpn;
+    s3_int_t                rc;
+    s3_uint_t               i;
+    int                     listen_fds[S3_SRV_LISTENERS_MAX];
+    struct sockaddr_storage listen_sa[S3_SRV_LISTENERS_MAX];
+    socklen_t               listen_salen[S3_SRV_LISTENERS_MAX];
+    unsigned                listeners = 0, li;
+    s3_event_ctx_t          ctx;
+    struct sigaction        act;
 
     s3_srv_log_init();
 
@@ -3725,18 +4003,19 @@ main(int argc, char **argv)
     }
 
     /*
-     * the OIDC options ride the long form (the daemon keeps the
-     * names), the pre-scan pulls them out of argv before the short
-     * getopt loop
+     * the OIDC options and the ssh3 routes ride the long form (the
+     * daemon keeps the names of the reference), the pre-scan pulls
+     * them out of argv before the short getopt loop
      */
 
     {
-        int   n, m, keep;
+        int   n, m, keep, drop;
         char *value;
 
         for (n = 1; n < argc;) {
 
             keep = 1;
+            drop = 0;
             value = NULL;
 
             if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
@@ -3750,17 +4029,34 @@ main(int argc, char **argv)
             } else if (strcmp(argv[n], "--oidc-jwks-ttl") == 0 && n + 1 < argc) {
                 s3_srv_oidc_ttl = (time_t)atoi(argv[n + 1]);
                 value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--url-path") == 0 && n + 1 < argc) {
+                url_path_arg = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--enable-password-login") == 0) {
+
+                /* the flag form carries no value: it overrides the
+                 * env default parsed below and drops alone */
+
+                s3_srv_password_enabled = 1;
+                drop = 1;
             }
 
             if (value != NULL) {
+                drop = 2;
+            }
 
-                /* the option and its value leave the argv */
+            if (drop > 0) {
 
-                for (m = n; m + 2 < argc; m++) {
-                    argv[m] = argv[m + 2];
+                /* the option (and its value, when one rides) leaves
+                 * the argv */
+
+                for (m = n; m + drop < argc; m++) {
+                    argv[m] = argv[m + drop];
                 }
 
-                argc -= 2;
+                argc -= drop;
                 keep = 0;
             }
 
@@ -3816,7 +4112,16 @@ main(int argc, char **argv)
             break;
 
         case 'K':
-            s3_srv_keyfile = optarg;
+
+            /* the repeatable -K: the files walk in the given order */
+
+            if (s3_srv_keyfiles_n >= S3_SRV_KEYFILES_MAX) {
+                s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "too many -K files (max %d)",
+                             S3_SRV_KEYFILES_MAX);
+                return 1;
+            }
+
+            s3_srv_keyfiles[s3_srv_keyfiles_n++] = optarg;
             break;
 
         case 'H':
@@ -3848,12 +4153,53 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* the route of the reference -url-path: a non-empty path with the
+     * leading slash, the query stays out of the config */
+
+    if (url_path_arg != NULL) {
+
+        size_t n = strlen(url_path_arg);
+
+        if (n == 0 || n >= sizeof(s3_srv_url_path) || url_path_arg[0] != '/') {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad url path \"%s\"", url_path_arg);
+            return 1;
+        }
+
+        memcpy(s3_srv_url_path, url_path_arg, n + 1);
+        s3_srv_url_path_len = n;
+    }
+
+    /*
+     * the password login: the env default parsed first (the
+     * ParseBool of the reference accepts the 1/true forms, the rest
+     * reads as off), the flag above has overridden it already
+     */
+
+    if (!s3_srv_password_enabled) {
+
+        const char *env = getenv("SSH3_ENABLE_PASSWORD_LOGIN");
+
+        if (env != NULL &&
+            (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0 ||
+             strcmp(env, "True") == 0 || strcmp(env, "t") == 0 || strcmp(env, "T") == 0)) {
+            s3_srv_password_enabled = 1;
+        }
+    }
+
+    if (s3_srv_passfile != NULL && !s3_srv_password_enabled) {
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "the password file serves nothing: the password login is off,"
+                     " opt in with --enable-password-login or"
+                     " SSH3_ENABLE_PASSWORD_LOGIN=1");
+    }
+
     /*
      * -l stays optional: the socket-activated daemon serves the passed
      * fd and binds nothing (the check below runs before any use of
      * listen_text)
      */
-    if (listen_text != NULL && s3_srv_parse_addr(listen_text, &sa) != S3_OK) {
+    if (listen_text != NULL &&
+        s3_srv_parse_addr(listen_text, &listen_sa[0], &listen_salen[0]) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad listen address %s", listen_text);
         return 1;
     }
@@ -3925,9 +4271,11 @@ main(int argc, char **argv)
                            s3_ssh3_oidc_verifier_fetch_timer(&s3_srv_oidc_ver, time(NULL)));
     }
 
-    fd = s3_srv_sd_listen_fd(&sa);
+    rc = s3_srv_sd_listen_fds(listen_fds, listen_sa, listen_salen, &listeners);
 
-    if (fd < 0) {
+    if (rc < 0) {
+
+        int fd;
 
         if (listen_text == NULL) {
 
@@ -3936,10 +4284,32 @@ main(int argc, char **argv)
             return 1;
         }
 
-        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        fd = socket(listen_sa[0].ss_family, SOCK_DGRAM, 0);
         if (fd == -1) {
             s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "socket() failed");
             return 1;
+        }
+
+        if (listen_sa[0].ss_family == AF_INET6) {
+
+            /*
+             * the dual-stack bind of the reference ([::]:443): the
+             * v4 clients ride the v4-mapped addresses, one socket
+             * serves both families (the OpenSSH ListenAddress
+             * default shape).  A kernel that refuses the dual mode
+             * stops the daemon: a silent v6-only [::] bind would
+             * move the v4 failure to the first packet
+             */
+            int v6only = 0;
+
+            if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) == -1) {
+                s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                             "setsockopt(IPV6_V6ONLY) failed");
+                return 1;
+            }
+
+            s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
+                         "the [v6] bind serves both families (V6ONLY=0)");
         }
 
         if (s3_nonblocking(fd) != S3_OK) {
@@ -3958,53 +4328,50 @@ main(int argc, char **argv)
             return 1;
         }
 
-        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+        if (bind(fd, (struct sockaddr *)&listen_sa[0], listen_salen[0]) == -1) {
             s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "bind() %s failed", listen_text);
             return 1;
         }
 
-        sa_len = sizeof(sa);
-
-        if (getsockname(fd, (struct sockaddr *)&sa, &sa_len) == -1) {
+        if (getsockname(fd, (struct sockaddr *)&listen_sa[0], &listen_salen[0]) == -1) {
             s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "getsockname() failed");
             return 1;
         }
+
+        listen_fds[0] = fd;
+        listeners = 1;
 
     } else if (listen_text != NULL) {
 
         /*
          * the unit owns the port: the activated socket serves, a -l
          * the operator kept changes nothing (no second bind); the
-         * claim already filled *sa and verified the family, the
-         * length follows here for the listener sockaddr below
+         * claim already filled listen_sa[] and verified the family
          */
-        sa_len = sizeof(sa);
-
         s3_log_error(S3_LOG_WARN, &s3_srv_log, 0, "socket-activated: -l %s ignored", listen_text);
-
-    } else {
-        sa_len = sizeof(sa);
     }
 
-    s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "ssh3-server version %d.%d.%d listening on %s:%ui",
-                 S3_SSH3_SOFTWARE_MAJOR, S3_SSH3_SOFTWARE_MINOR, S3_SSH3_SOFTWARE_PATCH,
-                 inet_ntoa(sa.sin_addr), (s3_uint_t)ntohs(sa.sin_port));
+    for (li = 0; li < listeners; li++) {
 
-    s3_srv_report("INTEROP-LISTEN port=%u\n", (unsigned)ntohs(sa.sin_port));
+        char addr_text[INET6_ADDRSTRLEN];
 
-    listener = s3_get_connection(&ctx, fd);
-    if (listener == NULL) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "connection alloc failed");
-        return 1;
+        s3_connection_t *listener =
+            s3_srv_listener_add(&ctx, listen_fds[li], &listen_sa[li], listen_salen[li], li);
+
+        if (listener == NULL) {
+            return 1;
+        }
+
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
+                     "ssh3-server version %d.%d.%d listening on %s:%ui", S3_SSH3_SOFTWARE_MAJOR,
+                     S3_SSH3_SOFTWARE_MINOR, S3_SSH3_SOFTWARE_PATCH,
+                     s3_srv_addr_text(&listen_sa[li], addr_text, sizeof(addr_text)),
+                     (s3_uint_t)s3_srv_port_of(&listen_sa[li]));
+
+        /* the runner scripts pick the first listener by this line */
+
+        s3_srv_report("INTEROP-LISTEN port=%u\n", (unsigned)s3_srv_port_of(&listen_sa[li]));
     }
-
-    listener->sockaddr = (struct sockaddr *)s3_palloc(ctx.pool, sa_len);
-    if (listener->sockaddr == NULL) {
-        return 1;
-    }
-
-    s3_memcpy(listener->sockaddr, &sa, sa_len);
-    listener->socklen = sa_len;
 
     s3_srv_alpn_wire(alpn_wire, alpn_name);
 
@@ -4046,26 +4413,6 @@ main(int argc, char **argv)
     if (RAND_bytes(s3_srv_conf.av_token_key, S3_QUIC_AV_KEY_LEN) != 1 ||
         RAND_bytes(s3_srv_conf.sr_token_key, S3_QUIC_SR_KEY_LEN) != 1) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "RAND_bytes() failed");
-        return 1;
-    }
-
-    /* the quic listener: the rbtree is keyed by the packet dcid */
-
-    s3_memzero(&ul, sizeof(ul));
-
-    ul.connection = listener;
-    ul.ctx = &ctx;
-    ul.handler = s3_srv_accept;
-    ul.quic = 1;
-
-    s3_rbtree_init(&ul.rbtree, &ul.sentinel, s3_quic_rbtree_insert_socket);
-
-    listener->data = &ul;
-    listener->read->handler = s3_event_recvmsg;
-
-    rc = s3_event_actions.add_event(listener->read, S3_READ_EVENT, 0);
-    if (rc != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "add_event failed");
         return 1;
     }
 
