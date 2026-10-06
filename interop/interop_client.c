@@ -3023,8 +3023,15 @@ s3_interop_cm_shutdown(void)
         s3_interop_cm_listen_fd = -1;
     }
 
-    /* the clean teardown: no stale socket file */
-    (void)unlink(s3_interop_cm_path);
+    /*
+     * the clean teardown: no stale socket file; only the process that
+     * owned the listening socket unlinks the path, the dup master that
+     * refused the live path must leave its peer's file alone
+     */
+
+    if (s3_interop_cm_listening) {
+        (void)unlink(s3_interop_cm_path);
+    }
 }
 
 /* the append and flush of one connection, the growth pays per size
@@ -5825,6 +5832,7 @@ main(int argc, char **argv)
     s3_uint_t             hs_reported = 0, sfin_sent = 0;
     s3_msec_t             start;
     s3_fd_t               fd;
+    int                   rc = 0;
     struct sockaddr_in    sa;
     s3_event_ctx_t        ctx;
     s3_connection_t      *cli;
@@ -6427,12 +6435,14 @@ main(int argc, char **argv)
 
     cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_interop_log);
     if (cli->pool == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     cli->sockaddr = (struct sockaddr *)s3_palloc(cli->pool, sizeof(sa));
     if (cli->sockaddr == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     s3_memcpy(cli->sockaddr,
@@ -6460,7 +6470,8 @@ main(int argc, char **argv)
     conf.ssl = s3_ssl_client_create(&s3_interop_log, &alpn);
     if (conf.ssl == NULL) {
         fprintf(stderr, "interop-client: ssl init failed\n");
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     conf.gso_enabled = 1;
@@ -6489,17 +6500,20 @@ main(int argc, char **argv)
     }
 
     if (s3_event_actions.add_event(cli->read, S3_READ_EVENT, 0) != S3_OK) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     if (s3_quic_connect(cli, &conf) != S3_OK) {
         fprintf(stderr, "interop-client: connect failed\n");
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     qc = s3_quic_get_connection(cli);
     if (qc == NULL) {
-        return 1;
+        rc = 1;
+        goto teardown;
     }
 
     /* the shared connection the master sessions open their channels on */
@@ -6525,7 +6539,8 @@ main(int argc, char **argv)
 
         if (qc == NULL) {
             fprintf(stderr, "interop-client: connection is gone\n");
-            return 1;
+            rc = 1;
+            goto teardown;
         }
 
         if (!hs_reported && cli->ssl != NULL && cli->ssl->handshaked) {
@@ -6537,13 +6552,15 @@ main(int argc, char **argv)
             if ((s3_interop_oidc_issuer != NULL || s3_interop_oidc_raw != NULL) &&
                 s3_interop_oidc_acquire(cli->ssl->connection) != S3_OK) {
                 fprintf(stderr, "interop-client: oidc auth failed\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_pubkey_path != NULL &&
                 s3_interop_pubkey_jwt(cli->ssl->connection) != S3_OK) {
                 fprintf(stderr, "interop-client: pubkey jwt failed\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_h3_mode) {
@@ -6555,7 +6572,8 @@ main(int argc, char **argv)
                  */
                 if (s3_h3_get_session(cli) == NULL && s3_h3_init_session(cli) != S3_OK) {
                     fprintf(stderr, "interop-client: h3 init_session failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_memzero(&s3_interop_h3_parse, sizeof(s3_h3_parse_headers_t));
@@ -6563,7 +6581,8 @@ main(int argc, char **argv)
                 s3_interop_h3_stream = s3_quic_open_stream(cli, 1);
                 if (s3_interop_h3_stream == NULL) {
                     fprintf(stderr, "interop-client: open_stream failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_interop_h3_stream->read->handler = s3_interop_h3_response_read;
@@ -6581,7 +6600,8 @@ main(int argc, char **argv)
                 s3_interop_stream = s3_quic_open_stream(cli, 1);
                 if (s3_interop_stream == NULL) {
                     fprintf(stderr, "interop-client: open_stream failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 s3_interop_stream->read->handler = s3_interop_stream_echo_read;
@@ -6591,7 +6611,8 @@ main(int argc, char **argv)
 
             } else if (qc->client_tp_done && qc->ctp.max_datagram_frame_size == 0) {
                 fprintf(stderr, "interop-client: peer does not support datagrams\n");
-                return 1;
+                rc = 1;
+                goto teardown;
             }
         }
 
@@ -6625,7 +6646,8 @@ main(int argc, char **argv)
 
                 else if (m != (ssize_t)total) {
                     fprintf(stderr, "interop-client: h3 request send failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 else {
@@ -6642,7 +6664,8 @@ main(int argc, char **argv)
                  */
                 if (s3_interop_h3_status_seen && !s3_interop_cm_listening &&
                     s3_interop_cm_listen_open(&ctx) != S3_OK) {
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
 
                 if (s3_interop_cm_stop) {
@@ -6664,7 +6687,8 @@ main(int argc, char **argv)
 
                     if (s3_interop_h3_channel == NULL) {
                         fprintf(stderr, "interop-client: channel open_stream failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     s3_interop_fwd_conv_id = ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
@@ -6748,7 +6772,8 @@ main(int argc, char **argv)
 
                         if (inet_pton(AF_INET, "127.0.0.1", target.ip) != 1) {
                             fprintf(stderr, "interop-client: inet_pton failed\n");
-                            return 1;
+                            rc = 1;
+                            goto teardown;
                         }
 
                         target.port = (uint16_t)s3_interop_fwd_port;
@@ -6893,7 +6918,8 @@ main(int argc, char **argv)
 
                     else if (m != (ssize_t)total) {
                         fprintf(stderr, "interop-client: channel send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     else {
@@ -6921,7 +6947,8 @@ main(int argc, char **argv)
                             if (s3_quic_shutdown_stream(s3_interop_h3_channel, S3_WRITE_SHUTDOWN) !=
                                 S3_OK) {
                                 fprintf(stderr, "interop-client: channel shutdown failed\n");
-                                return 1;
+                                rc = 1;
+                                goto teardown;
                             }
                         }
                     }
@@ -6953,7 +6980,8 @@ main(int argc, char **argv)
 
                     } else {
                         fprintf(stderr, "interop-client: forward datagram send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
                 }
 
@@ -6993,7 +7021,8 @@ main(int argc, char **argv)
 
                     else if (m != (ssize_t)total) {
                         fprintf(stderr, "interop-client: signal send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     else {
@@ -7079,7 +7108,8 @@ main(int argc, char **argv)
 
                     if (m <= 0) {
                         fprintf(stderr, "interop-client: stream send failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     s3_interop_ssent += (size_t)m;
@@ -7089,7 +7119,8 @@ main(int argc, char **argv)
                 if (s3_interop_ssent == s3_interop_stotal && !sfin_sent) {
                     if (s3_quic_shutdown_stream(s3_interop_stream, S3_WRITE_SHUTDOWN) != S3_OK) {
                         fprintf(stderr, "interop-client: stream shutdown failed\n");
-                        return 1;
+                        rc = 1;
+                        goto teardown;
                     }
 
                     sfin_sent = 1;
@@ -7112,7 +7143,8 @@ main(int argc, char **argv)
 
                 } else {
                     fprintf(stderr, "interop-client: send_datagram failed\n");
-                    return 1;
+                    rc = 1;
+                    goto teardown;
                 }
             }
 
@@ -7159,7 +7191,8 @@ main(int argc, char **argv)
                             (unsigned long long)s3_interop_jump_recv, s3_interop_bridge_parked);
                 }
 
-                return 1;
+                rc = 1;
+                goto teardown;
             }
 
             if (s3_interop_streams_mode) {
@@ -7195,15 +7228,18 @@ main(int argc, char **argv)
                         sent, s3_interop_received, required);
             }
 
-            return 1;
+            rc = 1;
+            goto teardown;
         }
     }
 
     /*
-     * the silent abort runs the full teardown: the ssl shutdown frees
-     * the openssl object, the keys are cleansed and the connection
-     * pool dies with the quic connection in it
+     * the common teardown: the success breaks and every error path
+     * after the connection was created land here, the quic layer and
+     * the harness-owned buffers die before the exit leak check
      */
+
+teardown:
 
     /*
      * the harness-owned streams first: dropping them runs the quic
@@ -7229,7 +7265,21 @@ main(int argc, char **argv)
         s3_interop_cm_shutdown();
     }
 
-    s3_event_process_posted(&ctx, &ctx.posted_events);
+    /*
+     * the posted drain: the force-reset streams run their teardown
+     * handlers, the quic close reposts until the connection pools die
+     */
+
+    for (i = 0; i < 64; i++) {
+
+        if (s3_quic_get_connection(cli) == NULL &&
+            (s3_interop_jump_cli == NULL || s3_quic_get_connection(s3_interop_jump_cli) == NULL) &&
+            s3_queue_empty(&ctx.posted_events)) {
+            break;
+        }
+
+        s3_event_process_posted(&ctx, &ctx.posted_events);
+    }
 
     s3_ssl_free(conf.ssl);
 
@@ -7240,6 +7290,15 @@ main(int argc, char **argv)
     free(s3_interop_expected);
     free(s3_interop_got);
     free(s3_interop_fwd_payload);
+
+    /* the mode-local accumulators grow by realloc, NULL free is fine */
+
+    free(s3_interop_h3_buf);
+    free(s3_interop_h3_ch_buf);
+    free(s3_interop_h3_sess_out);
+    free(s3_interop_sftp_out);
+    free(s3_interop_sftp_buf);
+    free(s3_interop_agent_in);
 
     (void)close(fd);
 
@@ -7255,7 +7314,9 @@ main(int argc, char **argv)
         (void)close(s3_interop_bridge_b);
     }
 
-    s3_destroy_pool(ctx.pool);
+    /* the event method data dies with the pool of the connections */
 
-    return 0;
+    s3_event_ctx_shutdown(&ctx);
+
+    return rc;
 }
