@@ -34,6 +34,24 @@ s3_int_t s3_ssh3_auth_basic_decode(const s3_str_t *header, s3_str_t *user, s3_st
 s3_int_t s3_ssh3_auth_user_from_path(const s3_str_t *path, s3_str_t *user);
 
 /*
+ * the default identities chain of the session user, the reference
+ * DefaultIdentitiesFileNames() (server_auth/authorized_identities.go):
+ * $home/.ssh3/authorized_identities first, $home/.ssh/authorized_keys
+ * second, the home from the user database (getpwnam(3), the verdict
+ * process reads the target user's files).  The names land in buf as
+ * zero-terminated strings and paths[] points into it; S3_OK fills *n
+ * (always S3_SSH3_AUTH_CHAIN_MAX), S3_ERROR on an unusable username
+ * (outside the plain-name charset, unknown in the user database, no
+ * room in buf).  The file existence is the caller's concern: the
+ * reference opens both and tolerates the missing one
+ */
+
+#define S3_SSH3_AUTH_CHAIN_MAX 2
+
+s3_int_t s3_ssh3_auth_default_chain(const s3_str_t *user, char *buf, size_t size,
+                                    const char *paths[S3_SSH3_AUTH_CHAIN_MAX], unsigned *n);
+
+/*
  * the harness credential file: one "user:secret" per line, '#'
  * comments and empty lines skip; S3_OK on a match, S3_DECLINED when
  * the user or the secret does not match, S3_ERROR on an unreadable

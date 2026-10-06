@@ -516,7 +516,7 @@ s3_tj_flip(char *token, size_t zone)
 static int
 s3_test_ssh3_auth_jwt(void)
 {
-    char      path_a[32], path_ec[32], path_rsa[32], path_multi[32];
+    char      path_a[32], path_ec[32], path_rsa[32], path_multi[32], path_idents[32];
     char      content[1024], blob[512], blob_b64[800], jti[64], claims[1024];
     char      token[2200];
     long long now = (long long)time(NULL);
@@ -564,6 +564,21 @@ s3_test_ssh3_auth_jwt(void)
              blob_b64);
     s3_tj_keysfile(path_multi, content);
 
+    /* the identities shape of the fork (the authorized_identities
+     * file): the directive lines are not keys, the walk skips them
+     * and the key behind them still decides (the reference logs and
+     * continues over an unparsable identity line) */
+
+    snprintf(content, sizeof(content),
+             "# the identities fixture\n"
+             "\n"
+             "plugin:some-plugin some-option\n"
+             "oidc https://issuer.example client_id user@example.org\n"
+             "\n"
+             "no-pty ssh-ed25519 %s identities\n",
+             blob_b64);
+    s3_tj_keysfile(path_idents, content);
+
     /* the happy paths, one per allowlisted algorithm */
 
     /* the fresh clock: the whole suite runs over 10s under
@@ -586,6 +601,11 @@ s3_test_ssh3_auth_jwt(void)
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("decorated keys file", token, "bob", path_multi, s3_tj_conv, sizeof(s3_tj_conv),
                S3_OK);
+
+    /* the identities directives before the key: the walk skips them */
+
+    s3_tj_case("identities directives skip", token, "bob", path_idents, s3_tj_conv,
+               sizeof(s3_tj_conv), S3_OK);
 
     /* the aud array form carries the audience in a member */
 

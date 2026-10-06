@@ -1065,8 +1065,11 @@ s3_ssh3_jwt_sig_verify(const s3_str_t *alg, EVP_PKEY *key, const u_char *msg, si
 /*
  * the authorized_keys walk: one line at a time through the iterator,
  * the blob decodes in place and the first key that verifies the
- * signature wins; an unparseable line skips (the reference logs and
- * continues), the unreadable file is S3_ERROR
+ * signature wins; a malformed line skips to the next one (the
+ * reference ParseAuthorizedIdentitiesFile() logs and continues over
+ * an unparsable identity - the directive lines of the fork's
+ * authorized_identities file, the plugin: and oidc shapes, ride the
+ * same skip), the unreadable file is S3_ERROR
  */
 
 static s3_int_t
@@ -1077,7 +1080,7 @@ s3_ssh3_jwt_keys_file(const char *path, const s3_str_t *alg, const u_char *msg, 
     size_t   dlen;
     long     size;
     FILE    *f;
-    s3_int_t rc;
+    s3_int_t rc, line;
 
     f = fopen(path, "rb");
 
@@ -1121,26 +1124,39 @@ s3_ssh3_jwt_keys_file(const char *path, const s3_str_t *alg, const u_char *msg, 
         const u_char *pos = buf, *end = buf + size;
         s3_str_t      keytype, b64;
 
-        while (rc == S3_DECLINED &&
-               s3_ssh3_auth_authorized_keys_next(&pos, end, &keytype, &b64) == S3_OK) {
+        line = s3_ssh3_auth_authorized_keys_next(&pos, end, &keytype, &b64);
 
-            EVP_PKEY *key;
+        while (rc == S3_DECLINED && line != S3_DONE) {
 
-            if (s3_ssh3_jwt_b64_decode(b64.data, b64.len, &dlen, 0) != S3_OK) {
-                continue;
+            if (line == S3_OK) {
+
+                EVP_PKEY *key;
+
+                if (s3_ssh3_jwt_b64_decode(b64.data, b64.len, &dlen, 0) == S3_OK) {
+
+                    key = s3_ssh3_jwt_blob_key(b64.data, dlen);
+
+                    if (key != NULL) {
+
+                        if (s3_ssh3_jwt_sig_verify(alg, key, msg, msglen, sig, siglen) == S3_OK) {
+                            rc = S3_OK;
+                        }
+
+                        EVP_PKEY_free(key);
+                    }
+                }
+
+            } else {
+
+                /* the iterator stays on the malformed line: the walk
+                 * skips past it and the rest of the file decides */
+
+                const u_char *nl = memchr(pos, '\n', (size_t)(end - pos));
+
+                pos = (nl != NULL) ? nl + 1 : end;
             }
 
-            key = s3_ssh3_jwt_blob_key(b64.data, dlen);
-
-            if (key == NULL) {
-                continue;
-            }
-
-            if (s3_ssh3_jwt_sig_verify(alg, key, msg, msglen, sig, siglen) == S3_OK) {
-                rc = S3_OK;
-            }
-
-            EVP_PKEY_free(key);
+            line = s3_ssh3_auth_authorized_keys_next(&pos, end, &keytype, &b64);
         }
     }
 

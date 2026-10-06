@@ -8,6 +8,7 @@
 
 #include <s3_core.h>
 
+#include <pwd.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -344,6 +345,92 @@ s3_test_authorized_keys(void)
 }
 
 static int
+s3_test_default_chain(void)
+{
+    char        buf[1024];
+    const char *paths[S3_SSH3_AUTH_CHAIN_MAX];
+    unsigned    n;
+    s3_str_t    user;
+
+    struct passwd *pw;
+    char           want[2][512];
+    unsigned       i;
+
+    /*
+     * the chain of the reference DefaultIdentitiesFileNames(): the
+     * user database home joined with the two suffixes, in that order
+     */
+
+    pw = getpwuid(geteuid());
+
+    S3_ASSERT(pw != NULL);
+
+    if (pw == NULL) {
+        return s3_test_failures;
+    }
+
+    snprintf(want[0], sizeof(want[0]), "%s/.ssh3/authorized_identities", pw->pw_dir);
+    snprintf(want[1], sizeof(want[1]), "%s/.ssh/authorized_keys", pw->pw_dir);
+
+    user.data = (u_char *)pw->pw_name;
+    user.len = strlen(pw->pw_name);
+
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_OK);
+    S3_ASSERT(n == 2);
+
+    for (i = 0; i < n; i++) {
+
+        S3_ASSERT(paths[i] != NULL);
+        S3_ASSERT(strlen(paths[i]) == strlen(want[i]));
+        S3_ASSERT(strcmp(paths[i], want[i]) == 0);
+    }
+
+    /* the names must not overlap: two zero-terminated strings */
+
+    S3_ASSERT(paths[1] >= paths[0] + strlen(paths[0]) + 1);
+
+    /* the unknown user does not resolve */
+
+    user.data = (u_char *)"s3-no-such-user-9x7";
+    user.len = strlen((char *)user.data);
+
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    /* the plain-name guard: the chain never climbs or splits paths */
+
+    user.data = (u_char *)"../etc";
+    user.len = 6;
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    user.data = (u_char *)".hidden";
+    user.len = 7;
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    user.data = (u_char *)"a/b";
+    user.len = 3;
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    user.data = (u_char *)"a b";
+    user.len = 3;
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    /* the empty user is rejected before the lookup */
+
+    user.data = (u_char *)"root";
+    user.len = 0;
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, sizeof(buf), paths, &n) == S3_ERROR);
+
+    /* the output buffer that cannot hold both names is an error */
+
+    user.data = (u_char *)pw->pw_name;
+    user.len = strlen(pw->pw_name);
+
+    S3_ASSERT(s3_ssh3_auth_default_chain(&user, buf, 8, paths, &n) == S3_ERROR);
+
+    return s3_test_failures;
+}
+
+static int
 s3_test_ssh3_auth_srv(void)
 {
     (void)s3_test_basic_decode();
@@ -351,6 +438,7 @@ s3_test_ssh3_auth_srv(void)
     (void)s3_test_password_file();
     (void)s3_test_password_file_missing();
     (void)s3_test_authorized_keys();
+    (void)s3_test_default_chain();
 
     return s3_test_failures;
 }
