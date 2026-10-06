@@ -1,0 +1,31 @@
+[Unit]
+Description=SSH3 server QUIC/UDP listener (socket activation)
+Documentation=man:ssh3-server(8)
+
+[Socket]
+# ssh3 is QUIC over UDP (RFC 9000), the route rides HTTP/3 extended
+# CONNECT (RFC 9220) - one datagram listener serves everything.
+#
+# The wildcard is spelled out on purpose: the daemon speaks IPv4 and
+# serves exactly ONE passed fd (see ssh3-server(8), SOCKET
+# ACTIVATION); a bare "ListenDatagram=443" would create the v6+v4
+# pair and the service would pick only the first socket.  IPv6 needs
+# a dual-stack listener in the daemon first - not a second line here.
+ListenDatagram=0.0.0.0:443
+#
+# Binding as root here is the whole point of the socket activation:
+# the bound fd is handed to ssh3-server.service, which runs
+# unprivileged and needs no CAP_NET_BIND_SERVICE at all.
+#
+# Bind even while the address is not yet assigned to the interface
+# (anycast/VIP failover setups, late network bring-up).
+FreeBind=yes
+#
+# Port variation: override the line above from a drop-in, do not edit
+# this file:
+#   systemctl edit ssh3-server.socket
+#   [Socket]
+#   ListenDatagram=0.0.0.0:8443
+
+[Install]
+WantedBy=sockets.target

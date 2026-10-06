@@ -1,0 +1,192 @@
+.Dd October 5, 2026
+.Dt SSH3-SERVER 8
+.Os ssh3-c
+.Sh NAME
+.Nm ssh3-server
+.Nd SSH3 server: user sessions and forwards over HTTP/3 (QUIC)
+.Sh SYNOPSIS
+.Nm
+.Op Fl l Ar addr:port
+.Op Fl c Ar cert.pem
+.Op Fl k Ar key.pem
+.Op Fl A Ar alpn
+.Op Fl d Ar dg_size
+.Op Fl i Ar idle_ms
+.Op Fl L Ar level
+.Op Fl P Ar pwfile
+.Op Fl K Ar authorized_keys
+.Op Fl H Ar dir
+.Op Fl -oidc-issuer Ar url
+.Op Fl -oidc-audience Ar id
+.Op Fl -oidc-jwks-ttl Ar seconds
+.Op Fl v
+.Op Fl V
+.Op Fl h
+.Sh DESCRIPTION
+.Nm
+speaks the SSH3 transport of RFC 9220: one QUIC (UDP) listener carries
+an HTTP/3 extended CONNECT to the
+.Pa /ssh3-term
+route, and every subsequent bidirectional stream is an SSH3 channel.
+Shell and exec sessions, direct-tcp and direct-udp forwards, SFTP and
+forward-agent bridges ride those channels; QUIC datagrams carry the
+direct-udp control prefix.
+The auth chain answers the CONNECT verdict: OIDC id_tokens
+.Pq Fl -oidc-issuer ,
+Bearer JWTs signed by
+.Pq Fl K
+authorized_keys keys (the conversation binds through the TLS
+.Ev EXPORTER-SSH3
+exporter), or Basic credentials against
+.Pq Fl P .
+The 200 response carries the
+.Cm server
+field with the protocol version.
+.Pp
+Logs are one-liners on stderr (journald-friendly); the log file of
+.Ev SSH3_LOG_FILE
+is skipped when the process runs under systemd
+.Pq Ev INVOCATION_ID .
+.Pp
+With no
+.Fl l ,
+.Nm
+serves a systemd socket-activated listener; see
+.Sx SOCKET ACTIVATION .
+.Sh OPTIONS
+.Bl -tag -width "-oidc-jwks-ttl"
+.It Fl l Ar addr:port
+IPv4 UDP listen address; port 0 picks an ephemeral one.  Optional
+under socket activation: when LISTEN_FDS is in effect the passed
+socket serves and an
+.Fl l
+argument is ignored (a warning is logged, nothing is bound).
+.It Fl c Ar cert.pem
+TLS certificate, PEM (required).
+.It Fl k Ar key.pem
+TLS private key, PEM (required).
+.It Fl A Ar alpn
+ALPN protocol name, default
+.Ql h3 .
+.It Fl d Ar dg_size
+The max_datagram_frame_size transport parameter, default 1200.
+.It Fl i Ar idle_ms
+QUIC idle timeout in milliseconds, default 60000.
+.It Fl L Ar level
+Log level: a name
+.Pf ( Ql debug ,
+.Ql info ,
+.Ql warn ,
+.Ql error ,
+.Ql all )
+or a numeric s3 level.  An unknown name keeps the default.
+.It Fl P Ar pwfile
+Password file: lines of
+.Li user:secret ;
+the CONNECT passes only with matching Basic credentials.
+.It Fl K Ar authorized_keys
+Authorized_keys file: the CONNECT passes only with a Bearer JWT
+signed by one of its keys.  A
+.Cm %u
+token in the path substitutes the session username (the
+.Xr sshd 8
+AuthorizedKeysFile shape); a path without it is one file for every
+user.
+.It Fl H Ar dir
+SFTP jail directory override (the default is the user's home).
+.It Fl -oidc-issuer Ar url
+OIDC mode: the CONNECT passes only with a Bearer id_token of that
+provider.  The discovery document and the first key set are fetched
+once before the listener opens.
+.It Fl -oidc-audience Ar id
+The expected token audience (the client id).
+.It Fl -oidc-jwks-ttl Ar seconds
+Key-set lifetime of the OIDC provider, default 3600; the set rotates
+in the background, an unknown kid schedules a refetch outside the
+request path.
+.It Fl v
+Verbose logging (debug).
+.It Fl V
+Print the version and exit.
+.It Fl h
+Print the usage summary.
+.It Fl 3
+Accepted for compatibility with the interop harness; the SSH3 route
+is the only mode of the daemon, the flag does nothing.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "SSH3_SHUTDOWN_DRAIN"
+.It Ev SSH3_LOG_LEVEL
+Same as
+.Fl L .
+.It Ev SSH3_LOG_FILE
+Append-only log file; ignored under systemd (journald takes stderr).
+.It Ev SSH3_SHUTDOWN_DRAIN
+Graceful-shutdown window in seconds, default 5; 0 closes the
+connections immediately, a negative or unparsable value falls back to
+the default.
+.It Ev SSH3C_PROTO
+With
+.Li 1 ,
+machine-readable INTEROP-* markers go to stdout (the interop runner
+protocol); production runs log one-liners instead.
+.It Ev S3_OIDC_CA_FILE
+Pins the HTTPS trust store of the OIDC discovery/JWKS fetches.
+.It Ev SHELL
+The program the session channels execute (default
+.Pa /bin/sh ) .
+.It Ev LISTEN_PID , Ev LISTEN_FDS
+Read-only protocol of
+.Xr sd_listen_fds 3 :
+present together, the UDP socket at fd 3 serves and
+.Fl l
+is not required; the markers are unset before any child is forked.
+.El
+.Sh FILES
+.Bl -tag -width "/etc/ssh3/authorized_keys"
+.It Pa /etc/ssh3/cert.pem
+TLS certificate (packaged default of
+.Fl c ,
+read by the service account).
+.It Pa /etc/ssh3/key.pem
+TLS private key (packaged default of
+.Fl k ,
+mode 0640 root:ssh3).
+.It Pa /etc/ssh3/authorized_keys
+Authorized keys (typical
+.Fl K
+target).
+.El
+.Sh SOCKET ACTIVATION
+The packaged
+.Pa ssh3-server.socket
+binds UDP/443 as root and systemd passes the ready datagram socket to
+the service, which runs unprivileged:
+.Nm
+takes fd 3, verifies it is a datagram IPv4 socket, sets
+nonblocking and close-on-exec, unsets the LISTEN_* markers and never
+calls
+.Xr bind 2 .
+No capability
+.Pq CAP_NET_BIND_SERVICE
+is needed by the service.
+An fd of the wrong type or family stops the daemon with an error
+instead of falling back to a second bind; several passed fds are
+allowed by the protocol but only the first serves.
+The listener address and port are owned by the socket unit
+.Xr systemd.socket 5 .
+.Sh SIGNALS
+.Bl -tag -width SIGTERM
+.It Dv SIGTERM Ns / Ns Dv SIGINT
+Graceful shutdown: new connections are answered with
+CONNECTION_CLOSE, the active conversations drain up to
+.Ev SSH3_SHUTDOWN_DRAIN
+seconds, then the leftovers close, the session children are killed
+and the daemon exits 0.  A repeated signal closes everything at once.
+.It Dv SIGPIPE
+Ignored.
+.El
+.Sh SEE ALSO
+.Xr systemd.socket 5 ,
+.Xr sd_listen_fds 3 ,
+.Xr sshd 8
