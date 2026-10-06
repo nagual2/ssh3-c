@@ -64,11 +64,16 @@ cmake --preset linux-release && cmake --build --preset linux-release
 
 ## systemd (socket-активация)
 
-Пара юнитов делит привилегии: root-овый `ssh3-c-server.socket` биндит
-UDP/443, а systemd передаёт готовый datagram-fd в `ssh3-c-server.service`,
-который работает от непривилегированного пользователя `ssh3` и не
-требует `CAP_NET_BIND_SERVICE` (демон берёт переданный fd и сам
-`bind()` не вызывает):
+Пара юнитов делит привилегию порта и сервис: root-овый
+`ssh3-c-server.socket` биндит UDP/443, а systemd передаёт готовый
+datagram-fd в `ssh3-c-server.service`. С P7.3 сервис работает от root
+с **per-session setuid**: после аутентификации каждая сессия с
+резолвящимся именем пользователя CONNECT переходит на его идентичность
+(`initgroups`, `setgid`, `setuid`, `chdir` в home) перед спавном —
+как OpenSSH/sshd; у самого демона минимальный bounding set
+(`CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETGID CAP_SETUID`) и нет
+`CAP_NET_BIND_SERVICE` (демон берёт переданный fd и сам `bind()` не
+вызывает):
 
 ```ini
 # ssh3-c-server.socket (фрагмент)
@@ -79,12 +84,20 @@ FreeBind=yes
 # ssh3-c-server.service (фрагмент)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
-User=ssh3
-NoNewPrivileges=yes
+User=root
+NoNewPrivileges=no
+RestrictSUIDSGID=no
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=no
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETGID CAP_SETUID
 PrivateTmp=yes
 ```
+
+Пользователь без записи в passwd получает 401 ещё на CONNECT; CONNECT
+без имени пользователя оставляет сессии идентичность демона.
+Одно-идентичная непривилегированная схема (`User=ssh3`,
+`--run-as-user off`, харденинг P7.2) описана в комментариях юнита и
+`man/ssh3-server.8` (`PRIVILEGE MODEL`).
 
 ```bash
 sudo systemctl enable --now ssh3-c-server.socket
@@ -117,6 +130,7 @@ sudo systemctl edit ssh3-c-server.socket
 | `--oidc-issuer url` | — | OIDC-провайдер (id_token) |
 | `--oidc-audience id` | — | ожидаемый audience (client id) |
 | `--oidc-jwks-ttl sec` | `3600` | время жизни JWKS-набора |
+| `--run-as-user on\|off` | `on` при euid 0 | per-session setuid: сессия с резолвящимся пользователем CONNECT переходит на его идентичность перед спавном |
 | `-v` / `-V` / `-h` | — | debug-лог / версия / usage |
 
 Переменные окружения:

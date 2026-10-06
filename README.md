@@ -64,11 +64,16 @@ cmake --preset linux-release && cmake --build --preset linux-release
 
 ## systemd (socket activation)
 
-The shipped pair splits the privilege: the root-owned
-`ssh3-c-server.socket` binds UDP/443 and systemd hands the ready
-datagram fd to `ssh3-c-server.service`, which runs as the unprivileged
-`ssh3` user and needs **no** `CAP_NET_BIND_SERVICE` (the daemon takes
-the passed fd, it never calls `bind()`):
+The shipped pair splits the port privilege from the service: the
+root-owned `ssh3-c-server.socket` binds UDP/443 and systemd hands the
+ready datagram fd to `ssh3-c-server.service`.  Since P7.3 the service
+runs as root with the **per-session setuid**: after authentication
+every session with a resolvable CONNECT username drops onto that
+identity (`initgroups`, `setgid`, `setuid`, the home `chdir`) before
+the spawn — the OpenSSH/sshd shape; the daemon itself keeps a minimal
+bounding set (`CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETGID CAP_SETUID`)
+and needs **no** `CAP_NET_BIND_SERVICE` (the daemon takes the passed
+fd, it never calls `bind()`):
 
 ```ini
 # ssh3-c-server.socket (excerpt)
@@ -79,12 +84,20 @@ FreeBind=yes
 # ssh3-c-server.service (excerpt)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
-User=ssh3
-NoNewPrivileges=yes
+User=root
+NoNewPrivileges=no
+RestrictSUIDSGID=no
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=no
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETGID CAP_SETUID
 PrivateTmp=yes
 ```
+
+A user without a passwd entry answers 401 at the CONNECT; a CONNECT
+without a session username keeps the daemon identity.  The
+single-identity unprivileged shape (`User=ssh3`, `--run-as-user off`,
+the P7.2 hardening) is documented in the unit comments and
+`man/ssh3-server.8` (`PRIVILEGE MODEL`).
 
 ```bash
 sudo systemctl enable --now ssh3-c-server.socket
@@ -117,6 +130,7 @@ CLI flags (defaults from `ssh3-server -h`):
 | `--oidc-issuer url` | — | OIDC-провайдер (id_token) |
 | `--oidc-audience id` | — | ожидаемый audience (client id) |
 | `--oidc-jwks-ttl sec` | `3600` | время жизни JWKS-набора |
+| `--run-as-user on\|off` | `on` при euid 0 | per-session setuid: сессия с резолвящимся пользователем CONNECT переходит на его идентичность перед спавном |
 | `-v` / `-V` / `-h` | — | debug-лог / версия / usage |
 
 Environment:
