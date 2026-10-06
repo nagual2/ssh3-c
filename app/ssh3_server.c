@@ -37,6 +37,10 @@
  *     5, 0 closes immediately, the fork parity), then the remaining
  *     ones are closed, the session children are killed and the
  *     daemon exits 0; a repeated signal closes everything at once
+ *   - systemd socket activation (sd_listen_fds(3)): with the
+ *     LISTEN_PID/LISTEN_FDS markers present the daemon serves the
+ *     passed UDP socket (fd 3) and never binds -l, the .socket unit
+ *     owns the port and the service runs unprivileged
  *
  * the env of the reference (cmd/ssh3-server.go): SSH3_LOG_LEVEL,
  * SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN
@@ -3482,13 +3486,108 @@ s3_srv_accept(s3_connection_t *c)
     }
 }
 
+/*
+ * the systemd socket activation, the sd_listen_fds(3) protocol: the
+ * passing process leaves the LISTEN_PID/LISTEN_FDS markers and the
+ * ready listening sockets at fd 3 upward (SD_LISTEN_FDS_START).  The
+ * claimed fd returns ready for the listener table, the local address
+ * rides *sa out (getsockname() doubles as the family guard), -1 means
+ * no activation here and the plain -l path runs.  A present but
+ * unusable fd is a unit misconfiguration: the daemon stops instead of
+ * falling back to -l - a silent second bind behind the unit's socket
+ * would only move the failure from the startup to the first packet
+ */
+#define S3_SRV_SD_LISTEN_FDS 3 /* SD_LISTEN_FDS_START of sd_listen_fds(3) */
+
+static int
+s3_srv_sd_listen_fd(struct sockaddr_in *sa)
+{
+    const char *pid, *nfds;
+    int         fd, type;
+    socklen_t   sl;
+    long        n;
+
+    pid = getenv("LISTEN_PID");
+
+    if (pid == NULL || (pid_t)atoi(pid) != getpid()) {
+
+        /* no markers or the activation belongs to another process */
+        return -1;
+    }
+
+    nfds = getenv("LISTEN_FDS");
+
+    if (nfds == NULL || (n = atol(nfds)) < 1) {
+        return -1;
+    }
+
+    fd = S3_SRV_SD_LISTEN_FDS;
+
+    /* the guard: a datagram socket bound to an IPv4 address only */
+
+    sl = sizeof(type);
+
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &sl) == -1) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                     "getsockopt(SO_TYPE) of the socket-activated fd %d failed", fd);
+        exit(1);
+    }
+
+    if (type != SOCK_DGRAM) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                     "socket-activated fd %d is not a datagram socket (type %d)", fd, type);
+        exit(1);
+    }
+
+    sl = sizeof(*sa);
+
+    if (getsockname(fd, (struct sockaddr *)sa, &sl) == -1) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                     "getsockname() of the socket-activated fd %d failed", fd);
+        exit(1);
+    }
+
+    if (sa->sin_family != AF_INET) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                     "socket-activated fd %d is not an IPv4 socket (family %d),"
+                     " the daemon serves IPv4 only",
+                     fd, (int)sa->sin_family);
+        exit(1);
+    }
+
+    /*
+     * the same listener hygiene as the -l path: nonblocking for the
+     * event loop, close-on-exec so the session children never hold
+     * the listening socket
+     */
+    if (s3_nonblocking(fd) != S3_OK || fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno,
+                     "socket-activated fd %d: hygiene failed", fd);
+        exit(1);
+    }
+
+    /*
+     * the markers go before anything forks: a session child must not
+     * grow up thinking the fds are its own (sd_listen_fds(3) does the
+     * same unsetenv once the fds are claimed)
+     */
+    (void)unsetenv("LISTEN_PID");
+    (void)unsetenv("LISTEN_FDS");
+
+    s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "socket-activated: serving the UDP fd %d", fd);
+
+    return fd;
+}
+
 static void
 s3_srv_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s -l addr:port -c cert.pem -k key.pem [-A alpn] [-d dg_size]"
+            "usage: %s [-l addr:port] -c cert.pem -k key.pem [-A alpn] [-d dg_size]"
             " [-i idle_ms] [-L level] [-P pwfile] [-H dir] [-v] [-V]\n"
-            "  -l  UDP listen address, port 0 picks an ephemeral one\n"
+            "  -l  UDP listen address, port 0 picks an ephemeral one; omitted under"
+            " systemd socket\n"
+            "      activation (LISTEN_FDS): the passed fd serves, no bind happens\n"
             "  -c  certificate PEM file\n"
             "  -k  private key PEM file\n"
             "  -A  ALPN name, default h3 (RFC 9220 extended CONNECT, ssh3)\n"
@@ -3512,7 +3611,9 @@ s3_srv_usage(const char *prog)
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
             "      default 5, 0 closes the connections immediately),\n"
-            "      SSH3C_PROTO=1 adds the runner protocol markers to stdout\n",
+            "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
+            "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,\n"
+            "      the passed UDP fd serves and -l is not required\n",
             prog);
 }
 
@@ -3680,8 +3781,18 @@ main(int argc, char **argv)
         }
     }
 
-    if (listen_text == NULL || cert_path == NULL || key_path == NULL) {
+    if (cert_path == NULL || key_path == NULL) {
         s3_srv_usage(argv[0]);
+        return 1;
+    }
+
+    /*
+     * -l stays optional: the socket-activated daemon serves the passed
+     * fd and binds nothing (the check below runs before any use of
+     * listen_text)
+     */
+    if (listen_text != NULL && s3_srv_parse_addr(listen_text, &sa) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad listen address %s", listen_text);
         return 1;
     }
 
@@ -3697,11 +3808,6 @@ main(int argc, char **argv)
     }
 
     (void)signal(SIGPIPE, SIG_IGN);
-
-    if (s3_srv_parse_addr(listen_text, &sa) != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad listen address %s", listen_text);
-        return 1;
-    }
 
     cert = s3_srv_read_file(cert_path, &cert_len);
     key = s3_srv_read_file(key_path, &key_len);
@@ -3757,38 +3863,65 @@ main(int argc, char **argv)
                            s3_ssh3_oidc_verifier_fetch_timer(&s3_srv_oidc_ver, time(NULL)));
     }
 
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "socket() failed");
-        return 1;
-    }
+    fd = s3_srv_sd_listen_fd(&sa);
 
-    if (s3_nonblocking(fd) != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "fcntl(O_NONBLOCK) failed");
-        return 1;
-    }
+    if (fd < 0) {
 
-    /*
-     * the session children fork this socket: the exec closes it so
-     * the shell commands of the sessions never hold the listener
-     * (the epoll fd of the ctx leaks into the children the same way,
-     * harmless for the short-lived session commands)
-     */
-    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "fcntl(FD_CLOEXEC) failed");
-        return 1;
-    }
+        if (listen_text == NULL) {
 
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "bind() %s failed", listen_text);
-        return 1;
-    }
+            /* neither the activation markers nor -l: nothing to serve */
+            s3_srv_usage(argv[0]);
+            return 1;
+        }
 
-    sa_len = sizeof(sa);
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "socket() failed");
+            return 1;
+        }
 
-    if (getsockname(fd, (struct sockaddr *)&sa, &sa_len) == -1) {
-        s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "getsockname() failed");
-        return 1;
+        if (s3_nonblocking(fd) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "fcntl(O_NONBLOCK) failed");
+            return 1;
+        }
+
+        /*
+         * the session children fork this socket: the exec closes it so
+         * the shell commands of the sessions never hold the listener
+         * (the epoll fd of the ctx leaks into the children the same way,
+         * harmless for the short-lived session commands)
+         */
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "fcntl(FD_CLOEXEC) failed");
+            return 1;
+        }
+
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "bind() %s failed", listen_text);
+            return 1;
+        }
+
+        sa_len = sizeof(sa);
+
+        if (getsockname(fd, (struct sockaddr *)&sa, &sa_len) == -1) {
+            s3_log_error(S3_LOG_ERR, &s3_srv_log, s3_socket_errno, "getsockname() failed");
+            return 1;
+        }
+
+    } else if (listen_text != NULL) {
+
+        /*
+         * the unit owns the port: the activated socket serves, a -l
+         * the operator kept changes nothing (no second bind); the
+         * claim already filled *sa and verified the family, the
+         * length follows here for the listener sockaddr below
+         */
+        sa_len = sizeof(sa);
+
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0, "socket-activated: -l %s ignored", listen_text);
+
+    } else {
+        sa_len = sizeof(sa);
     }
 
     s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "ssh3-server version %d.%d.%d listening on %s:%ui",
