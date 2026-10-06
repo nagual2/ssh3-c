@@ -112,7 +112,10 @@ SRV_ENV=""
 SRV_PATT="s3interop_server -3"
 
 if [ "${SSH3C_SERVER_BIN:-}" != "" ]; then
-    SRV_ENV="SSH3C_PROTO=1"
+    # the password opt-in rides the env (the reference
+    # SSH3_ENABLE_PASSWORD_LOGIN): the daemon gates the Basic verdict
+    # behind it since P7.3, the harness server ignores the variable
+    SRV_ENV="SSH3C_PROTO=1 SSH3_ENABLE_PASSWORD_LOGIN=1"
     SRV_PATT="${SERVER_BIN##*/} -3"
 fi
 

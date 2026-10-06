@@ -4,13 +4,15 @@
  * the server auth verifiers of the reference server_auth/ chain
  * (docs/P4-WIRE.md 7), the wire-level shape: the Basic credentials of
  * the authorization header, the username of the CONNECT target, the
- * harness password file (the plaintext fixture form standing in for
- * the unix shadow check) and the sshd authorized_keys iterator; the
- * wiring picks the checks it speaks
+ * default identities chain of the session user, the harness password
+ * file (the plaintext fixture form standing in for the unix shadow
+ * check) and the sshd authorized_keys iterator; the wiring picks the
+ * checks it speaks
  */
 
 #include <s3_core.h>
 
+#include <pwd.h>
 #include <stdio.h>
 
 #include <s3_ssh3_auth_srv.h>
@@ -239,6 +241,89 @@ s3_ssh3_auth_user_from_path(const s3_str_t *path, s3_str_t *user)
     }
 
     return S3_DECLINED;
+}
+
+/*
+ * the plain session names only: the same charset the -K %u expansion
+ * guards (no leading dot, no separator) - a username is never a path
+ * fragment
+ */
+
+static s3_int_t
+s3_ssh3_auth_plain_name(const s3_str_t *user)
+{
+    size_t i;
+
+    if (user->len == 0 || user->len > 255 || user->data[0] == '.') {
+        return S3_ERROR;
+    }
+
+    for (i = 0; i < user->len; i++) {
+
+        u_char c = user->data[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-')) {
+            return S3_ERROR;
+        }
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_auth_default_chain(const s3_str_t *user, char *buf, size_t size,
+                           const char *paths[S3_SSH3_AUTH_CHAIN_MAX], unsigned *n)
+{
+    static const char *suffix[S3_SSH3_AUTH_CHAIN_MAX] = {"/.ssh3/authorized_identities",
+                                                         "/.ssh/authorized_keys"};
+
+    char           name[256];
+    struct passwd *pw;
+    size_t         left = size;
+    unsigned       i;
+
+    *n = 0;
+
+    if (s3_ssh3_auth_plain_name(user) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(name, user->data, user->len);
+    name[user->len] = '\0';
+
+    pw = getpwnam(name);
+
+    /* the unknown user, or a home-less one: the CWD-relative read the
+     * reference's path.Join() would produce with an empty home is not
+     * reproduced here */
+
+    if (pw == NULL || pw->pw_dir == NULL || pw->pw_dir[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    for (i = 0; i < S3_SSH3_AUTH_CHAIN_MAX; i++) {
+
+        int m;
+
+        if (left == 0) {
+            return S3_ERROR;
+        }
+
+        m = snprintf(buf, left, "%s%s", pw->pw_dir, suffix[i]);
+
+        if (m < 0 || (size_t)m >= left) {
+            return S3_ERROR;
+        }
+
+        paths[i] = buf;
+        buf += (size_t)m + 1;
+        left -= (size_t)m + 1;
+    }
+
+    *n = S3_SSH3_AUTH_CHAIN_MAX;
+
+    return S3_OK;
 }
 
 s3_int_t

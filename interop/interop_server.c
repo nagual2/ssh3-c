@@ -780,14 +780,16 @@ s3_interop_h3_send_status(unsigned code)
     p = sec;
     p = s3_interop_h3_put_status(p, code);
 
-    if (code == 200) {
+    /*
+     * the Server field of the reference rides EVERY response: the
+     * handler sets it before any verdict (w.Header().Set("Server",
+     * GetCurrentVersionString()), server_auth/auth.go), so the client
+     * parses a version string out of the refusals too - a missing
+     * field reads as an empty version and the client reports the
+     * misleading "bad SSH version fields" instead of the verdict
+     */
 
-        /*
-         * the Server field of the reference (w.Header().Set("Server",
-         * GetCurrentVersionString())), the client parses it before it
-         * opens the conversation
-         */
-
+    {
         s3_str_t name = s3_string("server");
         s3_str_t value = s3_string(S3_SSH3_VERSION_STRING);
 

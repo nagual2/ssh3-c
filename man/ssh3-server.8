@@ -1,4 +1,4 @@
-.Dd October 5, 2026
+.Dd October 6, 2026
 .Dt SSH3-SERVER 8
 .Os ssh3-c
 .Sh NAME
@@ -16,6 +16,8 @@
 .Op Fl P Ar pwfile
 .Op Fl K Ar authorized_keys
 .Op Fl H Ar dir
+.Op Fl -url-path Ar path
+.Op Fl -enable-password-login
 .Op Fl -oidc-issuer Ar url
 .Op Fl -oidc-audience Ar id
 .Op Fl -oidc-jwks-ttl Ar seconds
@@ -27,7 +29,9 @@
 speaks the SSH3 transport of RFC 9220: one QUIC (UDP) listener carries
 an HTTP/3 extended CONNECT to the
 .Pa /ssh3-term
-route, and every subsequent bidirectional stream is an SSH3 channel.
+route (overridable with
+.Fl -url-path ) ,
+and every subsequent bidirectional stream is an SSH3 channel.
 Shell and exec sessions, direct-tcp and direct-udp forwards, SFTP and
 forward-agent bridges ride those channels; QUIC datagrams carry the
 direct-udp control prefix.
@@ -38,10 +42,16 @@ Bearer JWTs signed by
 authorized_keys keys (the conversation binds through the TLS
 .Ev EXPORTER-SSH3
 exporter), or Basic credentials against
-.Pq Fl P .
-The 200 response carries the
+.Pq Fl P
+with the password login opted into.
+Without any
+.Fl K
+the Bearer JWTs verify against the default identities chain of the
+session user (see
+.Sx FILES ) .
+Every response, the refusals included, carries the
 .Cm server
-field with the protocol version.
+field with the protocol version the clients parse.
 .Pp
 Logs are one-liners on stderr (journald-friendly); the log file of
 .Ev SSH3_LOG_FILE
@@ -54,11 +64,20 @@ With no
 serves a systemd socket-activated listener; see
 .Sx SOCKET ACTIVATION .
 .Sh OPTIONS
-.Bl -tag -width "-oidc-jwks-ttl"
+.Bl -tag -width "-enable-password-login"
 .It Fl l Ar addr:port
-IPv4 UDP listen address; port 0 picks an ephemeral one.  Optional
-under socket activation: when LISTEN_FDS is in effect the passed
-socket serves and an
+UDP listen address:
+.Li a.b.c.d:port
+or the bracketed IPv6 form
+.Li [v6]:port .
+The
+.Li [::]
+bind serves both address families (IPV6_V6ONLY=0, the dual-stack
+shape of the reference
+.Fl -bind
+default); a kernel that refuses the dual mode stops the daemon.
+Port 0 picks an ephemeral one.  Optional under socket activation:
+when LISTEN_FDS is in effect the passed sockets serve and an
 .Fl l
 argument is ignored (a warning is logged, nothing is bound).
 .It Fl c Ar cert.pem
@@ -83,15 +102,34 @@ or a numeric s3 level.  An unknown name keeps the default.
 .It Fl P Ar pwfile
 Password file: lines of
 .Li user:secret ;
-the CONNECT passes only with matching Basic credentials.
+the CONNECT passes only with matching Basic credentials AND the
+password login opted into (the
+.Fl -enable-password-login
+flag or
+.Ev SSH3_ENABLE_PASSWORD_LOGIN ,
+the reference default is off).
 .It Fl K Ar authorized_keys
-Authorized_keys file: the CONNECT passes only with a Bearer JWT
-signed by one of its keys.  A
+Authorized_keys file, repeatable: the CONNECT passes only with a
+Bearer JWT signed by one of the keys of any listed file, the files
+walk in the given order.  A
 .Cm %u
 token in the path substitutes the session username (the
 .Xr sshd 8
 AuthorizedKeysFile shape); a path without it is one file for every
 user.
+Without any
+.Fl K
+the default chain of the session user serves.
+.It Fl -url-path Ar path
+The CONNECT route, default
+.Pa /ssh3-term
+(the reference
+.Fl -url-path ) .
+Must start with a slash; the query part of the request path carries
+the username and does not affect the route.
+.It Fl -enable-password-login
+Opt into the Basic password method
+.Pq the reference enablePasswordLogin .
 .It Fl H Ar dir
 SFTP jail directory override (the default is the user's home).
 .It Fl -oidc-issuer Ar url
@@ -125,6 +163,14 @@ Append-only log file; ignored under systemd (journald takes stderr).
 Graceful-shutdown window in seconds, default 5; 0 closes the
 connections immediately, a negative or unparsable value falls back to
 the default.
+.It Ev SSH3_ENABLE_PASSWORD_LOGIN
+With a truthy value
+.Pf ( Li 1 ,
+.Li true ,
+.Li t ) ,
+the Basic password method is opted in without the flag; the flag
+overrides it (the reference env default for systemd
+EnvironmentFile installs).
 .It Ev SSH3C_PROTO
 With
 .Li 1 ,
@@ -138,12 +184,19 @@ The program the session channels execute (default
 .It Ev LISTEN_PID , Ev LISTEN_FDS
 Read-only protocol of
 .Xr sd_listen_fds 3 :
-present together, the UDP socket at fd 3 serves and
+present together, the passed UDP sockets serve and
 .Fl l
 is not required; the markers are unset before any child is forked.
 .El
 .Sh FILES
 .Bl -tag -width "/etc/ssh3/authorized_keys"
+.It Pa ~/.ssh3/authorized_identities
+First file of the default identities chain (the reference
+DefaultIdentitiesFileNames), read for the session user when no
+.Fl K
+is given; missing files are tolerated.
+.It Pa ~/.ssh/authorized_keys
+Second file of the default identities chain, the sshd shape.
 .It Pa /etc/ssh3/cert.pem
 TLS certificate (packaged default of
 .Fl c ,
@@ -160,19 +213,30 @@ target).
 .Sh SOCKET ACTIVATION
 The packaged
 .Pa ssh3-c-server.socket
-binds UDP/443 as root and systemd passes the ready datagram socket to
-the service, which runs unprivileged:
+binds UDP/443 and systemd passes the ready datagram socket to the
+service:
 .Nm
-takes fd 3, verifies it is a datagram IPv4 socket, sets
-nonblocking and close-on-exec, unsets the LISTEN_* markers and never
-calls
-.Xr bind 2 .
+takes the fds at fd 3 upward, one or two serve.  A bare
+.Li ListenDatagram=443
+hands over ONE dual-stack IPv6 socket
+.Pq BindIPv6Only=default ;
+a
+.Li 0.0.0.0:443
+plus
+.Li [::]:443
+pair hands over TWO, each becomes its own listener and a connection
+stays on the fd it arrived on.  Each fd is verified to be a datagram
+socket of either family, set nonblocking and close-on-exec, the
+LISTEN_* markers are unset and
+.Xr bind 2
+is never called; the IPv6 mode of the unit
+.Pq IPV6_V6ONLY
+is served as handed over and logged.
 No capability
 .Pq CAP_NET_BIND_SERVICE
 is needed by the service.
-An fd of the wrong type or family stops the daemon with an error
-instead of falling back to a second bind; several passed fds are
-allowed by the protocol but only the first serves.
+An fd of the wrong type or family, or more than two, stops the daemon
+with an error instead of falling back to a second bind.
 The listener address and port are owned by the socket unit
 .Xr systemd.socket 5 .
 .Sh SIGNALS
