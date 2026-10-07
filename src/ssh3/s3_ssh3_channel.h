@@ -21,6 +21,15 @@
 
 #define S3_SSH3_FRAME_TYPE 0xaf3627e6ULL
 
+/*
+ * the bound of the peer-advertised maxPacketSize (the F-01 tail, the
+ * util.MaxSSHStringLen of the reference): the advertised size bounds
+ * the data messages of the channel and is a second allocation knob
+ * otherwise, a channel open advertising more is refused at the header
+ * parse
+ */
+#define S3_SSH3_CHANNEL_MAX_PACKET_LIMIT (16u << 20)
+
 #define S3_SSH3_CHANNEL_TYPE_SESSION    "session"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_TCP "direct-tcp"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_UDP "direct-udp"

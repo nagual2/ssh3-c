@@ -223,12 +223,74 @@ s3_test_channel_chunk_size(void)
 }
 
 static int
+s3_test_channel_max_packet_bound(void)
+{
+    /* the F-01 tail of the reference: a channel open advertising a
+     * maxPacketSize beyond util.MaxSSHStringLen is refused at the
+     * parse, the advertised size is a second allocation knob
+     * otherwise (the data messages size through the same bound) */
+
+    static const u_char over[] = "\xc0\x00\x00\x00\xaf\x36\x27\xe6" /* the frame type */
+                                 "\x00"                             /* stream id 0 */
+                                 "\x07session"                      /* the type */
+                                 "\xc0\x01\x00\x01";                /* max packet 16 MiB + 1 */
+
+    s3_ssh3_channel_t ch;
+    u_char            buf[64];
+    const u_char     *pos, *end;
+
+    /* the bound itself still parses: 16 MiB is the last legal value */
+
+    s3_channel_init(&ch, "session", 0, 0);
+    ch.max_packet_size = S3_SSH3_CHANNEL_MAX_PACKET_LIMIT;
+
+    end = s3_ssh3_channel_build_header(buf, &ch);
+
+    s3_channel_init(&ch, "sentinel", 0xaaaa, 0xbbbb);
+
+    pos = buf;
+
+    S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
+    S3_ASSERT(pos == end);
+    S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MAX_PACKET_LIMIT);
+
+    /* one past the bound is a refusal: the cursor and the channel
+     * stay untouched like every other parse error */
+
+    s3_channel_init(&ch, "sentinel", 0xaaaa, 0xbbbb);
+
+    pos = over;
+    end = over + sizeof(over) - 1;
+
+    S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_ERROR);
+    S3_ASSERT(pos == over);
+    S3_ASSERT(ch.conversation_stream_id == 0xaaaa);
+    S3_ASSERT(ch.max_packet_size == 0xbbbb);
+
+    /* the far beyond form rides the same refusal */
+
+    s3_channel_init(&ch, "session", 0, 1ULL << 62);
+
+    end = s3_ssh3_channel_build_header(buf, &ch);
+
+    s3_channel_init(&ch, "sentinel", 0xaaaa, 0xbbbb);
+
+    pos = buf;
+
+    S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_ERROR);
+    S3_ASSERT(pos == buf);
+
+    return s3_test_failures;
+}
+
+static int
 s3_test_ssh3_channel(void)
 {
     (void)s3_test_channel_build();
     (void)s3_test_channel_parse_roundtrip();
     (void)s3_test_channel_parse_errors();
     (void)s3_test_channel_chunk_size();
+    (void)s3_test_channel_max_packet_bound();
 
     return s3_test_failures;
 }

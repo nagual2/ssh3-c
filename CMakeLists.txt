@@ -106,6 +106,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_auth_jwt.c
     src/ssh3/s3_ssh3_session_cli.c
     src/ssh3/s3_ssh3_forward.c
+    src/ssh3/s3_ssh3_forward_policy.c
     src/ssh3/s3_ssh3_agent.c
     src/ssh3/s3_ssh3_sftp_codec.c
     src/ssh3/s3_ssh3_sftp_srv.c
@@ -258,6 +259,7 @@ set(S3_TESTS
     test_ssh3_auth_jwt
     test_ssh3_session_cli
     test_ssh3_forward
+    test_ssh3_forward_policy
     test_ssh3_agent
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
