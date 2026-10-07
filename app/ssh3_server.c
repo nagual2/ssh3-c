@@ -55,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -81,6 +82,7 @@
 #include <s3_ssh3_oidc.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_srv.h>
+#include <s3_ssh3_sftp_jail.h>
 #include <s3_ssh3_sftp_srv.h>
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
@@ -232,6 +234,17 @@ static char s3_srv_sftp_home[512];
  * unrestricted dial (the zero policy of the module)
  */
 static s3_ssh3_forward_policy_t s3_srv_fwd_policy;
+
+/*
+ * the sftp isolation mode (the F-04 fix, --sftp-jail chroot|lexical):
+ * the chroot rides the sshd model - one forked child per channel
+ * enters the jail and drops before any user path opens, the kernel
+ * confines the paths; lexical keeps the historical in-process
+ * engine.  The default is chroot, the unprivileged runs fold to
+ * lexical at the startup (no chroot privilege, the harness shapes
+ * stay untouched)
+ */
+static unsigned s3_srv_sftp_chroot = 1;
 
 /*
  * the zerolog-style level name of the reference SSH3_LOG_LEVEL; an
@@ -865,10 +878,21 @@ struct s3_srv_h3_channel_s {
     /*
      * the sftp side ("sftp" channels): the pool owns the request
      * server, the 94 payloads feed s3_ssh3_sftp_srv_input and the 50
-     * ms timer drains s3_ssh3_sftp_srv_output into the 94 direction
+     * ms timer drains s3_ssh3_sftp_srv_output into the 94 direction;
+     * the chroot mode (F-04) leaves these empty and rides the child
+     * trio below instead
      */
     s3_pool_t          *sftp_pool;
     s3_ssh3_sftp_srv_t *sftp;
+
+    /*
+     * the chroot child of the sftp channel (the sshd model): the
+     * child serves the engine behind chroot+drop, the parent pumps
+     * the two pipes; the death of the child ends the channel
+     */
+    pid_t sftp_pid; /* the child process, 0 once reaped */
+    int   sftp_in;  /* the stdin pipe of the child, -1 when unused */
+    int   sftp_out; /* the stdout pipe of the child, -1 when unused */
 
     /*
      * the agent side of a session channel: the listener appears on
@@ -889,6 +913,7 @@ struct s3_srv_h3_channel_s {
 #define S3_SRV_FWD_TCP   1
 #define S3_SRV_FWD_UDP   2
 #define S3_SRV_FWD_AGENT 3
+#define S3_SRV_FWD_SFTP  4 /* the chroot child pipes, no target socket */
 
 /*
  * the frame buffer of the socket->channel direction: one 94 frame
@@ -903,6 +928,10 @@ static void s3_srv_session_teardown(s3_srv_h3_channel_t *ch);
 /* the sftp and the agent wiring of the wave 2, defined below */
 
 static void s3_srv_sftp_pump(s3_srv_h3_channel_t *ch);
+
+static void s3_srv_sftp_child_pump(s3_srv_h3_channel_t *ch);
+
+static s3_int_t s3_srv_sftp_chroot_start(s3_srv_h3_channel_t *ch);
 
 static void s3_srv_agent_accept_timer(s3_event_t *ev);
 
@@ -1973,6 +2002,24 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
         ch->sftp = NULL;
     }
 
+    /* the chroot child of the sftp channel: the pipes first (the eof
+     * ends the serve), then the process - the session teardown
+     * shape; the pump reaps the exited child, the pid survives until
+     * then */
+
+    if (ch->sftp_in >= 0) {
+        (void)close(ch->sftp_in);
+    }
+
+    if (ch->sftp_out >= 0) {
+        (void)close(ch->sftp_out);
+    }
+
+    if (ch->sftp_pid > 0) {
+        (void)kill(ch->sftp_pid, SIGKILL);
+        (void)waitpid(ch->sftp_pid, NULL, 0);
+    }
+
     if (ch->fwd_fd >= 0) {
         (void)close(ch->fwd_fd);
     }
@@ -2034,6 +2081,8 @@ s3_srv_h3_channel_alloc(s3_connection_t *sc)
             s3_memzero(&s3_srv_h3_channels[i], sizeof(s3_srv_h3_channels[i]));
             s3_srv_h3_channels[i].sc = sc;
             s3_srv_h3_channels[i].fwd_fd = -1;
+            s3_srv_h3_channels[i].sftp_in = -1;
+            s3_srv_h3_channels[i].sftp_out = -1;
 
             s3_srv_channel_user_snapshot(&s3_srv_h3_channels[i]);
 
@@ -2767,6 +2816,12 @@ s3_srv_fwd_timer(s3_event_t *ev)
     if (ch->sftp != NULL) {
         s3_srv_sftp_pump(ch);
 
+    } else if (ch->fwd_kind == S3_SRV_FWD_SFTP) {
+
+        /* the chroot child: the pipes drain instead of the engine */
+
+        s3_srv_sftp_child_pump(ch);
+
     } else {
         s3_srv_fwd_pump(ch);
     }
@@ -2794,9 +2849,10 @@ s3_srv_fwd_arm(s3_srv_h3_channel_t *ch)
 }
 
 /*
- * the sftp subsystem of the "sftp" channel (the wave 2): the request
- * server jails itself into the session user's home, the timer drains
- * the replies into the 94 direction
+ * the sftp subsystem of the "sftp" channel (the wave 2): the chroot
+ * mode forks the jailed child (the F-04, the sshd model), the
+ * lexical mode keeps the historical in-process request server jailed
+ * into the home, the timer drains the replies into the 94 direction
  */
 
 static s3_int_t
@@ -2804,6 +2860,10 @@ s3_srv_sftp_start(s3_srv_h3_channel_t *ch)
 {
     s3_str_t       home;
     struct passwd *pw;
+
+    if (s3_srv_sftp_chroot) {
+        return s3_srv_sftp_chroot_start(ch);
+    }
 
     if (s3_srv_sftp_home[0] != '\0') {
 
@@ -2891,6 +2951,394 @@ s3_srv_sftp_pump(s3_srv_h3_channel_t *ch)
     }
 
     s3_srv_fwd_flush(ch);
+}
+
+/*
+ * the chroot side (the F-04, the sshd internal-sftp model): the
+ * network-facing daemon stops touching user paths at all - per sftp
+ * channel it forks a child that enters the jail (chroot into the
+ * session home, then the full drop) and serves the same request
+ * engine over the stdio pair; after the chroot the confinement is
+ * the kernel's: absolute symlinks and ".." cannot reach outside, no
+ * lexical check is load-bearing anymore
+ *
+ * the child prep order: the pipes become fd 0 and 1, the daemon
+ * descriptors leave (the listeners, the epfd, the other channels),
+ * the signals reset, then the jail - any entrance failure is a
+ * refused subsystem (_exit 1), never an unjailed serve
+ */
+
+static void
+s3_srv_sftp_child_write(int fd, const u_char *buf, size_t len)
+{
+    while (len > 0) {
+
+        ssize_t n = write(fd, buf, len);
+
+        if (n < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            /* a dead parent killed the pipe (SIGPIPE rides the
+             * default here): the child has no work left in any case */
+
+            _exit(1);
+        }
+
+        buf += n;
+        len -= (size_t)n;
+    }
+}
+
+/* the serve loop of the child: stdin feeds the engine, the engine
+ * replies drain to stdout; the pipes are the blocking contract, one
+ * transfer at a time rides them */
+
+static void
+s3_srv_sftp_child_main(int in_fd, int out_fd, const char *jail, const char *name, uint32_t uid,
+                       uint32_t gid)
+{
+    s3_log_t            log;
+    s3_pool_t          *pool;
+    s3_ssh3_sftp_srv_t *t;
+    s3_str_t            root;
+    u_char              buf[16384];
+    ssize_t             n, m;
+
+    /*
+     * the jail entrance is the verdict of the whole design: any
+     * failure here is a refused subsystem, never an unjailed serve
+     */
+
+    if (s3_ssh3_sftp_jail_enter(jail, name, uid, gid) != S3_OK) {
+        fprintf(stderr, "ssh3-server: sftp child: the jail entrance failed\n");
+        _exit(1);
+    }
+
+    log.log_level = S3_LOG_ALERT;
+    log.fd = S3_INVALID_FILE;
+
+    pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &log);
+
+    if (pool == NULL) {
+        _exit(1);
+    }
+
+    t = s3_pcalloc(pool, sizeof(s3_ssh3_sftp_srv_t));
+
+    root.data = (u_char *)"/";
+    root.len = 1;
+
+    /*
+     * the served root is "/" now: the jail carries the home content
+     * and every spelling lands inside it (the engine keeps the wire,
+     * the kernel keeps the paths)
+     */
+
+    if (t == NULL || s3_ssh3_sftp_srv_init(t, pool, &root, uid, gid) != S3_OK) {
+        _exit(1);
+    }
+
+    for (;;) {
+
+        n = read(in_fd, buf, sizeof(buf));
+
+        if (n < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            _exit(1);
+        }
+
+        if (n == 0) {
+            /* the parent closed its side: the tail replies ride out */
+            break;
+        }
+
+        if (s3_ssh3_sftp_srv_input(t, buf, (size_t)n) != S3_OK || t->protocol_error) {
+            _exit(1);
+        }
+
+        while ((m = s3_ssh3_sftp_srv_output(t, buf, sizeof(buf))) > 0) {
+            s3_srv_sftp_child_write(out_fd, buf, (size_t)m);
+        }
+    }
+
+    while ((m = s3_ssh3_sftp_srv_output(t, buf, sizeof(buf))) > 0) {
+        s3_srv_sftp_child_write(out_fd, buf, (size_t)m);
+    }
+
+    _exit(0);
+}
+
+static s3_int_t
+s3_srv_sftp_chroot_start(s3_srv_h3_channel_t *ch)
+{
+    char          jail[512];
+    char          name[128];
+    uint32_t      uid, gid;
+    s3_int_t      rc;
+    int           in_pipe[2], out_pipe[2];
+    pid_t         pid;
+    struct rlimit rl;
+    int           i, max;
+
+    /*
+     * the jail resolution and the writability gate: the daemon
+     * touches the jail root metadata only, no content and no
+     * traversal inside; a refusal here answers the cancel before any
+     * process exists
+     */
+
+    rc = s3_ssh3_sftp_jail_resolve(s3_srv_sftp_home[0] != '\0' ? s3_srv_sftp_home : NULL,
+                                   ch->sess_user[0] != '\0' ? ch->sess_user : NULL, jail,
+                                   sizeof(jail), name, sizeof(name), &uid, &gid);
+
+    if (rc == S3_DECLINED) {
+
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                     "sftp chroot: no resolvable session user and no -H override, refused");
+
+        return S3_ERROR;
+    }
+
+    if (rc != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "sftp chroot: the jail path does not resolve");
+        return S3_ERROR;
+    }
+
+    rc = s3_ssh3_sftp_jail_check(jail);
+
+    if (rc == S3_DECLINED) {
+
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                     "sftp chroot: the jail root is group/world-writable, refused");
+
+        return S3_ERROR;
+    }
+
+    if (rc != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "sftp chroot: the jail root is not a directory");
+        return S3_ERROR;
+    }
+
+    in_pipe[0] = in_pipe[1] = -1;
+    out_pipe[0] = out_pipe[1] = -1;
+
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+
+        if (in_pipe[0] >= 0) {
+            (void)close(in_pipe[0]);
+        }
+
+        if (in_pipe[1] >= 0) {
+            (void)close(in_pipe[1]);
+        }
+
+        if (out_pipe[0] >= 0) {
+            (void)close(out_pipe[0]);
+        }
+
+        if (out_pipe[1] >= 0) {
+            (void)close(out_pipe[1]);
+        }
+
+        fprintf(stderr, "ssh3-server: sftp pipe() failed\n");
+
+        return S3_ERROR;
+    }
+
+    pid = fork();
+
+    if (pid < 0) {
+
+        (void)close(in_pipe[0]);
+        (void)close(in_pipe[1]);
+        (void)close(out_pipe[0]);
+        (void)close(out_pipe[1]);
+
+        fprintf(stderr, "ssh3-server: sftp fork() failed\n");
+
+        return S3_ERROR;
+    }
+
+    if (pid == 0) {
+
+        /*
+         * the child: the pipes become the stdio pair, the daemon
+         * surface leaves, the signals reset, then the jail and the
+         * serve - the body below never returns
+         */
+
+        (void)close(in_pipe[1]);
+        (void)close(out_pipe[0]);
+
+        if (dup2(in_pipe[0], STDIN_FILENO) < 0 || dup2(out_pipe[1], STDOUT_FILENO) < 0) {
+            _exit(1);
+        }
+
+        if (in_pipe[0] != STDIN_FILENO) {
+            (void)close(in_pipe[0]);
+        }
+
+        if (out_pipe[1] != STDOUT_FILENO) {
+            (void)close(out_pipe[1]);
+        }
+
+        /*
+         * the daemon descriptors go: the listeners (a surviving one
+         * would hold the port), the epfd, the fds of the other
+         * channels; the rlim sweep is the POSIX shape of closefrom,
+         * an fd past an infinite cap stays an inert hold
+         */
+
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+
+            max = rl.rlim_cur == RLIM_INFINITY ? 65536 : (int)rl.rlim_cur;
+
+            for (i = STDERR_FILENO + 1; i < max; i++) {
+                (void)close(i);
+            }
+        }
+
+        (void)signal(SIGPIPE, SIG_DFL);
+        (void)signal(SIGHUP, SIG_DFL);
+        (void)signal(SIGINT, SIG_DFL);
+        (void)signal(SIGTERM, SIG_DFL);
+
+        s3_srv_sftp_child_main(STDIN_FILENO, STDOUT_FILENO, jail, name, uid, gid);
+    }
+
+    /*
+     * the parent keeps one end per direction, both non-blocking (the
+     * 50 ms pump drains them, the fwd scheme); the served root
+     * report keeps the lexical marker shape
+     */
+
+    (void)close(in_pipe[0]);
+    (void)close(out_pipe[1]);
+
+    (void)s3_nonblocking(in_pipe[1]);
+    (void)s3_nonblocking(out_pipe[0]);
+
+    ch->fwd_kind = S3_SRV_FWD_SFTP;
+    ch->sftp_pid = pid;
+    ch->sftp_in = in_pipe[1];
+    ch->sftp_out = out_pipe[0];
+
+    s3_srv_report("INTEROP-SFTP-OPEN home=%s\n", jail);
+
+    s3_srv_fwd_arm(ch);
+
+    return S3_OK;
+}
+
+/*
+ * the byte relay of the chroot child: the pending channel payloads
+ * ride the stdin pipe, the child replies ride the 94 out-buffer, the
+ * child's death ends the channel (it surfaces as the stdout eof or
+ * an EPIPE); the 50 ms timer drives it like the forward pump
+ */
+
+static void
+s3_srv_sftp_child_pump(s3_srv_h3_channel_t *ch)
+{
+    static u_char buf[16384];
+    ssize_t       n;
+
+    /* the pending payloads ride the child stdin */
+
+    while (ch->sftp_in >= 0 && ch->fwd_in_len > 0) {
+
+        n = write(ch->sftp_in, ch->fwd_in, ch->fwd_in_len);
+
+        if (n > 0) {
+            s3_memmove(ch->fwd_in, ch->fwd_in + n, ch->fwd_in_len - (size_t)n);
+            ch->fwd_in_len -= (size_t)n;
+            continue;
+        }
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+
+        /* EPIPE or a dead fd: the child is gone, the stdout eof (or
+         * the end shape below) finishes the channel */
+
+        (void)close(ch->sftp_in);
+        ch->sftp_in = -1;
+        break;
+    }
+
+    /* the child replies ride the pending 94 out-buffer */
+
+    while (ch->sftp_out >= 0) {
+
+        n = read(ch->sftp_out, buf, sizeof(buf));
+
+        if (n > 0) {
+
+            if (s3_srv_fwd_append(&ch->fwd_out, &ch->fwd_out_cap, &ch->fwd_out_len, buf,
+                                  (size_t)n) != S3_OK) {
+                fprintf(stderr, "ssh3-server: sftp reply buffer growth failed\n");
+                s3_srv_h3_channel_free(ch);
+                return;
+            }
+
+            continue;
+        }
+
+        if (n == 0) {
+
+            /* the child served everything and left: the 94 tail
+             * drains below, the channel shuts down with it */
+
+            (void)close(ch->sftp_out);
+            ch->sftp_out = -1;
+            ch->fwd_eof = 1;
+            break;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+
+        (void)close(ch->sftp_out);
+        ch->sftp_out = -1;
+        ch->fwd_eof = 1;
+        break;
+    }
+
+    /* the reap of an exited child, the eof above is the usual way it
+     * shows; WNOHANG keeps the pump event-safe */
+
+    if (ch->sftp_pid > 0 && waitpid(ch->sftp_pid, NULL, WNOHANG) == (pid_t)ch->sftp_pid) {
+        ch->sftp_pid = 0;
+    }
+
+    s3_srv_fwd_flush(ch);
+
+    /* the end shape of the forward pump: the eof is in, the tail is
+     * out - the channel ends */
+
+    if (ch->sc != NULL && ch->fwd_eof && ch->fwd_out_len == 0 &&
+        ch->fwd_frame_sent == ch->fwd_frame_total) {
+
+        (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+        s3_srv_h3_channel_free(ch);
+    }
 }
 
 /*
@@ -3402,6 +3850,17 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 return;
             }
 
+            if (ch->fwd_kind == S3_SRV_FWD_SFTP) {
+
+                /* the transfer peer closed: the subsystem goes with
+                 * it (the free kills and reaps the child) */
+
+                s3_srv_report("SFTP-SRV-DONE\n");
+
+                s3_srv_h3_channel_free(ch);
+                return;
+            }
+
             if (ch->fwd_kind != S3_SRV_FWD_NONE) {
 
                 /*
@@ -3533,6 +3992,28 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     /* the udp channels carry the datagram path only */
                     s3_srv_h3_channel_cancel(ch, "data on a direct-udp channel");
                     return;
+                }
+
+                if (ch->fwd_kind == S3_SRV_FWD_SFTP) {
+
+                    /* the relay: the payload rides the chroot child
+                     * stdin, the pump drains both directions */
+
+                    if (s3_srv_fwd_append(&ch->fwd_in, &ch->fwd_in_cap, &ch->fwd_in_len,
+                                          msg_data.data.data, msg_data.data.len) != S3_OK) {
+                        fprintf(stderr, "ssh3-server: sftp buffer growth failed\n");
+                        s3_srv_h3_channel_free(ch);
+                        return;
+                    }
+
+                    s3_srv_sftp_child_pump(ch);
+
+                    if (ch->sc == NULL) {
+                        /* the pump freed the channel (a dead child) */
+                        return;
+                    }
+
+                    continue;
                 }
 
                 if (ch->sftp != NULL) {
@@ -4272,6 +4753,12 @@ s3_srv_usage(const char *prog)
             "  --url-path p: the CONNECT route, default /ssh3-term (the reference"
             " -url-path)\n"
             "  -H  the sftp jail directory override, default the user's home\n"
+            "  --sftp-jail chroot|lexical: the sftp isolation, default chroot: every\n"
+            "      sftp channel forks a child that chroots into the jail root and\n"
+            "      drops to the session identity before serving (the sshd shape,\n"
+            "      the kernel confines the paths); lexical keeps the historical\n"
+            "      in-process jail, the non-root runs fold to it; a group or\n"
+            "      world-writable jail root is refused\n"
             "  --oidc-issuer url --oidc-audience id: the CONNECT passes only"
             " with the Bearer\n"
             "      id_token of that provider (the S3_OIDC_CA_FILE env pins"
@@ -4322,6 +4809,7 @@ s3_srv_usage(const char *prog)
             " of the flags\n"
             "      above),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
+            "      SSH3_SFTP_JAIL=chroot|lexical (the --sftp-jail flag overrides),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
             "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
             " the passed UDP\n"
@@ -4420,6 +4908,29 @@ main(int argc, char **argv)
             s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                          "invalid SSH3_PASSWORD_LOCKOUT_SECONDS \"%s\", using the default",
                          getenv("SSH3_PASSWORD_LOCKOUT_SECONDS"));
+        }
+    }
+
+    /*
+     * the sftp isolation of the reference (-sftp-jail): the env
+     * default parses first, the CLI flag above overrides it, an
+     * unknown value keeps the default (the chroot)
+     */
+    {
+        const char *jail = getenv("SSH3_SFTP_JAIL");
+
+        if (jail != NULL && *jail != '\0') {
+
+            if (strcmp(jail, "chroot") == 0) {
+                s3_srv_sftp_chroot = 1;
+
+            } else if (strcmp(jail, "lexical") == 0) {
+                s3_srv_sftp_chroot = 0;
+
+            } else {
+                s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                             "invalid SSH3_SFTP_JAIL \"%s\", keeping the default", jail);
+            }
         }
     }
 
@@ -4532,6 +5043,21 @@ main(int argc, char **argv)
 
                 dos_pw_secs = k;
                 value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--sftp-jail") == 0 && n + 1 < argc) {
+
+                /* the chroot|lexical form: anything else stays in
+                 * the argv for the getopt loop to reject with the
+                 * usage */
+
+                if (strcmp(argv[n + 1], "chroot") == 0) {
+                    s3_srv_sftp_chroot = 1;
+                    value = argv[n + 1];
+
+                } else if (strcmp(argv[n + 1], "lexical") == 0) {
+                    s3_srv_sftp_chroot = 0;
+                    value = argv[n + 1];
+                }
             }
 
             if (value != NULL) {
@@ -4678,6 +5204,23 @@ main(int argc, char **argv)
 
     } else if (s3_srv_run_as) {
         s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "per-session setuid enabled");
+    }
+
+    /*
+     * the chroot without the privilege folds to the lexical jail at
+     * the startup (the one-time log): the unprivileged daemon has no
+     * privilege worth jailing and the unit shapes stay untouched
+     */
+
+    if (s3_srv_sftp_chroot && geteuid() != 0) {
+
+        s3_srv_sftp_chroot = 0;
+
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "sftp chroot jail without the root privilege, the lexical jail serves");
+
+    } else if (s3_srv_sftp_chroot) {
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "sftp chroot jail enabled");
     }
 
     if (cert_path == NULL || key_path == NULL) {

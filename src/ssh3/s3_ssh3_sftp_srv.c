@@ -331,11 +331,21 @@ s3_srv_clean(const u_char *src, size_t n, u_char *dst)
     return w;
 }
 
-/* the jail verdict: the root itself or anything below it */
+/*
+ * the jail verdict: the root itself or anything below it; the root
+ * jail ("/") is the chroot child of the server (the F-04, the sshd
+ * model): the kernel confined the process already, so every absolute
+ * spelling lands inside - the same special case the reference
+ * withinRoot carries (the withinRoot of sftp_subsystem.go)
+ */
 
 static unsigned
 s3_srv_inside(const s3_ssh3_sftp_srv_t *t, const u_char *p, size_t n)
 {
+    if (t->home.len == 1) {
+        return 1;
+    }
+
     if (n == t->home.len && s3_memcmp(p, t->home.data, n) == 0) {
         return 1;
     }

@@ -16,6 +16,7 @@
 .Op Fl P Ar pwfile
 .Op Fl K Ar authorized_keys
 .Op Fl H Ar dir
+.Op Fl -sftp-jail Cm chroot | lexical
 .Op Fl -url-path Ar path
 .Op Fl -enable-password-login
 .Op Fl -oidc-issuer Ar url
@@ -136,9 +137,27 @@ the username and does not affect the route.
 Opt into the Basic password method
 .Pq the reference enablePasswordLogin .
 .It Fl H Ar dir
-SFTP jail directory override (the default resolves from the daemon
+SFTP jail directory override (the default resolves from the session
 identity, see
 .Sx PRIVILEGE MODEL ) .
+.It Fl -sftp-jail Cm chroot | lexical
+SFTP isolation mode, default
+.Cm chroot
+(the sshd model, the F-04 fix): every sftp channel forks a child
+that chroots into the jail root and drops to the session identity
+(supplementary groups included) before any user path opens, then
+serves over stdio while the parent pumps bytes; after the chroot the
+path confinement is the kernel's, absolute symlinks and
+.Sq ..
+cannot reach outside.
+A jail root that is group or world-writable is refused, and a
+chroot without the root privilege fails closed.
+.Cm lexical
+keeps the historical in-process jail (the lexical prefix check,
+symlink-sensitive under a privileged daemon); an unprivileged daemon
+folds to it at startup with a one-time warning.
+.Ev SSH3_SFTP_JAIL
+carries the same values, the flag overrides it.
 .It Fl -oidc-issuer Ar url
 OIDC mode: the CONNECT passes only with a Bearer id_token of that
 provider.  The discovery document and the first key set are fetched
@@ -276,8 +295,12 @@ with
 every session and the in-process SFTP server then run as that
 account, per-user identities and /home access are not available.
 .Pp
-The in-process SFTP server always keeps the daemon identity (it
-never forks); point
+The SFTP isolation follows
+.Fl -sftp-jail :
+the default chroot mode forks a jailed, dropped child per channel
+and the daemon never touches user paths; the lexical mode keeps the
+in-process server on the daemon identity (the unprivileged runs,
+or an explicit opt-in) \- point
 .Fl H
 at the intended jail in either model.
 .Sh ENVIRONMENT
@@ -319,6 +342,14 @@ The default of
 .Fl -permit-open ;
 the flag overrides it, an unset or empty value keeps the
 unrestricted dial.
+.It Ev SSH3_SFTP_JAIL
+The SFTP isolation mode,
+.Cm chroot
+or
+.Cm lexical ,
+same as
+.Fl -sftp-jail ;
+the flag overrides it, an unknown value keeps the default.
 .It Ev SSH3C_PROTO
 With
 .Li 1 ,
