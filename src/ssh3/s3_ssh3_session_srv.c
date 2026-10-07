@@ -332,11 +332,24 @@ static char **
 s3_ssh3_session_envp(s3_ssh3_session_srv_t *s, char **envp, size_t cap)
 {
     size_t i, n = 0;
+    int    lang = 0;
+
+    /*
+     * the inherited environ rides FIRST, the session extras LAST:
+     * the children are shells, and the shell environ tables keep the
+     * last duplicate (the same shape as the reference exec.Cmd), so
+     * the extras (TERM, the run_as USER/HOME/SHELL) override the
+     * daemon env
+     */
 
     for (i = 0; environ[i] != NULL; i++) {
 
         if (n == cap - 1) {
             return NULL;
+        }
+
+        if (s3_strncmp(environ[i], "LANG=", 5) == 0) {
+            lang = 1;
         }
 
         envp[n++] = environ[i];
@@ -348,7 +361,44 @@ s3_ssh3_session_envp(s3_ssh3_session_srv_t *s, char **envp, size_t cap)
             return NULL;
         }
 
+        if (s3_strncmp(s->env[i], "LANG=", 5) == 0) {
+            lang = 1;
+        }
+
         envp[n++] = s->env[i];
+    }
+
+    /*
+     * the locale of the shells: the reference unit carries it in the
+     * server env (LANG=C.UTF-8, "forwarded by the server to user
+     * shells"), our whitelist env keeps it explicit - the daemon LANG
+     * passes through, the C.UTF-8 fallback covers the unit shapes
+     * without one
+     */
+
+    if (!lang) {
+
+        const char *l = getenv("LANG");
+        size_t      ln;
+
+        if (l == NULL || *l == '\0') {
+            l = "C.UTF-8";
+        }
+
+        if (n == cap - 1) {
+            return NULL;
+        }
+
+        ln = s3_strlen(l);
+        envp[n] = s3_palloc(s->pool, 5 + ln + 1);
+
+        if (envp[n] == NULL) {
+            return NULL;
+        }
+
+        s3_memcpy(envp[n], "LANG=", 5);
+        s3_memcpy(envp[n] + 5, l, ln + 1);
+        n++;
     }
 
     envp[n] = NULL;
@@ -638,17 +688,29 @@ s3_ssh3_session_srv_pty_req(s3_ssh3_session_srv_t *s, const s3_str_t *term, uint
     int            master, slave;
 
     /*
-     * the term and the modes are accepted and ignored: the reference
-     * keeps TERM for the child environment, the wire contract here
-     * needs nothing from either field
+     * the reference keeps TERM for the child environment (the Go
+     * client sends it with the xterm default, the remote ncurses
+     * programs cannot run without it); the tty modes are accepted
+     * and ignored, the wire contract here needs nothing from them
      */
-    (void)term;
     (void)modes;
 
     /* one pty per session, the second request is the state error */
 
     if (s->pty || s->pid != 0) {
         return S3_DECLINED;
+    }
+
+    if (term != NULL && term->len > 0 && term->len <= 64) {
+
+        char named[65];
+
+        s3_memcpy(named, term->data, term->len);
+        named[term->len] = '\0';
+
+        if (s3_ssh3_session_srv_env(s, "TERM", named) != S3_OK) {
+            return S3_ERROR;
+        }
     }
 
     if (openpty(&master, &slave, NULL, NULL, NULL) != 0) {

@@ -431,6 +431,102 @@ s3_test_session_pty_master_above_stdio(void)
     return s3_test_failures;
 }
 
+/* the pty session carries the requested TERM and the LANG fallback
+ * into the child env (the reference: TERM=<pty-req term> for the pty
+ * sessions, the unit LANG=C.UTF-8 for the shells); the inherited
+ * environ must not shadow the session extras (getenv reads the first
+ * occurrence, the extras ride before it) */
+
+static int
+s3_test_session_pty_term_env(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_ssh3_session_srv_t s;
+    static const s3_str_t term = s3_string("s3-term-probe-42");
+    static const s3_str_t modes = s3_string("");
+    u_char                probe[128];
+    size_t                probe_len;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+
+    /* poison the inherited env: the session extras must win */
+
+    S3_ASSERT(setenv("TERM", "poison-term", 1) == 0);
+    S3_ASSERT(setenv("LANG", "poison-lang", 1) == 0);
+
+    S3_ASSERT(s3_ssh3_session_srv_pty_req(&s, &term, 80, 24, 0, 0, &modes) == S3_OK);
+    S3_ASSERT(s3_ssh3_session_srv_shell(&s, "/bin/sh") == S3_OK);
+
+    probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "echo T=$TERM\n");
+
+    S3_ASSERT(s3_ssh3_session_srv_input(&s, probe, probe_len) == S3_OK);
+    S3_ASSERT(s3_test_read_until(&s, "T=s3-term-probe-42") == 1);
+
+    probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "echo L=${LANG:-none}\n");
+
+    S3_ASSERT(s3_ssh3_session_srv_input(&s, probe, probe_len) == S3_OK);
+
+    /* the inherited LANG is the honest passthrough: the reference
+     * children inherit the server env, the unit carries LANG there */
+
+    S3_ASSERT(s3_test_read_until(&s, "L=poison-lang") == 1);
+
+    probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "exit\n");
+
+    S3_ASSERT(s3_ssh3_session_srv_input(&s, probe, probe_len) == S3_OK);
+    S3_ASSERT(s3_test_read_eof(&s) == 1);
+
+    {
+        uint64_t code = 1;
+        s3_str_t name;
+        unsigned core;
+
+        S3_ASSERT(s3_test_reap_wait(&s, &code, &name, &core) == 0);
+        S3_ASSERT(code == 0);
+    }
+
+    S3_ASSERT(unsetenv("TERM") == 0);
+    S3_ASSERT(unsetenv("LANG") == 0);
+
+    /* the second shape: no LANG anywhere, the C.UTF-8 fallback covers
+     * the systemd-unit daemon env */
+
+    {
+        s3_ssh3_session_srv_t s2;
+
+        S3_ASSERT(s3_ssh3_session_srv_init(&s2, pool) == S3_OK);
+        S3_ASSERT(s3_ssh3_session_srv_pty_req(&s2, &term, 80, 24, 0, 0, &modes) == S3_OK);
+        S3_ASSERT(s3_ssh3_session_srv_shell(&s2, "/bin/sh") == S3_OK);
+
+        probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "echo L=${LANG:-none}\n");
+
+        S3_ASSERT(s3_ssh3_session_srv_input(&s2, probe, probe_len) == S3_OK);
+        S3_ASSERT(s3_test_read_until(&s2, "L=C.UTF-8") == 1);
+
+        probe_len = (size_t)snprintf((char *)probe, sizeof(probe), "exit\n");
+
+        S3_ASSERT(s3_ssh3_session_srv_input(&s2, probe, probe_len) == S3_OK);
+        S3_ASSERT(s3_test_read_eof(&s2) == 1);
+
+        {
+            uint64_t code = 1;
+            s3_str_t name;
+            unsigned core;
+
+            S3_ASSERT(s3_test_reap_wait(&s2, &code, &name, &core) == 0);
+            S3_ASSERT(code == 0);
+        }
+    }
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_session_pty_shell(void)
 {
@@ -1063,6 +1159,7 @@ s3_test_ssh3_session_srv(void)
     (void)s3_test_session_exit_code();
     (void)s3_test_session_signal_term();
     (void)s3_test_session_pty_shell();
+    (void)s3_test_session_pty_term_env();
     (void)s3_test_session_pty_master_above_stdio();
     (void)s3_test_session_pty_exec_signal();
     (void)s3_test_session_run_as_refusal();
