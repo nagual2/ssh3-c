@@ -62,45 +62,22 @@ RuntimeDirectory=ssh3
 TimeoutStopSec=30s
 Restart=on-failure
 RestartSec=3s
-UMask=0077
+# the session umask of the reference (the login default, 022): the
+# sessions are full-identity shells, a daemon-private 0077 would leak
+# into every file they create
+UMask=0022
 
-# Hardening.  The daemon is a plain C17 binary (no JIT, no runtime
-# code loading): MemoryDenyWriteExecute is safe.  ProtectSystem=strict
-# keeps /usr,/boot,/etc read-only under both privilege models.
-ProtectSystem=strict
-# model 1: the session children chdir into and work inside the real
-# user homes; model 2 restores ProtectHome=yes
-ProtectHome=no
-PrivateTmp=yes
-# the pty sessions need the real /dev: the private device set of
-# PrivateDevices=yes ships /dev/ptmx but not the /dev/pts mount, the
-# child reopen of the slave answers ENOENT (the session exits 127)
-PrivateDevices=no
-ProtectClock=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-ProtectProc=invisible
-RestrictRealtime=yes
-# model 1: setuid()/setgroups() of the session drop are the point of
-# this unit, the SUID/SGID seccomp would block them (and the exec of
-# the session shells would inherit that); model 2 restores yes
-RestrictSUIDSGID=no
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-# QUIC is IPv4 UDP; the forward-agent bridge talks AF_UNIX (the agent
-# listener per session), the direct-tcp forwards AF_INET - the
-# session shells need nothing beyond the two
-RestrictAddressFamilies=AF_INET AF_UNIX
-# model 1: exactly what the per-session drop needs - setuid/setgid
-# for the identity switch, chown for the pty slave of the
-# root-opened session, DAC_READ_SEARCH for the per-user files the
-# daemon itself reads (the %u authorized_keys paths); the port is
-# bound by the root-owned .socket unit, nothing else is granted
-# (model 2 replaces this with an empty bounding set)
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETGID CAP_SETUID
+# NO sandboxing in model 1 (the sshd shape): the session children are
+# full-identity shells, and every Namespacing/capability directive
+# here becomes their inherited ceiling - the live deployment caught
+# the ladder one rung at a time: CapabilityBoundingSet without
+# CAP_SYSLOG broke root dmesg, ProtectSystem=strict would break
+# apt (read-only /usr), ProtectProc=invisible hides the system
+# processes from root ps/htop, PrivateTmp hides the host /tmp.
+# sshd carries none of these for its root sessions and neither do
+# we; a hardened deployment wants model 2 (the unprivileged ssh3
+# account) instead - its drop-in recipes stay in ssh3-server(8).
+
 
 # socket-activated only: enabling the unit is
 #   systemctl enable --now ssh3-c-server.socket
