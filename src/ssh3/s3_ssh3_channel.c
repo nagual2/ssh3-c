@@ -65,6 +65,16 @@ s3_ssh3_channel_parse_header(const u_char **pos, const u_char *end, s3_ssh3_chan
         return S3_ERROR;
     }
 
+    /* the peer-advertised maxPacketSize bounds the data messages the
+     * channel may carry (the reference parseHeader refuses beyond the
+     * util.MaxSSHStringLen bound, the F-01 tail); the refusal leaves
+     * the cursor and the channel untouched like every other parse
+     * error, the channel dies below the stack */
+
+    if (max_packet_size > S3_SSH3_CHANNEL_MAX_PACKET_LIMIT) {
+        return S3_ERROR;
+    }
+
     *pos = p;
 
     /* the channel_id is not on the wire: it is the StreamID of the
