@@ -22,6 +22,7 @@
 .Op Fl -oidc-audience Ar id
 .Op Fl -oidc-jwks-ttl Ar seconds
 .Op Fl -run-as-user Cm on | off
+.Op Fl -permit-open Ar spec
 .Op Fl v
 .Op Fl V
 .Op Fl h
@@ -167,6 +168,49 @@ An explicit
 .Cm on
 without the root privilege logs a warning and the daemon serves as
 before.
+.It Fl -permit-open Ar spec
+The forward target policy of the
+.Cm direct-tcp
+and
+.Cm direct-udp
+channels (the
+.Xr sshd 8
+PermitOpen analog): a target the client asks the daemon to dial passes
+only when
+.Ar spec
+allows it, checked before any socket is opened; a denied target
+refuses the channel.
+.Pp
+The spec is a comma/space-separated list of
+.Li host:port
+entries:
+.Li host:port
+(the exact host and port),
+.Li host:*
+(any port),
+.Li *:port
+and
+.Li *:*
+(the wildcards),
+.Li *.example.org:443
+(the wildcard host suffix, matching the subdomains but not
+.Li example.org
+itself),
+.Li \&! Ns Li host:port
+(the negated entry, denying its own match wherever it stands in the
+list), and the bracketed IPv6 literal
+.Li [2001:db8::1]:443 .
+Host patterns are case-insensitive; the target compares in its
+canonical form as the client spelled it on the wire (the literal IP,
+before resolution).
+When the matched entries carry at least one allow entry, an
+unmatched target is denied; a policy of negated entries only keeps
+everything else allowed.
+An empty
+.Ar spec
+(the default, or the unset
+.Ev SSH3_PERMIT_OPEN )
+keeps the historical unrestricted dial.
 .El
 .Sh PRIVILEGE MODEL
 Two deployment shapes are supported.
@@ -231,6 +275,11 @@ With a truthy value
 the Basic password method is opted in without the flag; the flag
 overrides it (the reference env default for systemd
 EnvironmentFile installs).
+.It Ev SSH3_PERMIT_OPEN
+The default of
+.Fl -permit-open ;
+the flag overrides it, an unset or empty value keeps the
+unrestricted dial.
 .It Ev SSH3C_PROTO
 With
 .Li 1 ,

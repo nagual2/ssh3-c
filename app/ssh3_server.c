@@ -75,6 +75,7 @@
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
+#include <s3_ssh3_forward_policy.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_oidc.h>
 #include <s3_ssh3_request.h>
@@ -222,6 +223,14 @@ static s3_event_t              s3_srv_oidc_timer;
  * their workdir so the runs do not touch the real home
  */
 static char s3_srv_sftp_home[512];
+
+/*
+ * the forward target policy (--permit-open / SSH3_PERMIT_OPEN, the
+ * F-05 PermitOpen analog): the direct-tcp and direct-udp dials pass
+ * only the targets it allows; the empty default keeps the historical
+ * unrestricted dial (the zero policy of the module)
+ */
+static s3_ssh3_forward_policy_t s3_srv_fwd_policy;
 
 /*
  * the zerolog-style level name of the reference SSH3_LOG_LEVEL; an
@@ -2915,6 +2924,34 @@ s3_srv_fwd_report(const s3_ssh3_forward_target_t *t, const char *kind)
 }
 
 /*
+ * the permit-open gate of the direct dials (F-05): the target rides
+ * the wire as the raw ip, the canonical inet_ntop text is what the
+ * patterns compare against (the dial as the client spelled it); the
+ * refusal answers before any socket() and the channel dies through
+ * the same cancel path as the unreachable target
+ */
+static s3_int_t
+s3_srv_fwd_policy_gate(const s3_ssh3_forward_target_t *t, const char *kind)
+{
+    char        ip[64];
+    const char *text;
+
+    text = inet_ntop(t->family == 6 ? AF_INET6 : AF_INET, t->ip, ip, sizeof(ip));
+
+    if (text == NULL) {
+        text = "?";
+    }
+
+    if (s3_ssh3_forward_policy_check(&s3_srv_fwd_policy, text, t->port) == S3_OK) {
+        return S3_OK;
+    }
+
+    s3_srv_report("INTEROP-FWD-%s-DENIED target=%s:%u\n", kind, text, (unsigned)t->port);
+
+    return S3_ERROR;
+}
+
+/*
  * the target connect of the direct-tcp channel: the harness runs
  * against the loopback echo services, the plain blocking connect
  * (a refusal on loopback is immediate) is enough and keeps the pump
@@ -2925,6 +2962,10 @@ s3_srv_fwd_tcp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 {
     struct sockaddr_in sa;
     int                fd;
+
+    if (s3_srv_fwd_policy_gate(t, "TCP") != S3_OK) {
+        return S3_ERROR;
+    }
 
     if (t->family != 4) {
         fprintf(stderr, "ssh3-server: direct-tcp: only the ipv4 targets are supported\n");
@@ -2972,6 +3013,10 @@ s3_srv_fwd_udp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 {
     struct sockaddr_in sa;
     int                fd;
+
+    if (s3_srv_fwd_policy_gate(t, "UDP") != S3_OK) {
+        return S3_ERROR;
+    }
 
     if (t->family != 4) {
         fprintf(stderr, "ssh3-server: direct-udp: only the ipv4 targets are supported\n");
@@ -4097,10 +4142,21 @@ s3_srv_usage(const char *prog)
             "      a user without a passwd entry answers 401 before any"
             " spawn, a CONNECT\n"
             "      without a user keeps the daemon identity\n"
+            "  --permit-open spec: the forward target policy of the"
+            " direct-tcp and\n"
+            "      direct-udp dials (the sshd_config PermitOpen"
+            " semantics): comma/space\n"
+            "      separated host:port entries, the \"*\" wildcards"
+            " (the whole host, the\n"
+            "      \"*.suffix\" form, the port), the \"!\" negation,"
+            " the bracketed ipv6\n"
+            "      literal [v6]:port; an empty spec keeps the"
+            " unrestricted default\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
             "      default 5, 0 closes the connections immediately),\n"
+            "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
             "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
             " the passed UDP\n"
@@ -4116,7 +4172,7 @@ main(int argc, char **argv)
     char                    opt;
     const char             *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
     const char             *alpn_name = "h3";
-    const char             *url_path_arg = NULL;
+    const char             *url_path_arg = NULL, *permit_open_arg = NULL;
     unsigned                dg_size = 1200, idle_ms = 60000;
     u_char                 *cert, *key, alpn_wire[256];
     size_t                  cert_len = 0, key_len = 0;
@@ -4194,6 +4250,15 @@ main(int argc, char **argv)
 
                 s3_srv_password_enabled = 1;
                 drop = 1;
+
+            } else if (strcmp(argv[n], "--permit-open") == 0 && n + 1 < argc) {
+
+                /* the spec form: the whole rest of the command line
+                 * stays untouched, the parse rides after the env
+                 * default below */
+
+                permit_open_arg = argv[n + 1];
+                value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--run-as-user") == 0 && n + 1 < argc) {
 
@@ -4360,6 +4425,24 @@ main(int argc, char **argv)
 
         memcpy(s3_srv_url_path, url_path_arg, n + 1);
         s3_srv_url_path_len = n;
+    }
+
+    /*
+     * the forward target policy (F-05): the env default parses first,
+     * the flag above has overridden it already (an empty env keeps
+     * the unrestricted zero policy); a bad spec stops the daemon
+     * before the sockets open, the config-error shape of the
+     * url-path check
+     */
+
+    if (permit_open_arg == NULL) {
+        permit_open_arg = getenv("SSH3_PERMIT_OPEN");
+    }
+
+    if (permit_open_arg != NULL &&
+        s3_ssh3_forward_policy_parse(&s3_srv_fwd_policy, permit_open_arg) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad permit-open spec \"%s\"", permit_open_arg);
+        return 1;
     }
 
     /*
