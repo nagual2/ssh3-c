@@ -72,7 +72,10 @@ ProtectSystem=strict
 # user homes; model 2 restores ProtectHome=yes
 ProtectHome=no
 PrivateTmp=yes
-PrivateDevices=yes
+# the pty sessions need the real /dev: the private device set of
+# PrivateDevices=yes ships /dev/ptmx but not the /dev/pts mount, the
+# child reopen of the slave answers ENOENT (the session exits 127)
+PrivateDevices=no
 ProtectClock=yes
 ProtectHostname=yes
 ProtectKernelLogs=yes

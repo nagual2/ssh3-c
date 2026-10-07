@@ -467,6 +467,24 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
 
         /* the child: the exec failure answers 127 like the shells do */
 
+        /*
+         * the identity drop of the session (P7.3) goes FIRST, before
+         * any fd of the user namespace is wired: the pty slave node
+         * carries the chown of the parent (the session user, mode
+         * 620), and a capped root - the systemd bounding set keeps
+         * only chown/setgid/setuid/dac_read_search, no
+         * cap_dac_override - opens it through the plain DAC check as
+         * a non-owner other.  the supplementary groups first
+         * (initgroups needs the root euid), the group and the user
+         * next; the 126 verdict is the shell convention of a found
+         * but not executable command - the drop failure is the same
+         * class, the shell cannot run under the requested identity
+         */
+        if (s->run_as_name != NULL && (initgroups(s->run_as_name, s->run_as_gid) != 0 ||
+                                       setgid(s->run_as_gid) != 0 || setuid(s->run_as_uid) != 0)) {
+            _exit(126);
+        }
+
         if (s->pty) {
 
             char        path[128];
@@ -554,37 +572,21 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
         }
 
         /*
-         * the identity drop of the session (P7.3): after the fds are
-         * wired, before the exec; the supplementary groups first
-         * (initgroups needs the root euid), the group and the user
-         * next; the 126 verdict is the shell convention of a found
-         * but not executable command - the drop failure is the same
-         * class, the shell cannot run under the requested identity
+         * the home of the session user (the OpenSSH chdir), after the
+         * wiring so a failure message rides the session stream (the
+         * pty or the 95 pipe); a failed chdir is not fatal, the shell
+         * starts from the root
          */
-        if (s->run_as_name != NULL) {
+        if (s->run_as_name != NULL && s->run_as_home != NULL && chdir(s->run_as_home) != 0) {
+            int root_chdir;
 
-            if (initgroups(s->run_as_name, s->run_as_gid) != 0 || setgid(s->run_as_gid) != 0 ||
-                setuid(s->run_as_uid) != 0) {
-                _exit(126);
-            }
+            fprintf(stderr, "ssh3-server: chdir(%s) failed\n", s->run_as_home);
 
-            /*
-             * the home of the session user (the OpenSSH chdir): a
-             * failed chdir is not fatal, the message rides the
-             * session stream itself (the pty or the 95 pipe) and the
-             * shell starts from the root
-             */
-            if (s->run_as_home != NULL && chdir(s->run_as_home) != 0) {
-                int root_chdir;
+            root_chdir = chdir("/");
 
-                fprintf(stderr, "ssh3-server: chdir(%s) failed\n", s->run_as_home);
+            /* nothing to fall back to: the parent cwd serves */
 
-                root_chdir = chdir("/");
-
-                /* nothing to fall back to: the parent cwd serves */
-
-                (void)root_chdir;
-            }
+            (void)root_chdir;
         }
 
         if (env != NULL) {
