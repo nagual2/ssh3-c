@@ -507,7 +507,14 @@ s3_ssh3_session_spawn(s3_ssh3_session_srv_t *s, char *const argv[])
                 (void)close(slave);
             }
 
-            (void)close(master);
+            /* the same stdio guard as the pipes: with the master
+             * raised at the open this never fires on a stdio slot,
+             * the guard keeps the child honest if a caller hands one
+             * in */
+
+            if (master > 2) {
+                (void)close(master);
+            }
 
         } else {
 
@@ -644,6 +651,29 @@ s3_ssh3_session_srv_pty_req(s3_ssh3_session_srv_t *s, const s3_str_t *term, uint
 
     if (openpty(&master, &slave, NULL, NULL, NULL) != 0) {
         return S3_ERROR;
+    }
+
+    /*
+     * the session context runs with the stdio slots vacant (the
+     * connection fork closes them): an openpty master under 3 lands
+     * on a stdio slot and the child close of the inherited master
+     * then kills the fresh dup2 of the slave - the shell would start
+     * with a dead stdio and answer a silent exit 0.  the master is
+     * raised out of the stdio range the same way the exec pipes guard
+     * their ends
+     */
+
+    if (master < 3) {
+        int raised = fcntl(master, F_DUPFD, 3);
+
+        if (raised < 0) {
+            (void)close(master);
+            (void)close(slave);
+            return S3_ERROR;
+        }
+
+        (void)close(master);
+        master = raised;
     }
 
     /* the slave side is done: it reopens by name inside the child */
