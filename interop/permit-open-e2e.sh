@@ -165,6 +165,25 @@ srv_port() {
     grep -oE 'port=[0-9]+' "$WORK/srv.log" | cut -d= -f2
 }
 
+# the listen marker lands in one write, but the daemon start under the
+# drvfs-backed binary can lag whole seconds behind the fork: poll the
+# port out instead of reading it once next to start_srv
+
+wait_port() {
+    i=0
+
+    while [ "$i" -lt 50 ]; do
+        PORT=$(srv_port)
+
+        [ -n "$PORT" ] && return 0
+
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
     -days 30 -subj /CN=permit-open-e2e 2>/dev/null || die "openssl req failed"
 
@@ -192,7 +211,7 @@ echo "== run 1: the allow list 127.0.0.1:19999,127.0.0.1:19998"
 start_srv --permit-open '127.0.0.1:19999,127.0.0.1:19998' ||
     die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
-PORT=$(srv_port)
+wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
 echo "== leg 2: the listed tcp target relays"
 
@@ -249,7 +268,7 @@ echo "== run 2: the negation carve-out !127.0.0.1:19999,127.0.0.1:*"
 start_srv --permit-open '!127.0.0.1:19999,127.0.0.1:*' ||
     die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
-PORT=$(srv_port)
+wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
 echo "== leg 6: the negated entry wins over the wildcard port"
 
@@ -280,7 +299,7 @@ echo "== run 3: the default daemon, no flag"
 
 start_srv || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
-PORT=$(srv_port)
+wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
 echo "== leg 8: the dial behaves as before the policy existed"
 
