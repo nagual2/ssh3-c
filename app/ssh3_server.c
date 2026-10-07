@@ -74,6 +74,7 @@
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_dgram.h>
+#include <s3_ssh3_dos_guard.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_oidc.h>
@@ -1179,10 +1180,97 @@ s3_srv_auth_user_gate(const s3_str_t *user)
 }
 
 /*
+ * the presence probe of the passfile (the booking gate of the
+ * brute-force lockout): the failed verdicts book only for the users
+ * the password backend knows - a line carrying the name - so a flood
+ * of invented usernames grows nothing and locks nobody (the anti
+ * user-enumeration rule of the reference: the unknown user 401s at
+ * the GetUser gate before the password backend is ever reached,
+ * server_auth/auth.go)
+ */
+static s3_int_t
+s3_srv_passfile_has_user(const char *path, const s3_str_t *user)
+{
+    u_char  *buf, *p, *end, *nl, *line_end, *colon;
+    long     fsize;
+    FILE    *f;
+    s3_int_t rc = S3_DECLINED;
+
+    f = fopen(path, "rb");
+
+    if (f == NULL) {
+        return S3_ERROR;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return S3_ERROR;
+    }
+
+    fsize = ftell(f);
+
+    if (fsize < 0 || fsize > 1024 * 1024) {
+        fclose(f);
+        return S3_ERROR;
+    }
+
+    rewind(f);
+
+    buf = s3_alloc((size_t)fsize + 1, NULL);
+
+    if (buf == NULL) {
+        fclose(f);
+        return S3_ERROR;
+    }
+
+    if (fsize > 0 && fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) {
+        s3_free(buf);
+        fclose(f);
+        return S3_ERROR;
+    }
+
+    fclose(f);
+
+    p = buf;
+    end = buf + fsize;
+
+    while (p < end) {
+
+        nl = memchr(p, '\n', (size_t)(end - p));
+
+        line_end = (nl != NULL) ? nl : end;
+
+        if (line_end > p && line_end[-1] == '\r') {
+            line_end--;
+        }
+
+        if (line_end > p && *p != '#') {
+
+            colon = memchr(p, ':', (size_t)(line_end - p));
+
+            if (colon != NULL && (size_t)(colon - p) == user->len &&
+                s3_memcmp(p, user->data, user->len) == 0) {
+                rc = S3_OK;
+                break;
+            }
+        }
+
+        p = (nl != NULL) ? nl + 1 : end;
+    }
+
+    s3_free(buf);
+
+    return rc;
+}
+
+/*
  * the Basic verdict against the -P password file (docs/P4-WIRE.md 7,
  * the Basic step of the reference chain): the credentials decode from
  * the authorization header, the username comes from the CONNECT
- * target (?user=), the harness file answers the match
+ * target (?user=), the harness file answers the match; the
+ * brute-force lockout of the reference CheckBasicAuth sits in front
+ * of the file (429 without touching the backend), the failures of
+ * the known users book and the success clears
  */
 static unsigned
 s3_srv_h3_basic_verdict(void)
@@ -1214,13 +1302,34 @@ s3_srv_h3_basic_verdict(void)
         return 401;
     }
 
+    /* the locked account answers before the password file is read
+     * (the reference refuses with 429 without touching shadow) */
+
+    if (s3_dos_pw_locked(&user, s3_current_msec) == 1) {
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "password auth for %.*s refused: the account is locked out", (int)user.len,
+                     (const char *)user.data);
+        return 429;
+    }
+
     rc = s3_ssh3_auth_password_file_check(s3_srv_passfile, &user, &basic_pass);
 
     if (rc != S3_OK) {
         fprintf(stderr, "ssh3-server: basic auth: user=%.*s rejected rc=%d\n", (int)user.len,
                 (const char *)user.data, (int)rc);
+
+        /* only the users the backend knows accumulate toward the
+         * lockout; the unreadable file (S3_ERROR) is a server
+         * misconfiguration, not an attempt of the account */
+
+        if (rc == S3_DECLINED && s3_srv_passfile_has_user(s3_srv_passfile, &user) == S3_OK) {
+            s3_dos_pw_failure(&user, s3_current_msec);
+        }
+
         return 401;
     }
+
+    s3_dos_pw_success(&user);
 
     /* the setuid gate of the session identity (P7.3): the name that
      * no passwd entry backs never spawns, the CONNECT refuses */
@@ -1551,6 +1660,7 @@ static void
 s3_srv_h3_respond(s3_connection_t *pc)
 {
     unsigned          code;
+    unsigned          dos_slot = 0;
     s3_ssh3_version_t ver;
 
     if (s3_srv_h3_responded) {
@@ -1598,20 +1708,43 @@ s3_srv_h3_respond(s3_connection_t *pc)
 
             code = 425;
 
-        } else if (s3_srv_oidc_issuer != NULL) {
+        } else if (s3_dos_unauth_try_acquire() != S3_OK) {
 
-            /* the OIDC mode: the Bearer id_token of the provider
-             * decides, the conversation nonce binds it */
-            code = s3_srv_h3_oidc_verdict(pc);
+            /*
+             * the MaxStartups analog of the reference (CTO_TASK 4.1):
+             * the unauthenticated phase holds a DoS slot, the request
+             * over the cap refuses before any per-request work worth
+             * protecting - no user lookup, no identity-file read, no
+             * signature verification runs (the reference F-06, the
+             * slot lands here after the version and the early-data
+             * gates, exactly where the go handler takes it)
+             */
+
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "too many unauthenticated conversations (%ui active),"
+                         " the CONNECT is refused",
+                         (s3_uint_t)s3_dos_unauth_count());
+
+            code = 503;
 
         } else {
+
+            /* the verdict chain of the reference runs under the DoS
+             * slot: the OIDC mode lets the Bearer id_token of the
+             * provider decide, the conversation nonce binds it */
+
+            dos_slot = 1;
 
             s3_str_t header;
 
             header.data = s3_srv_h3_auth;
             header.len = s3_srv_h3_auth_len;
 
-            if (s3_srv_h3_auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+            if (s3_srv_oidc_issuer != NULL) {
+
+                code = s3_srv_h3_oidc_verdict(pc);
+
+            } else if (s3_srv_h3_auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
 
                 /* the pubkey step: the Bearer token verifies against
                  * the -K files, or against the default identities
@@ -1653,6 +1786,19 @@ s3_srv_h3_respond(s3_connection_t *pc)
     }
 
     s3_srv_h3_send_status(code);
+
+    if (dos_slot) {
+
+        /*
+         * the slot is released when the auth phase ends, whatever the
+         * verdict - it never survives a successful authentication,
+         * or the logins would brick the server with 503s (the
+         * reference F-03, the unconditional release of e61aca0)
+         */
+
+        s3_dos_unauth_release();
+        dos_slot = 0;
+    }
 
     if (code != 200) {
         /* the rejected request stream closes right after the status */
@@ -4097,10 +4243,29 @@ s3_srv_usage(const char *prog)
             "      a user without a passwd entry answers 401 before any"
             " spawn, a CONNECT\n"
             "      without a user keeps the daemon identity\n"
+            "  --max-unauth-conversations n: the cap of the CONNECTs"
+            " sitting between the\n"
+            "      arrival and the auth verdict (the MaxStartups"
+            " analog), default 100,\n"
+            "      over the cap the CONNECT answers 503 before any"
+            " auth work, 0 refuses\n"
+            "      every CONNECT\n"
+            "  --max-password-failures n: the failed Basic verdicts"
+            " that lock the account\n"
+            "      out of the password backend, default 10\n"
+            "  --password-lockout-seconds s: the lockout window of the"
+            " failed accounts,\n"
+            "      default 60, the locked account answers 429 without"
+            " the password file\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
             "      default 5, 0 closes the connections immediately),\n"
+            "      SSH3_MAX_UNAUTH_CONVERSATIONS,"
+            " SSH3_MAX_PASSWORD_FAILURES,\n"
+            "      SSH3_PASSWORD_LOCKOUT_SECONDS (the DoS guard knobs"
+            " of the flags\n"
+            "      above),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
             "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
             " the passed UDP\n"
@@ -4127,6 +4292,7 @@ main(int argc, char **argv)
     struct sockaddr_storage listen_sa[S3_SRV_LISTENERS_MAX];
     socklen_t               listen_salen[S3_SRV_LISTENERS_MAX];
     unsigned                listeners = 0, li;
+    int                     dos_unauth = -1, dos_pw_failures = -1, dos_pw_secs = -1;
     s3_event_ctx_t          ctx;
     struct sigaction        act;
 
@@ -4153,6 +4319,52 @@ main(int argc, char **argv)
 
     if (getenv("SSH3C_PROTO") != NULL && strcmp(getenv("SSH3C_PROTO"), "1") == 0) {
         s3_srv_proto_mode = 1;
+    }
+
+    /*
+     * the DoS guard knobs of the reference (server_auth/dos_guard.go):
+     * the env defaults parse first, the flags of the pre-scan below
+     * override, an unparsable value falls back to the default like
+     * SSH3_SHUTDOWN_DRAIN
+     */
+
+    if (getenv("SSH3_MAX_UNAUTH_CONVERSATIONS") != NULL) {
+        int n = atoi(getenv("SSH3_MAX_UNAUTH_CONVERSATIONS"));
+
+        if (n >= 0) {
+            dos_unauth = (unsigned)n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_MAX_UNAUTH_CONVERSATIONS \"%s\", using the default",
+                         getenv("SSH3_MAX_UNAUTH_CONVERSATIONS"));
+        }
+    }
+
+    if (getenv("SSH3_MAX_PASSWORD_FAILURES") != NULL) {
+        int n = atoi(getenv("SSH3_MAX_PASSWORD_FAILURES"));
+
+        if (n > 0) {
+            dos_pw_failures = n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_MAX_PASSWORD_FAILURES \"%s\", using the default",
+                         getenv("SSH3_MAX_PASSWORD_FAILURES"));
+        }
+    }
+
+    if (getenv("SSH3_PASSWORD_LOCKOUT_SECONDS") != NULL) {
+        int n = atoi(getenv("SSH3_PASSWORD_LOCKOUT_SECONDS"));
+
+        if (n >= 0) {
+            dos_pw_secs = n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_PASSWORD_LOCKOUT_SECONDS \"%s\", using the default",
+                         getenv("SSH3_PASSWORD_LOCKOUT_SECONDS"));
+        }
     }
 
     /*
@@ -4210,6 +4422,51 @@ main(int argc, char **argv)
                     s3_srv_run_as_set = 1;
                     value = argv[n + 1];
                 }
+
+            } else if (strcmp(argv[n], "--max-unauth-conversations") == 0 && n + 1 < argc) {
+
+                /* the DoS guard knobs (the reference
+                 * -max-unauth-conversations and friends): a value the
+                 * cap cannot carry is a config error, the daemon
+                 * refuses to start; the cap of zero is the legitimate
+                 * kill-switch (every CONNECT refuses with 503) */
+
+                int k = atoi(argv[n + 1]);
+
+                if (k < 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                                 "bad --max-unauth-conversations \"%s\"", argv[n + 1]);
+                    return 1;
+                }
+
+                dos_unauth = (unsigned)k;
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--max-password-failures") == 0 && n + 1 < argc) {
+
+                int k = atoi(argv[n + 1]);
+
+                if (k <= 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad --max-password-failures \"%s\"",
+                                 argv[n + 1]);
+                    return 1;
+                }
+
+                dos_pw_failures = k;
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--password-lockout-seconds") == 0 && n + 1 < argc) {
+
+                int k = atoi(argv[n + 1]);
+
+                if (k < 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                                 "bad --password-lockout-seconds \"%s\"", argv[n + 1]);
+                    return 1;
+                }
+
+                dos_pw_secs = k;
+                value = argv[n + 1];
             }
 
             if (value != NULL) {
@@ -4233,6 +4490,23 @@ main(int argc, char **argv)
                 n++;
             }
         }
+    }
+
+    /*
+     * the knobs land on the guards once: the env defaults and the
+     * flags met in the same locals, the last writer of each wins
+     * (the flag overrides the env, the untouched piece keeps the
+     * module default)
+     */
+
+    if (dos_unauth >= 0) {
+        s3_dos_unauth_set_limit((unsigned)dos_unauth);
+    }
+
+    if (dos_pw_failures >= 0 || dos_pw_secs >= 0) {
+        s3_dos_pw_set_limits(
+            dos_pw_failures >= 0 ? (unsigned)dos_pw_failures : S3_DOS_PW_FAILURES_MAX_DEFAULT,
+            dos_pw_secs >= 0 ? (s3_msec_t)dos_pw_secs * 1000 : S3_DOS_PW_LOCKOUT_MSEC_DEFAULT);
     }
 
     while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3vVh")) != -1) {

@@ -22,6 +22,9 @@
 .Op Fl -oidc-audience Ar id
 .Op Fl -oidc-jwks-ttl Ar seconds
 .Op Fl -run-as-user Cm on | off
+.Op Fl -max-unauth-conversations Ar n
+.Op Fl -max-password-failures Ar n
+.Op Fl -password-lockout-seconds Ar s
 .Op Fl v
 .Op Fl V
 .Op Fl h
@@ -167,6 +170,27 @@ An explicit
 .Cm on
 without the root privilege logs a warning and the daemon serves as
 before.
+.It Fl -max-unauth-conversations Ar n
+The cap of the CONNECTs sitting between the arrival and the auth
+verdict (the MaxStartups analog of the reference
+.Cm -max-unauth-conversations ) ,
+default 100.
+A CONNECT over the cap answers 503 before any auth work runs - no
+user lookup, no identity-file read, no signature verification; the
+slot of an answered CONNECT frees with the verdict, whatever the
+verdict is.
+Zero is the legitimate kill-switch: every CONNECT answers 503.
+.It Fl -max-password-failures Ar n
+The number of failed Basic verdicts that locks the account out of
+the password backend, default 10 (the reference
+.Cm -max-password-failures ) .
+Only the users the password file knows accumulate toward the
+lockout, the invented usernames book nothing.
+.It Fl -password-lockout-seconds Ar s
+The lockout window of a failed account, default 60 (the reference
+.Cm -password-lockout-seconds ) .
+While it lasts the locked account answers 429 without the password
+file being read; a successful authentication clears the record.
 .El
 .Sh PRIVILEGE MODEL
 Two deployment shapes are supported.
@@ -231,6 +255,21 @@ With a truthy value
 the Basic password method is opted in without the flag; the flag
 overrides it (the reference env default for systemd
 EnvironmentFile installs).
+.It Ev SSH3_MAX_UNAUTH_CONVERSATIONS
+The env default of
+.Fl -max-unauth-conversations ,
+the flag overrides it; an unparsable or negative value falls back
+to the default.
+.It Ev SSH3_MAX_PASSWORD_FAILURES
+The env default of
+.Fl -max-password-failures ,
+the flag overrides it; an unparsable or non-positive value falls
+back to the default.
+.It Ev SSH3_PASSWORD_LOCKOUT_SECONDS
+The env default of
+.Fl -password-lockout-seconds ,
+the flag overrides it; an unparsable or negative value falls back
+to the default.
 .It Ev SSH3C_PROTO
 With
 .Li 1 ,
