@@ -370,6 +370,67 @@ s3_test_session_signal_term(void)
  * interactive shells ignore SIGTERM, so the TERM leg of the brief
  * rides in the exec run above and in the pty exec run below
  */
+/* the pty master must stay out of the stdio range: the connection
+ * fork runs with the stdio slots closed, a master on such a slot is
+ * closed by the child after the dup2 and the shell starts with a dead
+ * stdio (the silent exit 0 of the setuid e2e pty leg) */
+
+static int
+s3_test_session_pty_master_above_stdio(void)
+{
+    s3_log_t              log;
+    s3_pool_t            *pool;
+    s3_ssh3_session_srv_t s;
+    static const s3_str_t modes = s3_string("");
+    static const s3_str_t term = s3_string("xterm");
+    int                   saved0, saved1, saved2;
+    int                   rc, master;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    S3_ASSERT(s3_ssh3_session_srv_init(&s, pool) == S3_OK);
+
+    saved0 = dup(0);
+    saved1 = dup(1);
+    saved2 = dup(2);
+    S3_ASSERT(saved0 >= 0 && saved1 >= 0 && saved2 >= 0);
+
+    /* the connection-fork shape: the stdio slots are vacant */
+
+    S3_ASSERT(close(0) == 0);
+    S3_ASSERT(close(1) == 0);
+    S3_ASSERT(close(2) == 0);
+
+    rc = s3_ssh3_session_srv_pty_req(&s, &term, 80, 24, 0, 0, &modes);
+    master = s.pty_master;
+
+    /* the stdio back before any assertion output rides it */
+
+    S3_ASSERT(dup2(saved0, 0) == 0);
+    S3_ASSERT(dup2(saved1, 1) == 1);
+    S3_ASSERT(dup2(saved2, 2) == 2);
+    S3_ASSERT(close(saved0) == 0);
+    S3_ASSERT(close(saved1) == 0);
+    S3_ASSERT(close(saved2) == 0);
+
+    S3_ASSERT(rc == S3_OK);
+    S3_ASSERT(s.pty == 1);
+
+    /* the master must not share a stdio slot: the child closes the
+     * inherited master by number after the dup2 of the slave */
+
+    S3_ASSERT(master > 2);
+
+    S3_ASSERT(close(master) == 0);
+    s.pty_master = S3_SSH3_SESSION_INVALID_FD;
+    s.pty = 0;
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_session_pty_shell(void)
 {
@@ -1002,6 +1063,7 @@ s3_test_ssh3_session_srv(void)
     (void)s3_test_session_exit_code();
     (void)s3_test_session_signal_term();
     (void)s3_test_session_pty_shell();
+    (void)s3_test_session_pty_master_above_stdio();
     (void)s3_test_session_pty_exec_signal();
     (void)s3_test_session_run_as_refusal();
     (void)s3_test_session_pump_events();
