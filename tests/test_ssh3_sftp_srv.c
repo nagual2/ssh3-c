@@ -839,6 +839,63 @@ s3_test_sftp_srv(void)
     S3_ASSERT(s3_ssh3_sftp_srv_input(&srv3, req, 4) == S3_ERROR);
     S3_ASSERT(s3_ssh3_sftp_srv_protocol_error(&srv3) == 1);
 
+    /* ---------------- 10. the root jail of the chroot child ---------------- */
+
+    /*
+     * the chroot child serves home "/" (the F-04, the sshd model):
+     * the kernel is the confinement, so every absolute spelling
+     * lands inside and nothing is denied on the wire (the reference
+     * withinRoot of the same commit)
+     */
+
+    {
+        s3_ssh3_sftp_srv_t srv_root;
+        s3_str_t           s_rfile, s_outside;
+
+        S3_ASSERT(s3_test_make_srv(&srv_root, pool, "/") == S3_OK);
+
+        n = S3_TEST_BUILD(s3_ssh3_sftp_encode_init, req, 3);
+        S3_ASSERT(s3_ssh3_sftp_srv_input(&srv_root, req, n) == S3_OK);
+        S3_ASSERT(s3_test_collect(&srv_root, s3_test_rep, sizeof(s3_test_rep)) > 0);
+
+        (void)snprintf(p1, sizeof(p1), "%s/rf.txt", jail);
+        S3_ASSERT(s3_test_write_file(p1, "rootjail\n") == 0);
+
+        /* the absolute spelling outside the old home shape still
+           opens: the root jail carries it */
+
+        (void)snprintf(exp, sizeof(exp), "%s/rf.txt", jail);
+
+        s_rfile = s3_test_str(exp);
+
+        id++;
+        n = S3_TEST_BUILD(s3_ssh3_sftp_encode_open, req, id, &s_rfile, S3_SSH3_SFTP_FXF_READ,
+                          &zero);
+        s3_test_expect_handle(&srv_root, req, n, id, hp, &pkt);
+        h = s3_test_handle_at(hp);
+
+        id++;
+        n = S3_TEST_BUILD(s3_ssh3_sftp_encode_read, req, id, &h, 0, 4096);
+        s3_test_rpc(&srv_root, req, n, id, S3_SSH3_SFTP_DATA, &pkt);
+        S3_ASSERT(s3_test_data_of(&pkt, &data) == 0);
+        S3_ASSERT(s3_test_str_is(&data, "rootjail\n"));
+
+        id++;
+        n = S3_TEST_BUILD(s3_ssh3_sftp_encode_close, req, id, &h);
+        s3_test_expect_status(&srv_root, req, n, id, S3_SSH3_SFTP_FX_OK, &pkt);
+
+        /* the .. walk is a plain mapping here, no wire denial: the
+           kernel confines the child, the lexical check is done */
+
+        s_outside = s3_test_str("../outside");
+
+        id++;
+        n = S3_TEST_BUILD(s3_ssh3_sftp_encode_realpath, req, id, &s_outside);
+        s3_test_rpc(&srv_root, req, n, id, S3_SSH3_SFTP_NAME, &pkt);
+        S3_ASSERT(s3_test_name1_of(&pkt, &path) == 0);
+        S3_ASSERT(s3_test_str_is(&path, "/outside"));
+    }
+
     /* ---------------- the cleanup ---------------- */
 
     s3_test_rmrec(jail, sizeof(jail));
