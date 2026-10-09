@@ -3895,6 +3895,7 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
     size_t                          total;
     ssize_t                         m;
     unsigned                        fwd;
+    unsigned                        is_session;
 
     s3_memzero(&hdr, sizeof(hdr));
 
@@ -3932,6 +3933,26 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
                       (int)hdr.type.len, (const char *)hdr.type.data);
 
         s3_srv_h3_channel_cancel(ch, "server-to-client channel type refused");
+        return S3_ERROR;
+    }
+
+    /*
+     * the allow-list (P3-03): the client-role surface is exactly the
+     * session, the two direct forwards and the sftp channel; any
+     * other string would take a tracked slot and a 91 for a channel
+     * the server never meant to serve (the pass-3 audit), the
+     * refusal sits before the confirmation like the role table above
+     */
+    is_session = s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SESSION);
+
+    if (!is_session && !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SFTP) &&
+        !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_TCP) &&
+        !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_UDP)) {
+
+        s3_srv_report("CHROLE-UNKNOWN-DENIED id=%llu type=%.*s\n", (unsigned long long)qs->id,
+                      (int)hdr.type.len, (const char *)hdr.type.data);
+
+        s3_srv_h3_channel_cancel(ch, "unknown channel type refused");
         return S3_ERROR;
     }
 
@@ -3975,7 +3996,7 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
 
     /* the role snapshot for the request gate below (S2-03) */
 
-    ch->is_session = s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SESSION);
+    ch->is_session = is_session;
 
     if (fwd) {
 

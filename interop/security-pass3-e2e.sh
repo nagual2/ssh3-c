@@ -97,7 +97,7 @@ else
     fail "raw: want BAD-CHANNEL-VERDICT confirmed=0, got $(tail -1 "$WORK/cli-raw.log")"
 fi
 
-if grep -q "CHROLE-UNKNOWN-DENIED type=evil-type" "$WORK/srv1.log"; then
+if grep -q "CHROLE-UNKNOWN-DENIED id=[0-9]* type=evil-type" "$WORK/srv1.log"; then
     pass "the server denied the unknown type"
 else
     fail "the server log has no CHROLE-UNKNOWN-DENIED"
@@ -123,7 +123,7 @@ else
     fail "the session channel: rc=$RC $(tail -1 "$WORK/cli-ok.log")"
 fi
 
-if grep -q "INTEROP-CHANNEL-ACCEPT type=session" "$WORK/srv2.log"; then
+if grep -q "INTEROP-CHANNEL-ACCEPT id=[0-9]* type=session" "$WORK/srv2.log"; then
     pass "the server accepted the session type"
 else
     fail "the server log has no INTEROP-CHANNEL-ACCEPT type=session"
