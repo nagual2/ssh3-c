@@ -7096,11 +7096,17 @@ main(int argc, char **argv)
                          * the probe: forwarded-* is the bogus
                          * server-to-client role, the overgrow opens a
                          * valid session channel and trickles the
-                         * garbage after the 91 arrives
+                         * garbage after the 91 arrives, the raw:
+                         * prefix rides the rest verbatim as the
+                         * channel type (the pass-3 unknown-type probe)
                          */
 
-                        if (strcmp(s3_interop_bad_channel, "forwarded-tcp") == 0 ||
-                            strcmp(s3_interop_bad_channel, "forwarded-udp") == 0) {
+                        if (strncmp(s3_interop_bad_channel, "raw:", 4) == 0) {
+                            hdr.type.data = (u_char *)s3_interop_bad_channel + 4;
+                            hdr.type.len = strlen(s3_interop_bad_channel + 4);
+
+                        } else if (strcmp(s3_interop_bad_channel, "forwarded-tcp") == 0 ||
+                                   strcmp(s3_interop_bad_channel, "forwarded-udp") == 0) {
                             hdr.type.data = (u_char *)s3_interop_bad_channel;
                             hdr.type.len = strlen(s3_interop_bad_channel);
 
