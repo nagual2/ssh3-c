@@ -97,6 +97,22 @@
 #define S3_SRV_CHANNEL_MAX_PACKET 30000
 
 /*
+ * the accumulation bound of one channel stream (S2-01, the pass-2
+ * audit): a peer trickling bytes that never complete a message must
+ * not grow the receive buffer forever; the largest legit message is
+ * the locally advertised maxPacketSize plus the header and frame
+ * overheads, everything past the bound is a protocol violation
+ */
+#define S3_SRV_CHANNEL_BUF_MAX (S3_SRV_CHANNEL_MAX_PACKET + 1024)
+
+/*
+ * the same bound for the h3 request buffer: the CONNECT request with
+ * its auth headers is a few KiB at worst, an endless request never
+ * completes and is torn down instead of growing the heap
+ */
+#define S3_SRV_H3_BUF_MAX 65536
+
+/*
  * the flush grace after the drain ends: the queued frames of the
  * finished channels (the 98 verdicts, the stream fins) ride the next
  * event passes before the CONNECTION_CLOSE goes out
@@ -830,6 +846,7 @@ struct s3_srv_h3_channel_s {
     size_t   cap;
     size_t   len;
     unsigned confirmed;
+    unsigned is_session; /* the type is "session", the requests ride it (S2-03) */
 
     /*
      * the session side: the pool owns the session struct and its
@@ -1884,8 +1901,27 @@ s3_srv_h3_request_read(s3_event_t *ev)
         }
 
         if (s3_srv_h3_len == s3_srv_h3_cap) {
-            size_t  cap = s3_srv_h3_cap + 262144;
-            u_char *grown = realloc(s3_srv_h3_buf, cap);
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound on the request path: a full buffer with
+             * no complete request inside is a peer trickling bytes,
+             * the stream is torn down instead of growing */
+
+            if (s3_srv_h3_cap >= S3_SRV_H3_BUF_MAX) {
+                fprintf(stderr, "ssh3-server: h3 request overgrown\n");
+                (void)s3_quic_cancelable_stream(sc);
+                (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+                return;
+            }
+
+            cap = s3_srv_h3_cap + 262144;
+
+            if (cap > S3_SRV_H3_BUF_MAX) {
+                cap = S3_SRV_H3_BUF_MAX;
+            }
+
+            grown = realloc(s3_srv_h3_buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "ssh3-server: h3 buffer growth failed\n");
@@ -3722,6 +3758,22 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
     }
 
     /*
+     * the role table (S2-03): the forwarded-* types are the
+     * server-to-client half of the reverse forward, a client opening
+     * them towards the server is refused before the confirmation -
+     * the reference cancels the stream the same way
+     */
+    if (s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_FORWARDED_TCP) ||
+        s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP)) {
+
+        s3_srv_report("CHROLE-FORWARDED-DENIED id=%llu type=%.*s\n", (unsigned long long)qs->id,
+                      (int)hdr.type.len, (const char *)hdr.type.data);
+
+        s3_srv_h3_channel_cancel(ch, "server-to-client channel type refused");
+        return S3_ERROR;
+    }
+
+    /*
      * the direct-* channels carry the target extension right after
      * the header (docs/P4-WIRE.md 2.1), the other types end there
      */
@@ -3758,6 +3810,10 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
     }
 
     ch->confirmed = 1;
+
+    /* the role snapshot for the request gate below (S2-03) */
+
+    ch->is_session = s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SESSION);
 
     if (fwd) {
 
@@ -3822,8 +3878,25 @@ s3_srv_h3_channel_read(s3_event_t *ev)
     for (;;) {
 
         if (ch->len == ch->cap) {
-            size_t  cap = ch->cap + 262144;
-            u_char *grown = realloc(ch->buf, cap);
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: a full buffer with no complete message
+             * inside is a peer trickling bytes past the advertised
+             * maxPacketSize, the channel dies instead of growing */
+
+            if (ch->cap >= S3_SRV_CHANNEL_BUF_MAX) {
+                s3_srv_h3_channel_cancel(ch, "channel buffer overgrown");
+                return;
+            }
+
+            cap = ch->cap + 262144;
+
+            if (cap > S3_SRV_CHANNEL_BUF_MAX) {
+                cap = S3_SRV_CHANNEL_BUF_MAX;
+            }
+
+            grown = realloc(ch->buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "ssh3-server: channel buffer growth failed\n");
@@ -4110,10 +4183,14 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
             if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
 
-                if (ch->fwd_kind != S3_SRV_FWD_NONE) {
+                if (ch->fwd_kind != S3_SRV_FWD_NONE || !ch->is_session) {
 
-                    /* the forward channels carry no requests */
-                    s3_srv_h3_channel_cancel(ch, "request on a forward channel");
+                    /*
+                     * the role table (S2-03): the requests belong to
+                     * the session channels only, the forward kinds and
+                     * the unnamed types carry none
+                     */
+                    s3_srv_h3_channel_cancel(ch, "request on a non-session channel");
                     return;
                 }
 
