@@ -113,6 +113,17 @@
  */
 #define S3_INTEROP_CHANNEL_MAX_PACKET 30000
 
+/*
+ * the receive bounds of the harness client (S2-01, the pass-2
+ * audit): a server trickling bytes that never complete a response
+ * or a message must not grow the buffers forever; the legit content
+ * of the bounded buffers is a few 30000-byte frames at most, the
+ * exec output accumulator carries the verdicts and stops at 8 MiB
+ */
+#define S3_INTEROP_H3_BUF_MAX   65536
+#define S3_INTEROP_CH_BUF_MAX   65536
+#define S3_INTEROP_SESS_OUT_MAX (8 << 20)
+
 static s3_log_t s3_interop_log;
 
 static u_char *s3_interop_expected;
@@ -155,6 +166,16 @@ static s3_connection_t *s3_interop_h3_channel;
 static unsigned         s3_interop_h3_ch_sent;
 static unsigned         s3_interop_h3_ch_confirmed;
 static unsigned         s3_interop_h3_ch_ok;
+
+/*
+ * the pass-2 e2e probe (S3INTEROP_BAD_CHANNEL=forwarded-tcp|
+ * forwarded-udp|overgrow): the channel phase opens the bogus
+ * server-to-client type (or trickles the garbage past the receive
+ * bound after the 91) and expects the teardown instead of the echo;
+ * the verdict line rides stdout for the script to assert
+ */
+static const char *s3_interop_bad_channel;
+static unsigned    s3_interop_bad_garbage_sent;
 
 /*
  * the session scenarios (-3 -C -S exec|pty|kill): the channel carries
@@ -1448,8 +1469,24 @@ s3_interop_h3_response_read(s3_event_t *ev)
     for (;;) {
 
         if (s3_interop_h3_len == s3_interop_h3_cap) {
-            size_t  cap = s3_interop_h3_cap + 262144;
-            u_char *grown = realloc(s3_interop_h3_buf, cap);
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: an endless response never completes */
+
+            if (s3_interop_h3_cap >= S3_INTEROP_H3_BUF_MAX) {
+                s3_interop_h3_stream_fatal(sc, "h3 response overgrown");
+                return;
+            }
+
+            cap = s3_interop_h3_cap + 262144;
+
+            if (cap > S3_INTEROP_H3_BUF_MAX) {
+                cap = S3_INTEROP_H3_BUF_MAX;
+            }
+
+            grown = realloc(s3_interop_h3_buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "interop-client: h3 buffer growth failed\n");
@@ -1583,8 +1620,25 @@ s3_interop_h3_channel_read(s3_event_t *ev)
     for (;;) {
 
         if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
-            size_t  cap = s3_interop_h3_ch_cap + 262144;
-            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: a full buffer with no complete
+             * message inside is a server trickling bytes */
+
+            if (s3_interop_h3_ch_cap >= S3_INTEROP_CH_BUF_MAX) {
+                s3_interop_h3_stream_fatal(sc, "channel buffer overgrown");
+                return;
+            }
+
+            cap = s3_interop_h3_ch_cap + 262144;
+
+            if (cap > S3_INTEROP_CH_BUF_MAX) {
+                cap = S3_INTEROP_CH_BUF_MAX;
+            }
+
+            grown = realloc(s3_interop_h3_ch_buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "interop-client: channel buffer growth failed\n");
@@ -1599,6 +1653,20 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                      s3_interop_h3_ch_cap - s3_interop_h3_ch_len);
 
         if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n <= 0 && s3_interop_bad_channel != NULL) {
+
+            /* the probe pass: the peer tore the channel down, the
+             * confirmation fact tells which refusal it was (the
+             * forwarded-* role dies without the 91, the overgrown
+             * buffer dies right after it) */
+
+            printf("BAD-CHANNEL-VERDICT mode=%s confirmed=%u OK\n", s3_interop_bad_channel,
+                   s3_interop_h3_ch_confirmed);
+            fflush(stdout);
+            s3_interop_h3_ch_ok = 1;
             return;
         }
 
@@ -1644,6 +1712,35 @@ s3_interop_h3_channel_read(s3_event_t *ev)
                 }
 
                 s3_interop_h3_ch_confirmed = 1;
+
+                if (s3_interop_bad_channel != NULL && !s3_interop_bad_garbage_sent) {
+
+                    /*
+                     * the overgrow probe: a valid 94 data frame
+                     * claiming a 4 GiB payload rides right after the
+                     * 91, the zero bytes dribble behind it - the
+                     * server waits for the body and dies at its
+                     * receive bound instead of growing; the type
+                     * varint is the two-byte 94 (0x40 0x5e), the
+                     * SSHString length rides the 8-byte form
+                     */
+
+                    static u_char frame[11] = {0x40, 0x5e, 0xc0, 0x00, 0x00, 0x00,
+                                               0x00, 0xff, 0xff, 0xff, 0xff};
+                    static u_char zeros[4096];
+                    unsigned      k;
+
+                    s3_interop_bad_garbage_sent = 1;
+
+                    (void)s3_quic_stream_send(sc, frame, sizeof(frame));
+
+                    for (k = 0; k < 10; k++) {
+                        if (s3_quic_stream_send(sc, zeros, sizeof(zeros)) < 0) {
+                            break;
+                        }
+                    }
+                }
+
                 continue;
             }
 
@@ -1781,8 +1878,25 @@ s3_interop_h3_fwd_read(s3_event_t *ev)
     for (;;) {
 
         if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
-            size_t  cap = s3_interop_h3_ch_cap + 262144;
-            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: a full buffer with no complete
+             * message inside is a server trickling bytes */
+
+            if (s3_interop_h3_ch_cap >= S3_INTEROP_CH_BUF_MAX) {
+                s3_interop_h3_stream_fatal(sc, "channel buffer overgrown");
+                return;
+            }
+
+            cap = s3_interop_h3_ch_cap + 262144;
+
+            if (cap > S3_INTEROP_CH_BUF_MAX) {
+                cap = S3_INTEROP_CH_BUF_MAX;
+            }
+
+            grown = realloc(s3_interop_h3_ch_buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "interop-client: channel buffer growth failed\n");
@@ -1963,6 +2077,15 @@ s3_interop_h3_sess_append(const u_char *data, size_t len)
 {
     if (len == 0) {
         return;
+    }
+
+    if (s3_interop_h3_sess_out_len + len > S3_INTEROP_SESS_OUT_MAX) {
+
+        /* the S2-01 bound: the verdicts are KiB, a server flooding
+         * the session output is not a peer to keep serving */
+
+        fprintf(stderr, "interop-client: session output overgrown\n");
+        exit(1);
     }
 
     if (s3_interop_h3_sess_out_len + len > s3_interop_h3_sess_out_cap) {
@@ -3479,8 +3602,27 @@ s3_interop_cm_run_read(s3_event_t *ev)
     for (;;) {
 
         if (run->ch_len == run->ch_cap) {
-            size_t  cap = run->ch_cap + 262144;
-            u_char *grown = realloc(run->ch_buf, cap);
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: the run channel carries the small
+             * replies of the bridged sessions, an endless stream is
+             * a server bug or an attack, the run dies either way */
+
+            if (run->ch_cap >= S3_INTEROP_CH_BUF_MAX) {
+                fprintf(stderr, "interop-client: cm channel buffer overgrown\n");
+                s3_interop_cm_run_finalize(run, 255);
+                return;
+            }
+
+            cap = run->ch_cap + 262144;
+
+            if (cap > S3_INTEROP_CH_BUF_MAX) {
+                cap = S3_INTEROP_CH_BUF_MAX;
+            }
+
+            grown = realloc(run->ch_buf, cap);
 
             if (grown == NULL) {
                 s3_interop_cm_run_finalize(run, 255);
@@ -5074,8 +5216,25 @@ s3_interop_h3_session_read(s3_event_t *ev)
     for (;;) {
 
         if (s3_interop_h3_ch_len == s3_interop_h3_ch_cap) {
-            size_t  cap = s3_interop_h3_ch_cap + 262144;
-            u_char *grown = realloc(s3_interop_h3_ch_buf, cap);
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the S2-01 bound: a full buffer with no complete
+             * message inside is a server trickling bytes */
+
+            if (s3_interop_h3_ch_cap >= S3_INTEROP_CH_BUF_MAX) {
+                s3_interop_h3_stream_fatal(sc, "channel buffer overgrown");
+                return;
+            }
+
+            cap = s3_interop_h3_ch_cap + 262144;
+
+            if (cap > S3_INTEROP_CH_BUF_MAX) {
+                cap = S3_INTEROP_CH_BUF_MAX;
+            }
+
+            grown = realloc(s3_interop_h3_ch_buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "interop-client: channel buffer growth failed\n");
@@ -6922,7 +7081,35 @@ main(int argc, char **argv)
                     hdr.conversation_stream_id = s3_interop_fwd_conv_id;
                     hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
 
-                    if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
+                    if (s3_interop_bad_channel == NULL) {
+
+                        const char *bad = getenv("S3INTEROP_BAD_CHANNEL");
+
+                        if (bad != NULL && *bad != '\0') {
+                            s3_interop_bad_channel = bad;
+                        }
+                    }
+
+                    if (s3_interop_bad_channel != NULL) {
+
+                        /*
+                         * the probe: forwarded-* is the bogus
+                         * server-to-client role, the overgrow opens a
+                         * valid session channel and trickles the
+                         * garbage after the 91 arrives
+                         */
+
+                        if (strcmp(s3_interop_bad_channel, "forwarded-tcp") == 0 ||
+                            strcmp(s3_interop_bad_channel, "forwarded-udp") == 0) {
+                            hdr.type.data = (u_char *)s3_interop_bad_channel;
+                            hdr.type.len = strlen(s3_interop_bad_channel);
+
+                        } else {
+                            hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
+                            hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+                        }
+
+                    } else if (s3_interop_fwd_mode == S3_INTEROP_FWD_TCP) {
                         hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
                         hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
 
@@ -6942,7 +7129,14 @@ main(int argc, char **argv)
                     p = frame;
                     p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
 
-                    if (s3_interop_fwd_mode != S3_INTEROP_FWD_NONE) {
+                    if (s3_interop_bad_channel != NULL) {
+
+                        /* the probe: the header alone rides, the rest
+                         * of the frame stays empty */
+
+                    }
+
+                    else if (s3_interop_fwd_mode != S3_INTEROP_FWD_NONE) {
 
                         /*
                          * the target extension of the direct-* types

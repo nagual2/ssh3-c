@@ -263,6 +263,44 @@ static s3_ssh3_forward_policy_t s3_srv_fwd_policy;
 static unsigned s3_srv_sftp_chroot = 1;
 
 /*
+ * the concurrent sftp sessions per authenticated user (S2-02, the
+ * pass-2 audit, --max-sftp-sessions-per-user): every sftp channel
+ * holds one slot of its user's budget for its lifetime (the chroot
+ * child or the in-process engine alike), over the cap the channel is
+ * refused before any fork.  0 disables the budget.  The per-user
+ * table is small: the daemon serves one conversation at a time, the
+ * extra entries exist for the shape only
+ */
+#define S3_SRV_SFTP_BUDGET_USERS 16
+#define S3_SRV_SFTP_USER_MAX     127
+
+static unsigned s3_srv_sftp_cap = 16;
+
+typedef struct {
+    char     user[S3_SRV_SFTP_USER_MAX + 1];
+    unsigned n; /* the live sftp channels of the user */
+} s3_srv_sftp_budget_t;
+
+static s3_srv_sftp_budget_t s3_srv_sftp_budgets[S3_SRV_SFTP_BUDGET_USERS];
+
+/* the CONNECTs without a user serve under the daemon identity, their
+ * budget lives in its own counter (the empty key never occupies a
+ * table slot) */
+
+static unsigned s3_srv_sftp_budget_none;
+
+/*
+ * the concurrent QUIC connections (S2-06, --max-connections): over
+ * the cap the new connection answers CONNECTION_CLOSE at once, 0
+ * (the default) keeps the historical unbounded behavior
+ */
+static int s3_srv_max_conns = 0;
+
+/* the handshake timeout in ms (S2-06, --handshake-timeout-ms) */
+
+static int s3_srv_hs_ms = 30000;
+
+/*
  * the zerolog-style level name of the reference SSH3_LOG_LEVEL; an
  * unknown name keeps the fallback (the default level)
  */
@@ -907,9 +945,10 @@ struct s3_srv_h3_channel_s {
      * child serves the engine behind chroot+drop, the parent pumps
      * the two pipes; the death of the child ends the channel
      */
-    pid_t sftp_pid; /* the child process, 0 once reaped */
-    int   sftp_in;  /* the stdin pipe of the child, -1 when unused */
-    int   sftp_out; /* the stdout pipe of the child, -1 when unused */
+    pid_t    sftp_pid;      /* the child process, 0 once reaped */
+    int      sftp_in;       /* the stdin pipe of the child, -1 when unused */
+    int      sftp_out;      /* the stdout pipe of the child, -1 when unused */
+    unsigned sftp_budgeted; /* the per-user sftp budget slot is held (S2-02) */
 
     /*
      * the agent side of a session channel: the listener appears on
@@ -949,6 +988,10 @@ static void s3_srv_sftp_pump(s3_srv_h3_channel_t *ch);
 static void s3_srv_sftp_child_pump(s3_srv_h3_channel_t *ch);
 
 static s3_int_t s3_srv_sftp_chroot_start(s3_srv_h3_channel_t *ch);
+
+static unsigned s3_srv_sftp_budget_take(const char *user);
+
+static void s3_srv_sftp_budget_give(const char *user);
 
 static void s3_srv_agent_accept_timer(s3_event_t *ev);
 
@@ -2009,6 +2052,13 @@ s3_srv_h3_stream_write(s3_event_t *ev)
 static void
 s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
 {
+    /* the sftp budget slot dies with the channel that took it (S2-02) */
+
+    if (ch->sftp_budgeted) {
+        ch->sftp_budgeted = 0;
+        s3_srv_sftp_budget_give(ch->sess_user);
+    }
+
     /* the pump timers must leave the rbtree before the memory goes */
 
     if (ch->fwd_timer.timer_set) {
@@ -2885,6 +2935,109 @@ s3_srv_fwd_arm(s3_srv_h3_channel_t *ch)
 }
 
 /*
+ * the per-user sftp budget (S2-02): one slot per live sftp channel of
+ * the user, the empty username (a CONNECT without a user) is a key of
+ * its own.  The table is scanned linearly, its size is a constant and
+ * the daemon serves one conversation at a time; a full table with no
+ * entry of the user refuses (fail-closed, unreachable in the
+ * single-conversation shape)
+ */
+
+static unsigned
+s3_srv_sftp_budget_take(const char *user)
+{
+    size_t len = strlen(user);
+
+    if (s3_srv_sftp_cap == 0) {
+        return 1;
+    }
+
+    if (len == 0) {
+
+        /* the daemon-identity CONNECTs, the key of their own */
+
+        if (s3_srv_sftp_budget_none >= s3_srv_sftp_cap) {
+            return 0;
+        }
+
+        s3_srv_sftp_budget_none++;
+        return 1;
+    }
+
+    if (len > S3_SRV_SFTP_USER_MAX) {
+        len = S3_SRV_SFTP_USER_MAX;
+    }
+
+    for (unsigned i = 0; i < S3_SRV_SFTP_BUDGET_USERS; i++) {
+
+        s3_srv_sftp_budget_t *b = &s3_srv_sftp_budgets[i];
+
+        if (b->user[0] != '\0' && strlen(b->user) == len && memcmp(b->user, user, len) == 0) {
+
+            if (b->n >= s3_srv_sftp_cap) {
+                return 0;
+            }
+
+            b->n++;
+            return 1;
+        }
+    }
+
+    for (unsigned i = 0; i < S3_SRV_SFTP_BUDGET_USERS; i++) {
+
+        s3_srv_sftp_budget_t *b = &s3_srv_sftp_budgets[i];
+
+        if (b->user[0] == '\0') {
+            s3_memcpy(b->user, user, len);
+            b->user[len] = '\0';
+            b->n = 1;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void
+s3_srv_sftp_budget_give(const char *user)
+{
+    size_t len = strlen(user);
+
+    if (len == 0) {
+
+        if (s3_srv_sftp_budget_none > 0) {
+            s3_srv_sftp_budget_none--;
+        }
+
+        return;
+    }
+
+    if (len > S3_SRV_SFTP_USER_MAX) {
+        len = S3_SRV_SFTP_USER_MAX;
+    }
+
+    for (unsigned i = 0; i < S3_SRV_SFTP_BUDGET_USERS; i++) {
+
+        s3_srv_sftp_budget_t *b = &s3_srv_sftp_budgets[i];
+
+        if (b->user[0] != '\0' && strlen(b->user) == len && memcmp(b->user, user, len) == 0) {
+
+            if (b->n > 0) {
+                b->n--;
+            }
+
+            /* the empty entry frees the table slot */
+
+            if (b->n == 0) {
+                b->user[0] = '\0';
+            }
+
+            return;
+        }
+    }
+}
+
+/*
  * the sftp subsystem of the "sftp" channel (the wave 2): the chroot
  * mode forks the jailed child (the F-04, the sshd model), the
  * lexical mode keeps the historical in-process request server jailed
@@ -2896,6 +3049,15 @@ s3_srv_sftp_start(s3_srv_h3_channel_t *ch)
 {
     s3_str_t       home;
     struct passwd *pw;
+
+    /* the S2-02 budget: the refusal cancels the channel below */
+
+    if (!s3_srv_sftp_budget_take(ch->sess_user)) {
+        s3_srv_report("SFTP-SRV-CAP-DENIED user=%s\n", ch->sess_user);
+        return S3_ERROR;
+    }
+
+    ch->sftp_budgeted = 1;
 
     if (s3_srv_sftp_chroot) {
         return s3_srv_sftp_chroot_start(ch);
@@ -4540,6 +4702,11 @@ s3_srv_stream_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 static void
 s3_srv_accept(s3_connection_t *c)
 {
+    /* the S2-06 cap counts the connections accepted before this
+     * one, 0 (the default) keeps the unbounded behavior */
+
+    unsigned prior = s3_srv_active_conns();
+
     /*
      * the tracking rides the pool cleanup: a closing connection
      * nulls its slot, the main loop never probes a freed connection
@@ -4549,6 +4716,16 @@ s3_srv_accept(s3_connection_t *c)
     }
 
     s3_quic_run(c, &s3_srv_conf);
+
+    /* the refusal rides after the run (the drain shape below): the
+     * engine had to create the connection to answer the Initial,
+     * the CONNECTION_CLOSE goes out on the next pass */
+
+    if (!s3_srv_draining && s3_srv_max_conns > 0 && prior >= (unsigned)s3_srv_max_conns) {
+        s3_srv_report("CONN-CAP-DENIED\n");
+        s3_quic_finalize_connection(c, 0, "too many connections");
+        return;
+    }
 
     if (s3_srv_draining && c->udp != NULL) {
 
@@ -4876,6 +5053,15 @@ s3_srv_usage(const char *prog)
             " the bracketed ipv6\n"
             "      literal [v6]:port; an empty spec keeps the"
             " unrestricted default\n"
+            "  --max-sftp-sessions-per-user n: the concurrent sftp"
+            " channels of one\n"
+            "      user, default 16, 0 disables the budget (S2-02)\n"
+            "  --max-connections n: the concurrent QUIC connections,"
+            " default 0 (no\n"
+            "      limit), over the cap the new connection is closed"
+            " at once (S2-06)\n"
+            "  --handshake-timeout-ms ms: the QUIC handshake timeout,"
+            " default 30000\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
@@ -4883,6 +5069,11 @@ s3_srv_usage(const char *prog)
             "      SSH3_MAX_UNAUTH_CONVERSATIONS,"
             " SSH3_MAX_PASSWORD_FAILURES,\n"
             "      SSH3_PASSWORD_LOCKOUT_SECONDS (the DoS guard knobs"
+            " of the flags\n"
+            "      above),\n"
+            "      SSH3_MAX_SFTP_SESSIONS_PER_USER,"
+            " SSH3_MAX_CONNECTIONS,\n"
+            "      SSH3_HANDSHAKE_TIMEOUT_MS (the S2-02/S2-06 knobs"
             " of the flags\n"
             "      above),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
@@ -4985,6 +5176,51 @@ main(int argc, char **argv)
             s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                          "invalid SSH3_PASSWORD_LOCKOUT_SECONDS \"%s\", using the default",
                          getenv("SSH3_PASSWORD_LOCKOUT_SECONDS"));
+        }
+    }
+
+    /*
+     * the S2-02/S2-06 knobs: the env defaults parse first, the CLI
+     * flags of the pre-scan below override, an unparsable value
+     * falls back to the default like the DoS guard knobs above
+     */
+
+    if (getenv("SSH3_MAX_SFTP_SESSIONS_PER_USER") != NULL) {
+        int n = atoi(getenv("SSH3_MAX_SFTP_SESSIONS_PER_USER"));
+
+        if (n >= 0) {
+            s3_srv_sftp_cap = (unsigned)n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_MAX_SFTP_SESSIONS_PER_USER \"%s\", using the default",
+                         getenv("SSH3_MAX_SFTP_SESSIONS_PER_USER"));
+        }
+    }
+
+    if (getenv("SSH3_MAX_CONNECTIONS") != NULL) {
+        int n = atoi(getenv("SSH3_MAX_CONNECTIONS"));
+
+        if (n >= 0) {
+            s3_srv_max_conns = n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_MAX_CONNECTIONS \"%s\", using the default",
+                         getenv("SSH3_MAX_CONNECTIONS"));
+        }
+    }
+
+    if (getenv("SSH3_HANDSHAKE_TIMEOUT_MS") != NULL) {
+        int n = atoi(getenv("SSH3_HANDSHAKE_TIMEOUT_MS"));
+
+        if (n > 0) {
+            s3_srv_hs_ms = n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_HANDSHAKE_TIMEOUT_MS \"%s\", using the default",
+                         getenv("SSH3_HANDSHAKE_TIMEOUT_MS"));
         }
     }
 
@@ -5119,6 +5355,49 @@ main(int argc, char **argv)
                 }
 
                 dos_pw_secs = k;
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--max-sftp-sessions-per-user") == 0 && n + 1 < argc) {
+
+                /* the S2-02 budget: 0 is the legitimate unlimited */
+
+                int k = atoi(argv[n + 1]);
+
+                if (k < 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                                 "bad --max-sftp-sessions-per-user \"%s\"", argv[n + 1]);
+                    return 1;
+                }
+
+                s3_srv_sftp_cap = (unsigned)k;
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--max-connections") == 0 && n + 1 < argc) {
+
+                /* the S2-06 cap: 0 keeps the unbounded behavior */
+
+                int k = atoi(argv[n + 1]);
+
+                if (k < 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad --max-connections \"%s\"",
+                                 argv[n + 1]);
+                    return 1;
+                }
+
+                s3_srv_max_conns = k;
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--handshake-timeout-ms") == 0 && n + 1 < argc) {
+
+                int k = atoi(argv[n + 1]);
+
+                if (k <= 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad --handshake-timeout-ms \"%s\"",
+                                 argv[n + 1]);
+                    return 1;
+                }
+
+                s3_srv_hs_ms = k;
                 value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--sftp-jail") == 0 && n + 1 < argc) {
@@ -5569,7 +5848,7 @@ main(int argc, char **argv)
 
     s3_srv_conf.gso_enabled = 1;
     s3_srv_conf.ctx = &ctx;
-    s3_srv_conf.handshake_timeout = 30000;
+    s3_srv_conf.handshake_timeout = (s3_msec_t)s3_srv_hs_ms;
     s3_srv_conf.idle_timeout = (s3_msec_t)idle_ms;
     /* the bulk sftp credit: the client trains ride it (see the client conf) */
     s3_srv_conf.stream_buffer_size = 1 << 20;
