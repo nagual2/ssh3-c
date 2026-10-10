@@ -6,13 +6,10 @@
 
 #include <s3_core.h>
 
+#include <s3_udp_msg.h>
 #include <s3_udp_sendmsg_chain.h>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-
+#if (S3_HAVE_QUIC)
 /*
  * the quic listener branch keys the rbtree by the packet dcid and
  * hands the datagrams over through the quic sockets
@@ -20,6 +17,7 @@
  */
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
+#endif
 
 #if (S3_HAVE_ADDRINFO_CMSG)
 #include <s3_cmsg.h>
@@ -43,11 +41,13 @@ struct s3_udp_connection_s {
     size_t           len;
 };
 
+#if (S3_HAVE_QUIC)
 static s3_int_t s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul,
-                                struct msghdr *msg, u_char *buffer, ssize_t n,
+                                s3_udp_msg_t *msg, u_char *buffer, ssize_t n,
                                 struct sockaddr *sockaddr, socklen_t socklen);
 static void     s3_quic_deliver(s3_connection_t *c, u_char *buffer, ssize_t n,
                                 struct sockaddr *sockaddr, socklen_t socklen);
+#endif
 
 static void             s3_close_accepted_udp_connection(s3_connection_t *c);
 static s3_int_t         s3_insert_udp_connection(s3_udp_listen_t *ul, s3_connection_t *c);
@@ -66,8 +66,8 @@ s3_event_recvmsg(s3_event_t *ev)
     s3_err_t                err;
     socklen_t               socklen;
     s3_event_t             *rev, *wev;
-    struct iovec            iov[1];
-    struct msghdr           msg;
+    s3_udp_iov_t            iov[1];
+    s3_udp_msg_t            msg;
     struct sockaddr_storage sa;
     struct sockaddr        *sockaddr;
     s3_udp_listen_t        *ul;
@@ -90,7 +90,7 @@ s3_event_recvmsg(s3_event_t *ev)
 
     ev->ready = 0;
 
-    s3_memzero(&msg, sizeof(struct msghdr));
+    s3_memzero(&msg, sizeof(s3_udp_msg_t));
 
     iov[0].iov_base = (void *)buffer;
     iov[0].iov_len = sizeof(buffer);
@@ -108,7 +108,7 @@ s3_event_recvmsg(s3_event_t *ev)
     }
 #endif
 
-    n = recvmsg(lc->fd, &msg, 0);
+    n = s3_udp_recvmsg(lc->fd, &msg);
 
     if (n == -1) {
         err = s3_socket_errno;
@@ -126,7 +126,7 @@ s3_event_recvmsg(s3_event_t *ev)
     sockaddr = (struct sockaddr *)&sa;
     socklen = msg.msg_namelen;
 
-    if (socklen > sizeof(sa)) {
+    if (socklen > (socklen_t)sizeof(sa)) {
         socklen = sizeof(sa);
     }
 
@@ -142,10 +142,12 @@ s3_event_recvmsg(s3_event_t *ev)
         sa.ss_family = lc->sockaddr != NULL ? lc->sockaddr->sa_family : AF_INET;
     }
 
+#if (S3_HAVE_QUIC)
     if (ul->quic) {
         (void)s3_quic_recvmsg(ev, lc, ul, &msg, buffer, n, sockaddr, socklen);
         return;
     }
+#endif
 
     c = s3_lookup_udp_connection(ul, lc, sockaddr, socklen);
 
@@ -262,8 +264,9 @@ s3_event_recvmsg(s3_event_t *ev)
  * listener handler with the datagram in c->buffer
  * (the reference ngx_event_quic_udp.c)
  */
+#if (S3_HAVE_QUIC)
 static s3_int_t
-s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul, struct msghdr *msg,
+s3_quic_recvmsg(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul, s3_udp_msg_t *msg,
                 u_char *buffer, ssize_t n, struct sockaddr *sockaddr, socklen_t socklen)
 {
     s3_log_t        *log;
@@ -459,6 +462,8 @@ s3_quic_deliver(s3_connection_t *c, u_char *buffer, ssize_t n, struct sockaddr *
     rev->ready = 0;
     rev->active = 1;
 }
+
+#endif /* S3_HAVE_QUIC */
 
 static void
 s3_close_accepted_udp_connection(s3_connection_t *c)
@@ -699,7 +704,7 @@ s3_udp_key_text(u_char *buf, size_t max, s3_str_t *key, struct sockaddr *sa, soc
 
         /* the raw sockaddr bytes as the key */
 
-        if (salen > max) {
+        if (salen > (socklen_t)max) {
             return S3_ERROR;
         }
 

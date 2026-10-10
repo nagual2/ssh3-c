@@ -69,7 +69,7 @@ s3_close_connection(s3_connection_t *c)
 {
     s3_fd_t fd;
 
-    if (c->fd == -1) {
+    if (c->fd == (s3_fd_t)-1) {
         s3_log_error(S3_LOG_ALERT, c->log, 0, "connection already closed");
         return;
     }
@@ -105,7 +105,11 @@ s3_close_connection(s3_connection_t *c)
      * (an udp pseudo connection) must not close the listening socket
      */
 
+#if (S3_WIN32)
+    if (!c->shared && closesocket((SOCKET)fd) == SOCKET_ERROR) {
+#else
     if (!c->shared && close(fd) == -1) {
+#endif
         s3_log_error(S3_LOG_CRIT, c->log, s3_socket_errno, "close() fd:%d failed", fd);
     }
 

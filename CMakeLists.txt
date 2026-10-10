@@ -33,6 +33,15 @@ if(WIN32)
         src/os/win/s3_nonblocking.c
         src/os/win/s3_sock_ntop.c
         src/os/win/s3_os_init.c
+        src/os/win/s3_udp_recv.c
+        src/os/win/s3_udp_sendmsg_chain.c
+        src/os/win/s3_udp_msg.c
+        src/event/s3_event.c
+        src/event/s3_event_posted.c
+        src/event/s3_event_timer.c
+        src/event/s3_connection.c
+        src/event/s3_event_udp.c
+        src/event/modules/s3_select_module.c
         src/h3/s3_h3_encode.c
         src/h3/s3_h3_table.c
         src/h3/s3_h3_parse.c
@@ -70,6 +79,8 @@ if(WIN32)
         test_queue
         test_string
         test_log
+        test_event
+        test_udp
         test_h3_parse
         test_ssh3_version
         test_ssh3_wire
@@ -217,6 +228,10 @@ endif()
 if(S3_HAVE_ADDRINFO_CMSG)
     target_compile_definitions(s3core PUBLIC S3_HAVE_ADDRINFO_CMSG=1)
 endif()
+
+# the quic branch of the udp event path; the win bootstrap compiles it
+# out until the quic layer lands (P9 wave 2)
+target_compile_definitions(s3core PUBLIC S3_HAVE_QUIC=1)
 
 target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
 

@@ -11,6 +11,14 @@
 /* current monotonic time in milliseconds */
 s3_msec_t s3_current_msec;
 
+#if (S3_WIN32)
+void
+s3_time_update(void)
+{
+    /* the monotonic millisecond counter since the boot, never wraps */
+    s3_current_msec = (s3_msec_t)GetTickCount64();
+}
+#else
 void
 s3_time_update(void)
 {
@@ -20,6 +28,7 @@ s3_time_update(void)
 
     s3_current_msec = (s3_msec_t)ts.tv_sec * 1000 + (s3_msec_t)ts.tv_nsec / 1000000;
 }
+#endif
 
 s3_int_t
 s3_event_ctx_init(s3_event_ctx_t *ctx, s3_log_t *log)

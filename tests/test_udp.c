@@ -12,8 +12,21 @@
 #include <s3_nonblocking.h>
 #include <s3_udp_sendmsg_chain.h>
 
+#if (S3_WIN32)
+#include <s3_os_init.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+/* the win32 sockets are not close(fd)-able */
+
+#define s3_test_close(fd) closesocket((SOCKET)(fd))
+#else
 #include <netinet/in.h>
 #include <sys/socket.h>
+
+#define s3_test_close(fd) close(fd)
+#endif
+
 #include <unistd.h>
 
 #include "s3_test.h"
@@ -58,6 +71,10 @@ s3_test_udp(void)
     struct sockaddr_in sa;
 
     failures = 0;
+
+#if (S3_WIN32)
+    S3_ASSERT(s3_os_init() == S3_OK);
+#endif
 
     S3_ASSERT(s3_event_ctx_init(&ctx, &s3_stderr_log) == S3_OK);
 
@@ -124,8 +141,8 @@ s3_test_udp(void)
     if (c == NULL) {
         /* avoid a cascade of failures after a broken accept */
 
-        (void)close(csd);
-        (void)close(lsd);
+        (void)s3_test_close(csd);
+        (void)s3_test_close(lsd);
         s3_destroy_pool(ctx.pool);
 
         return failures;
@@ -163,8 +180,8 @@ s3_test_udp(void)
 
     S3_ASSERT(ul.rbtree.root == &ul.sentinel);
 
-    (void)close(csd);
-    (void)close(lsd);
+    (void)s3_test_close(csd);
+    (void)s3_test_close(lsd);
 
     s3_destroy_pool(ctx.pool);
 
