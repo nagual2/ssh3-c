@@ -67,6 +67,8 @@
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_dgram.h>
+#include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_cli.h>
@@ -228,6 +230,114 @@ static size_t  s3_cli_sftp_buf_len;
 
 static unsigned s3_cli_ch_confirmed;
 
+/* === the -L forwards (the stage B): the local listeners bridge into
+ * the direct-tcp/direct-udp channels of the CONNECT conversation === */
+
+#define S3_CLI_FWD_TCP 1
+#define S3_CLI_FWD_UDP 2
+
+/* the spec and the concurrent shapes the client budget allows */
+
+#define S3_CLI_FWD_MAX         8
+#define S3_CLI_FWD_TCP_CONNS   16
+#define S3_CLI_FWD_UDP_SRCS    8
+#define S3_CLI_FWD_UDP_PENDING 8
+
+/* the in-flight 94 frame of one bridge (the sftp rationale: one
+ * frame below the channel maxPacketSize) */
+
+#define S3_CLI_FWD_FRAME 33000
+
+/* the local read chunk and the parked caps of one bridge */
+
+#define S3_CLI_FWD_CHUNK    16384
+#define S3_CLI_FWD_PARK_MAX (512 * 1024)
+
+/* the datagram budget: the transport parameter is 1352, the dgram
+ * envelope (the two varints) rides on top */
+
+#define S3_CLI_FWD_UDP_DATAGRAM 1200
+
+typedef struct {
+    unsigned kind;      /* S3_CLI_FWD_TCP or S3_CLI_FWD_UDP */
+    unsigned bind_addr; /* the network order ipv4 */
+    unsigned bind_port;
+    unsigned target_addr; /* the network order ipv4 of the target */
+    unsigned target_port;
+    char     text[128]; /* the tcp://bind:port/host:port shape of the logs */
+} s3_cli_fwd_spec_t;
+
+static s3_cli_fwd_spec_t s3_cli_fwd_specs[S3_CLI_FWD_MAX];
+static unsigned          s3_cli_fwd_count;
+static unsigned          s3_cli_fwd_ready;
+
+/* one local tcp connection of a tcp forward: the channel opens per
+ * accepted socket, both directions park and drain on the tick */
+
+typedef struct {
+    unsigned         used;
+    unsigned         dead;
+    unsigned         spec;
+    SOCKET           fd;
+    s3_connection_t *evc;      /* the event connection of the fd */
+    s3_connection_t *chan;     /* the quic stream, NULL until opened */
+    unsigned         hdr_sent; /* the direct-tcp header parks until sent */
+    unsigned         confirmed;
+    unsigned         chan_fin;      /* the channel fin: the local write closes */
+    unsigned         local_eof;     /* the local eof: the fin rides the channel */
+    unsigned         chan_fin_sent; /* the fin waits for the park drain */
+    u_char           hdr[64];       /* the parked direct-tcp header */
+    size_t           hdr_len;
+    u_char          *frame; /* the in-flight 94 frame */
+    size_t           frame_sent;
+    size_t           frame_total;
+    u_char          *chan_acc; /* the channel stream accumulator (the 91, the 94) */
+    size_t           chan_acc_len;
+    size_t           chan_acc_cap;
+    u_char          *to_chan; /* the parked channel bytes */
+    size_t           to_chan_len;
+    size_t           to_chan_cap;
+    u_char          *to_local; /* the parked local bytes */
+    size_t           to_local_len;
+    size_t           to_local_cap;
+} s3_cli_fwd_tcp_conn_t;
+
+static s3_cli_fwd_tcp_conn_t s3_cli_fwd_conns[S3_CLI_FWD_TCP_CONNS];
+
+static SOCKET s3_cli_fwd_listen[S3_CLI_FWD_MAX]; /* INVALID_SOCKET when free */
+
+/* one udp forward spec: one local socket, one direct-udp channel per
+ * source address, the pre-91 datagrams park per source */
+
+typedef struct {
+    unsigned           used;
+    s3_connection_t   *chan;
+    uint64_t           chan_id;
+    unsigned           confirmed;
+    unsigned           hdr_sent;
+    unsigned           pend_head;
+    unsigned           pend_count;
+    u_short            pend_len[S3_CLI_FWD_UDP_PENDING];
+    u_char             pend[S3_CLI_FWD_UDP_PENDING][S3_CLI_FWD_UDP_DATAGRAM];
+    struct sockaddr_in src;
+    /* the parked direct-udp header (the tick retries it) and the
+     * tiny accumulator of the 91 confirmation */
+    u_char hdr_park[64];
+    size_t hdr_len;
+    u_char conf_acc[16];
+    size_t conf_len;
+} s3_cli_fwd_udp_src_t;
+
+typedef struct {
+    unsigned             used;
+    SOCKET               fd;
+    s3_connection_t     *evc;
+    unsigned             src_count;
+    s3_cli_fwd_udp_src_t srcs[S3_CLI_FWD_UDP_SRCS];
+} s3_cli_fwd_udp_t;
+
+static s3_cli_fwd_udp_t s3_cli_fwd_udp[S3_CLI_FWD_MAX];
+
 /* the h3 response side (the :status section, the ctrl read handler) */
 
 static s3_h3_parse_headers_t s3_cli_h3parse;
@@ -307,6 +417,18 @@ static void     s3_cli_sftp_pump(void);
 static void     s3_cli_sftp_write(s3_event_t *ev);
 static void     s3_cli_sftp_start(void);
 static void     s3_cli_sftp_read(s3_event_t *ev);
+static s3_int_t s3_cli_fwd_parse(const char *arg);
+static s3_int_t s3_cli_fwd_listeners_start(void);
+static void     s3_cli_fwd_tcp_accept(s3_event_t *ev);
+static void     s3_cli_fwd_tcp_local_read(s3_event_t *ev);
+static void     s3_cli_fwd_tcp_chan_read(s3_event_t *ev);
+static void     s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc);
+static void     s3_cli_fwd_tcp_drop(s3_cli_fwd_tcp_conn_t *fc);
+static void     s3_cli_fwd_udp_local_read(s3_event_t *ev);
+static void     s3_cli_fwd_udp_chan_read(s3_event_t *ev);
+static void     s3_cli_fwd_udp_pump(s3_cli_fwd_udp_t *uf);
+static void     s3_cli_fwd_datagram(s3_chain_t *data);
+static void     s3_cli_fwd_tick(void);
 
 /*
  * the usage: the stage-A option set (the keys the Go fork shares,
@@ -327,6 +449,10 @@ s3_cli_usage(const char *prog)
             "              with -r the -r forms recurse over the tree (a colon\n"
             "              beyond the Windows drive letter ends the paths)\n"
             "  -r          with -J: the recursive transfer\n"
+            "  -L tcp://[bind:]port/host/port  the local tcp forward: every\n"
+            "              accepted connection rides a direct-tcp channel of the\n"
+            "              same conversation to the ipv4 target; udp:// likewise\n"
+            "              over the datagrams (the bind defaults to 127.0.0.1)\n"
             "  -v          verbose logging\n"
             "  -l lvl      the s3 log level 0..9 or all\n"
             "  -V          version\n"
@@ -1297,13 +1423,17 @@ s3_cli_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
     s3_h3_init_stream(c);
 }
 
-/* the datagrams are not on the session path, drained */
+/* the datagrams: the udp forwards route them, the other runs drain */
 
 static void
 s3_cli_datagram(s3_connection_t *c, s3_chain_t *data)
 {
+    if (s3_cli_fwd_count) {
+        s3_cli_fwd_datagram(data);
+        return;
+    }
+
     (void)c;
-    (void)data;
 }
 
 /* === the sftp transfer mode (-J put|get, the stage B) === */
@@ -1682,6 +1812,1121 @@ s3_cli_sftp_read(s3_event_t *ev)
     }
 }
 
+/* === the -L forwards (the stage B) === */
+
+/*
+ * the -L spec of the URL form: tcp://[bind:]port/host/port, udp
+ * likewise; the bind defaults to the loopback (the OpenSSH shape),
+ * the target is the raw ipv4 the server dials (the wire extension
+ * carries no names)
+ */
+
+static s3_int_t
+s3_cli_fwd_parse(const char *arg)
+{
+    s3_cli_fwd_spec_t *spec;
+    const char        *s = arg, *slash, *slash2;
+    char              *colon;
+    char               authority[128], host[128];
+    unsigned           kind, bind_port, target_port;
+    struct in_addr     bind_addr, target_addr;
+
+    if (strncmp(s, "tcp://", 6) == 0) {
+        kind = S3_CLI_FWD_TCP;
+        s += 6;
+
+    } else if (strncmp(s, "udp://", 6) == 0) {
+        kind = S3_CLI_FWD_UDP;
+        s += 6;
+
+    } else {
+        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
+        return S3_ERROR;
+    }
+
+    slash = strchr(s, '/');
+
+    if (slash == NULL || slash == s || (size_t)(slash - s) >= sizeof(authority)) {
+        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
+        return S3_ERROR;
+    }
+
+    memcpy(authority, s, (size_t)(slash - s));
+    authority[slash - s] = '\0';
+
+    s = slash + 1;
+    slash2 = strchr(s, '/');
+
+    if (slash2 == NULL || slash2 == s || (size_t)(slash2 - s) >= sizeof(host) ||
+        strlen(slash2 + 1) == 0 || strlen(slash2 + 1) > 5) {
+        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
+        return S3_ERROR;
+    }
+
+    memcpy(host, s, (size_t)(slash2 - s));
+    host[slash2 - s] = '\0';
+
+    /* the authority: [bind:]port, the bind defaults to the loopback */
+
+    colon = strchr(authority, ':');
+
+    if (colon != NULL) {
+        *colon = '\0';
+
+        if (colon == authority || inet_pton(AF_INET, authority, &bind_addr) != 1) {
+            fprintf(stderr, "ssh3: -L bind %s is not an ipv4 address\n", authority);
+            return S3_ERROR;
+        }
+
+        bind_port = (unsigned)atoi(colon + 1);
+
+    } else {
+        bind_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind_port = (unsigned)atoi(authority);
+    }
+
+    if (bind_port == 0 || bind_port > 65535) {
+        fprintf(stderr, "ssh3: -L bad bind port in %s\n", arg);
+        return S3_ERROR;
+    }
+
+    target_port = (unsigned)atoi(slash2 + 1);
+
+    if (target_port == 0 || target_port > 65535 || inet_pton(AF_INET, host, &target_addr) != 1) {
+        fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4 socket\n", host, slash2 + 1);
+        return S3_ERROR;
+    }
+
+    if (s3_cli_fwd_count >= S3_CLI_FWD_MAX) {
+        fprintf(stderr, "ssh3: too many -L forwards\n");
+        return S3_ERROR;
+    }
+
+    spec = &s3_cli_fwd_specs[s3_cli_fwd_count++];
+
+    memset(spec, 0, sizeof(*spec));
+
+    spec->kind = kind;
+    spec->bind_addr = (unsigned)bind_addr.s_addr;
+    spec->bind_port = bind_port;
+    spec->target_addr = (unsigned)target_addr.s_addr;
+    spec->target_port = target_port;
+    snprintf(spec->text, sizeof(spec->text), "%s", arg);
+
+    return S3_OK;
+}
+
+/*
+ * the listeners of the -L specs: the tcp ones listen and register the
+ * accept reads, the udp ones bind and register the datagram reads
+ */
+
+static s3_int_t
+s3_cli_fwd_listeners_start(void)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_fwd_count; i++) {
+
+        s3_cli_fwd_spec_t *spec = &s3_cli_fwd_specs[i];
+        struct sockaddr_in sa;
+        SOCKET             fd;
+        s3_connection_t   *c;
+
+        memset(&sa, 0, sizeof(sa));
+
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = (ULONG)spec->bind_addr;
+        sa.sin_port = htons((u_short)spec->bind_port);
+
+        fd = (spec->kind == S3_CLI_FWD_TCP) ? socket(AF_INET, SOCK_STREAM, 0)
+                                            : socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (fd == INVALID_SOCKET) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "socket() failed for %s",
+                         spec->text);
+            return S3_ERROR;
+        }
+
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "bind() failed for %s",
+                         spec->text);
+            closesocket(fd);
+            return S3_ERROR;
+        }
+
+        if (spec->kind == S3_CLI_FWD_TCP && listen(fd, 8) != 0) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "listen() failed for %s",
+                         spec->text);
+            closesocket(fd);
+            return S3_ERROR;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            closesocket(fd);
+            return S3_ERROR;
+        }
+
+        c = s3_get_connection(&s3_cli_ctx, fd);
+
+        if (c == NULL) {
+            closesocket(fd);
+            return S3_ERROR;
+        }
+
+        c->read->handler =
+            (spec->kind == S3_CLI_FWD_TCP) ? s3_cli_fwd_tcp_accept : s3_cli_fwd_udp_local_read;
+        c->read->data = c; /* the select module contract: data is the conn */
+
+        /* the spec index rides the free data of the raw connection */
+
+        c->data = (void *)(uintptr_t)i;
+
+        c->read->active = 1;
+
+        if (s3_event_actions.add_event(c->read, S3_READ_EVENT, 0) != S3_OK) {
+            closesocket(fd);
+            return S3_ERROR;
+        }
+
+        if (spec->kind == S3_CLI_FWD_TCP) {
+            s3_cli_fwd_listen[i] = fd;
+
+        } else {
+            s3_cli_fwd_udp[i].used = 1;
+            s3_cli_fwd_udp[i].fd = fd;
+            s3_cli_fwd_udp[i].evc = c;
+        }
+
+        s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "forwarding %s", spec->text);
+    }
+
+    return S3_OK;
+}
+
+/* the parked buffer growth of the bridges (16 KiB steps) */
+
+static s3_int_t
+s3_cli_fwd_park_grow(u_char **buf, size_t *cap, size_t need)
+{
+    u_char *grown;
+    size_t  want = *cap ? *cap : 16384;
+
+    if (need <= *cap) {
+        return S3_OK;
+    }
+
+    while (want < need) {
+        want += 16384;
+    }
+
+    grown = realloc(*buf, want);
+
+    if (grown == NULL) {
+        return S3_ERROR;
+    }
+
+    *buf = grown;
+    *cap = want;
+
+    return S3_OK;
+}
+
+/* the full drop of one bridge: the socket and the channel go, the
+ * slot returns to the accept budget */
+
+static void
+s3_cli_fwd_tcp_drop(s3_cli_fwd_tcp_conn_t *fc)
+{
+    if (fc->dead) {
+        return;
+    }
+
+    fc->dead = 1;
+
+    if (fc->evc != NULL) {
+        s3_close_connection(fc->evc);
+        fc->evc = NULL;
+    }
+
+    if (fc->fd != INVALID_SOCKET) {
+        closesocket(fc->fd);
+        fc->fd = INVALID_SOCKET;
+    }
+
+    if (fc->chan != NULL) {
+        (void)s3_quic_shutdown_stream(fc->chan, S3_RDWR_SHUTDOWN);
+        s3_close_connection(fc->chan);
+        fc->chan = NULL;
+    }
+
+    free(fc->frame);
+    free(fc->chan_acc);
+    free(fc->to_chan);
+    free(fc->to_local);
+
+    fc->used = 0;
+}
+
+/*
+ * the parked drains of one bridge: the direct-tcp header first, the
+ * 94 frame tail, the parked payload of the local direction; the tick
+ * and the write events call it
+ */
+
+static void
+s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
+{
+    ssize_t m;
+
+    if (fc->dead) {
+        return;
+    }
+
+    /* the parked header of the channel */
+
+    if (fc->chan != NULL && !fc->hdr_sent && fc->hdr_len > 0) {
+
+        m = s3_quic_stream_send(fc->chan, fc->hdr, fc->hdr_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (m <= 0) {
+            s3_cli_fwd_tcp_drop(fc);
+            return;
+        }
+
+        fc->hdr_sent = 1;
+    }
+
+    /* the payload into the channel: the 94 frames under the channel
+     * maxPacketSize, a partial send parks the tail; the frames ride
+     * behind the 91 confirmation (the header goes at once) */
+
+    while (fc->chan != NULL && fc->chan_fin == 0 && fc->confirmed &&
+           (fc->to_chan_len > 0 || fc->frame_sent < fc->frame_total)) {
+
+        if (fc->frame_sent == fc->frame_total) {
+
+            u_char *p;
+            size_t  chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > fc->to_chan_len) {
+                chunk = fc->to_chan_len;
+            }
+
+            p = fc->frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+            memcpy(p, fc->to_chan, chunk);
+
+            fc->frame_total = (size_t)(p - fc->frame) + chunk;
+            fc->frame_sent = 0;
+
+            memmove(fc->to_chan, fc->to_chan + chunk, fc->to_chan_len - chunk);
+            fc->to_chan_len -= chunk;
+        }
+
+        m = s3_quic_stream_send(fc->chan, fc->frame + fc->frame_sent,
+                                fc->frame_total - fc->frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (m <= 0) {
+            s3_cli_fwd_tcp_drop(fc);
+            return;
+        }
+
+        fc->frame_sent += (size_t)m;
+    }
+
+    /* the local eof rides after the park: the fin cannot jump the
+     * queued payload (the quic layer marks the stream DATA_SENT at
+     * once, the parked bytes would die behind it) */
+
+    if (fc->local_eof && !fc->chan_fin_sent && fc->chan != NULL && fc->to_chan_len == 0 &&
+        fc->frame_sent == fc->frame_total) {
+        (void)s3_quic_shutdown_stream(fc->chan, S3_WRITE_SHUTDOWN);
+        fc->chan_fin_sent = 1;
+}
+
+/* the parked payload into the local socket */
+
+while (!fc->dead && fc->to_local_len > 0) {
+
+    int n = (int)send(fc->fd, (const char *)fc->to_local, (int)fc->to_local_len, 0);
+
+    if (n > 0) {
+        memmove(fc->to_local, fc->to_local + n, fc->to_local_len - (size_t)n);
+        fc->to_local_len -= (size_t)n;
+        continue;
+    }
+
+    /* the local socket still blocks, the tick retries */
+
+    break;
+}
+}
+
+/*
+ * the channel reader of one bridge: the 91 confirms (the parked
+ * payload rides), the 94 payloads go to the local socket; the fin
+ * half-closes the local write side
+ */
+
+static void
+s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
+{
+    s3_cli_fwd_tcp_conn_t *fc = ev->data;
+
+    if (fc->dead) {
+        return;
+    }
+
+    for (;;) {
+
+        ssize_t n;
+
+        if (fc->chan_acc_len == fc->chan_acc_cap) {
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the accumulator bound: a full buffer with no complete
+             * frame inside is a peer trickling bytes */
+
+            if (fc->chan_acc_cap >= S3_CLI_FWD_PARK_MAX) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            cap = fc->chan_acc_cap + 262144;
+
+            grown = realloc(fc->chan_acc, cap);
+
+            if (grown == NULL) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            fc->chan_acc = grown;
+            fc->chan_acc_cap = cap;
+        }
+
+        n = fc->chan->recv(fc->chan, fc->chan_acc + fc->chan_acc_len,
+                           fc->chan_acc_cap - fc->chan_acc_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+
+            /* the server fin: the target closed the write side, the
+             * local write side closes (the half-close) */
+
+            fc->chan_fin = 1;
+
+            (void)shutdown(fc->fd, SD_SEND);
+
+            if (fc->local_eof) {
+                s3_cli_fwd_tcp_drop(fc);
+            }
+
+            return;
+        }
+
+        if (n < 0) {
+            s3_cli_fwd_tcp_drop(fc);
+            return;
+        }
+
+        fc->chan_acc_len += (size_t)n;
+
+        {
+            const u_char *pos = fc->chan_acc;
+            const u_char *end = fc->chan_acc + fc->chan_acc_len;
+
+            while (pos < end) {
+
+                const u_char *msg = pos;
+                uint64_t      type;
+
+                if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                    s3_ssh3_msg_open_confirmation_t conf;
+
+                    if (fc->confirmed) {
+                        s3_cli_fwd_tcp_drop(fc);
+                        return;
+                    }
+
+                    if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    fc->confirmed = 1;
+
+                    /* the confirmation opens the pump: the parked
+                     * payload rides at once */
+
+                    s3_cli_fwd_tcp_flush(fc);
+
+                    if (fc->dead) {
+                        return;
+                    }
+
+                    continue;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                    s3_ssh3_msg_data_t data;
+                    size_t             off = 0;
+
+                    if (!fc->confirmed) {
+                        s3_cli_fwd_tcp_drop(fc);
+                        return;
+                    }
+
+                    if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    /* the payload parks or rides the local socket */
+
+                    while (off < data.data.len) {
+
+                        int m = (int)send(fc->fd, (const char *)data.data.data + off,
+                                          (int)(data.data.len - off), 0);
+
+                        if (m > 0) {
+                            off += (size_t)m;
+                            continue;
+                        }
+
+                        /* the local socket blocked: the rest parks */
+
+                        if (fc->to_local_len + (data.data.len - off) > S3_CLI_FWD_PARK_MAX) {
+                            s3_cli_fwd_tcp_drop(fc);
+                            return;
+                        }
+
+                        if (s3_cli_fwd_park_grow(&fc->to_local, &fc->to_local_cap,
+                                                 fc->to_local_len + (data.data.len - off)) !=
+                            S3_OK) {
+                            s3_cli_fwd_tcp_drop(fc);
+                            return;
+                        }
+
+                        memcpy(fc->to_local + fc->to_local_len, data.data.data + off,
+                               data.data.len - off);
+                        fc->to_local_len += data.data.len - off;
+                        off = data.data.len;
+                    }
+
+                    continue;
+                }
+
+                /* the other channel messages do not exist here */
+
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            fc->chan_acc_len = (size_t)(end - pos);
+            memmove(fc->chan_acc, pos, fc->chan_acc_len);
+        }
+
+        if (fc->dead) {
+            return;
+        }
+    }
+}
+
+/*
+ * the local reader of one bridge: the socket bytes wrap into the 94
+ * frames, the eof sends the channel fin (the half-close)
+ */
+
+static void
+s3_cli_fwd_tcp_local_read(s3_event_t *ev)
+{
+    s3_connection_t       *c = ev->data;
+    s3_cli_fwd_tcp_conn_t *fc = (s3_cli_fwd_tcp_conn_t *)c->data;
+    u_char                 buf[S3_CLI_FWD_CHUNK];
+
+    if (fc->dead || fc->local_eof) {
+        return;
+    }
+
+    for (;;) {
+
+        int n = recv(fc->fd, (char *)buf, sizeof(buf), 0);
+
+        if (n > 0) {
+
+            if (fc->to_chan_len + (size_t)n > S3_CLI_FWD_PARK_MAX) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            if (s3_cli_fwd_park_grow(&fc->to_chan, &fc->to_chan_cap, fc->to_chan_len + (size_t)n) !=
+                S3_OK) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            memcpy(fc->to_chan + fc->to_chan_len, buf, (size_t)n);
+            fc->to_chan_len += (size_t)n;
+
+            s3_cli_fwd_tcp_flush(fc);
+
+            if (fc->dead) {
+                return;
+            }
+
+            continue;
+        }
+
+        if (n == 0 || s3_socket_errno != S3_EAGAIN) {
+
+            /* the eof or a broken local socket: the fin rides the
+             * channel when the parked payload drained (the quic fin
+             * jumps the queue otherwise, the parked bytes die) */
+
+            fc->local_eof = 1;
+
+            (void)s3_event_actions.del_event(fc->evc->read, S3_READ_EVENT, 0);
+
+            if (fc->chan != NULL && fc->to_chan_len == 0 && fc->frame_sent == fc->frame_total) {
+                (void)s3_quic_shutdown_stream(fc->chan, S3_WRITE_SHUTDOWN);
+                fc->chan_fin_sent = 1;
+            }
+
+            if (fc->chan_fin) {
+                s3_cli_fwd_tcp_drop(fc);
+            }
+
+            return;
+        }
+
+        /* WSAEWOULDBLOCK: done for now */
+
+        return;
+    }
+}
+
+/*
+ * the accept of a tcp listener: one bridge per accepted socket, the
+ * direct-tcp header with the target extension rides at once
+ */
+
+static void
+s3_cli_fwd_tcp_accept(s3_event_t *ev)
+{
+    s3_connection_t       *lc = ev->data;
+    unsigned               spec = (unsigned)(uintptr_t)lc->data;
+    s3_cli_fwd_tcp_conn_t *fc = NULL;
+    unsigned               k;
+
+    for (;;) {
+
+        SOCKET             fd;
+        struct sockaddr_in peer;
+        int                plen = sizeof(peer);
+        s3_connection_t   *c;
+
+        fd = accept(s3_cli_fwd_listen[spec], (struct sockaddr *)&peer, &plen);
+
+        if (fd == INVALID_SOCKET) {
+
+            /* WSAEWOULDBLOCK or a transient: the next event retries */
+
+            return;
+        }
+
+        for (k = 0; k < S3_CLI_FWD_TCP_CONNS; k++) {
+
+            if (!s3_cli_fwd_conns[k].used) {
+                fc = &s3_cli_fwd_conns[k];
+                break;
+            }
+        }
+
+        if (fc == NULL) {
+
+            /* the bridge budget is out: the socket refuses */
+
+            closesocket(fd);
+            continue;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            closesocket(fd);
+            continue;
+        }
+
+        c = s3_get_connection(&s3_cli_ctx, fd);
+
+        if (c == NULL) {
+            closesocket(fd);
+            continue;
+        }
+
+        memset(fc, 0, sizeof(*fc));
+
+        fc->used = 1;
+        fc->spec = spec;
+        fc->fd = fd;
+        fc->evc = c;
+        fc->chan = s3_quic_open_stream(s3_cli_conn, 1);
+
+        if (fc->chan == NULL) {
+            s3_cli_fwd_tcp_drop(fc);
+            continue;
+        }
+
+        fc->frame = malloc(S3_CLI_FWD_FRAME);
+
+        if (fc->frame == NULL) {
+            s3_cli_fwd_tcp_drop(fc);
+            continue;
+        }
+
+        {
+            s3_cli_fwd_spec_t       *sp = &s3_cli_fwd_specs[spec];
+            s3_ssh3_channel_t        h;
+            s3_ssh3_forward_target_t t;
+            u_char                  *p;
+            ssize_t                  m;
+
+            memset(&h, 0, sizeof(h));
+
+            h.conversation_stream_id = s3_cli_conv_id;
+            h.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+            h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
+            h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
+
+            t.family = 4;
+            t.ip_len = 4;
+            memcpy(t.ip, &sp->target_addr, 4);
+            t.port = (uint16_t)sp->target_port;
+
+            p = fc->hdr;
+            p = (u_char *)s3_ssh3_channel_build_header(p, &h);
+            p = s3_ssh3_forward_build_target(p, &t);
+
+            fc->hdr_len = (size_t)(p - fc->hdr);
+
+            m = s3_quic_stream_send(fc->chan, fc->hdr, fc->hdr_len);
+
+            if (m == (ssize_t)S3_AGAIN) {
+
+                /* the tiny header parks, the flush retries */
+
+            } else if (m <= 0) {
+                s3_cli_fwd_tcp_drop(fc);
+                continue;
+
+            } else {
+                fc->hdr_sent = 1;
+            }
+        }
+
+        fc->chan->read->handler = s3_cli_fwd_tcp_chan_read;
+        fc->chan->read->data = fc;
+        fc->chan->read->active = 1;
+
+        c->read->handler = s3_cli_fwd_tcp_local_read;
+        c->read->data = c; /* the select module contract: data is the conn */
+        c->data = fc;      /* the bridge rides the free data of the raw conn */
+        c->read->active = 1;
+
+        if (s3_event_actions.add_event(c->read, S3_READ_EVENT, 0) != S3_OK) {
+            s3_cli_fwd_tcp_drop(fc);
+            continue;
+        }
+    }
+}
+
+/*
+ * the local datagram read of one udp forward: the source finds its
+ * channel (one direct-udp per source address), the datagram rides
+ * the QUIC DATAGRAM frame with the (conversation, channel) envelope
+ */
+
+static void
+s3_cli_fwd_udp_local_read(s3_event_t *ev)
+{
+    s3_connection_t      *c = ev->data;
+    unsigned              spec = (unsigned)(uintptr_t)c->data;
+    s3_cli_fwd_udp_t     *uf = &s3_cli_fwd_udp[spec];
+    s3_cli_fwd_spec_t    *sp = &s3_cli_fwd_specs[spec];
+    u_char                buf[S3_CLI_FWD_UDP_DATAGRAM];
+    struct sockaddr_in    from;
+    int                   flen = sizeof(from);
+    s3_cli_fwd_udp_src_t *src = NULL;
+    unsigned              k;
+
+    for (;;) {
+
+        int n = recvfrom(uf->fd, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
+
+        if (n < 0) {
+
+            if (s3_socket_errno == WSAEMSGSIZE) {
+
+                /* the oversized datagram drops (the udp semantics) */
+
+                continue;
+            }
+
+            /* WSAEWOULDBLOCK or a transient: the next event retries */
+
+            return;
+        }
+
+        if (n == 0) {
+            return;
+        }
+
+        for (k = 0; k < S3_CLI_FWD_UDP_SRCS; k++) {
+
+            s3_cli_fwd_udp_src_t *s = &uf->srcs[k];
+
+            if (s->used && s->src.sin_addr.S_un.S_addr == from.sin_addr.S_un.S_addr &&
+                s->src.sin_port == from.sin_port) {
+                src = s;
+                break;
+            }
+        }
+
+        if (src == NULL) {
+
+            for (k = 0; k < S3_CLI_FWD_UDP_SRCS; k++) {
+
+                if (!uf->srcs[k].used) {
+                    src = &uf->srcs[k];
+                    break;
+                }
+            }
+
+            if (src == NULL) {
+
+                /* the source budget is out: the datagram drops */
+
+                continue;
+            }
+
+            memset(src, 0, sizeof(*src));
+
+            src->used = 1;
+            src->src = from;
+            uf->src_count++;
+
+            /* the direct-udp channel of the source opens here: the
+             * header parks, the tick (and the confirmation read)
+             * carry it out */
+
+            src->chan = s3_quic_open_stream(s3_cli_conn, 1);
+
+            if (src->chan == NULL) {
+                src->used = 0;
+                uf->src_count--;
+                continue;
+            }
+
+            src->chan_id = ((s3_quic_stream_t *)src->chan->data)->id;
+
+            {
+                s3_ssh3_channel_t        h;
+                s3_ssh3_forward_target_t t;
+                u_char                  *p;
+
+                memset(&h, 0, sizeof(h));
+
+                h.conversation_stream_id = s3_cli_conv_id;
+                h.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+                h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
+                h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
+
+                t.family = 4;
+                t.ip_len = 4;
+                memcpy(t.ip, &sp->target_addr, 4);
+                t.port = (uint16_t)sp->target_port;
+
+                p = src->hdr_park;
+                p = (u_char *)s3_ssh3_channel_build_header(p, &h);
+                p = s3_ssh3_forward_build_target(p, &t);
+
+                src->hdr_len = (size_t)(p - src->hdr_park);
+            }
+
+            src->chan->read->handler = s3_cli_fwd_udp_chan_read;
+            src->chan->read->data = src;
+            src->chan->read->active = 1;
+        }
+
+        /* the datagram rides at once on a confirmed channel, the
+         * pre-91 datagrams park */
+
+        if (!src->confirmed) {
+
+            if (src->pend_count >= S3_CLI_FWD_UDP_PENDING) {
+                continue;
+            }
+
+            {
+                unsigned tail = (src->pend_head + src->pend_count) % S3_CLI_FWD_UDP_PENDING;
+
+                memcpy(src->pend[tail], buf, (size_t)n);
+                src->pend_len[tail] = (u_short)n;
+                src->pend_count++;
+            }
+
+            continue;
+        }
+
+        {
+            u_char  dg[S3_CLI_FWD_UDP_DATAGRAM + 16];
+            u_char *p;
+
+            p = s3_ssh3_dgram_encode(dg, s3_cli_conv_id, src->chan_id, buf, (size_t)n);
+
+            (void)s3_quic_send_datagram(s3_cli_conn, dg, (size_t)(p - dg));
+        }
+    }
+}
+
+/*
+ * the channel reader of a udp source: the 91 confirms, the parked
+ * datagrams ride; anything else on the stream is a violation
+ */
+
+static void
+s3_cli_fwd_udp_chan_read(s3_event_t *ev)
+{
+    s3_cli_fwd_udp_src_t *src = ev->data;
+    u_char                buf[64];
+
+    if (!src->used || src->confirmed) {
+        return;
+    }
+
+    for (;;) {
+
+        ssize_t n = src->chan->recv(src->chan, buf, sizeof(buf));
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n <= 0) {
+
+            /* the fin or the error: the source dies with its channel */
+
+            src->used = 0;
+            s3_close_connection(src->chan);
+            src->chan = NULL;
+
+            return;
+        }
+
+        if (src->conf_len + (size_t)n > sizeof(src->conf_acc)) {
+
+            /* only the tiny 91 lives here, more is a violation */
+
+            src->used = 0;
+            s3_close_connection(src->chan);
+            src->chan = NULL;
+
+            return;
+        }
+
+        memcpy(src->conf_acc + src->conf_len, buf, (size_t)n);
+        src->conf_len += (size_t)n;
+
+        {
+            const u_char *pos = src->conf_acc;
+            const u_char *end = src->conf_acc + src->conf_len;
+            uint64_t      type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                return; /* a split type varint waits for the next recv */
+            }
+
+            if (type != S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+                src->used = 0;
+                s3_close_connection(src->chan);
+                src->chan = NULL;
+                return;
+            }
+
+            {
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    return; /* a split body waits */
+                }
+
+                src->confirmed = 1;
+            }
+        }
+    }
+}
+
+/*
+ * the incoming datagrams of the udp forwards: the envelope names the
+ * conversation and the channel, the payload rides the source socket
+ */
+
+static void
+s3_cli_fwd_datagram(s3_chain_t *data)
+{
+    u_char        flat[S3_CLI_FWD_UDP_DATAGRAM + 16];
+    u_char       *p;
+    size_t        len = 0;
+    s3_chain_t   *cl;
+    const u_char *pos, *end;
+    uint64_t      csid, chid;
+    s3_str_t      payload;
+    unsigned      i, k;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    if (len == 0 || len > sizeof(flat)) {
+        return;
+    }
+
+    p = flat;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+    }
+
+    pos = flat;
+    end = flat + len;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return;
+    }
+
+    if (csid != s3_cli_conv_id) {
+        return;
+    }
+
+    for (i = 0; i < s3_cli_fwd_count; i++) {
+
+        s3_cli_fwd_udp_t *uf = &s3_cli_fwd_udp[i];
+
+        if (!uf->used) {
+            continue;
+        }
+
+        for (k = 0; k < S3_CLI_FWD_UDP_SRCS; k++) {
+
+            s3_cli_fwd_udp_src_t *s = &uf->srcs[k];
+
+            if (s->used && s->confirmed && s->chan_id == chid) {
+                (void)sendto(uf->fd, (const char *)payload.data, (int)payload.len, 0,
+                             (struct sockaddr *)&s->src, sizeof(s->src));
+                return;
+            }
+        }
+    }
+}
+
+/* the parked drains of the udp forwards: the channel headers and the
+ * pre-91 datagrams ride here (the tick) */
+
+static void
+s3_cli_fwd_udp_pump(s3_cli_fwd_udp_t *uf)
+{
+    unsigned k;
+
+    for (k = 0; k < S3_CLI_FWD_UDP_SRCS; k++) {
+
+        s3_cli_fwd_udp_src_t *src = &uf->srcs[k];
+
+        if (!src->used) {
+            continue;
+        }
+
+        if (!src->hdr_sent) {
+
+            ssize_t m = s3_quic_stream_send(src->chan, src->hdr_park, src->hdr_len);
+
+            if (m == (ssize_t)S3_AGAIN) {
+                return;
+            }
+
+            if (m <= 0) {
+                src->used = 0;
+                (void)s3_quic_shutdown_stream(src->chan, S3_RDWR_SHUTDOWN);
+                s3_close_connection(src->chan);
+                src->chan = NULL;
+                uf->src_count--;
+                continue;
+            }
+
+            src->hdr_sent = 1;
+        }
+
+        while (src->confirmed && src->pend_count > 0) {
+
+            u_char  dg[S3_CLI_FWD_UDP_DATAGRAM + 16];
+            u_char *p;
+
+            p = s3_ssh3_dgram_encode(dg, s3_cli_conv_id, src->chan_id, src->pend[src->pend_head],
+                                     src->pend_len[src->pend_head]);
+
+            if (s3_quic_send_datagram(s3_cli_conn, dg, (size_t)(p - dg)) != S3_OK) {
+                return;
+            }
+
+            src->pend_head = (src->pend_head + 1) % S3_CLI_FWD_UDP_PENDING;
+            src->pend_count--;
+        }
+    }
+}
+
+/* the tick of the forward run: the tcp bridges and the udp sources
+ * drain their parked bytes */
+
+static void
+s3_cli_fwd_tick(void)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_CLI_FWD_TCP_CONNS; i++) {
+
+        if (s3_cli_fwd_conns[i].used) {
+            s3_cli_fwd_tcp_flush(&s3_cli_fwd_conns[i]);
+        }
+    }
+
+    for (i = 0; i < s3_cli_fwd_count; i++) {
+
+        if (s3_cli_fwd_udp[i].used) {
+            s3_cli_fwd_udp_pump(&s3_cli_fwd_udp[i]);
+        }
+    }
+}
+
 /*
  * the pump tick of the session and of the sftp run: one timer event
  * on the connection pool, the handler re-arms itself
@@ -1889,6 +3134,21 @@ s3_cli_tick_handler(s3_event_t *ev)
 {
     u_char frame[S3_CLI_RING_SIZE + 8];
 
+    if (s3_cli_fwd_count) {
+
+        /* the forward run: the parked drains ride the tick (the
+         * local socket writes park rarely, the echo paths stay
+         * hot); the console machinery stays off */
+
+        s3_cli_fwd_tick();
+
+        if (!s3_cli_stop && !s3_cli_verdict) {
+            s3_event_add_timer(ev, S3_CLI_TICK_MS);
+        }
+
+        return;
+    }
+
     if (s3_cli_sftp_mode) {
 
         /* the sftp run: the pump rides the tick (the window reopens
@@ -2041,7 +3301,7 @@ main(int argc, char **argv)
     s3_cli_log.fd = S3_INVALID_FILE;
     s3_cli_log.log_level = S3_LOG_WARN;
 
-    while ((opt = getopt(argc, argv, "i:U:J:rvl:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:U:J:L:rvl:Vh")) != -1) {
 
         switch (opt) {
 
@@ -2137,6 +3397,14 @@ main(int argc, char **argv)
 
             break;
         }
+
+        case 'L':
+
+            if (s3_cli_fwd_parse(optarg) != S3_OK) {
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            break;
 
         case 'r':
             s3_cli_sftp_recursive = 1;
@@ -2299,10 +3567,15 @@ main(int argc, char **argv)
 
     (void)s3_cli_tofu_prepare();
 
-    /* the sftp transfer carries no exec words */
+    /* the sftp transfer and the forwards carry no exec words */
 
-    if (s3_cli_sftp_mode && optind < argc) {
-        fprintf(stderr, "ssh3: -J takes no command\n");
+    if ((s3_cli_sftp_mode || s3_cli_fwd_count) && optind < argc) {
+        fprintf(stderr, "ssh3: -J and -L take no command\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    if (s3_cli_sftp_mode && s3_cli_fwd_count) {
+        fprintf(stderr, "ssh3: -J and -L do not ride one session\n");
         return S3_CLI_EXIT_ERROR;
     }
 
@@ -2539,9 +3812,31 @@ main(int argc, char **argv)
             }
         }
 
+        /* the 200 brings the -L listeners up: the forward run carries
+         * no session channel, the bridges live on the event loop */
+
+        if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_fwd_count && !s3_cli_fwd_ready) {
+
+            if (s3_cli_fwd_listeners_start() != S3_OK) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+
+            s3_cli_fwd_ready = 1;
+            s3_cli_phase = S3_CLI_PH_SESSION;
+
+            s3_cli_tick_arm();
+
+            if (s3_cli_tick == NULL) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+        }
+
         /* the 200 opens the session channel */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_chan == NULL) {
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count &&
+            s3_cli_chan == NULL) {
 
             s3_cli_chan = s3_quic_open_stream(cli, 1);
 
@@ -2577,7 +3872,7 @@ main(int argc, char **argv)
 
         /* the header plus the session requests ride one send */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_ch_sent) {
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_ch_sent) {
 
             u_char            frame[2048];
             u_char           *p;
@@ -2802,6 +4097,56 @@ s3_cli_teardown(void)
     unsigned              i;
 
     s3_cli_console_done();
+
+    /* the -L listeners and the bridges close before the wire */
+
+    if (s3_cli_fwd_ready) {
+
+        unsigned k;
+
+        for (k = 0; k < S3_CLI_FWD_TCP_CONNS; k++) {
+
+            if (s3_cli_fwd_conns[k].used) {
+                s3_cli_fwd_tcp_drop(&s3_cli_fwd_conns[k]);
+            }
+        }
+
+        for (k = 0; k < s3_cli_fwd_count; k++) {
+
+            unsigned j;
+
+            if (s3_cli_fwd_listen[k] != INVALID_SOCKET) {
+                closesocket(s3_cli_fwd_listen[k]);
+                s3_cli_fwd_listen[k] = INVALID_SOCKET;
+            }
+
+            for (j = 0; j < S3_CLI_FWD_UDP_SRCS; j++) {
+
+                s3_cli_fwd_udp_src_t *src = &s3_cli_fwd_udp[k].srcs[j];
+
+                if (src->used && src->chan != NULL) {
+                    (void)s3_quic_shutdown_stream(src->chan, S3_RDWR_SHUTDOWN);
+                    s3_close_connection(src->chan);
+                    src->chan = NULL;
+                }
+
+                src->used = 0;
+            }
+
+            if (s3_cli_fwd_udp[k].used) {
+
+                if (s3_cli_fwd_udp[k].evc != NULL) {
+                    s3_close_connection(s3_cli_fwd_udp[k].evc);
+                }
+
+                if (s3_cli_fwd_udp[k].fd != INVALID_SOCKET && s3_cli_fwd_udp[k].fd != 0) {
+                    closesocket(s3_cli_fwd_udp[k].fd);
+                }
+
+                s3_cli_fwd_udp[k].used = 0;
+            }
+        }
+    }
 
     if (s3_cli_tick != NULL && s3_cli_tick->timer_set) {
         s3_event_del_timer(s3_cli_tick);
