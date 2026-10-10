@@ -11,8 +11,11 @@
 #include <s3_quic_frames.h>
 #include <s3_quic_ack.h>
 
+#include <s3_udp_msg.h>
 #include <s3_udp_sendmsg_chain.h>
+#if (S3_HAVE_ADDRINFO_CMSG)
 #include <s3_cmsg.h>
+#endif
 #include <s3_errno.h>
 
 #include <time.h>
@@ -34,7 +37,7 @@
  */
 #define S3_QUIC_MIN_PKT_LEN 41 /* 21 + 20 (server cid length) */
 
-#define S3_QUIC_MIN_SR_PACKET 43   /* 5 rand + 16 srt + 22 padding */
+#define S3_QUIC_MIN_SR_PACKET 43 /* 5 rand + 16 srt + 22 padding */
 #define S3_QUIC_MAX_SR_PACKET 1200
 
 #define S3_QUIC_CC_MIN_INTERVAL 1000 /* 1s */
@@ -43,35 +46,33 @@
 
 #define s3_quic_log_packet(log, pkt)                                                               \
     s3_log_debug6(S3_LOG_DEBUG_EVENT, log, 0,                                                      \
-                  "quic packet tx %s bytes:%ui need_ack:%d number:%L encoded nl:%d trunc:0x%xD",    \
-                  s3_quic_level_name((pkt)->level), (s3_uint_t)(pkt)->payload.len,                  \
-                  (s3_int_t)(pkt)->need_ack, (int64_t)(pkt)->number, (s3_int_t)(pkt)->num_len,      \
+                  "quic packet tx %s bytes:%ui need_ack:%d number:%L encoded nl:%d trunc:0x%xD",   \
+                  s3_quic_level_name((pkt)->level), (s3_uint_t)(pkt)->payload.len,                 \
+                  (s3_int_t)(pkt)->need_ack, (int64_t)(pkt)->number, (s3_int_t)(pkt)->num_len,     \
                   (s3_uint32_t)(pkt)->trunc)
 
 #if (S3_HAVE_ADDRINFO_CMSG)
 static s3_udp_listen_t *s3_quic_socket_listener(s3_connection_t *c);
 #endif
-static s3_int_t         s3_quic_create_datagrams(s3_connection_t *c);
-static void             s3_quic_commit_send(s3_connection_t *c);
-static s3_uint_t        s3_quic_streams_pending(s3_quic_connection_t *qc);
-static void             s3_quic_revert_send(s3_connection_t *c,
-                                            uint64_t preserved_pnum[S3_QUIC_SEND_CTX_LAST]);
+static s3_int_t  s3_quic_create_datagrams(s3_connection_t *c);
+static void      s3_quic_commit_send(s3_connection_t *c);
+static s3_uint_t s3_quic_streams_pending(s3_quic_connection_t *qc);
+static void s3_quic_revert_send(s3_connection_t *c, uint64_t preserved_pnum[S3_QUIC_SEND_CTX_LAST]);
 #if (S3_HAVE_UDP_SEGMENT)
 static s3_uint_t s3_quic_allow_segmentation(s3_connection_t *c);
 static s3_int_t  s3_quic_create_segments(s3_connection_t *c);
 static ssize_t   s3_quic_send_segments(s3_connection_t *c, u_char *buf, size_t len,
-                                       struct sockaddr *sockaddr, socklen_t socklen,
-                                       size_t segment);
+                                       struct sockaddr *sockaddr, socklen_t socklen, size_t segment);
 #endif
-static ssize_t   s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
-                                       size_t max, size_t min, s3_uint_t ack_only);
-static void      s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx,
-                                     s3_quic_header_t *pkt, s3_quic_path_t *path);
+static ssize_t s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
+                                     size_t max, size_t min, s3_uint_t ack_only);
+static void s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, s3_quic_header_t *pkt,
+                                s3_quic_path_t *path);
 static s3_uint_t s3_quic_get_padding_level(s3_connection_t *c);
-static ssize_t   s3_quic_send(s3_connection_t *c, u_char *buf, size_t len,
-                               struct sockaddr *sockaddr, socklen_t socklen);
-static void      s3_quic_set_packet_number(s3_quic_header_t *pkt, s3_quic_send_ctx_t *ctx);
-static s3_int_t  s3_quic_stateless_reset_filter(s3_connection_t *c);
+static ssize_t  s3_quic_send(s3_connection_t *c, u_char *buf, size_t len, struct sockaddr *sockaddr,
+                             socklen_t socklen);
+static void     s3_quic_set_packet_number(s3_quic_header_t *pkt, s3_quic_send_ctx_t *ctx);
+static s3_int_t s3_quic_stateless_reset_filter(s3_connection_t *c);
 
 /*
  * the nginx c->listening link does not exist; the quic socket keeps
@@ -134,16 +135,16 @@ s3_quic_output(s3_connection_t *c)
 static s3_int_t
 s3_quic_create_datagrams(s3_connection_t *c)
 {
-    size_t                 len, min;
-    ssize_t                n;
-    u_char                *p;
-    uint64_t               preserved_pnum[S3_QUIC_SEND_CTX_LAST];
-    s3_uint_t              i, pad;
-    s3_quic_path_t        *path;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_congestion_t  *cg;
-    s3_quic_connection_t  *qc;
-    static u_char          dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    size_t                len, min;
+    ssize_t               n;
+    u_char               *p;
+    uint64_t              preserved_pnum[S3_QUIC_SEND_CTX_LAST];
+    s3_uint_t             i, pad;
+    s3_quic_path_t       *path;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_congestion_t *cg;
+    s3_quic_connection_t *qc;
+    static u_char         dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
@@ -179,7 +180,8 @@ s3_quic_create_datagrams(s3_connection_t *c)
             }
 
             min = (i == pad && p - dst < S3_QUIC_MIN_INITIAL_SIZE)
-                  ? S3_QUIC_MIN_INITIAL_SIZE - (p - dst) : 0;
+                      ? S3_QUIC_MIN_INITIAL_SIZE - (p - dst)
+                      : 0;
 
             if (min > len) {
                 /* padding can't be applied - avoid sending the packet */
@@ -225,12 +227,12 @@ s3_quic_create_datagrams(s3_connection_t *c)
 static void
 s3_quic_commit_send(s3_connection_t *c)
 {
-    s3_uint_t              i, idle;
-    s3_queue_t            *q;
-    s3_quic_frame_t       *f;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_congestion_t  *cg;
-    s3_quic_connection_t  *qc;
+    s3_uint_t             i, idle;
+    s3_queue_t           *q;
+    s3_quic_frame_t      *f;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_congestion_t *cg;
+    s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
@@ -289,9 +291,9 @@ s3_quic_commit_send(s3_connection_t *c)
 static s3_uint_t
 s3_quic_streams_pending(s3_quic_connection_t *qc)
 {
-    s3_rbtree_t         *tree;
-    s3_rbtree_node_t    *node;
-    s3_quic_stream_t    *qs;
+    s3_rbtree_t      *tree;
+    s3_rbtree_node_t *node;
+    s3_quic_stream_t *qs;
 
     tree = &qc->streams.tree;
 
@@ -301,8 +303,7 @@ s3_quic_streams_pending(s3_quic_connection_t *qc)
 
     /* s3_rbtree_next() terminates with NULL, not with the sentinel */
     for (node = s3_rbtree_min(tree->root, tree->sentinel); node != NULL;
-         node = s3_rbtree_next(tree, node))
-    {
+         node = s3_rbtree_next(tree, node)) {
         qs = (s3_quic_stream_t *)node;
 
         if (qs->send.size > qs->send.offset) {
@@ -316,10 +317,10 @@ s3_quic_streams_pending(s3_quic_connection_t *qc)
 static void
 s3_quic_revert_send(s3_connection_t *c, uint64_t pnum[S3_QUIC_SEND_CTX_LAST])
 {
-    s3_uint_t              i;
-    s3_queue_t            *q;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_connection_t  *qc;
+    s3_uint_t             i;
+    s3_queue_t           *q;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
 
@@ -347,11 +348,11 @@ s3_quic_revert_send(s3_connection_t *c, uint64_t pnum[S3_QUIC_SEND_CTX_LAST])
 static s3_uint_t
 s3_quic_allow_segmentation(s3_connection_t *c)
 {
-    size_t                 bytes, len;
-    s3_queue_t            *q;
-    s3_quic_frame_t       *f;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_connection_t  *qc;
+    size_t                bytes, len;
+    s3_queue_t           *q;
+    s3_quic_frame_t      *f;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_connection_t *qc;
 
     qc = s3_quic_get_connection(c);
 
@@ -380,8 +381,7 @@ s3_quic_allow_segmentation(s3_connection_t *c)
     len = s3_min(qc->path->mtu, S3_QUIC_MAX_UDP_SEGMENT_BUF);
 
     for (q = s3_queue_head(&ctx->frames); q != s3_queue_sentinel(&ctx->frames);
-         q = s3_queue_next(q))
-    {
+         q = s3_queue_next(q)) {
         f = s3_queue_data(q, s3_quic_frame_t, queue);
 
         bytes += f->len;
@@ -402,16 +402,16 @@ s3_quic_allow_segmentation(s3_connection_t *c)
 static s3_int_t
 s3_quic_create_segments(s3_connection_t *c)
 {
-    size_t                 len, segsize;
-    ssize_t                n;
-    u_char                *p, *end;
-    s3_uint_t              nseg, level;
-    s3_quic_path_t        *path;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_congestion_t  *cg;
-    s3_quic_connection_t  *qc;
-    static u_char          dst[S3_QUIC_MAX_UDP_SEGMENT_BUF];
-    static uint64_t        preserved_pnum[S3_QUIC_SEND_CTX_LAST];
+    size_t                len, segsize;
+    ssize_t               n;
+    u_char               *p, *end;
+    s3_uint_t             nseg, level;
+    s3_quic_path_t       *path;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_congestion_t *cg;
+    s3_quic_connection_t *qc;
+    static u_char         dst[S3_QUIC_MAX_UDP_SEGMENT_BUF];
+    static uint64_t       preserved_pnum[S3_QUIC_SEND_CTX_LAST];
 
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
@@ -488,17 +488,17 @@ s3_quic_send_segments(s3_connection_t *c, u_char *buf, size_t len, struct sockad
     size_t          clen;
     ssize_t         n;
     uint16_t       *valp;
-    struct iovec    iov;
-    struct msghdr   msg;
+    s3_udp_iov_t    iov;
+    s3_udp_msg_t    msg;
     struct cmsghdr *cmsg;
 
 #if (S3_HAVE_ADDRINFO_CMSG)
-    char            msg_control[CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(s3_addrinfo_t))];
+    char msg_control[CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(s3_addrinfo_t))];
 #else
-    char            msg_control[CMSG_SPACE(sizeof(uint16_t))];
+    char msg_control[CMSG_SPACE(sizeof(uint16_t))];
 #endif
 
-    s3_memzero(&msg, sizeof(struct msghdr));
+    s3_memzero(&msg, sizeof(s3_udp_msg_t));
     s3_memzero(msg_control, sizeof(msg_control));
 
     iov.iov_len = len;
@@ -525,9 +525,8 @@ s3_quic_send_segments(s3_connection_t *c, u_char *buf, size_t len, struct sockad
     *valp = segment;
 
 #if (S3_HAVE_ADDRINFO_CMSG)
-    if (s3_quic_socket_listener(c) != NULL && s3_quic_socket_listener(c)->wildcard
-        && c->local_sockaddr)
-    {
+    if (s3_quic_socket_listener(c) != NULL && s3_quic_socket_listener(c)->wildcard &&
+        c->local_sockaddr) {
         cmsg = CMSG_NXTHDR(&msg, cmsg);
         clen += s3_set_srcaddr_cmsg(cmsg, c->local_sockaddr);
     }
@@ -550,11 +549,11 @@ s3_quic_send_segments(s3_connection_t *c, u_char *buf, size_t len, struct sockad
 static s3_uint_t
 s3_quic_get_padding_level(s3_connection_t *c)
 {
-    s3_uint_t              i;
-    s3_queue_t            *q;
-    s3_quic_frame_t       *f;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_connection_t  *qc;
+    s3_uint_t             i;
+    s3_queue_t           *q;
+    s3_quic_frame_t      *f;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_connection_t *qc;
 
     /*
      * RFC 9000, 14.1.  Initial Datagram Size
@@ -568,8 +567,7 @@ s3_quic_get_padding_level(s3_connection_t *c)
     ctx = s3_quic_get_send_ctx(qc, S3_QUIC_ENCRYPTION_INITIAL);
 
     for (q = s3_queue_head(&ctx->frames); q != s3_queue_sentinel(&ctx->frames);
-         q = s3_queue_next(q))
-    {
+         q = s3_queue_next(q)) {
         f = s3_queue_data(q, s3_quic_frame_t, queue);
 
         /*
@@ -597,18 +595,18 @@ static ssize_t
 s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data, size_t max,
                       size_t min, s3_uint_t ack_only)
 {
-    size_t                 len, pad, min_payload, max_payload;
-    u_char                *p;
-    ssize_t                flen;
-    s3_str_t               res;
-    s3_int_t               rc;
-    s3_uint_t              nframes;
-    s3_msec_t              now;
-    s3_queue_t            *q;
-    s3_quic_frame_t       *f;
-    s3_quic_header_t       pkt;
-    s3_quic_connection_t  *qc;
-    static u_char          src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    size_t                len, pad, min_payload, max_payload;
+    u_char               *p;
+    ssize_t               flen;
+    s3_str_t              res;
+    s3_int_t              rc;
+    s3_uint_t             nframes;
+    s3_msec_t             now;
+    s3_queue_t           *q;
+    s3_quic_frame_t      *f;
+    s3_quic_header_t      pkt;
+    s3_quic_connection_t *qc;
+    static u_char         src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
     if (s3_queue_empty(&ctx->frames)) {
         return 0;
@@ -653,8 +651,7 @@ s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
     len = 0;
 
     for (q = s3_queue_head(&ctx->frames); q != s3_queue_sentinel(&ctx->frames);
-         q = s3_queue_next(q))
-    {
+         q = s3_queue_next(q)) {
         f = s3_queue_data(q, s3_quic_frame_t, queue);
 
         if (ack_only && f->type != S3_QUIC_FT_ACK) {
@@ -782,15 +779,15 @@ static ssize_t
 s3_quic_send(s3_connection_t *c, u_char *buf, size_t len, struct sockaddr *sockaddr,
              socklen_t socklen)
 {
-    ssize_t         n;
-    struct iovec    iov;
-    struct msghdr   msg;
+    ssize_t      n;
+    s3_udp_iov_t iov;
+    s3_udp_msg_t msg;
 #if (S3_HAVE_ADDRINFO_CMSG)
     struct cmsghdr *cmsg;
     char            msg_control[CMSG_SPACE(sizeof(s3_addrinfo_t))];
 #endif
 
-    s3_memzero(&msg, sizeof(struct msghdr));
+    s3_memzero(&msg, sizeof(s3_udp_msg_t));
 
     iov.iov_len = len;
     iov.iov_base = (void *)buf;
@@ -802,9 +799,8 @@ s3_quic_send(s3_connection_t *c, u_char *buf, size_t len, struct sockaddr *socka
     msg.msg_namelen = socklen;
 
 #if (S3_HAVE_ADDRINFO_CMSG)
-    if (s3_quic_socket_listener(c) != NULL && s3_quic_socket_listener(c)->wildcard
-        && c->local_sockaddr)
-    {
+    if (s3_quic_socket_listener(c) != NULL && s3_quic_socket_listener(c)->wildcard &&
+        c->local_sockaddr) {
 
         msg.msg_control = msg_control;
         msg.msg_controllen = sizeof(msg_control);
@@ -889,11 +885,11 @@ s3_quic_negotiate_version(s3_connection_t *c, s3_quic_header_t *inpkt)
 s3_int_t
 s3_quic_send_stateless_reset(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t *pkt)
 {
-    u_char    *token;
-    size_t     len, max;
-    uint16_t   rndbytes;
-    s3_int_t   rc;
-    u_char     buf[S3_QUIC_MAX_SR_PACKET];
+    u_char  *token;
+    size_t   len, max;
+    uint16_t rndbytes;
+    s3_int_t rc;
+    u_char   buf[S3_QUIC_MAX_SR_PACKET];
 
     s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "quic handle stateless reset output");
 
@@ -945,14 +941,14 @@ s3_quic_send_stateless_reset(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_h
 static s3_int_t
 s3_quic_stateless_reset_filter(s3_connection_t *c)
 {
-    time_t      now;
-    u_char      salt;
-    s3_uint_t   i, n, m, hit;
-    u_char      hash[20];
+    time_t    now;
+    u_char    salt;
+    s3_uint_t i, n, m, hit;
+    u_char    hash[20];
 
-    static time_t   t;
-    static u_char   rndbyte;
-    static uint8_t  bitmap[65536];
+    static time_t  t;
+    static u_char  rndbyte;
+    static uint8_t bitmap[65536];
 
     now = time(NULL);
 
@@ -1040,8 +1036,8 @@ s3_quic_send_early_cc(s3_connection_t *c, s3_quic_header_t *inpkt, s3_uint_t err
     s3_quic_frame_t  frame;
     s3_quic_header_t pkt;
 
-    static u_char    src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
-    static u_char    dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    static u_char src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    static u_char dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
     s3_memzero(&frame, sizeof(s3_quic_frame_t));
     s3_memzero(&pkt, sizeof(s3_quic_header_t));
@@ -1115,9 +1111,9 @@ s3_quic_send_retry(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t *i
     s3_str_t         res, token;
     s3_quic_header_t pkt;
 
-    u_char           buf[S3_QUIC_RETRY_BUFFER_SIZE];
-    u_char           dcid[S3_QUIC_SERVER_CID_LEN];
-    u_char           tbuf[S3_QUIC_TOKEN_BUF_SIZE];
+    u_char buf[S3_QUIC_RETRY_BUFFER_SIZE];
+    u_char dcid[S3_QUIC_SERVER_CID_LEN];
+    u_char tbuf[S3_QUIC_TOKEN_BUF_SIZE];
 
     expires = time(NULL) + S3_QUIC_RETRY_TOKEN_LIFETIME;
 
@@ -1125,8 +1121,7 @@ s3_quic_send_retry(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_t *i
     token.len = S3_QUIC_TOKEN_BUF_SIZE;
 
     if (s3_quic_new_token(c->log, c->sockaddr, c->socklen, conf->av_token_key, &token, &inpkt->dcid,
-                          expires, 1) != S3_OK)
-    {
+                          expires, 1) != S3_OK) {
         return S3_ERROR;
     }
 
@@ -1184,7 +1179,7 @@ s3_quic_send_new_token(s3_connection_t *c, s3_quic_path_t *path)
     s3_quic_frame_t      *frame;
     s3_quic_connection_t *qc;
 
-    u_char                tbuf[S3_QUIC_TOKEN_BUF_SIZE];
+    u_char tbuf[S3_QUIC_TOKEN_BUF_SIZE];
 
     qc = s3_quic_get_connection(c);
 
@@ -1194,8 +1189,7 @@ s3_quic_send_new_token(s3_connection_t *c, s3_quic_path_t *path)
     token.len = S3_QUIC_TOKEN_BUF_SIZE;
 
     if (s3_quic_new_token(c->log, path->sockaddr, path->socklen, qc->conf->av_token_key, &token,
-                          NULL, expires, 0) != S3_OK)
-    {
+                          NULL, expires, 0) != S3_OK) {
         return S3_ERROR;
     }
 
@@ -1315,17 +1309,17 @@ s3_quic_send_ack_range(s3_connection_t *c, s3_quic_send_ctx_t *ctx, uint64_t sma
 s3_int_t
 s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_quic_path_t *path)
 {
-    size_t                 max, max_payload, min_payload, pad;
-    ssize_t                len, sent;
-    s3_str_t               res;
-    s3_msec_t              now;
-    s3_quic_header_t       pkt;
-    s3_quic_send_ctx_t    *ctx;
-    s3_quic_congestion_t  *cg;
-    s3_quic_connection_t  *qc;
+    size_t                max, max_payload, min_payload, pad;
+    ssize_t               len, sent;
+    s3_str_t              res;
+    s3_msec_t             now;
+    s3_quic_header_t      pkt;
+    s3_quic_send_ctx_t   *ctx;
+    s3_quic_congestion_t *cg;
+    s3_quic_connection_t *qc;
 
-    static u_char          src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
-    static u_char          dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    static u_char src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
+    static u_char dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
@@ -1483,10 +1477,8 @@ s3_quic_send_datagram(s3_connection_t *c, const u_char *data, size_t len)
      * the peer transport parameter; the conf value of 0 disables
      * datagrams entirely (porting map 3.4.2)
      */
-    if (qc->conf->max_datagram_frame_size == 0
-        || (s3_uint_t)len > qc->ctp.max_datagram_frame_size
-        || qc->ctp.max_datagram_frame_size == 0)
-    {
+    if (qc->conf->max_datagram_frame_size == 0 ||
+        (s3_uint_t)len > qc->ctp.max_datagram_frame_size || qc->ctp.max_datagram_frame_size == 0) {
         s3_log_error(S3_LOG_INFO, c->log, 0, "quic datagram of size %uz is too large", len);
         return S3_ERROR;
     }

@@ -9,13 +9,22 @@
  * invariant (porting map 3.3.1)
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
-#include <sys/socket.h>
+#endif
 #include <unistd.h>
 
 #include <openssl/ssl.h>
 
 #include <s3_nonblocking.h>
+#if (S3_WIN32)
+/* the test sockets are non-blocking, the per-call flag is a posix ext */
+#define MSG_DONTWAIT 0
+#endif
+
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
@@ -44,7 +53,7 @@ s3_test_udp_socket(struct sockaddr_in *sa)
     s3_fd_t fd;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
+    if (fd == (s3_fd_t)-1) {
         return -1;
     }
 
@@ -58,7 +67,7 @@ s3_test_udp_socket(struct sockaddr_in *sa)
     sa->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(fd, (struct sockaddr *)sa, sizeof(*sa)) == -1) {
-        close(fd);
+        s3_test_close(fd);
         return -1;
     }
 
@@ -116,7 +125,7 @@ s3_test_env_init(s3_test_out_env_t *env)
 
     /* the peer (server) socket */
     env->peer_fd = s3_test_udp_socket(&sa);
-    if (env->peer_fd == -1) {
+    if (env->peer_fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
 
@@ -128,7 +137,7 @@ s3_test_env_init(s3_test_out_env_t *env)
 
     /* the connection socket is bound to its own port */
     env->conn = s3_get_connection(&env->ctx, s3_test_udp_socket(&conn_sa));
-    if (env->conn == NULL || env->conn->fd == -1) {
+    if (env->conn == NULL || env->conn->fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
 
@@ -195,8 +204,8 @@ s3_test_env_done(s3_test_out_env_t *env)
         env->conf.ssl = NULL;
     }
 
-    if (env->peer_fd != -1) {
-        (void)close(env->peer_fd);
+    if (env->peer_fd != (s3_fd_t)-1) {
+        (void)s3_test_close(env->peer_fd);
     }
 
     if (env->pool != NULL) {
@@ -219,10 +228,9 @@ s3_test_seed_app(s3_test_out_env_t *env)
         secret[i] = (uint8_t)(0x11 * (i + 1));
     }
 
-    S3_ASSERT(s3_quic_keys_set_encryption_secret(&s3_test_tls_log, 1, env->qc->keys,
-                                                 S3_QUIC_ENCRYPTION_APPLICATION,
-                                                 TLS1_3_CK_AES_128_GCM_SHA256, secret,
-                                                 sizeof(secret)) == S3_OK);
+    S3_ASSERT(s3_quic_keys_set_encryption_secret(
+                  &s3_test_tls_log, 1, env->qc->keys, S3_QUIC_ENCRYPTION_APPLICATION,
+                  TLS1_3_CK_AES_128_GCM_SHA256, secret, sizeof(secret)) == S3_OK);
 
     env->qc->ctp.max_datagram_frame_size = 1200;
 }
@@ -267,14 +275,14 @@ test_datagram_roundtrip(void)
 
     s3_test_seed_app(&env);
 
-    n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+    n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     S3_ASSERT(n == S3_QUIC_MIN_INITIAL_SIZE);
     S3_ASSERT(s3_test_parse(buf, n, &pkt) == S3_OK);
     S3_ASSERT(pkt.level == S3_QUIC_ENCRYPTION_INITIAL);
 
     /* the rest of the handshake flight */
     do {
-        n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     } while (n > 0);
 
     /* the DATAGRAM frame goes out in a 1-RTT packet */
@@ -284,7 +292,7 @@ test_datagram_roundtrip(void)
     /* the queued frame is gone */
     S3_ASSERT(s3_queue_empty(&env.qc->send_ctx[2].frames));
 
-    n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+    n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     S3_ASSERT(n > 0);
     S3_ASSERT(s3_test_parse(buf, n, &pkt) == S3_OK);
     S3_ASSERT(pkt.level == S3_QUIC_ENCRYPTION_APPLICATION);
@@ -368,7 +376,7 @@ test_gso_segments(void)
     s3_test_seed_app(&env);
 
     do {
-        n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     } while (n > 0);
 
     /*
@@ -401,7 +409,7 @@ test_gso_segments(void)
     total = 0;
 
     do {
-        n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
 
         if (n > 0) {
             total += n;

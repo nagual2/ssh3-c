@@ -46,6 +46,12 @@ typedef s3_int_t  s3_msec_int_t;
 typedef uintptr_t     s3_fd_t;
 typedef unsigned long s3_err_t;
 
+/* the BSD names winsock does not define, the ngx_win32_config.h twins */
+typedef uint32_t in_addr_t;
+typedef u_short  in_port_t;
+
+typedef int socklen_t;
+
 #else
 
 typedef int s3_fd_t;

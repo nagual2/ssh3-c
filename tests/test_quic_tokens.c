@@ -2,9 +2,15 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
-#include <string.h>
 #include <sys/socket.h>
+#endif
+
+#include <string.h>
 #include <time.h>
 
 #include <s3_quic.h>

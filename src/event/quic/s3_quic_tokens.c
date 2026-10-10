@@ -3,8 +3,7 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <s3_udp_msg.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>

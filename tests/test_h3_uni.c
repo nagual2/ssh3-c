@@ -11,9 +11,13 @@
  * cleanly without the idle timeouts
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
+#endif
 #include <string.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <openssl/ssl.h>
@@ -101,7 +105,7 @@ s3_test_env_init(s3_test_env_t *env)
     /* the server side */
 
     env->listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (env->listen_fd == -1) {
+    if (env->listen_fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
 
@@ -186,7 +190,7 @@ s3_test_env_init(s3_test_env_t *env)
     /* the client side */
 
     env->cli_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (env->cli_fd == -1) {
+    if (env->cli_fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
 
@@ -267,13 +271,13 @@ s3_test_env_done(s3_test_env_t *env)
         env->srv_conf.ssl = NULL;
     }
 
-    if (env->cli_fd != -1) {
-        (void)close(env->cli_fd);
+    if (env->cli_fd != (s3_fd_t)-1) {
+        (void)s3_test_close(env->cli_fd);
         env->cli_fd = -1;
     }
 
-    if (env->listen_fd != -1) {
-        (void)close(env->listen_fd);
+    if (env->listen_fd != (s3_fd_t)-1) {
+        (void)s3_test_close(env->listen_fd);
         env->listen_fd = -1;
     }
 
@@ -298,7 +302,7 @@ s3_test_pump(s3_test_env_t *env)
      */
 
     s3_time_update();
-    (void) s3_event_actions.process_events(&env->ctx, 1, S3_UPDATE_TIME);
+    (void)s3_event_actions.process_events(&env->ctx, 1, S3_UPDATE_TIME);
 
     s3_event_expire_timers(&env->ctx);
     s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
@@ -330,10 +334,8 @@ s3_test_h3_uni(void)
     for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
         s3_test_pump(env);
 
-        if (env->server != NULL && env->server->ssl != NULL
-            && env->server->ssl->handshaked && env->cli->ssl != NULL
-            && env->cli->ssl->handshaked)
-        {
+        if (env->server != NULL && env->server->ssl != NULL && env->server->ssl->handshaked &&
+            env->cli->ssl != NULL && env->cli->ssl->handshaked) {
             break;
         }
     }

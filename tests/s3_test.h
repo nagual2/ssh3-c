@@ -8,6 +8,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+/* the win32 sockets are not close(fd)-able */
+
+#define s3_test_close(fd) closesocket((SOCKET)(fd))
+
+static void
+s3_test_winsock_init(void)
+{
+    WSADATA wsd;
+
+    WSAStartup(MAKEWORD(2, 2), &wsd);
+}
+#else
+#define s3_test_close(fd) close(fd)
+
+static void
+s3_test_winsock_init(void)
+{
+}
+#endif
+
 static int s3_test_failures = 0;
 
 #define S3_ASSERT(cond)                                                                            \
@@ -27,6 +51,9 @@ static int s3_test_failures = 0;
     {                                                                                              \
         int failures;                                                                              \
         setvbuf(stdout, NULL, _IONBF, 0);                                                          \
+                                                                                                   \
+        s3_test_winsock_init();                                                                    \
+                                                                                                   \
         failures = name();                                                                         \
         if (failures == 0) {                                                                       \
             printf("OK\n");                                                                        \

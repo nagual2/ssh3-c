@@ -11,9 +11,18 @@
  * the h3 session on c->data (the P3 integration scene)
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
+#endif
+#endif
 #include <string.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <s3_core.h>
@@ -136,7 +145,7 @@ s3_test_env_init(s3_test_env_t *e)
     }
 
     e->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (e->fd == -1) {
+    if (e->fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
 
@@ -646,7 +655,7 @@ s3_test_h3_qpack(void)
     s3_test_dynamic_table(&e);
     s3_test_empty_value(&e);
 
-    close(e.fd);
+    s3_test_close(e.fd);
 
     while (e.npools > 0) {
         s3_destroy_pool(e.pools[--e.npools]);

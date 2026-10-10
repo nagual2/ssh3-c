@@ -13,18 +13,11 @@
 #include <s3_udp_sendmsg_chain.h>
 
 #if (S3_WIN32)
-#include <s3_os_init.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-
-/* the win32 sockets are not close(fd)-able */
-
-#define s3_test_close(fd) closesocket((SOCKET)(fd))
 #else
 #include <netinet/in.h>
 #include <sys/socket.h>
-
-#define s3_test_close(fd) close(fd)
 #endif
 
 #include <unistd.h>
@@ -71,10 +64,6 @@ s3_test_udp(void)
     struct sockaddr_in sa;
 
     failures = 0;
-
-#if (S3_WIN32)
-    S3_ASSERT(s3_os_init() == S3_OK);
-#endif
 
     S3_ASSERT(s3_event_ctx_init(&ctx, &s3_stderr_log) == S3_OK);
 

@@ -264,6 +264,58 @@ eintr:
     return n;
 }
 
+ssize_t
+s3_sendmsg(s3_connection_t *c, s3_udp_msg_t *msg, int flags)
+{
+    DWORD    sent;
+    WSABUF   wbuf[S3_IOVS_PREALLOCATE];
+    size_t   i, count;
+    s3_err_t err;
+    int      rc;
+
+    (void)flags;
+
+    count = (msg->msg_iovlen <= S3_IOVS_PREALLOCATE) ? msg->msg_iovlen : S3_IOVS_PREALLOCATE;
+
+    for (i = 0; i < count; i++) {
+        wbuf[i].buf = (char *)msg->msg_iov[i].iov_base;
+        wbuf[i].len = (ULONG)msg->msg_iov[i].iov_len;
+    }
+
+    sent = 0;
+
+    rc = WSASendTo((SOCKET)c->fd, wbuf, (DWORD)count, &sent, 0, (struct sockaddr *)msg->msg_name,
+                   (int)msg->msg_namelen, NULL, NULL);
+
+    if (rc == SOCKET_ERROR) {
+        err = s3_socket_errno;
+
+        switch (err) {
+
+        case S3_EAGAIN:
+            s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, err, "WSASendTo() not ready");
+            return (ssize_t)S3_AGAIN;
+
+        case S3_EMSGSIZE:
+
+            /*
+             * the datagram is too large for the path; returned instead
+             * of an error, the same contract as the unix s3_sendmsg()
+             */
+
+            s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, err, "WSASendTo() datagram too large");
+            return (ssize_t)S3_DECLINED;
+
+        default:
+            c->write->error = 1;
+            s3_log_error(S3_LOG_ERR, c->log, err, "WSASendTo() failed");
+            return (ssize_t)S3_ERROR;
+        }
+    }
+
+    return (ssize_t)sent;
+}
+
 static s3_chain_t *
 s3_chain_update_sent(s3_chain_t *in, off_t sent)
 {

@@ -42,9 +42,22 @@ if(WIN32)
         src/event/s3_connection.c
         src/event/s3_event_udp.c
         src/event/modules/s3_select_module.c
+        src/event/quic/s3_quic_transport.c
+        src/event/quic/s3_quic_frames.c
+        src/event/quic/s3_quic_protection.c
+        src/event/quic/s3_quic_tokens.c
+        src/event/quic/s3_quic_connid.c
+        src/event/quic/s3_ssl.c
+        src/event/quic/s3_quic_ssl.c
+        src/event/quic/s3_quic.c
+        src/event/quic/s3_quic_migration.c
+        src/event/quic/s3_quic_output.c
+        src/event/quic/s3_quic_ack.c
+        src/event/quic/s3_quic_streams.c
         src/h3/s3_h3_encode.c
         src/h3/s3_h3_table.c
         src/h3/s3_h3_parse.c
+        src/h3/s3_h3_uni.c
         src/ssh3/s3_ssh3_version.c
         src/ssh3/s3_ssh3_wire.c
         src/ssh3/s3_ssh3_message.c
@@ -63,14 +76,32 @@ if(WIN32)
         PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core
             ${CMAKE_CURRENT_SOURCE_DIR}/src/event
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/event/quic
             ${CMAKE_CURRENT_SOURCE_DIR}/src/h3
             ${CMAKE_CURRENT_SOURCE_DIR}/src/ssh3
             ${CMAKE_CURRENT_SOURCE_DIR}/src/os/win
         )
 
     target_compile_definitions(s3core PUBLIC S3_WIN32=1)
+
+    # the quic branch of the udp event path; the quic layer rides the
+    # cross-built OpenSSL like the unix build below
+    target_compile_definitions(s3core PUBLIC S3_HAVE_QUIC=1)
+
     target_link_libraries(s3core PUBLIC ws2_32)
     target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
+
+    # the QUIC crypto layer (HKDF/AEAD, the OpenSSL QUIC TLS API); the
+    # cross-built OpenSSL, the same ~/opt layout as the unix build
+    if(EXISTS $ENV{HOME}/opt/openssl-3.5-mingw)
+        list(PREPEND CMAKE_PREFIX_PATH $ENV{HOME}/opt/openssl-3.5-mingw)
+    endif()
+
+    find_package(OpenSSL 3.5 REQUIRED)
+
+    message(STATUS "OpenSSL ${OPENSSL_VERSION} (crypto: ${OPENSSL_CRYPTO_LIBRARY})")
+
+    target_link_libraries(s3core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
 
     set(S3_WIN_TESTS
         test_pool
@@ -81,7 +112,18 @@ if(WIN32)
         test_log
         test_event
         test_udp
+        test_quic_transport
+        test_quic_frames
+        test_quic_protection
+        test_quic_tokens
+        test_quic_ssl
+        test_quic_core
+        test_quic_output
+        test_quic_ack
+        test_quic_e2e
         test_h3_parse
+        test_h3_qpack
+        test_h3_uni
         test_ssh3_version
         test_ssh3_wire
         test_ssh3_message
@@ -229,8 +271,8 @@ if(S3_HAVE_ADDRINFO_CMSG)
     target_compile_definitions(s3core PUBLIC S3_HAVE_ADDRINFO_CMSG=1)
 endif()
 
-# the quic branch of the udp event path; the win bootstrap compiles it
-# out until the quic layer lands (P9 wave 2)
+# the quic branch of the udp event path (the win build defines it in
+# the win branch above)
 target_compile_definitions(s3core PUBLIC S3_HAVE_QUIC=1)
 
 target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)

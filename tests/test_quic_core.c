@@ -2,8 +2,17 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
-#include <sys/socket.h>
+#endif
+#endif
 #include <unistd.h>
 
 #define S3_TEST_TLS_NO_LOCKSTEP
@@ -71,7 +80,7 @@ s3_test_udp_socket(void)
     struct sockaddr_in sa;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
+    if (fd == (s3_fd_t) -1) {
         return -1;
     }
 
@@ -85,7 +94,7 @@ s3_test_udp_socket(void)
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-        close(fd);
+        s3_test_close(fd);
         return -1;
     }
 
@@ -245,7 +254,7 @@ s3_test_core_env_done(s3_test_core_env_t *env)
         }
     }
 
-    if (env->conn != NULL && env->conn->fd != -1) {
+    if (env->conn != NULL && env->conn->fd != (s3_fd_t)-1) {
         s3_close_connection(env->conn); /* destroys conn_pool */
         env->conn = NULL;
     }

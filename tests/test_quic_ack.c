@@ -9,13 +9,26 @@
  * (porting map 1.7)
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
-#include <sys/socket.h>
+#endif
+#endif
 #include <unistd.h>
 
 #include <openssl/ssl.h>
 
 #include <s3_nonblocking.h>
+#if (S3_WIN32)
+#define MSG_DONTWAIT 0
+#endif
+
 #include <s3_quic.h>
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
@@ -44,7 +57,7 @@ s3_test_udp_socket(struct sockaddr_in *sa)
     s3_fd_t fd;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
+    if (fd == (s3_fd_t) -1) {
         return -1;
     }
 
@@ -58,7 +71,7 @@ s3_test_udp_socket(struct sockaddr_in *sa)
     sa->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(fd, (struct sockaddr *)sa, sizeof(*sa)) == -1) {
-        close(fd);
+        s3_test_close(fd);
         return -1;
     }
 
@@ -114,7 +127,7 @@ s3_test_env_init(s3_test_ack_env_t *env)
     }
 
     env->peer_fd = s3_test_udp_socket(&sa);
-    if (env->peer_fd == -1) {
+    if (env->peer_fd == (s3_fd_t) -1) {
         return S3_ERROR;
     }
 
@@ -125,7 +138,7 @@ s3_test_env_init(s3_test_ack_env_t *env)
     }
 
     env->conn = s3_get_connection(&env->ctx, s3_test_udp_socket(&conn_sa));
-    if (env->conn == NULL || env->conn->fd == -1) {
+    if (env->conn == NULL || env->conn->fd == (s3_fd_t) -1) {
         return S3_ERROR;
     }
 
@@ -191,8 +204,8 @@ s3_test_env_done(s3_test_ack_env_t *env)
         env->conf.ssl = NULL;
     }
 
-    if (env->peer_fd != -1) {
-        (void)close(env->peer_fd);
+    if (env->peer_fd != (s3_fd_t) -1) {
+        (void)s3_test_close(env->peer_fd);
     }
 
     if (env->pool != NULL) {
@@ -410,12 +423,12 @@ test_loss_retransmit(void)
 
     /* drop the original flight, then the retransmission goes out */
     do {
-        n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     } while (n > 0);
 
     S3_ASSERT(s3_quic_output(env.conn) == S3_OK);
 
-    n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+    n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
     S3_ASSERT(n == S3_QUIC_MIN_INITIAL_SIZE);
 
     s3_memzero(&pkt, sizeof(s3_quic_header_t));
@@ -514,7 +527,7 @@ test_max_stream_data_retransmit(void)
         ssize_t n;
 
         do {
-            n = recv(env.peer_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            n = recv(env.peer_fd, (char *)buf, sizeof(buf), MSG_DONTWAIT);
         } while (n > 0);
     }
 

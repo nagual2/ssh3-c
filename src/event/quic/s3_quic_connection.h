@@ -6,7 +6,10 @@
 #ifndef _S3_QUIC_CONNECTION_H_INCLUDED_
 #define _S3_QUIC_CONNECTION_H_INCLUDED_
 
+#if !(S3_WIN32)
 #include <netinet/in.h>
+#endif
+/* the win32 build: the winsock headers come from s3_base.h */
 
 #include <s3_sock_ntop.h>
 

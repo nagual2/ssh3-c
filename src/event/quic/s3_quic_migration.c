@@ -241,7 +241,7 @@ s3_quic_new_path(s3_connection_t *c, struct sockaddr *sockaddr, socklen_t sockle
 
     path->seqnum = qc->path_seqnum++;
 
-    if (sockaddr != NULL && socklen > 0 && socklen <= sizeof(struct sockaddr_storage)) {
+    if (sockaddr != NULL && socklen > 0 && socklen <= (socklen_t)sizeof(struct sockaddr_storage)) {
 
         path->sockaddr = (struct sockaddr *)&path->sa;
         path->socklen = socklen;

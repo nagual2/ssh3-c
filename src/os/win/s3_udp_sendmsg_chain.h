@@ -13,6 +13,7 @@
 #include <s3_base.h>
 #include <s3_connection.h>
 #include <s3_palloc.h>
+#include <s3_udp_msg.h>
 
 #define S3_IOVS_PREALLOCATE 16
 
@@ -32,5 +33,7 @@ typedef struct {
 } s3_iovec_t;
 
 s3_chain_t *s3_udp_sendmsg_chain(s3_connection_t *c, s3_chain_t *in, off_t limit);
+
+ssize_t s3_sendmsg(s3_connection_t *c, s3_udp_msg_t *msg, int flags);
 
 #endif /* _S3_UDP_SENDMSG_CHAIN_H_INCLUDED_ */
