@@ -24,8 +24,34 @@ typedef uint64_t s3_uint64_t;
 typedef s3_uint_t s3_msec_t;
 typedef s3_int_t  s3_msec_int_t;
 
+#if (S3_WIN32)
+
+/*
+ * the platform seam of the base types, the build defines S3_WIN32 for
+ * the os/win targets: SOCKET is pointer-sized, the error codes are DWORD.
+ * windows.h comes here, before the CR/LF shorthands below -- winnt.h
+ * uses CR as an identifier, the nginx ngx_win32_config.h ordering
+ */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <winsock2.h>
+#include <windows.h>
+
+typedef uintptr_t     s3_fd_t;
+typedef unsigned long s3_err_t;
+
+#else
+
 typedef int s3_fd_t;
 typedef int s3_err_t;
+
+#endif
 
 #define S3_OK       0
 #define S3_ERROR    -1

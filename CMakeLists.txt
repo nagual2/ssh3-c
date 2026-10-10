@@ -16,6 +16,89 @@ set(S3_FEATURE_DEFINITIONS -D_POSIX_C_SOURCE=200809L)
 
 add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 
+# the Windows beachhead (P9 wave 1, docs/PLAN.md): cross-built with
+# mingw-w64 (preset windows-core, from WSL).  platform-free core,
+# codecs and the os/win layer only -- the event/quic layers land with
+# the select module (P9 wave 2+).  the unix path below is untouched
+if(WIN32)
+
+    add_library(s3core STATIC
+        src/core/s3_string.c
+        src/core/s3_palloc.c
+        src/core/s3_buf.c
+        src/core/s3_rbtree.c
+        src/core/s3_log.c
+        src/core/s3_crc32.c
+        src/os/win/s3_errno.c
+        src/os/win/s3_nonblocking.c
+        src/os/win/s3_sock_ntop.c
+        src/os/win/s3_os_init.c
+        src/h3/s3_h3_encode.c
+        src/h3/s3_h3_table.c
+        src/h3/s3_h3_parse.c
+        src/ssh3/s3_ssh3_version.c
+        src/ssh3/s3_ssh3_wire.c
+        src/ssh3/s3_ssh3_message.c
+        src/ssh3/s3_ssh3_request.c
+        src/ssh3/s3_ssh3_channel.c
+        src/ssh3/s3_ssh3_conversation.c
+        src/ssh3/s3_ssh3_dgram.c
+        src/ssh3/s3_ssh3_forward.c
+        src/ssh3/s3_ssh3_forward_policy.c
+        src/ssh3/s3_ssh3_dos_guard.c
+        src/ssh3/s3_ssh3_sftp_codec.c
+        src/ssh3/s3_ssh3_cm.c
+    )
+
+    target_include_directories(s3core
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/event
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/h3
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ssh3
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/os/win
+        )
+
+    target_compile_definitions(s3core PUBLIC S3_WIN32=1)
+    target_link_libraries(s3core PUBLIC ws2_32)
+    target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
+
+    set(S3_WIN_TESTS
+        test_pool
+        test_buf
+        test_rbtree
+        test_queue
+        test_string
+        test_log
+        test_h3_parse
+        test_ssh3_version
+        test_ssh3_wire
+        test_ssh3_message
+        test_ssh3_request
+        test_ssh3_channel
+        test_ssh3_conversation
+        test_ssh3_dgram
+        test_ssh3_forward
+        test_ssh3_forward_policy
+        test_ssh3_dos_guard
+        test_ssh3_sftp_codec
+        test_ssh3_cm
+        test_os_win
+    )
+
+    enable_testing()
+
+    foreach(S3_TEST ${S3_WIN_TESTS})
+        add_executable(${S3_TEST} tests/${S3_TEST}.c)
+        target_link_libraries(${S3_TEST} PRIVATE s3core)
+        target_include_directories(${S3_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_compile_options(${S3_TEST} PRIVATE -Wall -Wextra -Werror)
+        add_test(NAME ${S3_TEST} COMMAND ${S3_TEST})
+    endforeach()
+
+    return()
+endif()
+
 include(CheckCSourceCompiles)
 
 set(CMAKE_REQUIRED_DEFINITIONS ${S3_FEATURE_DEFINITIONS})

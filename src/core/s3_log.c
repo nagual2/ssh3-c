@@ -5,6 +5,9 @@
 
 #include <s3_core.h>
 
+#if (S3_WIN32)
+#include <io.h>
+#endif
 #include <unistd.h>
 
 static s3_str_t s3_err_levels[] = {s3_null_string,      s3_string("emerg"), s3_string("alert"),
@@ -45,7 +48,11 @@ s3_log_error_core(unsigned level, s3_log_t *log, s3_err_t err, const char *fmt, 
 
     fd = (log != NULL && log->fd != S3_INVALID_FILE) ? log->fd : STDERR_FILENO;
 
+#if (S3_WIN32)
+    n = _write(fd, errstr, (unsigned)(p - errstr));
+#else
     n = write(fd, errstr, p - errstr);
+#endif
     (void)n;
 }
 

@@ -5,7 +5,30 @@
 #include <s3_core.h>
 #include <string.h>
 
+#if (S3_WIN32)
+#include <process.h>
+#endif
+
 #include "s3_test.h"
+
+/*
+ * the MSVCRT tmpfile() creates files in the drive root and fails on a
+ * locked-down system: on win32 a named temp file in the build tree
+ * with the MSVC delete-on-close flag keeps the tmpfile() hygiene
+ */
+static FILE *
+s3_test_tmpfile(void)
+{
+#if (S3_WIN32)
+    char name[64];
+
+    snprintf(name, sizeof(name), "test_log_%d.tmp", _getpid());
+
+    return fopen(name, "w+bD");
+#else
+    return tmpfile();
+#endif
+}
 
 static int
 s3_test_log(void)
@@ -23,7 +46,7 @@ s3_test_log(void)
 
     /* the macro gate: messages below the threshold are silent */
 
-    f = tmpfile();
+    f = s3_test_tmpfile();
     S3_ASSERT(f != NULL);
     if (f == NULL) {
         return s3_test_failures;
@@ -55,7 +78,7 @@ s3_test_log(void)
 
     /* errno formatting: " (%d: strerror)" is appended */
 
-    f = tmpfile();
+    f = s3_test_tmpfile();
     S3_ASSERT(f != NULL);
     if (f == NULL) {
         return s3_test_failures;
@@ -72,13 +95,20 @@ s3_test_log(void)
     rbuf[n] = '\0';
     S3_ASSERT(strstr(rbuf, "[crit]") != NULL);
     S3_ASSERT(strstr(rbuf, "open failed") != NULL);
+
+#if (S3_WIN32)
+    /* the code is the EACCES mapping (ERROR_ACCESS_DENIED), the text
+       comes back localized from FormatMessage */
+    S3_ASSERT(strstr(rbuf, " (5: ") != NULL);
+#else
     S3_ASSERT(strstr(rbuf, " (13: Permission denied)") != NULL);
+#endif
 
     fclose(f);
 
     /* debug macros use the S3_LOG_DEBUG_EVENT mask */
 
-    f = tmpfile();
+    f = s3_test_tmpfile();
     S3_ASSERT(f != NULL);
     if (f == NULL) {
         return s3_test_failures;

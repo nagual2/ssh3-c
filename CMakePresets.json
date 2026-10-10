@@ -50,6 +50,19 @@
         "lhs": "${hostSystemName}",
         "rhs": "Linux"
       }
+    },
+    {
+      "name": "windows-core",
+      "displayName": "Windows Core Bootstrap (mingw-w64 cross, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_C_COMPILER": "x86_64-w64-mingw32-gcc",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_EXE_LINKER_FLAGS": "-static"
+      }
     }
   ],
   "buildPresets": [
@@ -64,6 +77,10 @@
     {
       "name": "linux-fuzz",
       "configurePreset": "linux-fuzz"
+    },
+    {
+      "name": "windows-core",
+      "configurePreset": "windows-core"
     }
   ],
   "testPresets": [
@@ -77,6 +94,13 @@
     {
       "name": "linux-asan",
       "configurePreset": "linux-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-core",
+      "configurePreset": "windows-core",
       "output": {
         "outputOnFailure": true
       }

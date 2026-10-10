@@ -6,7 +6,12 @@
 #ifndef _S3_CONNECTION_H_INCLUDED_
 #define _S3_CONNECTION_H_INCLUDED_
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
+#endif
 
 #include <s3_base.h>
 #include <s3_buf.h>

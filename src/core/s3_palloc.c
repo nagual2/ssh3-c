@@ -20,15 +20,24 @@ s3_create_pool(size_t size, s3_log_t *log)
 {
     s3_pool_t *p;
     static int pagesize_done = 0;
-    long       n;
+#if !(S3_WIN32)
+    long n;
+#endif
 
     if (!pagesize_done) {
         pagesize_done = 1;
 
+#if (S3_WIN32)
+        SYSTEM_INFO si;
+
+        GetSystemInfo(&si);
+        s3_pagesize = si.dwPageSize;
+#else
         n = sysconf(_SC_PAGESIZE);
         if (n > 0) {
             s3_pagesize = (size_t)n;
         }
+#endif
     }
 
     p = s3_memalign(S3_POOL_ALIGNMENT, size, log);
@@ -375,14 +384,31 @@ s3_memalign(size_t alignment, size_t size, s3_log_t *log)
 {
     void *p;
 
-    if (posix_memalign(&p, alignment, size) != 0) {
-        s3_log_error(S3_LOG_EMERG, log, s3_errno, "posix_memalign(%uz, %uz) failed", alignment,
-                     size);
+#if (S3_WIN32)
+
+    /*
+     * the CRT malloc returns memory 16-byte aligned, the pool
+     * alignment asks no more (the ngx_win32 ngx_memalign())
+     */
+    p = s3_alloc(size, log);
+
+    if (p == NULL) {
+        s3_log_error(S3_LOG_EMERG, log, s3_errno, "memalign(%uz, %uz) failed", alignment, size);
 
         return NULL;
     }
 
-    s3_log_debug3(S3_LOG_DEBUG_ALLOC, log, 0, "posix_memalign: %p:%uz aligned to %uz", p, size,
+#else
+
+    if (posix_memalign(&p, alignment, size) != 0) {
+        s3_log_error(S3_LOG_EMERG, log, s3_errno, "memalign(%uz, %uz) failed", alignment, size);
+
+        return NULL;
+    }
+
+#endif
+
+    s3_log_debug3(S3_LOG_DEBUG_ALLOC, log, 0, "memalign: %p:%uz aligned to %uz", p, size,
                   alignment);
 
     return p;
