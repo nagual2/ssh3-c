@@ -15,6 +15,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <s3_ssh3_sftp_cli.h>
@@ -35,11 +37,12 @@
 #define S3_TEST_CORRUPT_AT 50000
 
 typedef struct {
-    char    name[S3_TEST_NAME_MAX];
-    u_char *data;
-    size_t  len;
-    size_t  cap;
-    int     is_dir;
+    char     name[S3_TEST_NAME_MAX];
+    u_char  *data;
+    size_t   len;
+    size_t   cap;
+    uint32_t mtime; /* the stamped mtime, the SETSTAT of the client lands here */
+    int      is_dir;
 } s3_test_node_t;
 
 typedef struct {
@@ -113,6 +116,20 @@ s3_test_read_local(const char *path, u_char *buf, size_t len)
     S3_ASSERT(fread(buf, 1, len, f) == len);
     S3_ASSERT(fgetc(f) == EOF);
     S3_ASSERT(fclose(f) == 0);
+}
+
+/* the backdate of one local file, the R7 resume tests need it */
+
+static void
+s3_test_set_local_mtime(const char *path, uint32_t t)
+{
+    struct timeval tv[2];
+
+    tv[0].tv_sec = (time_t)t;
+    tv[0].tv_usec = 0;
+    tv[1] = tv[0];
+
+    S3_ASSERT(utimes(path, tv) == 0);
 }
 
 static void
@@ -299,9 +316,11 @@ s3_test_node_attrs(s3_ssh3_sftp_attrs_t *a, const s3_test_node_t *n)
 {
     s3_memzero(a, sizeof(*a));
 
-    a->flags = S3_SSH3_SFTP_ATTR_SIZE | S3_SSH3_SFTP_ATTR_PERMISSION;
+    a->flags = S3_SSH3_SFTP_ATTR_SIZE | S3_SSH3_SFTP_ATTR_PERMISSION | S3_SSH3_SFTP_ATTR_ACMODTIME;
     a->size = n->len;
     a->perms = n->is_dir ? 040755 : 0100644;
+    a->atime = n->mtime;
+    a->mtime = n->mtime;
 }
 
 static u_char *
@@ -552,6 +571,31 @@ s3_test_srv_reply(s3_test_fs_t *fs, s3_ssh3_sftp_pkt_t *pkt, u_char *w)
             (uint64_t)fs->corrupt < offset + data.len) {
             n->data[fs->corrupt] ^= 0xff;
         }
+
+        return s3_test_srv_status(w, pkt->request_id, S3_SSH3_SFTP_FX_OK);
+
+    case S3_SSH3_SFTP_SETSTAT:
+
+        if (s3_ssh3_sftp_parse_setstat_body(&pkt->body, &path, &attrs) != S3_OK ||
+            s3_test_path_copy(&path, path_buf, sizeof(path_buf)) != 0) {
+            S3_ASSERT(!"broken SETSTAT");
+            return w;
+        }
+
+        /* the real server honors the timestamp form only */
+
+        if (!(attrs.flags & S3_SSH3_SFTP_ATTR_ACMODTIME) ||
+            (attrs.mtime == 0 && attrs.atime == 0)) {
+            return s3_test_srv_status(w, pkt->request_id, S3_SSH3_SFTP_FX_OP_UNSUPPORTED);
+        }
+
+        n = s3_test_node_find(fs, path_buf);
+
+        if (n == NULL) {
+            return s3_test_srv_status(w, pkt->request_id, S3_SSH3_SFTP_FX_NO_SUCH_FILE);
+        }
+
+        n->mtime = attrs.mtime;
 
         return s3_test_srv_status(w, pkt->request_id, S3_SSH3_SFTP_FX_OK);
 
@@ -1035,7 +1079,12 @@ s3_test_cli_resume_put(void)
     return s3_test_failures;
 }
 
-/* the resume over the equal sizes skips the write, the verify tail only */
+/*
+ * the resume over the equal sizes and the equal mtimes skips the
+ * write, the verify tail only: the remote keeps its own bytes even
+ * when they differ from the local ones (the mtime is the content
+ * witness, R7)
+ */
 
 static int
 s3_test_cli_resume_put_equal(void)
@@ -1044,11 +1093,13 @@ s3_test_cli_resume_put_equal(void)
     s3_pool_t         *pool;
     s3_ssh3_sftp_cli_t cli;
     s3_test_fs_t       fs;
-    u_char             data[S3_TEST_BIG_LEN];
+    u_char             data[S3_TEST_BIG_LEN], rmt[S3_TEST_BIG_LEN];
     char               dir[64], local[160];
     s3_test_node_t    *n;
+    uint32_t           t0;
 
     s3_test_fill(data, sizeof(data), 11);
+    s3_test_fill(rmt, sizeof(rmt), 12);
 
     pool = s3_test_make_pool(&log);
     S3_ASSERT(pool != NULL);
@@ -1058,7 +1109,14 @@ s3_test_cli_resume_put_equal(void)
     fs.shrink = -1;
     fs.read_cap = -1;
 
-    S3_ASSERT(s3_test_fs_seed(&fs, "/cont.bin", data, sizeof(data)) != NULL);
+    /* the remote of the same size and the stamped mtime: a past
+     * transfer left it there */
+
+    n = s3_test_fs_seed(&fs, "/cont.bin", rmt, sizeof(rmt));
+    S3_ASSERT(n != NULL);
+
+    t0 = (uint32_t)time(NULL) - 7200;
+    n->mtime = t0;
 
     S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
 
@@ -1066,6 +1124,7 @@ s3_test_cli_resume_put_equal(void)
     S3_ASSERT(mkdtemp(dir) != NULL);
     snprintf(local, sizeof(local), "%s/cont.bin", dir);
     s3_test_write_local(local, data, sizeof(data));
+    s3_test_set_local_mtime(local, t0);
 
     S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/cont.bin", 1, 0) == S3_OK);
 
@@ -1074,10 +1133,12 @@ s3_test_cli_resume_put_equal(void)
     S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
     S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
 
+    /* the skip: the remote bytes survive untouched */
+
     n = s3_test_node_find(&fs, "/cont.bin");
     S3_ASSERT(n != NULL);
-    S3_ASSERT(n->len == sizeof(data));
-    S3_ASSERT(n->data != NULL && s3_memcmp(n->data, data, sizeof(data)) == 0);
+    S3_ASSERT(n->len == sizeof(rmt));
+    S3_ASSERT(n->data != NULL && s3_memcmp(n->data, rmt, sizeof(rmt)) == 0);
 
     s3_test_fs_free(&fs);
     s3_test_rm_rf(dir);
@@ -1127,6 +1188,387 @@ s3_test_cli_resume_put_larger(void)
 
     S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
     S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_FAILURE);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
+ * the R7 core, the upload side: a source rewritten in place (the same
+ * size, the new mtime) re-transfers under --continue instead of the
+ * stale-content skip of the size-only decision
+ */
+
+static int
+s3_test_cli_resume_put_mtime_stale(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char             v1[S3_TEST_BIG_LEN], v2[S3_TEST_BIG_LEN];
+    char               dir[64], local[160];
+    s3_test_node_t    *n;
+    uint32_t           t0, t1;
+
+    s3_test_fill(v1, sizeof(v1), 41);
+    s3_test_fill(v2, sizeof(v2), 42);
+
+    t0 = (uint32_t)time(NULL) - 7200;
+    t1 = t0 + 3600;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    /* the past transfer: the remote carries v1 and the stamped mtime */
+
+    n = s3_test_fs_seed(&fs, "/cont.bin", v1, sizeof(v1));
+    S3_ASSERT(n != NULL);
+    n->mtime = t0;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/cont.bin", dir);
+
+    s3_test_write_local(local, v1, sizeof(v1));
+    s3_test_set_local_mtime(local, t0);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/cont.bin", 1, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+
+    /* the equal size and mtime: the remote bytes survive */
+
+    n = s3_test_node_find(&fs, "/cont.bin");
+    S3_ASSERT(n != NULL && n->data != NULL);
+    S3_ASSERT(s3_memcmp(n->data, v1, sizeof(v1)) == 0);
+
+    /* the rewrite in place: the same size, the new mtime */
+
+    s3_test_write_local(local, v2, sizeof(v2));
+    s3_test_set_local_mtime(local, t1);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/cont.bin", 1, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    /* the stale content cannot hide behind the equal length */
+
+    n = s3_test_node_find(&fs, "/cont.bin");
+    S3_ASSERT(n != NULL && n->data != NULL);
+    S3_ASSERT(n->len == sizeof(v2));
+    S3_ASSERT(s3_memcmp(n->data, v2, sizeof(v2)) == 0);
+    S3_ASSERT(n->mtime == t1);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/* the fresh upload stamps the remote with the source mtime (R7) */
+
+static int
+s3_test_cli_put_stamps_remote_mtime(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char             data[4096];
+    char               dir[64], local[160];
+    s3_test_node_t    *n;
+    uint32_t           t1;
+
+    s3_test_fill(data, sizeof(data), 43);
+
+    t1 = (uint32_t)time(NULL) - 3600;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/f.bin", dir);
+    s3_test_write_local(local, data, sizeof(data));
+    s3_test_set_local_mtime(local, t1);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put(&cli, local, "/f.bin", 0, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    n = s3_test_node_find(&fs, "/f.bin");
+    S3_ASSERT(n != NULL);
+    S3_ASSERT(n->mtime == t1);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
+ * the R7 core, the download side: the local copy inherits the remote
+ * mtime, so a remote rewrite in place (the same size, the new mtime)
+ * re-transfers under --continue instead of the size-only skip
+ */
+
+static int
+s3_test_cli_resume_get_mtime_stale(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char             v1[4096], v2[4096], got[4096];
+    char               dir[64], local[160];
+    s3_test_node_t    *n;
+    struct stat        st;
+    uint32_t           t0, t1;
+
+    s3_test_fill(v1, sizeof(v1), 44);
+    s3_test_fill(v2, sizeof(v2), 45);
+
+    t0 = (uint32_t)time(NULL) - 7200;
+    t1 = t0 + 3600;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    n = s3_test_fs_seed(&fs, "/g.bin", v1, sizeof(v1));
+    S3_ASSERT(n != NULL);
+    n->mtime = t0;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/g.bin", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/g.bin", local, 0, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+
+    /* the local copy inherited the remote mtime */
+
+    S3_ASSERT(stat(local, &st) == 0);
+    S3_ASSERT((uint32_t)st.st_mtime == t0);
+
+    /* the remote rewrite in place: the same size, the new mtime */
+
+    n = s3_test_node_find(&fs, "/g.bin");
+    S3_ASSERT(n != NULL);
+    S3_ASSERT(s3_test_node_write(n, 0, v2, sizeof(v2)) == 0);
+    n->mtime = t1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get(&cli, "/g.bin", local, 1, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    s3_test_read_local(local, got, sizeof(got));
+    S3_ASSERT(s3_memcmp(got, v2, sizeof(v2)) == 0);
+
+    S3_ASSERT(stat(local, &st) == 0);
+    S3_ASSERT((uint32_t)st.st_mtime == t1);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
+ * the R7 rule over the upload tree: the per-file resume decision sees
+ * the stamped mtimes, the rewritten member re-transfers
+ */
+
+static int
+s3_test_cli_put_r_mtime_stale(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char             v1[1000], v2[1000];
+    char               dir[64], root[160], path[512];
+    s3_test_node_t    *n;
+    uint32_t           t0, t1;
+
+    s3_test_fill(v1, sizeof(v1), 46);
+    s3_test_fill(v2, sizeof(v2), 47);
+
+    t0 = (uint32_t)time(NULL) - 7200;
+    t1 = t0 + 3600;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(root, sizeof(root), "%s/root", dir);
+    S3_ASSERT(mkdir(root, 0755) == 0);
+    snprintf(path, sizeof(path), "%s/a", root);
+    S3_ASSERT(mkdir(path, 0755) == 0);
+
+    snprintf(path, sizeof(path), "%s/a/1.txt", root);
+    s3_test_write_local(path, v1, sizeof(v1));
+    s3_test_set_local_mtime(path, t0);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put_r(&cli, root, "/tree", 0, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    /* the stamp rode the SETSTAT of the walk */
+
+    n = s3_test_node_find(&fs, "/tree/a/1.txt");
+    S3_ASSERT(n != NULL);
+    S3_ASSERT(n->mtime == t0);
+
+    /* the rewrite in place: the same size, the new mtime */
+
+    s3_test_write_local(path, v2, sizeof(v2));
+    s3_test_set_local_mtime(path, t1);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put_r(&cli, root, "/tree", 1, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    n = s3_test_node_find(&fs, "/tree/a/1.txt");
+    S3_ASSERT(n != NULL && n->data != NULL);
+    S3_ASSERT(s3_memcmp(n->data, v2, sizeof(v2)) == 0);
+    S3_ASSERT(n->mtime == t1);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/*
+ * the R7 rule over the download tree: the NAME batch carries the
+ * mtimes, the local copies inherit them, the rewritten remote member
+ * re-transfers
+ */
+
+static int
+s3_test_cli_get_r_mtime_stale(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    u_char             v1[1000], v2[1000], got[1000];
+    char               dir[64], root[160], path[512];
+    s3_test_node_t    *n;
+    struct stat        st;
+    uint32_t           t0, t1;
+
+    s3_test_fill(v1, sizeof(v1), 48);
+    s3_test_fill(v2, sizeof(v2), 49);
+
+    t0 = (uint32_t)time(NULL) - 7200;
+    t1 = t0 + 3600;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    S3_ASSERT(s3_test_node_add(&fs, "/tree", 1) != NULL);
+    S3_ASSERT(s3_test_node_add(&fs, "/tree/a", 1) != NULL);
+    n = s3_test_fs_seed(&fs, "/tree/a/1.txt", v1, sizeof(v1));
+    S3_ASSERT(n != NULL);
+    n->mtime = t0;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(root, sizeof(root), "%s/dl", dir);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get_r(&cli, "/tree", root, 0, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    /* the local copy inherited the remote mtime of the NAME batch */
+
+    snprintf(path, sizeof(path), "%s/a/1.txt", root);
+    S3_ASSERT(stat(path, &st) == 0);
+    S3_ASSERT((uint32_t)st.st_mtime == t0);
+
+    /* the remote rewrite in place: the same size, the new mtime */
+
+    n = s3_test_node_find(&fs, "/tree/a/1.txt");
+    S3_ASSERT(n != NULL);
+    S3_ASSERT(s3_test_node_write(n, 0, v2, sizeof(v2)) == 0);
+    n->mtime = t1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get_r(&cli, "/tree", root, 1, 0) == S3_OK);
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_DONE);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_OK);
+
+    s3_test_read_local(path, got, sizeof(got));
+    S3_ASSERT(s3_memcmp(got, v2, sizeof(v2)) == 0);
+
+    S3_ASSERT(stat(path, &st) == 0);
+    S3_ASSERT((uint32_t)st.st_mtime == t1);
 
     s3_test_fs_free(&fs);
     s3_test_rm_rf(dir);
@@ -2027,6 +2469,11 @@ s3_test_ssh3_sftp_cli(void)
     (void)s3_test_cli_resume_put();
     (void)s3_test_cli_resume_put_equal();
     (void)s3_test_cli_resume_put_larger();
+    (void)s3_test_cli_resume_put_mtime_stale();
+    (void)s3_test_cli_put_stamps_remote_mtime();
+    (void)s3_test_cli_resume_get_mtime_stale();
+    (void)s3_test_cli_put_r_mtime_stale();
+    (void)s3_test_cli_get_r_mtime_stale();
     (void)s3_test_cli_verify();
     (void)s3_test_cli_get_missing();
     (void)s3_test_cli_put_r();

@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /*
@@ -94,6 +95,7 @@ static s3_int_t s3_srv_mkdir(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t 
 static s3_int_t s3_srv_rmdir(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body);
 static s3_int_t s3_srv_remove(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body);
 static s3_int_t s3_srv_rename(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body);
+static s3_int_t s3_srv_setstat(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body);
 static s3_int_t s3_srv_realpath(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body);
 static s3_int_t s3_srv_dispatch(s3_ssh3_sftp_srv_t *t, s3_ssh3_sftp_pkt_t *pkt);
 
@@ -1484,6 +1486,51 @@ s3_srv_rename(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body)
     return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_OK);
 }
 
+/*
+ * the timestamp form of SETSTAT: the recursive-transfer client stamps
+ * the peer with the source mtime, so the next --continue skips by
+ * size+mtime (the reference R7); the mode/uid/gid/size requests stay
+ * unsupported, nothing in the repo issues them
+ */
+
+static s3_int_t
+s3_srv_setstat(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body)
+{
+    s3_ssh3_sftp_attrs_t attrs;
+    s3_str_t             path, jailed;
+    struct timeval       tv[2];
+    int                  rc;
+
+    if (s3_ssh3_sftp_parse_setstat_body(body, &path, &attrs) != S3_OK) {
+        return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_BAD_MESSAGE);
+    }
+
+    /* the reference verdict: the zero pair reads as the flagless
+       attrs of a mode or size request, the times are missing */
+
+    if (attrs.mtime == 0 && attrs.atime == 0) {
+        return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_OP_UNSUPPORTED);
+    }
+
+    rc = s3_srv_jailed(t, id, &path, &jailed);
+
+    if (rc != S3_OK) {
+        return rc == S3_DECLINED ? S3_OK : S3_ERROR;
+    }
+
+    /* the reference Chtimes: both times take the mtime */
+
+    tv[0].tv_sec = (time_t)attrs.mtime;
+    tv[0].tv_usec = 0;
+    tv[1] = tv[0];
+
+    if (utimes((const char *)jailed.data, tv) != 0) {
+        return s3_srv_reply_status(t, id, s3_srv_errno_status(errno));
+    }
+
+    return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_OK);
+}
+
 static s3_int_t
 s3_srv_realpath(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body)
 {
@@ -1564,6 +1611,8 @@ s3_srv_dispatch(s3_ssh3_sftp_srv_t *t, s3_ssh3_sftp_pkt_t *pkt)
         return s3_srv_rename(t, id, &pkt->body);
 
     case S3_SSH3_SFTP_SETSTAT:
+        return s3_srv_setstat(t, id, &pkt->body);
+
     case S3_SSH3_SFTP_FSETSTAT:
     case S3_SSH3_SFTP_EXTENDED:
         return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_OP_UNSUPPORTED);

@@ -14,6 +14,8 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <s3_ssh3_sftp_codec.h>
@@ -385,7 +387,7 @@ s3_test_sftp_srv(void)
     s3_pool_t           *pool;
     s3_ssh3_sftp_srv_t   srv, srv2, srv3;
     s3_ssh3_sftp_pkt_t   pkt;
-    s3_ssh3_sftp_attrs_t zero, ra, entry_attrs[8];
+    s3_ssh3_sftp_attrs_t zero, tsa, ra, entry_attrs[8];
     s3_str_t             h, h2, data, path, names[8], lnames[8];
     u_char               hw[8], hr[8], hp[8], hd[8];
     u_char               req[8192], body[S3_TEST_PATH_CAP];
@@ -394,7 +396,7 @@ s3_test_sftp_srv(void)
     const u_char        *pos, *end;
     size_t               n, rlen, blen;
     uint32_t             id = 0, i;
-    uint32_t             v;
+    uint32_t             v, ts;
     mode_t               um;
     struct stat          st;
     FILE                *f;
@@ -698,6 +700,36 @@ s3_test_sftp_srv(void)
     id++;
     n = s3_test_frame(req, S3_SSH3_SFTP_SETSTAT, id, body, blen);
     s3_test_expect_status(&srv, req, n, id, S3_SSH3_SFTP_FX_OP_UNSUPPORTED, &pkt);
+
+    /* the timestamp form applies the source mtime, the R7 stamp of
+     * the recursive-transfer client; the atime rides along like in
+     * the reference Chtimes */
+
+    ts = (uint32_t)time(NULL) - 7200;
+
+    s3_memzero(&tsa, sizeof(tsa));
+    tsa.flags = S3_SSH3_SFTP_ATTR_ACMODTIME;
+    tsa.atime = ts;
+    tsa.mtime = ts;
+
+    id++;
+    n = S3_TEST_BUILD(s3_ssh3_sftp_encode_setstat, req, id, &s_hello, &tsa);
+    s3_test_expect_status(&srv, req, n, id, S3_SSH3_SFTP_FX_OK, &pkt);
+
+    id++;
+    n = S3_TEST_BUILD(s3_ssh3_sftp_encode_stat, req, id, &s_hello);
+    s3_test_rpc(&srv, req, n, id, S3_SSH3_SFTP_ATTRS, &pkt);
+    S3_ASSERT(s3_test_attrs_of(&pkt, &ra) == 0);
+    S3_ASSERT(ra.mtime == ts);
+    S3_ASSERT(ra.atime == ts);
+
+    /* the times-only request dies on a missing path like the reference */
+
+    tsa.mtime = (uint32_t)time(NULL);
+
+    id++;
+    n = S3_TEST_BUILD(s3_ssh3_sftp_encode_setstat, req, id, &s_missing, &tsa);
+    s3_test_expect_status(&srv, req, n, id, S3_SSH3_SFTP_FX_NO_SUCH_FILE, &pkt);
 
     /* the unknown type dies as unsupported, the channel lives */
 

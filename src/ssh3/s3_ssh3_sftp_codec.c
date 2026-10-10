@@ -708,6 +708,24 @@ s3_ssh3_sftp_encode_mkdir(u_char *p, uint32_t id, const s3_str_t *path,
 }
 
 uintptr_t
+s3_ssh3_sftp_encode_setstat(u_char *p, uint32_t id, const s3_str_t *path,
+                            const s3_ssh3_sftp_attrs_t *attrs)
+{
+    uintptr_t body;
+
+    body = s3_ssh3_sftp_string_size(path) + s3_ssh3_sftp_attrs_size(attrs);
+
+    if (p == NULL) {
+        return 9 + body;
+    }
+
+    p = s3_ssh3_sftp_put_head(p, S3_SSH3_SFTP_SETSTAT, id, body);
+    p = s3_ssh3_sftp_put_string(p, path);
+
+    return (uintptr_t)s3_ssh3_sftp_put_attrs(p, attrs);
+}
+
+uintptr_t
 s3_ssh3_sftp_encode_rmdir(u_char *p, uint32_t id, const s3_str_t *path)
 {
     return s3_ssh3_sftp_encode_id_string(p, S3_SSH3_SFTP_RMDIR, id, path);

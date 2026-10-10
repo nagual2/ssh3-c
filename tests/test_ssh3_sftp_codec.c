@@ -587,7 +587,7 @@ s3_test_codec_requests(void)
     uint32_t             pflags, out_flags, out_len;
     uint64_t             offset, out_offset;
     s3_ssh3_sftp_pkt_t   pkt;
-    s3_ssh3_sftp_attrs_t a, out_attrs;
+    s3_ssh3_sftp_attrs_t a, tsa, out_attrs;
 
     /* the path requests and the handle requests ride the shared shape */
 
@@ -715,6 +715,36 @@ s3_test_codec_requests(void)
     S3_ASSERT(tmp.len == 4);
 
     s3_test_check_attrs(&a, &out_attrs);
+
+    /* the setstat: the same path plus attrs body, the mtime stamp of
+     * the R7 transfer tail rides it */
+
+    tmp.data = (u_char *)"/tmp";
+    tmp.len = 4;
+
+    s3_memzero(&tsa, sizeof(tsa));
+    tsa.flags = S3_SSH3_SFTP_ATTR_ACMODTIME;
+    tsa.atime = 0x5f5e0fff;
+    tsa.mtime = 0x5f5e0fff;
+
+    s3_memzero(buf, sizeof(buf));
+
+    p = (u_char *)s3_ssh3_sftp_encode_setstat(buf, 0x2222, &tmp, &tsa);
+
+    S3_ASSERT(p == buf + s3_ssh3_sftp_encode_setstat(NULL, 0x2222, &tmp, &tsa));
+
+    pos = buf;
+    end = p;
+
+    S3_ASSERT(s3_ssh3_sftp_codec_frame(&pos, end, &pkt) == S3_OK);
+    S3_ASSERT(pkt.type == S3_SSH3_SFTP_SETSTAT);
+    S3_ASSERT(pkt.request_id == 0x2222);
+    S3_ASSERT(pos == end);
+
+    S3_ASSERT(s3_ssh3_sftp_parse_setstat_body(&pkt.body, &tmp, &out_attrs) == S3_OK);
+    S3_ASSERT(tmp.len == 4);
+
+    s3_test_check_attrs(&tsa, &out_attrs);
 
     /* the rename: the old path and the new path */
 
@@ -906,8 +936,8 @@ s3_test_codec_strict(void)
 {
     /*
      * the setstat body built by hand: the path then the attrs with
-     * the full four flags (the codec keeps no client setstat
-     * encoder, the server side parses the request only)
+     * the full four flags (the literal pins the wire bytes against
+     * the encoder the R7 stamp introduced)
      */
 
     static const u_char setstat_body[] = {

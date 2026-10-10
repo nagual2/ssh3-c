@@ -136,6 +136,9 @@ uintptr_t s3_ssh3_sftp_encode_readdir(u_char *p, uint32_t id, const s3_str_t *ha
 uintptr_t s3_ssh3_sftp_encode_mkdir(u_char *p, uint32_t id, const s3_str_t *path,
                                     const s3_ssh3_sftp_attrs_t *attrs);
 
+uintptr_t s3_ssh3_sftp_encode_setstat(u_char *p, uint32_t id, const s3_str_t *path,
+                                      const s3_ssh3_sftp_attrs_t *attrs);
+
 uintptr_t s3_ssh3_sftp_encode_rmdir(u_char *p, uint32_t id, const s3_str_t *path);
 
 uintptr_t s3_ssh3_sftp_encode_remove(u_char *p, uint32_t id, const s3_str_t *path);

@@ -20,9 +20,13 @@
  * recursions (the reference uploadDir/downloadDir); the transfer
  * chunking follows the channel maxPacketSize, the resume (--continue)
  * continues from the size of the existing side and errors when that
- * side is the larger one, the checksum verification (the verify flag
- * or the automatic threshold above 32 MiB, the reference
- * checksumAutoThreshold) re-reads both sides through SHA-256
+ * side is the larger one, the equal sizes skip only when the mtimes
+ * agree too - the source mtime rides the peer after every written
+ * transfer (SETSTAT on the put, the local stamp on the get), so a
+ * same-size rewrite can no longer hide behind its length (R7), the
+ * checksum verification (the verify flag or the automatic threshold
+ * above 32 MiB, the reference checksumAutoThreshold) re-reads both
+ * sides through SHA-256
  */
 
 #define S3_SSH3_SFTP_CLI_CHECKSUM_AUTO_THRESHOLD (32 * 1024 * 1024)

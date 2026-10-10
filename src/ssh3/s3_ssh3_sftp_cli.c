@@ -75,6 +75,7 @@ enum {
     PH_PUT_OPEN,     /* the OPEN of the remote file for writing */
     PH_PUT_WRITE,    /* the WRITE chunks of the payload */
     PH_PUT_CLOSE,    /* the CLOSE of the written file */
+    PH_PUT_SETSTAT,  /* the mtime stamp of the written file (R7) */
     PH_GET_STAT,     /* the STAT of the remote file to download */
     PH_GET_OPEN,     /* the OPEN of the remote file for reading */
     PH_GET_READ,     /* the READ chunks of the payload */
@@ -100,6 +101,7 @@ enum {
 typedef struct {
     char    *name;
     uint64_t size;
+    uint32_t mtime; /* the ACMODTIME mtime of the batch entry, 0 when absent */
     unsigned is_dir : 1;
     unsigned is_reg : 1;
 } s3_ssh3_sftp_cli_entry_t;
@@ -129,6 +131,7 @@ typedef struct {
     int      fd;        /* the local file of the transfer */
     uint32_t expect_id; /* the id of the oldest outstanding request */
     uint64_t file_size; /* the local size on put, the remote on get */
+    uint32_t mtime;     /* the local mtime on put, the remote on get (R7) */
     uint64_t offset;    /* the receive cursor (the pwrite position, the progress) */
     uint64_t emit_off;  /* the wire offset of the next train request */
     uint32_t inflight;  /* the requests emitted without a reply */
@@ -150,6 +153,7 @@ typedef struct {
     unsigned resume : 1;
     unsigned verify : 1;
     unsigned trunc : 1;
+    unsigned stamp : 1; /* the transfer wrote data: the peer takes the mtime (R7) */
 
     /* the checksum tail */
 
@@ -191,6 +195,7 @@ static s3_int_t s3_cli_emit_open(s3_ssh3_sftp_cli_t *t, const char *path, unsign
 static s3_int_t s3_cli_emit_read(s3_ssh3_sftp_cli_t *t, uint64_t offset, size_t len);
 static s3_int_t s3_cli_emit_write(s3_ssh3_sftp_cli_t *t, const u_char *data, size_t len);
 static s3_int_t s3_cli_emit_mkdir(s3_ssh3_sftp_cli_t *t, const char *path, size_t len);
+static s3_int_t s3_cli_emit_setstat(s3_ssh3_sftp_cli_t *t, const char *path);
 
 static char    *s3_cli_strdup(s3_pool_t *pool, const char *s);
 static char    *s3_cli_path_join(s3_pool_t *pool, const char *dir, const char *name);
@@ -202,6 +207,7 @@ static void     s3_cli_fail_op(s3_ssh3_sftp_cli_t *t, uint32_t code);
 static void     s3_cli_file_fail(s3_ssh3_sftp_cli_t *t, uint32_t code);
 static void     s3_cli_transfer_fail(s3_ssh3_sftp_cli_t *t, uint32_t code);
 static void     s3_cli_transfer_done(s3_ssh3_sftp_cli_t *t);
+static void     s3_cli_stamp_done(s3_ssh3_sftp_cli_t *t);
 static s3_int_t s3_cli_handle_copy(s3_ssh3_sftp_cli_t *t, u_char **dst, size_t *dst_len,
                                    const s3_str_t *handle);
 static int      s3_cli_attrs_is_dir(const s3_ssh3_sftp_attrs_t *a);
@@ -467,6 +473,37 @@ s3_cli_emit_mkdir(s3_ssh3_sftp_cli_t *t, const char *path, size_t len)
     return S3_OK;
 }
 
+/* the R7 stamp: the ACMODTIME pair carries the source mtime, the
+ * reference Chtimes shape (both times ride the same value) */
+
+static s3_int_t
+s3_cli_emit_setstat(s3_ssh3_sftp_cli_t *t, const char *path)
+{
+    s3_ssh3_sftp_cli_op_t *op = t->op;
+    s3_ssh3_sftp_attrs_t   attrs;
+    s3_str_t               s;
+    uintptr_t              need;
+
+    s.len = s3_strlen(path);
+    s.data = (u_char *)path;
+
+    s3_memzero(&attrs, sizeof(attrs));
+    attrs.flags = S3_SSH3_SFTP_ATTR_ACMODTIME;
+    attrs.atime = op->mtime;
+    attrs.mtime = op->mtime;
+
+    need = s3_ssh3_sftp_encode_setstat(NULL, t->next_id, &s, &attrs);
+
+    if (s3_cli_buf_grow(t->pool, &t->out, t->out_len, &t->out_cap, need) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    (void)s3_ssh3_sftp_encode_setstat(t->out + t->out_len, t->next_id, &s, &attrs);
+    s3_cli_commit(t, need, 1);
+
+    return S3_OK;
+}
+
 static char *
 s3_cli_strdup(s3_pool_t *pool, const char *s)
 {
@@ -635,6 +672,39 @@ s3_cli_transfer_done(s3_ssh3_sftp_cli_t *t)
 
         op->phase = (op->kind == S3_SSH3_SFTP_CLI_OP_PUT_R) ? PH_PUT_R_WALK : PH_GET_R_WALK;
     }
+}
+
+/*
+ * the R7 tail of a verified transfer: the peer inherits the source
+ * mtime so the next --continue skips by size+mtime, not by the size
+ * alone. The put stamps the remote through SETSTAT (one more wire
+ * turn), the get stamps the local file right here; the refusals are
+ * not fatal, they cost one redundant transfer later, never data
+ */
+
+static void
+s3_cli_stamp_done(s3_ssh3_sftp_cli_t *t)
+{
+    s3_ssh3_sftp_cli_op_t *op = t->op;
+    struct timespec        ts[2];
+
+    if (op->kind == S3_SSH3_SFTP_CLI_OP_PUT || op->kind == S3_SSH3_SFTP_CLI_OP_PUT_R) {
+
+        if (op->stamp) {
+            op->phase = PH_PUT_SETSTAT;
+            return;
+        }
+
+    } else if (op->stamp && op->fd >= 0) {
+
+        ts[0].tv_sec = (time_t)op->mtime;
+        ts[0].tv_nsec = 0;
+        ts[1] = ts[0];
+
+        (void)futimens(op->fd, ts);
+    }
+
+    s3_cli_transfer_done(t);
 }
 
 /*
@@ -992,6 +1062,7 @@ s3_cli_parse_name_batch(s3_ssh3_sftp_cli_t *t, const s3_str_t *body)
         entries[i].name[name.filename.len] = '\0';
 
         entries[i].size = (name.attrs.flags & S3_SSH3_SFTP_ATTR_SIZE) ? name.attrs.size : 0;
+        entries[i].mtime = (name.attrs.flags & S3_SSH3_SFTP_ATTR_ACMODTIME) ? name.attrs.mtime : 0;
         entries[i].is_dir = (unsigned)s3_cli_attrs_is_dir(&name.attrs);
         entries[i].is_reg = (unsigned)s3_cli_attrs_is_reg(&name.attrs);
     }
@@ -1009,8 +1080,9 @@ s3_cli_parse_name_batch(s3_ssh3_sftp_cli_t *t, const s3_str_t *body)
 
 /*
  * the local side of a download: the resume checks against the remote
- * size, the equal sizes skip straight to the verify tail, the fresh
- * download truncates
+ * size and mtime, the equal pair skips straight to the verify tail,
+ * the equal size with the differing mtime is the stale copy and
+ * re-transfers (R7), the fresh download truncates
  */
 
 static void
@@ -1033,9 +1105,10 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
             return;
         }
 
-        if ((uint64_t)st.st_size == op->file_size) {
+        if ((uint64_t)st.st_size == op->file_size && (uint32_t)st.st_mtime == op->mtime) {
 
-            /* fully downloaded: the verify tail only, keep the bytes */
+            /* fully downloaded, the inherited mtime agrees: the
+             * verify tail only, keep the bytes (R7) */
 
             op->fd = open(op->local_path, O_RDWR);
 
@@ -1046,13 +1119,22 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
 
             op->offset = 0;
             op->emit_off = 0;
+            op->stamp = 0;
             op->phase = PH_VERIFY_STAT;
 
             return;
         }
 
-        start = (uint64_t)st.st_size;
-        trunc = 0;
+        /* the size alone cannot prove the content: the equal size
+         * with the differing mtime is the stale copy, it re-transfers
+         * from zero (R7); the smaller local appends from its size */
+
+        if ((uint64_t)st.st_size < op->file_size) {
+            start = (uint64_t)st.st_size;
+            trunc = 0;
+        }
+
+        op->stamp = 1;
     }
 
     op->fd = open(op->local_path, O_RDWR | O_CREAT | (trunc ? O_TRUNC : 0), 0644);
@@ -1187,8 +1269,10 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
         op->local_path = local_sub;
         op->remote_path = remote_sub;
         op->file_size = (uint64_t)st.st_size;
+        op->mtime = (uint32_t)st.st_mtime;
         op->offset = 0;
         op->emit_off = 0;
+        op->stamp = 1;
 
         if (op->resume) {
             op->phase = PH_PUT_STAT;
@@ -1253,6 +1337,8 @@ s3_cli_get_r_walk(s3_ssh3_sftp_cli_t *t)
             op->local_path = local_sub;
             op->remote_path = remote_sub;
             op->file_size = e->size;
+            op->mtime = e->mtime;
+            op->stamp = 1;
 
             s3_cli_get_local_open(t);
 
@@ -1468,6 +1554,9 @@ s3_cli_step(s3_ssh3_sftp_cli_t *t)
         case PH_VERIFY_CLOSE:
             return s3_cli_emit_handle(t, s3_ssh3_sftp_encode_close, op->handle, op->handle_len);
 
+        case PH_PUT_SETSTAT:
+            return s3_cli_emit_setstat(t, op->remote_path);
+
         case PH_MKDIR:
 
             next = s3_cli_mkdir_next(op->mkdir_path, op->mkdir_len);
@@ -1591,6 +1680,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             op->offset = 0;
             op->emit_off = 0;
             op->trunc = 1;
+            op->stamp = 1;
             op->phase = PH_PUT_OPEN;
 
             return s3_cli_step(t);
@@ -1614,16 +1704,36 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
         if (attrs.size == op->file_size) {
 
-            /* fully uploaded: the verify tail only */
+            if ((attrs.flags & S3_SSH3_SFTP_ATTR_ACMODTIME) && attrs.mtime == op->mtime) {
 
-            op->phase = PH_VERIFY_STAT;
+                /* fully uploaded, the stamped mtime agrees: the
+                 * verify tail only (R7) */
+
+                op->stamp = 0;
+                op->phase = PH_VERIFY_STAT;
+
+                return s3_cli_step(t);
+            }
+
+            /* the size alone cannot prove the content: the equal
+             * size with the differing mtime is the stale remote, it
+             * re-transfers from zero (R7) */
+
+            op->offset = 0;
+            op->emit_off = 0;
+            op->trunc = 1;
+            op->stamp = 1;
+            op->phase = PH_PUT_OPEN;
 
             return s3_cli_step(t);
         }
 
+        /* the younger remote: the resume appends from its size */
+
         op->offset = attrs.size;
         op->emit_off = attrs.size;
         op->trunc = 0;
+        op->stamp = 1;
         op->phase = PH_PUT_OPEN;
 
         return s3_cli_step(t);
@@ -1698,6 +1808,23 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
         return s3_cli_step(t);
 
+    case PH_PUT_SETSTAT:
+
+        if (pkt->type != S3_SSH3_SFTP_STATUS) {
+            return S3_ERROR;
+        }
+
+        if (s3_cli_on_status(t, &pkt->body, &code) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        /* the reference logs a refused stamp and moves on: an old
+         * dialect server costs one redundant re-transfer later */
+
+        s3_cli_transfer_done(t);
+
+        return s3_cli_step(t);
+
     case PH_GET_STAT:
 
         if (pkt->type == S3_SSH3_SFTP_ATTRS) {
@@ -1740,6 +1867,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             }
 
             op->file_size = attrs.size;
+            op->mtime = (attrs.flags & S3_SSH3_SFTP_ATTR_ACMODTIME) ? attrs.mtime : 0;
 
             s3_cli_get_local_open(t);
 
@@ -1922,7 +2050,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
                 return s3_cli_step(t);
             }
 
-            s3_cli_transfer_done(t);
+            s3_cli_stamp_done(t);
 
             return s3_cli_step(t);
         }
@@ -2059,7 +2187,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
             return s3_cli_step(t);
         }
 
-        s3_cli_transfer_done(t);
+        s3_cli_stamp_done(t);
 
         return s3_cli_step(t);
 
@@ -2363,6 +2491,8 @@ s3_ssh3_sftp_cli_put(s3_ssh3_sftp_cli_t *t, const char *local_path, const char *
     }
 
     op->file_size = (uint64_t)st.st_size;
+    op->mtime = (uint32_t)st.st_mtime;
+    op->stamp = 1;
 
     t->state = S3_SSH3_SFTP_CLI_RUN;
     op->phase = op->resume ? PH_PUT_STAT : PH_PUT_OPEN;
@@ -2411,6 +2541,7 @@ s3_ssh3_sftp_cli_get(s3_ssh3_sftp_cli_t *t, const char *remote_path, const char 
     }
 
     t->state = S3_SSH3_SFTP_CLI_RUN;
+    op->stamp = 1; /* a download writes the bytes, it stamps them (R7) */
     op->phase = PH_GET_STAT;
 
     if (s3_cli_step(t) != S3_OK) {
@@ -2511,6 +2642,7 @@ s3_ssh3_sftp_cli_get_r(s3_ssh3_sftp_cli_t *t, const char *remote_path, const cha
     }
 
     t->state = S3_SSH3_SFTP_CLI_RUN;
+    op->stamp = 1; /* a download writes the bytes, it stamps them (R7) */
     op->phase = PH_GET_STAT;
 
     if (s3_cli_step(t) != S3_OK) {
