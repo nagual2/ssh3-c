@@ -40,6 +40,467 @@
 #include <s3_ssh3_sftp_cli.h>
 #include <s3_ssh3_sftp_codec.h>
 
+#if (S3_WIN32)
+
+/* the CRT descriptor surface of the win32 file arm (the
+ * _open_osfhandle pair) and the struct timespec of the stamp */
+
+#include <io.h>
+#include <time.h>
+
+#endif
+
+/* the wchar scratch of the win32 path conversions (1024 wchars
+ * cover the paths this driver works with, a longer one errors) */
+
+#define S3_SSH3_SFTP_CLI_PATH_W 1024
+
+/*
+ * the local file surface: the POSIX-shaped helpers keep the driver
+ * body identical on both sides; the win32 arm converts the UTF-8
+ * paths to UTF-16 on every syscall (the ANSI argv and the narrow
+ * CRT calls would mangle the non-ASCII names) and keeps the
+ * transfer fd as the CRT descriptor of the file handle
+ */
+
+#if (S3_WIN32)
+
+typedef struct s3_cli_fs_dir_s s3_cli_fs_dir_t;
+
+#else
+
+typedef DIR s3_cli_fs_dir_t;
+
+#endif
+
+typedef struct {
+    char *d_name;
+} s3_cli_fs_ent_t;
+
+static int              s3_cli_fs_open_rd(const char *path);
+static int              s3_cli_fs_open_rdwr(const char *path);
+static int              s3_cli_fs_open_creat(const char *path, unsigned trunc);
+static int              s3_cli_fs_pread(int fd, void *buf, size_t len, int64_t off);
+static int              s3_cli_fs_pwrite(int fd, const void *buf, size_t len, int64_t off);
+static int              s3_cli_fs_stat(const char *path, struct stat *st);
+static int              s3_cli_fs_fstat(int fd, struct stat *st);
+static int              s3_cli_fs_futimens(int fd, const struct timespec ts[2]);
+static int              s3_cli_fs_mkdir(const char *path);
+static s3_cli_fs_dir_t *s3_cli_fs_opendir(const char *path);
+static s3_cli_fs_ent_t *s3_cli_fs_readdir(s3_cli_fs_dir_t *dir);
+static void             s3_cli_fs_closedir(s3_cli_fs_dir_t *dir);
+
+#if (S3_WIN32)
+
+/* the win32 arm: io.h and fileapi.h ride the os layer headers
+ * through windows.h (s3_base.h includes it first), every path
+ * converts UTF-8 to UTF-16 before the syscall */
+
+static int
+s3_cli_fs_open_rd(const char *path)
+{
+    wchar_t w[S3_SSH3_SFTP_CLI_PATH_W];
+    HANDLE  h;
+    int     n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    return _open_osfhandle((intptr_t)h, _O_RDONLY);
+}
+
+static int
+s3_cli_fs_open_rdwr(const char *path)
+{
+    wchar_t w[S3_SSH3_SFTP_CLI_PATH_W];
+    HANDLE  h;
+    int     n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    return _open_osfhandle((intptr_t)h, _O_RDWR);
+}
+
+static int
+s3_cli_fs_open_creat(const char *path, unsigned trunc)
+{
+    wchar_t w[S3_SSH3_SFTP_CLI_PATH_W];
+    HANDLE  h;
+    DWORD   mode = trunc ? CREATE_ALWAYS : OPEN_ALWAYS;
+    int     n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, mode,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    return _open_osfhandle((intptr_t)h, _O_RDWR);
+}
+
+static int
+s3_cli_fs_pread(int fd, void *buf, size_t len, int64_t off)
+{
+    HANDLE        h = (HANDLE)_get_osfhandle(fd);
+    LARGE_INTEGER li, saved;
+    DWORD         got = 0;
+    BOOL          ok;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    li.QuadPart = 0;
+
+    if (SetFilePointerEx(h, li, &saved, FILE_CURRENT) == 0) {
+        return -1;
+    }
+
+    li.QuadPart = (LONGLONG)off;
+
+    if (SetFilePointerEx(h, li, NULL, FILE_BEGIN) == 0) {
+        return -1;
+    }
+
+    ok = ReadFile(h, buf, (DWORD)len, &got, NULL);
+
+    (void)SetFilePointerEx(h, saved, NULL, FILE_BEGIN);
+
+    return ok ? (int)got : -1;
+}
+
+static int
+s3_cli_fs_pwrite(int fd, const void *buf, size_t len, int64_t off)
+{
+    HANDLE        h = (HANDLE)_get_osfhandle(fd);
+    LARGE_INTEGER li, saved;
+    DWORD         put = 0;
+    BOOL          ok;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    li.QuadPart = 0;
+
+    if (SetFilePointerEx(h, li, &saved, FILE_CURRENT) == 0) {
+        return -1;
+    }
+
+    li.QuadPart = (LONGLONG)off;
+
+    if (SetFilePointerEx(h, li, NULL, FILE_BEGIN) == 0) {
+        return -1;
+    }
+
+    ok = WriteFile(h, buf, (DWORD)len, &put, NULL);
+
+    (void)SetFilePointerEx(h, saved, NULL, FILE_BEGIN);
+
+    return ok ? (int)put : -1;
+}
+
+static void
+s3_cli_fs_stat_fill(struct stat *st, const WIN32_FILE_ATTRIBUTE_DATA *fa)
+{
+    int64_t ft;
+
+    s3_memzero(st, sizeof(*st));
+
+    ft = ((int64_t)fa->ftLastWriteTime.dwHighDateTime << 32) | fa->ftLastWriteTime.dwLowDateTime;
+
+    st->st_size = (off_t)(((int64_t)fa->nFileSizeHigh << 32) | fa->nFileSizeLow);
+    st->st_mtime = (time_t)(ft / 10000000 - 11644473600);
+    st->st_mode = (fa->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? S_IFDIR : S_IFREG;
+}
+
+static int
+s3_cli_fs_stat(const char *path, struct stat *st)
+{
+    wchar_t                   w[S3_SSH3_SFTP_CLI_PATH_W];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    int                       n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    if (GetFileAttributesExW(w, GetFileExInfoStandard, &fa) == 0) {
+        return -1;
+    }
+
+    s3_cli_fs_stat_fill(st, &fa);
+
+    return 0;
+}
+
+static int
+s3_cli_fs_fstat(int fd, struct stat *st)
+{
+    HANDLE                     h = (HANDLE)_get_osfhandle(fd);
+    BY_HANDLE_FILE_INFORMATION fi;
+    WIN32_FILE_ATTRIBUTE_DATA  fa;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    if (GetFileInformationByHandle(h, &fi) == 0) {
+        return -1;
+    }
+
+    fa.dwFileAttributes = fi.dwFileAttributes;
+    fa.ftCreationTime = fi.ftCreationTime;
+    fa.ftLastAccessTime = fi.ftLastAccessTime;
+    fa.ftLastWriteTime = fi.ftLastWriteTime;
+    fa.nFileSizeHigh = fi.nFileSizeHigh;
+    fa.nFileSizeLow = fi.nFileSizeLow;
+
+    s3_cli_fs_stat_fill(st, &fa);
+
+    return 0;
+}
+
+static int
+s3_cli_fs_futimens(int fd, const struct timespec ts[2])
+{
+    HANDLE   h = (HANDLE)_get_osfhandle(fd);
+    FILETIME ft[2];
+    int64_t  v;
+    int      i;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    for (i = 0; i < 2; i++) {
+
+        v = ((int64_t)ts[i].tv_sec + 11644473600) * 10000000;
+
+        ft[i].dwLowDateTime = (DWORD)(v & 0xffffffff);
+        ft[i].dwHighDateTime = (DWORD)((uint64_t)v >> 32);
+    }
+
+    return SetFileTime(h, NULL, &ft[0], &ft[1]) ? 0 : -1;
+}
+
+static int
+s3_cli_fs_mkdir(const char *path)
+{
+    wchar_t w[S3_SSH3_SFTP_CLI_PATH_W];
+    int     n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    if (CreateDirectoryW(w, NULL) == 0) {
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            errno = EEXIST;
+        }
+
+        return -1;
+    }
+
+    return 0;
+}
+
+/* the -r walk over the wide enumeration, the names come back UTF-8 */
+
+struct s3_cli_fs_dir_s {
+    HANDLE           find;
+    WIN32_FIND_DATAW fd;
+    s3_cli_fs_ent_t  ent;
+    char             name[S3_SSH3_SFTP_CLI_PATH_W];
+    unsigned         first;
+};
+
+static s3_cli_fs_dir_t *
+s3_cli_fs_opendir(const char *path)
+{
+    wchar_t          w[S3_SSH3_SFTP_CLI_PATH_W], pat[S3_SSH3_SFTP_CLI_PATH_W];
+    s3_cli_fs_dir_t *d;
+    int              n;
+
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, S3_SSH3_SFTP_CLI_PATH_W);
+
+    if (n <= 0 || n + 2 >= S3_SSH3_SFTP_CLI_PATH_W) {
+        return NULL;
+    }
+
+    _snwprintf(pat, S3_SSH3_SFTP_CLI_PATH_W - 1, L"%s\\*", w);
+    pat[S3_SSH3_SFTP_CLI_PATH_W - 1] = L'\0';
+
+    d = (s3_cli_fs_dir_t *)malloc(sizeof(*d));
+
+    if (d == NULL) {
+        return NULL;
+    }
+
+    d->first = 1;
+    d->find = FindFirstFileW(pat, &d->fd);
+
+    if (d->find == INVALID_HANDLE_VALUE) {
+        free(d);
+        return NULL;
+    }
+
+    return d;
+}
+
+static s3_cli_fs_ent_t *
+s3_cli_fs_readdir(s3_cli_fs_dir_t *d)
+{
+    int n;
+
+    if (!d->first) {
+
+        if (FindNextFileW(d->find, &d->fd) == 0) {
+            return NULL;
+        }
+    }
+
+    d->first = 0;
+
+    n = WideCharToMultiByte(CP_UTF8, 0, d->fd.cFileName, -1, d->name, (int)sizeof(d->name), NULL,
+                            NULL);
+
+    if (n <= 0) {
+        return NULL;
+    }
+
+    d->ent.d_name = d->name;
+
+    return &d->ent;
+}
+
+static void
+s3_cli_fs_closedir(s3_cli_fs_dir_t *d)
+{
+    FindClose(d->find);
+    free(d);
+}
+
+#else
+
+/* the unix arm: the plain POSIX calls */
+
+static int
+s3_cli_fs_open_rd(const char *path)
+{
+    return open(path, O_RDONLY);
+}
+
+static int
+s3_cli_fs_open_rdwr(const char *path)
+{
+    return open(path, O_RDWR);
+}
+
+static int
+s3_cli_fs_open_creat(const char *path, unsigned trunc)
+{
+    return open(path, O_RDWR | O_CREAT | (trunc ? O_TRUNC : 0), 0644);
+}
+
+static int
+s3_cli_fs_pread(int fd, void *buf, size_t len, int64_t off)
+{
+    return (int)pread(fd, buf, len, (off_t)off);
+}
+
+static int
+s3_cli_fs_pwrite(int fd, const void *buf, size_t len, int64_t off)
+{
+    return (int)pwrite(fd, buf, len, (off_t)off);
+}
+
+static int
+s3_cli_fs_stat(const char *path, struct stat *st)
+{
+    return stat(path, st);
+}
+
+static int
+s3_cli_fs_fstat(int fd, struct stat *st)
+{
+    return fstat(fd, st);
+}
+
+static int
+s3_cli_fs_futimens(int fd, const struct timespec ts[2])
+{
+    return futimens(fd, ts);
+}
+
+static int
+s3_cli_fs_mkdir(const char *path)
+{
+    return mkdir(path, 0755);
+}
+
+static s3_cli_fs_dir_t *
+s3_cli_fs_opendir(const char *path)
+{
+    return opendir(path);
+}
+
+static s3_cli_fs_ent_t *
+s3_cli_fs_readdir(s3_cli_fs_dir_t *dir)
+{
+    static s3_cli_fs_ent_t ent;
+    struct dirent         *de = readdir(dir);
+
+    if (de == NULL) {
+        return NULL;
+    }
+
+    ent.d_name = de->d_name;
+
+    return &ent;
+}
+
+static void
+s3_cli_fs_closedir(s3_cli_fs_dir_t *dir)
+{
+    (void)closedir(dir);
+}
+
+#endif
+
 /* the transfer chunk lives in the header: the callers size their
  * drains against it (the reference copyWithOffset() buffer) */
 
@@ -111,7 +572,7 @@ typedef struct {
 typedef struct {
     char                     *local_dir;
     char                     *remote_dir;
-    DIR                      *dir;    /* the put_r side */
+    s3_cli_fs_dir_t          *dir;    /* the put_r side */
     u_char                   *handle; /* the get_r side */
     size_t                    handle_len;
     s3_ssh3_sftp_cli_entry_t *entries;
@@ -604,7 +1065,7 @@ s3_cli_fail_op(s3_ssh3_sftp_cli_t *t, uint32_t code)
     for (i = 0; i < op->frame_count; i++) {
 
         if (op->frames[i].dir != NULL) {
-            (void)closedir(op->frames[i].dir);
+            (void)s3_cli_fs_closedir(op->frames[i].dir);
             op->frames[i].dir = NULL;
         }
     }
@@ -701,7 +1162,7 @@ s3_cli_stamp_done(s3_ssh3_sftp_cli_t *t)
         ts[0].tv_nsec = 0;
         ts[1] = ts[0];
 
-        (void)futimens(op->fd, ts);
+        (void)s3_cli_fs_futimens(op->fd, ts);
     }
 
     s3_cli_transfer_done(t);
@@ -813,7 +1274,7 @@ s3_cli_mkdir_local_all(const char *path)
 
         *slash = '\0';
 
-        if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+        if (s3_cli_fs_mkdir(copy) != 0 && errno != EEXIST) {
             s3_free(copy);
             return -1;
         }
@@ -821,14 +1282,14 @@ s3_cli_mkdir_local_all(const char *path)
         *slash = '/';
     }
 
-    if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+    if (s3_cli_fs_mkdir(copy) != 0 && errno != EEXIST) {
         s3_free(copy);
         return -1;
     }
 
     /* the EEXIST is fine only for the directory */
 
-    if (stat(copy, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (s3_cli_fs_stat(copy, &st) != 0 || !S_ISDIR(st.st_mode)) {
         s3_free(copy);
         return -1;
     }
@@ -858,7 +1319,7 @@ s3_cli_local_digest(s3_ssh3_sftp_cli_t *t, u_char *out)
 
     for (;;) {
 
-        n = pread(op->fd, op->io_buf, S3_SSH3_SFTP_CLI_CHUNK, (off_t)off);
+        n = s3_cli_fs_pread(op->fd, op->io_buf, S3_SSH3_SFTP_CLI_CHUNK, off);
 
         if (n < 0) {
             goto done;
@@ -935,7 +1396,7 @@ s3_cli_frame_push(s3_ssh3_sftp_cli_t *t, const char *local_dir, const char *remo
 
     if (op->kind == S3_SSH3_SFTP_CLI_OP_PUT_R) {
 
-        frame->dir = opendir(local_dir);
+        frame->dir = s3_cli_fs_opendir(local_dir);
 
         if (frame->dir == NULL) {
             op->frame_count--;
@@ -1095,7 +1556,7 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
 
     s3_cli_close_file(t);
 
-    if (op->resume && stat(op->local_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
+    if (op->resume && s3_cli_fs_stat(op->local_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
 
         if ((uint64_t)st.st_size > op->file_size) {
 
@@ -1110,7 +1571,7 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
             /* fully downloaded, the inherited mtime agrees: the
              * verify tail only, keep the bytes (R7) */
 
-            op->fd = open(op->local_path, O_RDWR);
+            op->fd = s3_cli_fs_open_rdwr(op->local_path);
 
             if (op->fd < 0) {
                 s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
@@ -1137,7 +1598,7 @@ s3_cli_get_local_open(s3_ssh3_sftp_cli_t *t)
         op->stamp = 1;
     }
 
-    op->fd = open(op->local_path, O_RDWR | O_CREAT | (trunc ? O_TRUNC : 0), 0644);
+    op->fd = s3_cli_fs_open_creat(op->local_path, trunc);
 
     if (op->fd < 0) {
         s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
@@ -1160,7 +1621,7 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
 {
     s3_ssh3_sftp_cli_op_t    *op = t->op;
     s3_ssh3_sftp_cli_frame_t *frame;
-    struct dirent            *de;
+    s3_cli_fs_ent_t          *de;
     struct stat               st;
     char                     *local_sub, *remote_sub;
 
@@ -1169,7 +1630,7 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
     for (;;) {
 
         errno = 0;
-        de = readdir(frame->dir);
+        de = s3_cli_fs_readdir(frame->dir);
 
         if (de == NULL) {
 
@@ -1183,7 +1644,7 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
 
             /* the directory drained: pop, the parent walk resumes */
 
-            (void)closedir(frame->dir);
+            (void)s3_cli_fs_closedir(frame->dir);
             frame->dir = NULL;
             op->frame_count--;
 
@@ -1215,7 +1676,7 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
             return S3_ERROR;
         }
 
-        if (lstat(local_sub, &st) != 0) {
+        if (s3_cli_fs_stat(local_sub, &st) != 0) {
             s3_cli_file_fail(t, S3_SSH3_SFTP_FX_FAILURE);
             continue;
         }
@@ -1253,14 +1714,14 @@ s3_cli_put_r_walk(s3_ssh3_sftp_cli_t *t)
 
         s3_cli_close_file(t);
 
-        op->fd = open(local_sub, O_RDONLY);
+        op->fd = s3_cli_fs_open_rd(local_sub);
 
         if (op->fd < 0) {
             s3_cli_file_fail(t, S3_SSH3_SFTP_FX_FAILURE);
             continue;
         }
 
-        if (fstat(op->fd, &st) != 0) {
+        if (s3_cli_fs_fstat(op->fd, &st) != 0) {
             s3_cli_close_file(t);
             s3_cli_file_fail(t, S3_SSH3_SFTP_FX_FAILURE);
             continue;
@@ -1437,7 +1898,7 @@ s3_cli_step(s3_ssh3_sftp_cli_t *t)
                     len = S3_SSH3_SFTP_CLI_CHUNK;
                 }
 
-                n = pread(op->fd, op->io_buf, len, (off_t)op->emit_off);
+                n = s3_cli_fs_pread(op->fd, op->io_buf, len, (int64_t)op->emit_off);
 
                 if (n < 0) {
                     s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
@@ -1942,7 +2403,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
 
             if (body.len > 0) {
 
-                n = pwrite(op->fd, body.data, body.len, (off_t)op->offset);
+                n = s3_cli_fs_pwrite(op->fd, body.data, body.len, (int64_t)op->offset);
 
                 if (n < 0 || (size_t)n != body.len) {
                     s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
@@ -2015,7 +2476,7 @@ s3_cli_dispatch(s3_ssh3_sftp_cli_t *t, s3_ssh3_sftp_pkt_t *pkt)
                 return S3_ERROR;
             }
 
-            if (fstat(op->fd, &st) != 0) {
+            if (s3_cli_fs_fstat(op->fd, &st) != 0) {
                 s3_cli_transfer_fail(t, S3_SSH3_SFTP_FX_FAILURE);
                 return s3_cli_step(t);
             }
@@ -2388,7 +2849,7 @@ s3_cli_reset(s3_ssh3_sftp_cli_t *t)
         op->frame_count--;
 
         if (op->frames[op->frame_count].dir != NULL) {
-            (void)closedir(op->frames[op->frame_count].dir);
+            (void)s3_cli_fs_closedir(op->frames[op->frame_count].dir);
         }
     }
 
@@ -2476,13 +2937,13 @@ s3_ssh3_sftp_cli_put(s3_ssh3_sftp_cli_t *t, const char *local_path, const char *
 
     /* the immediate local failure: the missing (or directory) source */
 
-    if (stat(local_path, &st) != 0 || S_ISDIR(st.st_mode)) {
+    if (s3_cli_fs_stat(local_path, &st) != 0 || S_ISDIR(st.st_mode)) {
         t->state = S3_SSH3_SFTP_CLI_FAIL;
         t->status = S3_SSH3_SFTP_FX_FAILURE;
         return S3_ERROR;
     }
 
-    op->fd = open(local_path, O_RDONLY);
+    op->fd = s3_cli_fs_open_rd(local_path);
 
     if (op->fd < 0) {
         t->state = S3_SSH3_SFTP_CLI_FAIL;
@@ -2586,7 +3047,7 @@ s3_ssh3_sftp_cli_put_r(s3_ssh3_sftp_cli_t *t, const char *local_path, const char
 
     /* the immediate local failure: the walk cannot start */
 
-    if (stat(local_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (s3_cli_fs_stat(local_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         t->state = S3_SSH3_SFTP_CLI_FAIL;
         t->status = S3_SSH3_SFTP_FX_FAILURE;
         return S3_ERROR;

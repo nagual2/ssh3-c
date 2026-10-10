@@ -70,6 +70,7 @@
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_session_cli.h>
+#include <s3_ssh3_sftp_cli.h>
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
@@ -100,6 +101,18 @@
 
 /* the ssh exit code of the transport failures, the OpenSSH parity */
 #define S3_CLI_EXIT_ERROR 255
+
+/* the sftp op failure (the remote refused the transfer), the scp parity */
+#define S3_CLI_EXIT_SFTP 1
+
+/* the in-flight 94 frame of the sftp driver direction (the harness
+ * shape: one frame below the channel maxPacketSize, a partial send
+ * parks its tail) */
+#define S3_CLI_SFTP_FRAME 33000
+
+/* the receive accumulator cap of the sftp channel (the driver window
+ * is 32 inflight requests, an endless stream is a peer bug) */
+#define S3_CLI_SFTP_BUF_MAX (16 << 20)
 
 #define S3_CLI_ES256_HALF 32
 
@@ -174,6 +187,47 @@ static const char *s3_cli_auth_value;
 static char       *s3_cli_cmd; /* the joined exec text, NULL = shell */
 static unsigned    s3_cli_verbose;
 
+/* the sftp transfer mode of the -J form (the harness shape): the
+ * channel type is "sftp", the scp-style driver of s3_ssh3_sftp_cli
+ * runs over the 94 payloads, the verdict rides the driver state */
+
+#define S3_CLI_SFTP_NONE 0
+#define S3_CLI_SFTP_PUT  1
+#define S3_CLI_SFTP_GET  2
+
+static unsigned           s3_cli_sftp_mode;
+static char              *s3_cli_sftp_local;
+static char              *s3_cli_sftp_remote;
+static unsigned           s3_cli_sftp_recursive;
+static s3_pool_t         *s3_cli_sftp_pool;
+static s3_ssh3_sftp_cli_t s3_cli_sftp;
+static unsigned           s3_cli_sftp_started;
+static unsigned           s3_cli_sftp_parked; /* the flush parks on the stream window */
+
+/* the in-flight 94 frame (the tail parks, the write event retries) */
+
+static u_char s3_cli_sftp_frame[S3_CLI_SFTP_FRAME];
+static size_t s3_cli_sftp_frame_sent;
+static size_t s3_cli_sftp_frame_total;
+
+/* the pending driver bytes of the driver direction (the pool of the
+ * out accum rides malloc, the transfer lives one session) */
+
+static u_char *s3_cli_sftp_out;
+static size_t  s3_cli_sftp_out_cap;
+static size_t  s3_cli_sftp_out_len;
+
+/* the receive accumulator of the sftp channel (the 91 and the 94) */
+
+static u_char *s3_cli_sftp_buf;
+static size_t  s3_cli_sftp_buf_cap;
+static size_t  s3_cli_sftp_buf_len;
+
+/* the 91 confirmation of the sftp channel (the channel reader and
+ * the pump gate on it) */
+
+static unsigned s3_cli_ch_confirmed;
+
 /* the h3 response side (the :status section, the ctrl read handler) */
 
 static s3_h3_parse_headers_t s3_cli_h3parse;
@@ -246,11 +300,18 @@ static unsigned __stdcall s3_cli_reader(void *arg);
 static s3_int_t s3_cli_console_winsize(uint64_t *width, uint64_t *height);
 static void     s3_cli_tick_handler(s3_event_t *ev);
 static void     s3_cli_teardown(void);
+static void     s3_cli_tick_arm(void);
+static s3_int_t s3_cli_sftp_append(const u_char *data, size_t n);
+static void     s3_cli_sftp_finish(void);
+static void     s3_cli_sftp_pump(void);
+static void     s3_cli_sftp_write(s3_event_t *ev);
+static void     s3_cli_sftp_start(void);
+static void     s3_cli_sftp_read(s3_event_t *ev);
 
 /*
- * the usage of the stage-A option set: the keys the Go fork shares
- * (-i, -U, -v) plus the s3 level knob; the session shape rides the
- * operands (a command = exec, no command = shell)
+ * the usage: the stage-A option set (the keys the Go fork shares,
+ * -i, -U, -v) plus the stage-B session shapes; the log level moved
+ * to -l (the stage-B contract puts -L on the local forwards)
  */
 
 static void
@@ -262,8 +323,12 @@ s3_cli_usage(const char *prog)
             "              key (ed25519, P-256 or RSA); the username rides the\n"
             "              user@ part of the operand\n"
             "  -U user:pass  Basic auth (RFC 7617), the ?user= of the target\n"
+            "  -J put|get:local:remote  the sftp transfer (get: local first);\n"
+            "              with -r the -r forms recurse over the tree (a colon\n"
+            "              beyond the Windows drive letter ends the paths)\n"
+            "  -r          with -J: the recursive transfer\n"
             "  -v          verbose logging\n"
-            "  -L lvl      the s3 log level 0..9 or all\n"
+            "  -l lvl      the s3 log level 0..9 or all\n"
             "  -V          version\n"
             "  -h          this help\n"
             " no command opens an interactive shell (pty on a console, the\n"
@@ -1176,7 +1241,7 @@ s3_cli_ctrl_read(s3_event_t *ev)
 
                     if (code != 200) {
                         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
-                                     "the server refused the session (HTTP %u)", code);
+                                     "the server refused the session (HTTP %ud)", code);
                         s3_cli_rc = S3_CLI_EXIT_ERROR;
                         s3_quic_finalize_connection(pc, 0, "connect refused");
                     }
@@ -1239,6 +1304,409 @@ s3_cli_datagram(s3_connection_t *c, s3_chain_t *data)
 {
     (void)c;
     (void)data;
+}
+
+/* === the sftp transfer mode (-J put|get, the stage B) === */
+
+/*
+ * the driver bytes of the cli direction: the requests of
+ * s3_ssh3_sftp_cli drain here, the pump chunks them into the 94
+ * frames under the channel maxPacketSize; the accum rides malloc
+ * (the transfer lives one session, the process exits after it)
+ */
+
+static s3_int_t
+s3_cli_sftp_append(const u_char *data, size_t n)
+{
+    if (s3_cli_sftp_out_len + n > s3_cli_sftp_out_cap) {
+
+        size_t  cap = s3_cli_sftp_out_cap ? s3_cli_sftp_out_cap : 65536;
+        u_char *grown;
+
+        while (cap < s3_cli_sftp_out_len + n) {
+            cap += 65536;
+        }
+
+        grown = realloc(s3_cli_sftp_out, cap);
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        s3_cli_sftp_out = grown;
+        s3_cli_sftp_out_cap = cap;
+    }
+
+    memcpy(s3_cli_sftp_out + s3_cli_sftp_out_len, data, n);
+    s3_cli_sftp_out_len += n;
+
+    return S3_OK;
+}
+
+/*
+ * the verdict of the finished driver: FX_OK exits zero, anything
+ * else the scp parity exit 1 (the transport failures exit 255)
+ */
+
+static void
+s3_cli_sftp_finish(void)
+{
+    uint32_t status = s3_ssh3_sftp_cli_status(&s3_cli_sftp);
+
+    if (s3_cli_verdict) {
+        return;
+    }
+
+    s3_cli_verdict = 1;
+
+    if (s3_ssh3_sftp_cli_finished(&s3_cli_sftp) && status == S3_SSH3_SFTP_FX_OK) {
+        s3_cli_exit_code = 0;
+
+    } else {
+        s3_cli_exit_code = S3_CLI_EXIT_SFTP;
+    }
+}
+
+/*
+ * the cli direction: the drained requests chunk into the 94 frames
+ * under the channel maxPacketSize (a 32 KiB WRITE body overflows one
+ * frame), a partial send parks the tail on the static frame buffer;
+ * the retry rides the write event and the tick.  The pump gates on
+ * the 91: the INIT waits until the server confirmed the channel
+ */
+
+static void
+s3_cli_sftp_pump(void)
+{
+    u_char  buf[65536];
+    ssize_t n, m;
+    size_t  chunk;
+
+    if (s3_cli_chan == NULL || !s3_cli_ch_confirmed) {
+        return;
+    }
+
+    for (;;) {
+
+        n = s3_ssh3_sftp_cli_output(&s3_cli_sftp, buf, sizeof(buf));
+
+        if (n <= 0) {
+            break;
+        }
+
+        if (s3_cli_sftp_append(buf, (size_t)n) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp buffer growth failed");
+            s3_cli_chan = NULL;
+            s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                        "sftp buffer growth failed");
+            return;
+        }
+    }
+
+    while (s3_cli_sftp_out_len > 0 || s3_cli_sftp_frame_sent < s3_cli_sftp_frame_total) {
+
+        if (s3_cli_sftp_frame_sent == s3_cli_sftp_frame_total) {
+
+            u_char *p;
+
+            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > s3_cli_sftp_out_len) {
+                chunk = s3_cli_sftp_out_len;
+            }
+
+            p = s3_cli_sftp_frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+            memcpy(p, s3_cli_sftp_out, chunk);
+
+            s3_cli_sftp_frame_total = (size_t)(p - s3_cli_sftp_frame) + chunk;
+            s3_cli_sftp_frame_sent = 0;
+
+            memmove(s3_cli_sftp_out, s3_cli_sftp_out + chunk, s3_cli_sftp_out_len - chunk);
+            s3_cli_sftp_out_len -= chunk;
+        }
+
+        m = s3_quic_stream_send(s3_cli_chan, s3_cli_sftp_frame + s3_cli_sftp_frame_sent,
+                                s3_cli_sftp_frame_total - s3_cli_sftp_frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+
+            /* the window closed: the write event and the short
+             * tick retry the tail */
+
+            s3_cli_sftp_parked = 1;
+
+            return;
+        }
+
+        if (m <= 0) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp channel send failed");
+            s3_cli_chan = NULL;
+            s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                        "sftp send failed");
+            return;
+        }
+
+        s3_cli_sftp_frame_sent += (size_t)m;
+    }
+
+    s3_cli_sftp_parked = 0;
+}
+
+/*
+ * the write readiness of the sftp channel: the quic layer posts this
+ * when the peer reopens the stream window, the pump resumes there
+ */
+
+static void
+s3_cli_sftp_write(s3_event_t *ev)
+{
+    ev->ready = 0;
+
+    if (s3_cli_verdict) {
+        return;
+    }
+
+    s3_cli_sftp_pump();
+}
+
+/* the driver bring-up: put/get or their -r forms, verify on (the
+ * checksum tail proves the byte-exactness against the server side) */
+
+static void
+s3_cli_sftp_start(void)
+{
+    s3_int_t rc;
+
+    s3_cli_sftp_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (s3_cli_sftp_pool == NULL) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp pool failed");
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "sftp pool failed");
+        return;
+    }
+
+    if (s3_ssh3_sftp_cli_init(&s3_cli_sftp, s3_cli_sftp_pool, NULL, NULL) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp driver init failed");
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "sftp init failed");
+        return;
+    }
+
+    /* the READ bound follows the channel maxPacketSize this side
+     * announced: the DATA replies of the peer stay under it */
+
+    s3_ssh3_sftp_cli_channel_max_packet(&s3_cli_sftp, S3_CLI_CHANNEL_MAX_PACKET);
+
+    if (s3_cli_sftp_mode == S3_CLI_SFTP_PUT) {
+
+        if (s3_cli_sftp_recursive) {
+            rc = s3_ssh3_sftp_cli_put_r(&s3_cli_sftp, s3_cli_sftp_local, s3_cli_sftp_remote, 0, 1);
+
+        } else {
+            rc = s3_ssh3_sftp_cli_put(&s3_cli_sftp, s3_cli_sftp_local, s3_cli_sftp_remote, 0, 1);
+        }
+
+    } else {
+
+        if (s3_cli_sftp_recursive) {
+            rc = s3_ssh3_sftp_cli_get_r(&s3_cli_sftp, s3_cli_sftp_remote, s3_cli_sftp_local, 0, 1);
+
+        } else {
+            rc = s3_ssh3_sftp_cli_get(&s3_cli_sftp, s3_cli_sftp_remote, s3_cli_sftp_local, 0, 1);
+        }
+    }
+
+    if (rc != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp op start failed");
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "sftp start failed");
+        return;
+    }
+
+    s3_cli_sftp_started = 1;
+}
+
+/*
+ * the sftp channel reader: the 91 confirms the channel, the 94
+ * payloads feed the driver; the verdict lands from the driver state,
+ * the fin before it is the transport error
+ */
+
+static void
+s3_cli_sftp_read(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_cli_verdict) {
+        return;
+    }
+
+    for (;;) {
+
+        if (s3_cli_sftp_buf_len == s3_cli_sftp_buf_cap) {
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the accumulator bound: a full buffer with no complete
+             * frame inside is a peer trickling bytes */
+
+            if (s3_cli_sftp_buf_cap >= S3_CLI_SFTP_BUF_MAX) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp channel buffer overgrown");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                            "sftp buffer overgrown");
+                return;
+            }
+
+            cap = s3_cli_sftp_buf_cap + 262144;
+
+            if (cap > S3_CLI_SFTP_BUF_MAX) {
+                cap = S3_CLI_SFTP_BUF_MAX;
+            }
+
+            grown = realloc(s3_cli_sftp_buf, cap);
+
+            if (grown == NULL) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp buffer growth failed");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                            "sftp buffer growth failed");
+                return;
+            }
+
+            s3_cli_sftp_buf = grown;
+            s3_cli_sftp_buf_cap = cap;
+        }
+
+        n = sc->recv(sc, s3_cli_sftp_buf + s3_cli_sftp_buf_len,
+                     s3_cli_sftp_buf_cap - s3_cli_sftp_buf_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n <= 0) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp channel closed early");
+            s3_cli_rc = S3_CLI_EXIT_ERROR;
+            s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                        "sftp channel closed");
+            return;
+        }
+
+        s3_cli_sftp_buf_len += (size_t)n;
+
+        pos = s3_cli_sftp_buf;
+        end = s3_cli_sftp_buf + s3_cli_sftp_buf_len;
+
+        while (pos < end) {
+
+            const u_char *msg = pos;
+            uint64_t      type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                pos = msg;
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                s3_cli_ch_confirmed = 1;
+
+                /* the channel is confirmed: the parked INIT rides */
+
+                s3_cli_sftp_pump();
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t data;
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                if (s3_ssh3_sftp_cli_input(&s3_cli_sftp, data.data.data, data.data.len) != S3_OK) {
+                    s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp protocol violation");
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                    s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                                "sftp protocol violation");
+                    return;
+                }
+
+                if (s3_ssh3_sftp_cli_finished(&s3_cli_sftp)) {
+                    s3_cli_sftp_finish();
+                    continue;
+                }
+
+                /* the replies woke the driver: the next train rides
+                 * out at once, not on the tick */
+
+                s3_cli_sftp_pump();
+
+                continue;
+            }
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp unexpected message %llu",
+                         (unsigned long long)type);
+            s3_cli_rc = S3_CLI_EXIT_ERROR;
+            s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                        "sftp unexpected message");
+            return;
+        }
+
+        s3_cli_sftp_buf_len = (size_t)(end - pos);
+        memmove(s3_cli_sftp_buf, pos, s3_cli_sftp_buf_len);
+
+        if (s3_cli_verdict) {
+            return;
+        }
+    }
+}
+
+/*
+ * the pump tick of the session and of the sftp run: one timer event
+ * on the connection pool, the handler re-arms itself
+ */
+
+static void
+s3_cli_tick_arm(void)
+{
+    if (s3_cli_tick != NULL) {
+        return;
+    }
+
+    s3_cli_tick = s3_pnalloc(s3_cli_conn->pool, sizeof(s3_event_t));
+
+    if (s3_cli_tick == NULL) {
+        fprintf(stderr, "ssh3: out of memory\n");
+        return;
+    }
+
+    memset(s3_cli_tick, 0, sizeof(s3_event_t));
+
+    s3_cli_tick->handler = s3_cli_tick_handler;
+    s3_cli_tick->log = &s3_cli_log;
+
+    s3_event_add_timer(s3_cli_tick, S3_CLI_TICK_MS);
 }
 
 /*
@@ -1421,6 +1889,27 @@ s3_cli_tick_handler(s3_event_t *ev)
 {
     u_char frame[S3_CLI_RING_SIZE + 8];
 
+    if (s3_cli_sftp_mode) {
+
+        /* the sftp run: the pump rides the tick (the window reopens
+         * ride the write event earlier); the console machinery
+         * stays off, no ring is initialized */
+
+        if (s3_cli_chan == NULL || s3_cli_verdict) {
+            return;
+        }
+
+        if (s3_cli_sftp_started) {
+            s3_cli_sftp_pump();
+        }
+
+        if (!s3_cli_stop && !s3_cli_verdict) {
+            s3_event_add_timer(ev, s3_cli_sftp_parked ? 2 : S3_CLI_TICK_MS);
+        }
+
+        return;
+    }
+
     if (s3_cli_chan == NULL) {
         return;
     }
@@ -1552,7 +2041,7 @@ main(int argc, char **argv)
     s3_cli_log.fd = S3_INVALID_FILE;
     s3_cli_log.log_level = S3_LOG_WARN;
 
-    while ((opt = getopt(argc, argv, "i:U:vL:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:U:J:rvl:Vh")) != -1) {
 
         switch (opt) {
 
@@ -1585,16 +2074,80 @@ main(int argc, char **argv)
             s3_cli_user[sep - optarg] = '\0';
 
             s3_cli_auth = S3_CLI_AUTH_BASIC;
+            s3_cli_auth_value = s3_cli_basic;
 
             break;
         }
+
+        case 'J': {
+
+            const char *rest = optarg;
+            const char *sep;
+            size_t      len;
+
+            if (strncmp(rest, "put:", 4) == 0) {
+                s3_cli_sftp_mode = S3_CLI_SFTP_PUT;
+                rest += 4;
+
+            } else if (strncmp(rest, "get:", 4) == 0) {
+                s3_cli_sftp_mode = S3_CLI_SFTP_GET;
+                rest += 4;
+
+            } else {
+                fprintf(stderr, "ssh3: -J wants put|get:local:remote\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            /* the local:remote split: a colon right behind the drive
+             * letter rides the path, the next one ends the local
+             * side (the remote is the unix path of the server) */
+
+            sep = strchr(rest, ':');
+
+            if (sep == rest + 1 &&
+                ((rest[0] >= 'A' && rest[0] <= 'Z') || (rest[0] >= 'a' && rest[0] <= 'z'))) {
+                sep = strchr(sep + 1, ':');
+            }
+
+            if (sep == NULL || sep == rest || sep[1] == '\0') {
+                fprintf(stderr, "ssh3: -J wants put|get:local:remote\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            len = (size_t)(sep - rest);
+            s3_cli_sftp_local = malloc(len + 1);
+
+            if (s3_cli_sftp_local == NULL) {
+                fprintf(stderr, "ssh3: out of memory\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            memcpy(s3_cli_sftp_local, rest, len);
+            s3_cli_sftp_local[len] = '\0';
+
+            len = strlen(sep + 1);
+            s3_cli_sftp_remote = malloc(len + 1);
+
+            if (s3_cli_sftp_remote == NULL) {
+                fprintf(stderr, "ssh3: out of memory\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            memcpy(s3_cli_sftp_remote, sep + 1, len + 1);
+
+            break;
+        }
+
+        case 'r':
+            s3_cli_sftp_recursive = 1;
+            break;
 
         case 'v':
             s3_cli_verbose = 1;
             s3_cli_log.log_level = S3_LOG_DEBUG_ALL;
             break;
 
-        case 'L':
+        case 'l':
             s3_cli_log.log_level =
                 (strcmp(optarg, "all") == 0) ? S3_LOG_DEBUG_ALL : (s3_uint_t)atol(optarg);
             break;
@@ -1745,6 +2298,13 @@ main(int argc, char **argv)
     }
 
     (void)s3_cli_tofu_prepare();
+
+    /* the sftp transfer carries no exec words */
+
+    if (s3_cli_sftp_mode && optind < argc) {
+        fprintf(stderr, "ssh3: -J takes no command\n");
+        return S3_CLI_EXIT_ERROR;
+    }
 
     /* the trailing words join into the exec command (the ssh shape) */
 
@@ -1993,9 +2553,26 @@ main(int argc, char **argv)
 
             s3_cli_conv_id = ((s3_quic_stream_t *)s3_cli_ctrl->data)->id;
 
-            s3_cli_chan->read->handler = s3_cli_chan_read;
+            if (s3_cli_sftp_mode) {
+                s3_cli_chan->read->handler = s3_cli_sftp_read;
+
+            } else {
+                s3_cli_chan->read->handler = s3_cli_chan_read;
+            }
+
             s3_cli_chan->read->data = s3_cli_chan;
             s3_cli_chan->read->active = 1;
+
+            if (s3_cli_sftp_mode) {
+
+                /* the pump rides the write readiness: the quic layer
+                 * posts the write event when the peer reopens the
+                 * stream window, the parked frame resumes there */
+
+                s3_cli_chan->write->handler = s3_cli_sftp_write;
+                s3_cli_chan->write->data = s3_cli_chan;
+                s3_cli_chan->write->active = 1;
+            }
         }
 
         /* the header plus the session requests ride one send */
@@ -2012,13 +2589,29 @@ main(int argc, char **argv)
 
             hdr.conversation_stream_id = s3_cli_conv_id;
             hdr.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
-            hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
-            hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+
+            if (s3_cli_sftp_mode) {
+
+                /* the sftp transfer rides the "sftp" channel type,
+                 * no session request follows the header */
+
+                hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SFTP;
+                hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SFTP);
+
+            } else {
+                hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
+                hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+            }
 
             p = frame;
             p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
 
-            if (s3_cli_cmd != NULL) {
+            if (s3_cli_sftp_mode) {
+
+                /* the sftp channel: the header alone rides, the
+                 * driver start follows the send */
+
+            } else if (s3_cli_cmd != NULL) {
 
                 /* the exec: the command with the reply wanted, the
                  * fin rides right behind it */
@@ -2118,45 +2711,57 @@ main(int argc, char **argv)
             } else {
                 s3_cli_ch_sent = 1;
 
-                if (s3_cli_cmd != NULL &&
-                    s3_quic_shutdown_stream(s3_cli_chan, S3_WRITE_SHUTDOWN) != S3_OK) {
-                    fprintf(stderr, "ssh3: the channel fin failed\n");
-                    s3_cli_rc = S3_CLI_EXIT_ERROR;
-                    break;
+                if (s3_cli_sftp_mode) {
+
+                    /* the sftp driver: the INIT parks until the 91
+                     * confirms the channel, the first pump pass
+                     * rides the confirmation read */
+
+                    s3_cli_sftp_start();
+
+                    s3_cli_tick_arm();
+
+                    if (s3_cli_tick == NULL) {
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        break;
+                    }
+
+                    s3_cli_phase = S3_CLI_PH_SESSION;
+
+                } else {
+
+                    if (s3_cli_cmd != NULL &&
+                        s3_quic_shutdown_stream(s3_cli_chan, S3_WRITE_SHUTDOWN) != S3_OK) {
+                        fprintf(stderr, "ssh3: the channel fin failed\n");
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        break;
+                    }
+
+                    /* the session pump lives on the console tick */
+
+                    if (s3_ssh3_session_cli_init(&s3_cli_sess, cli->pool, s3_cli_out_sink, NULL,
+                                                 s3_cli_err_sink, NULL, s3_cli_exit_cb,
+                                                 NULL) != S3_OK) {
+                        fprintf(stderr, "ssh3: the session init failed\n");
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        break;
+                    }
+
+                    if (s3_cli_console_init() != S3_OK) {
+                        fprintf(stderr, "ssh3: the console init failed\n");
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        break;
+                    }
+
+                    s3_cli_tick_arm();
+
+                    if (s3_cli_tick == NULL) {
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        break;
+                    }
+
+                    s3_cli_phase = S3_CLI_PH_SESSION;
                 }
-
-                /* the session pump lives on the console tick */
-
-                if (s3_ssh3_session_cli_init(&s3_cli_sess, cli->pool, s3_cli_out_sink, NULL,
-                                             s3_cli_err_sink, NULL, s3_cli_exit_cb,
-                                             NULL) != S3_OK) {
-                    fprintf(stderr, "ssh3: the session init failed\n");
-                    s3_cli_rc = S3_CLI_EXIT_ERROR;
-                    break;
-                }
-
-                if (s3_cli_console_init() != S3_OK) {
-                    fprintf(stderr, "ssh3: the console init failed\n");
-                    s3_cli_rc = S3_CLI_EXIT_ERROR;
-                    break;
-                }
-
-                s3_cli_tick = s3_pnalloc(cli->pool, sizeof(s3_event_t));
-
-                if (s3_cli_tick == NULL) {
-                    fprintf(stderr, "ssh3: out of memory\n");
-                    s3_cli_rc = S3_CLI_EXIT_ERROR;
-                    break;
-                }
-
-                memset(s3_cli_tick, 0, sizeof(s3_event_t));
-
-                s3_cli_tick->handler = s3_cli_tick_handler;
-                s3_cli_tick->log = &s3_cli_log;
-
-                s3_event_add_timer(s3_cli_tick, S3_CLI_TICK_MS);
-
-                s3_cli_phase = S3_CLI_PH_SESSION;
             }
         }
 
@@ -2254,6 +2859,18 @@ s3_cli_teardown(void)
 
     free(s3_cli_cmd);
     s3_cli_cmd = NULL;
+
+    free(s3_cli_sftp_out);
+    s3_cli_sftp_out = NULL;
+
+    free(s3_cli_sftp_buf);
+    s3_cli_sftp_buf = NULL;
+
+    free(s3_cli_sftp_local);
+    s3_cli_sftp_local = NULL;
+
+    free(s3_cli_sftp_remote);
+    s3_cli_sftp_remote = NULL;
 
     WSACleanup();
 }
