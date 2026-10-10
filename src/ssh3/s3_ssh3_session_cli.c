@@ -18,21 +18,31 @@
  */
 
 /*
- * the BSD terminal surface of this module: cfmakeraw() rides behind
- * __USE_MISC, the winsize ioctl behind the kernel ioctls; the
- * definition lives in the file so only this TU pays for the extra
- * surface (the session_srv pattern)
+ * the terminal surface of this module is platform-split: the unix
+ * side rides cfmakeraw() (behind __USE_MISC) and the winsize ioctl,
+ * the win32 side rides the console API (the c-win32 skill, the
+ * termios-to-console port); the definitions live in the file so only
+ * this TU pays for the extra surface (the session_srv pattern)
  */
+
+/* cfmakeraw() hides behind __USE_MISC while the build pins only
+ * _POSIX_C_SOURCE on the command line: _DEFAULT_SOURCE must precede
+ * the first system header, features.h latches on the first include */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE 1
 #endif
 
 #include <s3_core.h>
 
-#include <string.h>
+#if (S3_WIN32)
+#include <io.h>
+#else
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
+
+#include <string.h>
 
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_request.h>
@@ -271,6 +281,122 @@ s3_ssh3_session_cli_exit_code(const s3_ssh3_session_cli_t *s)
  * *saved for tty_restore(), the S3_DECLINED when the fd is not a tty
  */
 
+#if (S3_WIN32)
+
+/*
+ * the console API twin of the termios branch (the c-win32 skill):
+ * the line, echo and processed input drop, the VT input passes the
+ * escape sequences through; the saved mode masquerades as the
+ * termios struct (the opaque pointer of the header contract)
+ */
+
+struct termios {
+    DWORD mode;
+};
+
+static HANDLE
+s3_ssh3_session_cli_console_in(int fd)
+{
+    return (HANDLE)_get_osfhandle(fd);
+}
+
+s3_int_t
+s3_ssh3_session_cli_tty_raw(int fd, struct termios *saved)
+{
+    HANDLE h;
+    DWORD  mode;
+
+    if (!_isatty(fd)) {
+        return S3_DECLINED;
+    }
+
+    h = s3_ssh3_session_cli_console_in(fd);
+
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
+        return S3_ERROR;
+    }
+
+    if (saved != NULL) {
+        saved->mode = mode;
+    }
+
+    mode &= ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    mode |= ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+    if (!SetConsoleMode(h, mode)) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+/* the saved state back: the non-tty fd declines like tty_raw() */
+
+s3_int_t
+s3_ssh3_session_cli_tty_restore(int fd, const struct termios *saved)
+{
+    HANDLE h;
+
+    if (!_isatty(fd)) {
+        return S3_DECLINED;
+    }
+
+    if (saved == NULL) {
+        return S3_ERROR;
+    }
+
+    h = s3_ssh3_session_cli_console_in(fd);
+
+    if (h == INVALID_HANDLE_VALUE || !SetConsoleMode(h, saved->mode)) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+/*
+ * the window size for the window-change requests, the visible
+ * window of the console screen buffer (the size lives on the output
+ * side, the fd stays the stdin one)
+ */
+
+s3_int_t
+s3_ssh3_session_cli_tty_winsize(int fd, uint64_t *width, uint64_t *height)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE                     h;
+
+    if (!_isatty(fd)) {
+        return S3_DECLINED;
+    }
+
+    h = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                    0, NULL);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return S3_ERROR;
+    }
+
+    if (!GetConsoleScreenBufferInfo(h, &info)) {
+        CloseHandle(h);
+        return S3_ERROR;
+    }
+
+    CloseHandle(h);
+
+    if (width != NULL) {
+        *width = (uint64_t)(info.srWindow.Right - info.srWindow.Left + 1);
+    }
+
+    if (height != NULL) {
+        *height = (uint64_t)(info.srWindow.Bottom - info.srWindow.Top + 1);
+    }
+
+    return S3_OK;
+}
+
+#else /* the unix branch */
+
 s3_int_t
 s3_ssh3_session_cli_tty_raw(int fd, struct termios *saved)
 {
@@ -339,3 +465,5 @@ s3_ssh3_session_cli_tty_winsize(int fd, uint64_t *width, uint64_t *height)
 
     return S3_OK;
 }
+
+#endif /* S3_WIN32 */

@@ -9,7 +9,9 @@
 
 #include <stdio.h>
 
-/* the terminal state of the tty helpers, defined in <termios.h> */
+/* the terminal state of the tty helpers: the termios struct on the
+ * unix side, the saved console mode behind the same opaque struct on
+ * the win32 side (the port of the P9 beachhead) */
 
 struct termios;
 

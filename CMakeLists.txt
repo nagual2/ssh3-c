@@ -70,6 +70,7 @@ if(WIN32)
         src/ssh3/s3_ssh3_dos_guard.c
         src/ssh3/s3_ssh3_sftp_codec.c
         src/ssh3/s3_ssh3_cm.c
+        src/ssh3/s3_ssh3_session_cli.c
     )
 
     target_include_directories(s3core
@@ -148,6 +149,14 @@ if(WIN32)
         target_compile_options(${S3_TEST} PRIVATE -Wall -Wextra -Werror)
         add_test(NAME ${S3_TEST} COMMAND ${S3_TEST})
     endforeach()
+
+    # the product client (P9 wave 3, stage A): the exec and the
+    # interactive console session over the proved client modules;
+    # the unix client target does not exist yet, the beachhead is
+    # win-only (docs/PLAN.md P9)
+    add_executable(ssh3 app/ssh3_client.c)
+    target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3 PRIVATE s3core)
 
     return()
 endif()
