@@ -6038,6 +6038,18 @@ main(int argc, char **argv)
     s3_cli_log.fd = S3_INVALID_FILE;
     s3_cli_log.log_level = S3_LOG_WARN;
 
+    /*
+     * the -privkey alias of the Go fork client (cmd/ssh3.go): the
+     * muscle memory of the reference users maps onto -i
+     */
+
+    for (opt = 1; opt < argc; opt++) {
+
+        if (strcmp(argv[opt], "-privkey") == 0) {
+            argv[opt] = (char *)"-i";
+        }
+    }
+
     while ((opt = getopt(argc, argv, "i:U:J:L:rMl:e:O:XVh")) != -1) {
 
         switch (opt) {
