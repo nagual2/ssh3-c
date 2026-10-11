@@ -55,6 +55,7 @@
 #include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 
 #include <s3_core.h>
@@ -67,6 +68,8 @@
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_agent.h>
+#include <s3_ssh3_cm.h>
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
@@ -338,6 +341,144 @@ typedef struct {
 
 static s3_cli_fwd_udp_t s3_cli_fwd_udp[S3_CLI_FWD_MAX];
 
+/* === the agent forwarding (-X) and the ControlMaster (-M/-U/-O,
+ * the stage B): the UDS shapes of the reference live on the named
+ * pipes of the Windows OpenSSH agent, byte mode, the first
+ * instance semantics === */
+
+#define S3_CLI_AGENT_PIPE_DEFAULT "\\\\.\\pipe\\openssh-ssh-agent"
+
+/* the CM pipe cap and the conn shapes (the interop rationale) */
+
+#define S3_CLI_CM_BUF_INIT  4096
+#define S3_CLI_CM_FRAME_CAP 33000 /* the 94 frame park, the sftp shape */
+#define S3_CLI_CM_TICK_MS   30
+
+/* the in-flight 94 frame of the agent bridge (the tail parks) */
+
+static unsigned         s3_cli_agent_mode;
+static HANDLE           s3_cli_agent_pipe;
+static unsigned         s3_cli_agent_bridged;
+static s3_connection_t *s3_cli_agent_sc; /* the agent-connection channel */
+static u_char           s3_cli_agent_hdr[64];
+static size_t           s3_cli_agent_hdr_len;
+static u_char          *s3_cli_agent_in; /* the channel bytes to the pipe */
+static size_t           s3_cli_agent_in_len;
+static size_t           s3_cli_agent_in_cap;
+static u_char           s3_cli_agent_frame[S3_CLI_SFTP_FRAME];
+static size_t           s3_cli_agent_frame_sent;
+static size_t           s3_cli_agent_frame_total;
+
+/* the reply accumulator of the pipe direction (the 94 frames build
+ * from it under the channel maxPacketSize) */
+
+static u_char s3_cli_agent_acc[16384];
+static size_t s3_cli_agent_acc_len;
+
+/* the channel stream accumulator of the agent bridge (the 91 and
+ * the 94 parse before the pipe) */
+
+static u_char *s3_cli_agent_chacc;
+static size_t  s3_cli_agent_chacc_len;
+static size_t  s3_cli_agent_chacc_cap;
+
+/* the CM master: one control/attach pipe conn each, the shared
+ * session table of the codec, one run per slave session */
+
+#define S3_CLI_CM_CMD_MAX 768
+
+enum { S3_CLI_CM_CONN_CONTROL = 0, S3_CLI_CM_CONN_IO = 1, S3_CLI_CM_CONN_STDERR = 2 };
+
+typedef struct s3_cli_cm_conn_s s3_cli_cm_conn_t;
+typedef struct s3_cli_cm_run_s  s3_cli_cm_run_t;
+
+struct s3_cli_cm_conn_s {
+    unsigned          used;
+    unsigned          dead;
+    unsigned          close_due; /* the ticks left before the done reply close */
+    HANDLE            h;         /* the connected pipe instance (sync) */
+    u_char            rbuf[8192];
+    s3_pool_t        *pool;
+    s3_ssh3_cm_srv_t  srv;
+    unsigned          kind;
+    s3_cli_cm_run_t  *run;
+    u_char           *out; /* the parked replies between the flushes */
+    size_t            out_len;
+    size_t            out_cap;
+    s3_cli_cm_conn_t *next;
+    s3_cli_cm_conn_t *grave_next; /* the dying list of the graveyard sweep */
+};
+
+struct s3_cli_cm_run_s {
+    u_char            token[S3_SSH3_CM_TOKEN_LEN];
+    unsigned          used : 1;
+    unsigned          ch_confirmed : 1;
+    unsigned          bridged : 1;
+    unsigned          finalized : 1;
+    unsigned          exit_queued : 1;
+    uint64_t          exit_code;
+    s3_connection_t  *chan;   /* the ssh3 session channel */
+    u_char           *ch_buf; /* the channel parse accumulator */
+    size_t            ch_len;
+    size_t            ch_cap;
+    u_char           *stdin_buf; /* the io bytes awaiting the 94 frames */
+    size_t            stdin_len;
+    size_t            stdin_cap;
+    u_char           *pend_out; /* the session output before the attach */
+    size_t            pend_out_len;
+    size_t            pend_out_cap;
+    u_char           *pend_err; /* the session stderr before the attach */
+    size_t            pend_err_len;
+    size_t            pend_err_cap;
+    unsigned          pend_due_out : 1; /* the flush waits out the reply read */
+    unsigned          pend_due_err : 1;
+    unsigned          close_lag : 1; /* the conns close one tick after the drain */
+    u_char            frame[S3_CLI_CM_FRAME_CAP];
+    size_t            frame_sent;
+    size_t            frame_total;
+    s3_cli_cm_conn_t *control;
+    s3_cli_cm_conn_t *io;
+    s3_cli_cm_conn_t *err;
+};
+
+static unsigned              s3_cli_cm_master;
+static char                  s3_cli_cm_path[256]; /* the pipe name */
+static const char           *s3_cli_cm_op;        /* the -O op, NULL */
+static char                 *s3_cli_cm_exec;      /* the -e command of the slave */
+static s3_ssh3_cm_sessions_t s3_cli_cm_table;
+static s3_cli_cm_run_t       s3_cli_cm_runs[S3_SSH3_CM_SRV_SESSIONS];
+static s3_cli_cm_conn_t     *s3_cli_cm_conns;
+static s3_cli_cm_conn_t     *s3_cli_cm_graveyard; /* the dying conns, the pools die on the tick */
+static s3_cli_cm_conn_t     *s3_cli_cm_cur;       /* the conn whose srv_input runs */
+
+/* the listening pipe: the blocking ConnectNamedPipe lives in its
+ * own accept thread (the sync server shape of the reference mux,
+ * the tick drains the accepted handles); the conn io is the sync
+ * peek/read/write on the tick - the overlapped shape proved flaky
+ * across the mingw builds here */
+
+#define S3_CLI_CM_ACC_QUEUE 8
+
+static HANDLE           s3_cli_cm_listen_h; /* the thread sets, the teardown closes */
+static HANDLE           s3_cli_cm_acc_thread;
+static volatile LONG    s3_cli_cm_acc_run;    /* the thread lifetime flag */
+static HANDLE           s3_cli_cm_acc_armed;  /* the first instance is up */
+static volatile LONG    s3_cli_cm_acc_failed; /* the create error, the master refuses */
+static HANDLE           s3_cli_cm_acc_queue[S3_CLI_CM_ACC_QUEUE];
+static LONG             s3_cli_cm_acc_head;
+static LONG             s3_cli_cm_acc_tail;
+static CRITICAL_SECTION s3_cli_cm_acc_cs;
+static unsigned         s3_cli_cm_acc_cs_init;
+static unsigned         s3_cli_cm_listening;
+static unsigned         s3_cli_cm_stop;
+static unsigned         s3_cli_cm_stop_lag; /* the verdict waits the stop reply */
+static unsigned         s3_cli_cm_pipe_name_called;
+static s3_msec_t        s3_cli_cm_started_ms;
+static s3_msec_t        s3_cli_cm_activity;
+
+/* the slave and the control op: the sequential Call client over the
+ * sync pipe handle, no quic state */
+
 /* the h3 response side (the :status section, the ctrl read handler) */
 
 static s3_h3_parse_headers_t s3_cli_h3parse;
@@ -429,6 +570,26 @@ static void     s3_cli_fwd_udp_chan_read(s3_event_t *ev);
 static void     s3_cli_fwd_udp_pump(s3_cli_fwd_udp_t *uf);
 static void     s3_cli_fwd_datagram(s3_chain_t *data);
 static void     s3_cli_fwd_tick(void);
+static void     s3_cli_agent_accept(s3_connection_t *c);
+static void     s3_cli_agent_read(s3_event_t *ev);
+static void     s3_cli_agent_teardown(const char *why);
+static void     s3_cli_agent_pump(void);
+static void     s3_cli_cm_listen_open(void);
+static void     s3_cli_cm_accepts_drain(void);
+static void     s3_cli_cm_acc_thread_stop(void);
+static void     s3_cli_cm_conn_feed(s3_cli_cm_conn_t *conn, const u_char *data, size_t n);
+static void     s3_cli_cm_conn_flush(s3_cli_cm_conn_t *conn);
+static void     s3_cli_cm_conn_send(s3_cli_cm_conn_t *conn, const u_char *data, size_t n);
+static void     s3_cli_cm_conn_close(s3_cli_cm_conn_t *conn);
+static void     s3_cli_cm_run_finalize(s3_cli_cm_run_t *run, uint64_t code);
+static void s3_cli_cm_run_pend(s3_cli_cm_run_t *run, unsigned err, const u_char *data, size_t n);
+static void s3_cli_cm_run_pend_flush(s3_cli_cm_run_t *run, unsigned err);
+static void s3_cli_cm_run_stdin(s3_cli_cm_run_t *run, const u_char *data, size_t len);
+static void s3_cli_cm_run_send_exit(s3_cli_cm_run_t *run, uint64_t code);
+static void s3_cli_cm_shutdown(void);
+static void s3_cli_cm_tick(void);
+static int  s3_cli_cm_slave_run(void);
+static int  s3_cli_cm_control_op(void);
 
 /*
  * the usage: the stage-A option set (the keys the Go fork shares,
@@ -453,6 +614,19 @@ s3_cli_usage(const char *prog)
             "              accepted connection rides a direct-tcp channel of the\n"
             "              same conversation to the ipv4 target; udp:// likewise\n"
             "              over the datagrams (the bind defaults to 127.0.0.1)\n"
+            "  -X          the agent forwarding: the server-initiated\n"
+            "              agent-connection channels bridge into the local agent\n"
+            "              pipe (SSH_AUTH_SOCK when it names a pipe, the OpenSSH\n"
+            "              for Windows agent pipe otherwise)\n"
+            "  -M          the control master: the control pipe serves the\n"
+            "              slaves and the ops, the sessions ride the same\n"
+            "              connection (the pipe name derives from %%USERPROFILE%%,\n"
+            "              printed at the start)\n"
+            "  -U value    user:pass for the Basic auth, or a \\\\\\\\pipe\\\\name of\n"
+            "              the control master for the slave and the ops\n"
+            "  -e cmd      the slave command: one exec session through the\n"
+            "              control master of -U (no server operand rides)\n"
+            "  -O check|stop|exit  the control op against the -U master\n"
             "  -v          verbose logging\n"
             "  -l lvl      the s3 log level 0..9 or all\n"
             "  -V          version\n"
@@ -1409,6 +1583,15 @@ s3_cli_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
 {
     if ((qs->id & 0x3) == 0x1) {
 
+        if (s3_cli_agent_mode && s3_cli_agent_sc == NULL) {
+
+            /* the server-initiated agent-connection channel: the
+             * bridge accepts it when -X asked for the forwarding */
+
+            s3_cli_agent_accept(c);
+            return;
+        }
+
         (void)s3_quic_cancelable_stream(c);
         (void)s3_quic_shutdown_stream(c, S3_RDWR_SHUTDOWN);
 
@@ -2055,8 +2238,16 @@ s3_cli_fwd_tcp_drop(s3_cli_fwd_tcp_conn_t *fc)
     }
 
     if (fc->chan != NULL) {
-        (void)s3_quic_shutdown_stream(fc->chan, S3_RDWR_SHUTDOWN);
-        s3_close_connection(fc->chan);
+
+        /* the quic stream ops ride the live connection only: the
+         * idle close tears the streams down first, the cleanup of
+         * the dead stream state would deref it */
+
+        if (s3_cli_conn != NULL && s3_quic_get_connection(s3_cli_conn) != NULL) {
+            (void)s3_quic_shutdown_stream(fc->chan, S3_RDWR_SHUTDOWN);
+            s3_close_connection(fc->chan);
+        }
+
         fc->chan = NULL;
     }
 
@@ -2152,24 +2343,24 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
         fc->frame_sent == fc->frame_total) {
         (void)s3_quic_shutdown_stream(fc->chan, S3_WRITE_SHUTDOWN);
         fc->chan_fin_sent = 1;
-}
-
-/* the parked payload into the local socket */
-
-while (!fc->dead && fc->to_local_len > 0) {
-
-    int n = (int)send(fc->fd, (const char *)fc->to_local, (int)fc->to_local_len, 0);
-
-    if (n > 0) {
-        memmove(fc->to_local, fc->to_local + n, fc->to_local_len - (size_t)n);
-        fc->to_local_len -= (size_t)n;
-        continue;
     }
 
-    /* the local socket still blocks, the tick retries */
+    /* the parked payload into the local socket */
 
-    break;
-}
+    while (!fc->dead && fc->to_local_len > 0) {
+
+        int n = (int)send(fc->fd, (const char *)fc->to_local, (int)fc->to_local_len, 0);
+
+        if (n > 0) {
+            memmove(fc->to_local, fc->to_local + n, fc->to_local_len - (size_t)n);
+            fc->to_local_len -= (size_t)n;
+            continue;
+        }
+
+        /* the local socket still blocks, the tick retries */
+
+        break;
+    }
 }
 
 /*
@@ -2927,6 +3118,2516 @@ s3_cli_fwd_tick(void)
     }
 }
 
+/* === the agent bridge (-X): the server-initiated agent-connection
+ * channel bridges into the local agent pipe === */
+
+static void
+s3_cli_agent_teardown(const char *why)
+{
+    if (!s3_cli_agent_bridged && s3_cli_agent_sc == NULL) {
+        return;
+    }
+
+    s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "the agent bridge down: %s", why);
+
+    if (s3_cli_agent_pipe != NULL && s3_cli_agent_pipe != INVALID_HANDLE_VALUE) {
+        CancelIoEx(s3_cli_agent_pipe, NULL);
+        CloseHandle(s3_cli_agent_pipe);
+        s3_cli_agent_pipe = NULL;
+    }
+
+    if (s3_cli_agent_sc != NULL) {
+        (void)s3_quic_shutdown_stream(s3_cli_agent_sc, S3_RDWR_SHUTDOWN);
+        s3_close_connection(s3_cli_agent_sc);
+        s3_cli_agent_sc = NULL;
+    }
+
+    s3_cli_agent_bridged = 0;
+    s3_cli_agent_in_len = 0;
+    s3_cli_agent_frame_sent = s3_cli_agent_frame_total = 0;
+    s3_cli_agent_hdr_len = 0;
+}
+
+/* the server-initiated bidi stream of the agent channel: the first
+ * one bridges, the unexpected ones shut down */
+
+static void
+s3_cli_agent_accept(s3_connection_t *c)
+{
+    c->read->handler = s3_cli_agent_read;
+    c->read->data = c;
+    c->read->active = 1;
+
+    /* the header may have landed before the arming */
+
+    if (c->read->ready) {
+        c->read->handler(c->read);
+    }
+}
+
+static s3_int_t
+s3_cli_agent_in_append(const u_char *data, size_t n)
+{
+    if (s3_cli_agent_in_len + n > s3_cli_agent_in_cap) {
+
+        size_t  cap = s3_cli_agent_in_cap ? s3_cli_agent_in_cap : 16384;
+        u_char *grown;
+
+        while (cap < s3_cli_agent_in_len + n) {
+            cap += 16384;
+        }
+
+        grown = realloc(s3_cli_agent_in, cap);
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        s3_cli_agent_in = grown;
+        s3_cli_agent_in_cap = cap;
+    }
+
+    memcpy(s3_cli_agent_in + s3_cli_agent_in_len, data, n);
+    s3_cli_agent_in_len += n;
+
+    return S3_OK;
+}
+
+/* the header phase of the accepted channel: the 90 checks, the 91
+ * answers, the local agent pipe dials, the bridge lives */
+
+static void
+s3_cli_agent_read(s3_event_t *ev)
+{
+    s3_connection_t *sc = ev->data;
+    const u_char    *pos, *end;
+    ssize_t          n;
+    const char      *sock;
+    wchar_t          wpipe[256];
+    int              wn;
+
+    if (s3_cli_agent_bridged) {
+        return; /* the pump rides the tick */
+    }
+
+    n = sc->recv(sc, s3_cli_agent_hdr + s3_cli_agent_hdr_len,
+                 sizeof(s3_cli_agent_hdr) - s3_cli_agent_hdr_len);
+
+    if (n == (ssize_t)S3_AGAIN) {
+        return;
+    }
+
+    if (n <= 0) {
+        s3_cli_agent_teardown("closed before the header");
+        return;
+    }
+
+    s3_cli_agent_hdr_len += (size_t)n;
+
+    pos = s3_cli_agent_hdr;
+    end = s3_cli_agent_hdr + s3_cli_agent_hdr_len;
+
+    {
+        s3_ssh3_channel_t hdr;
+
+        if (s3_ssh3_channel_parse_header(&pos, end, &hdr) != S3_OK) {
+
+            if (s3_cli_agent_hdr_len == sizeof(s3_cli_agent_hdr)) {
+                s3_cli_agent_teardown("bad agent channel header");
+            }
+
+            return; /* the header tail waits for the next recv */
+        }
+
+        if (hdr.conversation_stream_id != s3_cli_conv_id ||
+            hdr.type.len != strlen(S3_SSH3_CHANNEL_TYPE_AGENT) ||
+            memcmp(hdr.type.data, S3_SSH3_CHANNEL_TYPE_AGENT, hdr.type.len) != 0) {
+            s3_cli_agent_teardown("unexpected server channel");
+            return;
+        }
+    }
+
+    /* the 91 with our maxPacketSize, the shape of the server */
+
+    {
+        s3_ssh3_msg_open_confirmation_t conf;
+        u_char                          out[32];
+        u_char                         *p;
+        size_t                          total;
+        ssize_t                         m;
+
+        memset(&conf, 0, sizeof(conf));
+        conf.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+
+        p = out;
+        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+        p = (u_char *)s3_ssh3_msg_encode_open_confirmation(p, &conf);
+
+        total = (size_t)(p - out);
+
+        m = s3_quic_stream_send(sc, out, total);
+
+        if (m != (ssize_t)total) {
+            s3_cli_agent_teardown("confirmation send failed");
+            return;
+        }
+    }
+
+    /* the local half: the SSH_AUTH_SOCK when it names a pipe, the
+     * OpenSSH for Windows agent pipe otherwise */
+
+    sock = getenv("SSH_AUTH_SOCK");
+
+    if (sock != NULL && strncmp(sock, "\\\\", 2) == 0) {
+        wn = MultiByteToWideChar(CP_UTF8, 0, sock, -1, wpipe, 256);
+    } else {
+        wn = MultiByteToWideChar(CP_UTF8, 0, S3_CLI_AGENT_PIPE_DEFAULT, -1, wpipe, 256);
+    }
+
+    if (wn <= 0) {
+        s3_cli_agent_teardown("the agent pipe name failed");
+        return;
+    }
+
+    s3_cli_agent_pipe =
+        CreateFileW(wpipe, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+    if (s3_cli_agent_pipe == INVALID_HANDLE_VALUE) {
+        s3_cli_agent_pipe = NULL;
+        s3_cli_agent_teardown("the local agent pipe is not open");
+        return;
+    }
+
+    s3_cli_agent_sc = sc;
+    s3_cli_agent_bridged = 1;
+
+    printf("S3CLI-AGENT-BRIDGE\n");
+    fflush(stdout);
+
+    /* the header tail rides the channel parse (the 91 and the 94
+     * of the bridge stream) */
+
+    if (end - pos > 0) {
+
+        size_t tail = (size_t)(end - pos);
+
+        if (tail > s3_cli_agent_chacc_cap) {
+
+            u_char *grown = realloc(s3_cli_agent_chacc, tail);
+
+            if (grown == NULL) {
+                s3_cli_agent_teardown("the agent buffer growth failed");
+                return;
+            }
+
+            s3_cli_agent_chacc = grown;
+            s3_cli_agent_chacc_cap = tail;
+        }
+
+        memcpy(s3_cli_agent_chacc, pos, tail);
+        s3_cli_agent_chacc_len = tail;
+    }
+
+    s3_cli_agent_pump();
+}
+
+/* both directions: the channel payloads ride the pipe, the pipe
+ * replies wrap into the 94 frames (the tail parks) */
+
+static void
+s3_cli_agent_pump(void)
+{
+    u_char buf[16384];
+    DWORD  avail = 0, got = 0;
+
+    if (!s3_cli_agent_bridged || s3_cli_agent_sc == NULL) {
+        return;
+    }
+
+    for (;;) {
+
+        ssize_t n;
+
+        if (s3_cli_agent_chacc_len == s3_cli_agent_chacc_cap) {
+
+            size_t  cap;
+            u_char *grown;
+
+            cap = s3_cli_agent_chacc_cap + 16384;
+            grown = realloc(s3_cli_agent_chacc, cap);
+
+            if (grown == NULL) {
+                s3_cli_agent_teardown("the agent buffer growth failed");
+                return;
+            }
+
+            s3_cli_agent_chacc = grown;
+            s3_cli_agent_chacc_cap = cap;
+        }
+
+        n = s3_cli_agent_sc->recv(s3_cli_agent_sc, s3_cli_agent_chacc + s3_cli_agent_chacc_len,
+                                  s3_cli_agent_chacc_cap - s3_cli_agent_chacc_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            break;
+        }
+
+        if (n <= 0) {
+            s3_cli_agent_teardown("the agent channel closed");
+            return;
+        }
+
+        s3_cli_agent_chacc_len += (size_t)n;
+
+        {
+            const u_char *pos = s3_cli_agent_chacc;
+            const u_char *end = s3_cli_agent_chacc + s3_cli_agent_chacc_len;
+
+            while (pos < end) {
+
+                const u_char *msg = pos;
+                uint64_t      type;
+
+                if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                    s3_ssh3_msg_open_confirmation_t conf;
+
+                    if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                    s3_ssh3_msg_data_t data;
+
+                    if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    /* the probe bytes ride the pipe */
+
+                    if (data.data.len > 0 &&
+                        s3_cli_agent_in_append(data.data.data, data.data.len) != S3_OK) {
+                        s3_cli_agent_teardown("the agent buffer growth failed");
+                        return;
+                    }
+
+                    continue;
+                }
+
+                s3_cli_agent_teardown("the agent unexpected message");
+                return;
+            }
+
+            s3_cli_agent_chacc_len = (size_t)(end - pos);
+            memmove(s3_cli_agent_chacc, pos, s3_cli_agent_chacc_len);
+        }
+    }
+
+    while (s3_cli_agent_in_len > 0) {
+
+        DWORD put = 0;
+
+        if (!WriteFile(s3_cli_agent_pipe, s3_cli_agent_in, (DWORD)s3_cli_agent_in_len, &put,
+                       NULL) ||
+            put == 0) {
+            s3_cli_agent_teardown("the agent pipe write failed");
+            return;
+        }
+
+        memmove(s3_cli_agent_in, s3_cli_agent_in + put, s3_cli_agent_in_len - put);
+        s3_cli_agent_in_len -= put;
+    }
+
+    if (!PeekNamedPipe(s3_cli_agent_pipe, NULL, 0, NULL, &avail, NULL)) {
+        s3_cli_agent_teardown("the agent pipe peek failed");
+        return;
+    }
+
+    while (avail > 0) {
+
+        ssize_t m;
+        size_t  chunk;
+
+        if (avail > sizeof(buf)) {
+            avail = sizeof(buf);
+        }
+
+        if (!ReadFile(s3_cli_agent_pipe, buf, avail, &got, NULL) || got == 0) {
+            s3_cli_agent_teardown("the agent pipe read failed");
+            return;
+        }
+
+        /* the reply bytes accumulate into the 94 frames under the
+         * channel maxPacketSize, a partial send parks the tail */
+
+        {
+            size_t  piece = sizeof(s3_cli_agent_acc) - s3_cli_agent_acc_len;
+            u_char *p;
+
+            if (piece > got) {
+                piece = got;
+            }
+
+            memcpy(s3_cli_agent_acc + s3_cli_agent_acc_len, buf, piece);
+            s3_cli_agent_acc_len += piece;
+
+            /* the byte stream sends whatever accumulated: a partial
+             * frame is the wire shape, the wait would strand the
+             * short answers of the agent */
+
+            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > s3_cli_agent_acc_len) {
+                chunk = s3_cli_agent_acc_len;
+            }
+
+            p = s3_cli_agent_frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+            memcpy(p, s3_cli_agent_acc, chunk);
+
+            s3_cli_agent_frame_total = (size_t)(p - s3_cli_agent_frame) + chunk;
+            s3_cli_agent_frame_sent = 0;
+
+            memmove(s3_cli_agent_acc, s3_cli_agent_acc + chunk, s3_cli_agent_acc_len - chunk);
+            s3_cli_agent_acc_len -= chunk;
+        }
+
+        m = s3_quic_stream_send(s3_cli_agent_sc, s3_cli_agent_frame + s3_cli_agent_frame_sent,
+                                s3_cli_agent_frame_total - s3_cli_agent_frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return; /* the tick retries the parked tail */
+        }
+
+        if (m <= 0) {
+            s3_cli_agent_teardown("the agent channel send failed");
+            return;
+        }
+
+        s3_cli_agent_frame_sent += (size_t)m;
+
+        if (!PeekNamedPipe(s3_cli_agent_pipe, NULL, 0, NULL, &avail, NULL)) {
+            s3_cli_agent_teardown("the agent pipe peek failed");
+            return;
+        }
+    }
+}
+
+/* === the ControlMaster (-M): the control plane rides the named
+ * pipe instances, the session channels ride the shared connection === */
+
+static void
+s3_cli_cm_pipe_name(char *out, size_t size)
+{
+    const char *home = getenv("USERPROFILE");
+    const char *s = home != NULL ? home : "ssh3";
+    uint64_t    h = 0xcbf29ce484222325ULL;
+
+    while (*s != '\0') {
+        h ^= (u_char)*s++;
+        h *= 0x100000001b3ULL;
+    }
+
+    snprintf(out, size, "\\\\.\\pipe\\ssh3-cm-%08x%08x", (unsigned)(h >> 32), (unsigned)h);
+}
+
+/* the accept thread: the blocking ConnectNamedPipe loop, the
+ * connected handles queue for the tick (the sync server shape; a
+ * client that connected between the create and the connect answers
+ * ERROR_PIPE_CONNECTED and rides the queue the same way) */
+
+static void
+s3_cli_cm_acc_push(HANDLE h)
+{
+    EnterCriticalSection(&s3_cli_cm_acc_cs);
+
+    if (s3_cli_cm_acc_head - s3_cli_cm_acc_tail < S3_CLI_CM_ACC_QUEUE) {
+        s3_cli_cm_acc_queue[s3_cli_cm_acc_head++ % S3_CLI_CM_ACC_QUEUE] = h;
+
+    } else {
+        CloseHandle(h); /* the queue overflow, the client retries */
+    }
+
+    LeaveCriticalSection(&s3_cli_cm_acc_cs);
+}
+
+static unsigned __stdcall s3_cli_cm_accept_thread(void *arg)
+{
+    wchar_t w[256];
+    int     wn;
+    DWORD   err;
+
+    (void)arg;
+
+    wn = MultiByteToWideChar(CP_UTF8, 0, s3_cli_cm_path, -1, w, 256);
+
+    if (wn <= 0) {
+        s3_cli_cm_acc_failed = 1;
+        SetEvent(s3_cli_cm_acc_armed);
+        return 0;
+    }
+
+    while (s3_cli_cm_acc_run) {
+
+        s3_cli_cm_listen_h =
+            CreateNamedPipeW(w, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                             PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, NULL);
+
+        if (s3_cli_cm_listen_h == INVALID_HANDLE_VALUE) {
+            s3_cli_cm_acc_failed = GetLastError();
+            SetEvent(s3_cli_cm_acc_armed);
+            break;
+        }
+
+        SetEvent(s3_cli_cm_acc_armed); /* the first instance is up */
+
+        if (ConnectNamedPipe(s3_cli_cm_listen_h, NULL)) {
+            s3_cli_cm_acc_push(s3_cli_cm_listen_h);
+
+        } else {
+
+            err = GetLastError();
+
+            if (err == ERROR_PIPE_CONNECTED) {
+                s3_cli_cm_acc_push(s3_cli_cm_listen_h);
+
+            } else if (err == ERROR_OPERATION_ABORTED || !s3_cli_cm_acc_run) {
+                CloseHandle(s3_cli_cm_listen_h);
+                s3_cli_cm_listen_h = INVALID_HANDLE_VALUE;
+                break;
+
+            } else {
+
+                /* the client died between the create and the
+                 * connect: the instance re-arms */
+
+                DisconnectNamedPipe(s3_cli_cm_listen_h);
+                CloseHandle(s3_cli_cm_listen_h);
+                s3_cli_cm_listen_h = INVALID_HANDLE_VALUE;
+            }
+        }
+
+        s3_cli_cm_listen_h = INVALID_HANDLE_VALUE;
+    }
+
+    return 0;
+}
+
+static void
+s3_cli_cm_listen_open(void)
+{
+    if (s3_cli_cm_pipe_name_called == 0) {
+        s3_cli_cm_pipe_name(s3_cli_cm_path, sizeof(s3_cli_cm_path));
+        s3_cli_cm_pipe_name_called = 1;
+    }
+
+    if (s3_cli_cm_acc_cs_init == 0) {
+        InitializeCriticalSection(&s3_cli_cm_acc_cs);
+        s3_cli_cm_acc_cs_init = 1;
+    }
+
+    s3_cli_cm_acc_armed = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+    if (s3_cli_cm_acc_armed == NULL) {
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "the control pipe failed");
+        return;
+    }
+
+    s3_cli_cm_acc_run = 1;
+
+    s3_cli_cm_acc_thread = (HANDLE)_beginthreadex(NULL, 0, s3_cli_cm_accept_thread, NULL, 0, NULL);
+
+    if (s3_cli_cm_acc_thread == NULL) {
+        s3_cli_cm_acc_run = 0;
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "the control pipe failed");
+        return;
+    }
+
+    if (WaitForSingleObject(s3_cli_cm_acc_armed, 5000) != WAIT_OBJECT_0 || s3_cli_cm_acc_failed) {
+
+        if (s3_cli_cm_acc_failed == ERROR_ACCESS_DENIED) {
+            fprintf(stderr, "ssh3: a control master is already running on %s\n", s3_cli_cm_path);
+        } else if (s3_cli_cm_acc_failed) {
+            fprintf(stderr, "ssh3: CreateNamedPipeW(%s) failed (%lu)\n", s3_cli_cm_path,
+                    (unsigned long)s3_cli_cm_acc_failed);
+        } else {
+            fprintf(stderr, "ssh3: the control pipe did not come up\n");
+        }
+
+        s3_cli_cm_acc_run = 0;
+        CancelSynchronousIo(s3_cli_cm_acc_thread);
+        WaitForSingleObject(s3_cli_cm_acc_thread, 2000);
+        s3_cli_rc = S3_CLI_EXIT_ERROR;
+        s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                    "the control pipe failed");
+        return;
+    }
+
+    s3_cli_cm_listening = 1;
+    s3_cli_cm_started_ms = s3_current_msec;
+    s3_cli_cm_activity = s3_current_msec;
+
+    printf("S3CM-MASTER-LISTEN path=%s\n", s3_cli_cm_path);
+    fflush(stdout);
+}
+
+static s3_cli_cm_run_t *
+s3_cli_cm_run_alloc(void)
+{
+    uint32_t i;
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+
+        if (!s3_cli_cm_runs[i].used) {
+            memset(&s3_cli_cm_runs[i], 0, sizeof(s3_cli_cm_runs[i]));
+            s3_cli_cm_runs[i].used = 1;
+
+            return &s3_cli_cm_runs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static s3_cli_cm_run_t *
+s3_cli_cm_run_by_token(const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    uint32_t i;
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+
+        if (s3_cli_cm_runs[i].used &&
+            memcmp(s3_cli_cm_runs[i].token, token, S3_SSH3_CM_TOKEN_LEN) == 0) {
+            return &s3_cli_cm_runs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static s3_cli_cm_run_t *
+s3_cli_cm_run_by_chan(s3_connection_t *chan)
+{
+    uint32_t i;
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+
+        if (s3_cli_cm_runs[i].used && s3_cli_cm_runs[i].chan == chan) {
+            return &s3_cli_cm_runs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static unsigned
+s3_cli_cm_runs_live(void)
+{
+    unsigned n = 0;
+    uint32_t i;
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+        n += s3_cli_cm_runs[i].used && !s3_cli_cm_runs[i].finalized;
+    }
+
+    return n;
+}
+
+/* the accept thread stop: the flag drops, the blocking connect
+ * cancels, the pending instance and the queued handles close (the
+ * pipe name dies with them, no stale file on the pipe shape) */
+
+static void
+s3_cli_cm_acc_thread_stop(void)
+{
+    LONG head, tail;
+
+    if (s3_cli_cm_acc_thread == NULL) {
+        return;
+    }
+
+    s3_cli_cm_acc_run = 0;
+
+    if (s3_cli_cm_listen_h != NULL && s3_cli_cm_listen_h != INVALID_HANDLE_VALUE) {
+        CancelIoEx(s3_cli_cm_listen_h, NULL);
+        DisconnectNamedPipe(s3_cli_cm_listen_h);
+        CloseHandle(s3_cli_cm_listen_h);
+        s3_cli_cm_listen_h = INVALID_HANDLE_VALUE;
+    }
+
+    CancelSynchronousIo(s3_cli_cm_acc_thread);
+    WaitForSingleObject(s3_cli_cm_acc_thread, 2000);
+    CloseHandle(s3_cli_cm_acc_thread);
+    s3_cli_cm_acc_thread = NULL;
+
+    EnterCriticalSection(&s3_cli_cm_acc_cs);
+
+    for (head = s3_cli_cm_acc_head, tail = s3_cli_cm_acc_tail; tail < head; tail++) {
+        CloseHandle(s3_cli_cm_acc_queue[tail % S3_CLI_CM_ACC_QUEUE]);
+    }
+
+    s3_cli_cm_acc_head = s3_cli_cm_acc_tail = 0;
+
+    LeaveCriticalSection(&s3_cli_cm_acc_cs);
+}
+
+/* the master stops: the listening instance drops, the pipe name
+ * dies with the handle (no stale file on the pipe shape) */
+
+static void
+s3_cli_cm_shutdown(void)
+{
+    if (s3_cli_cm_stop) {
+        return;
+    }
+
+    s3_cli_cm_stop = 1;
+
+    s3_cli_cm_acc_thread_stop();
+
+    s3_cli_cm_listening = 0;
+}
+
+static s3_int_t
+s3_cli_cm_out_append(s3_cli_cm_conn_t *conn, const u_char *data, size_t n)
+{
+    u_char *grown;
+    size_t  want;
+
+    if (conn->out_cap - conn->out_len < n) {
+
+        want = conn->out_cap != 0 ? conn->out_cap : S3_CLI_CM_BUF_INIT;
+
+        while (want - conn->out_len < n) {
+            want *= 2;
+        }
+
+        grown = s3_pnalloc(conn->pool, want);
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        if (conn->out_len > 0) {
+            memcpy(grown, conn->out, conn->out_len);
+        }
+
+        conn->out = grown;
+        conn->out_cap = want;
+    }
+
+    if (n > 0) {
+        memcpy(conn->out + conn->out_len, data, n);
+        conn->out_len += n;
+    }
+
+    return S3_OK;
+}
+
+/* the parked replies drain into the sync write (a control-plane
+ * reply is under the pipe buffer, the write completes at once; the
+ * partial send parks the tail for the next tick) */
+
+static void
+s3_cli_cm_conn_flush(s3_cli_cm_conn_t *conn)
+{
+    DWORD put = 0;
+
+    if (conn->dead || conn->out_len == 0) {
+        return;
+    }
+
+    if (!WriteFile(conn->h, conn->out, (DWORD)conn->out_len, &put, NULL) || put == 0) {
+
+        s3_cli_cm_conn_close(conn);
+        return;
+    }
+
+    conn->out_len -= put;
+
+    if (conn->out_len > 0) {
+        memmove(conn->out, conn->out + put, conn->out_len);
+    }
+}
+
+static void
+s3_cli_cm_conn_send(s3_cli_cm_conn_t *conn, const u_char *data, size_t n)
+{
+    if (conn == NULL || conn->dead || n == 0) {
+        return;
+    }
+
+    if (s3_cli_cm_out_append(conn, data, n) != S3_OK) {
+        s3_cli_cm_conn_close(conn);
+        return;
+    }
+
+    s3_cli_cm_conn_flush(conn);
+}
+
+/* the conn close: the run pointers sweep, the handle drops, the
+ * pool lives to the graveyard tick (the callers iterate) */
+
+static void
+s3_cli_cm_conn_close(s3_cli_cm_conn_t *conn)
+{
+    s3_cli_cm_conn_t **link;
+    s3_cli_cm_run_t   *run = conn->run;
+
+    if (conn->dead) {
+        return;
+    }
+
+    conn->dead = 1;
+
+    for (link = &s3_cli_cm_conns; *link != NULL; link = &(*link)->next) {
+
+        if (*link == conn) {
+            *link = conn->next;
+            break;
+        }
+    }
+
+    if (run != NULL) {
+
+        if (run->control == conn) {
+            run->control = NULL;
+
+            if (!run->finalized) {
+
+                /* the slave ended the control conn before the exit
+                 * status: the session slot frees, the bridge closes */
+
+                s3_cli_cm_run_finalize(run, 255);
+            }
+        }
+
+        if (run->io == conn) {
+            run->io = NULL;
+        }
+
+        if (run->err == conn) {
+            run->err = NULL;
+        }
+
+        if (run->finalized && run->control == NULL && run->io == NULL && run->err == NULL) {
+
+            /* the finished run whose conns all left */
+
+            (void)s3_ssh3_cm_sessions_release(&s3_cli_cm_table, run->token);
+            memset(run, 0, sizeof(*run));
+        }
+    }
+
+    if (conn->h != NULL && conn->h != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(conn->h);
+        CloseHandle(conn->h);
+        conn->h = NULL;
+    }
+
+    /* the pool lives to the graveyard sweep of the tick: the srv
+     * under it may be mid-input in the caller's frame */
+
+    conn->pool = NULL;
+
+    if (s3_cli_cm_graveyard == NULL) {
+        s3_cli_cm_graveyard = conn;
+        conn->grave_next = NULL;
+
+    } else {
+        conn->grave_next = s3_cli_cm_graveyard;
+        s3_cli_cm_graveyard = conn;
+    }
+}
+
+/* the peer eof: the half-close semantics of the reference */
+
+static void
+s3_cli_cm_conn_eof(s3_cli_cm_conn_t *conn)
+{
+    if (conn->kind == S3_CLI_CM_CONN_IO && conn->run != NULL && conn->run->bridged) {
+
+        if (conn->run->chan != NULL) {
+            (void)s3_quic_shutdown_stream(conn->run->chan, S3_WRITE_SHUTDOWN);
+
+        } else {
+            s3_cli_cm_conn_close(conn);
+        }
+
+        return;
+    }
+
+    if (conn->kind == S3_CLI_CM_CONN_STDERR && conn->run != NULL) {
+
+        if (conn->run->finalized) {
+            s3_cli_cm_conn_close(conn);
+        }
+
+        /* else: the stderr conn waits for the session end */
+
+        return;
+    }
+
+    s3_cli_cm_conn_close(conn);
+}
+
+/* the stdin direction: the io bytes chunk into the 94 frames, a
+ * partial send parks the tail (the tick retries) */
+
+static void
+s3_cli_cm_run_stdin_pump(s3_cli_cm_run_t *run)
+{
+    u_char *p;
+    size_t  chunk;
+    ssize_t m;
+
+    while (run->stdin_len > 0 || run->frame_sent < run->frame_total) {
+
+        if (run->frame_sent == run->frame_total) {
+
+            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+
+            if (chunk > run->stdin_len) {
+                chunk = run->stdin_len;
+            }
+
+            p = run->frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+            memcpy(p, run->stdin_buf, chunk);
+
+            run->frame_total = (size_t)(p - run->frame) + chunk;
+            run->frame_sent = 0;
+
+            memmove(run->stdin_buf, run->stdin_buf + chunk, run->stdin_len - chunk);
+            run->stdin_len -= chunk;
+        }
+
+        m = s3_quic_stream_send(run->chan, run->frame + run->frame_sent,
+                                run->frame_total - run->frame_sent);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (m <= 0) {
+            s3_cli_cm_run_finalize(run, 255);
+            return;
+        }
+
+        run->frame_sent += (size_t)m;
+    }
+}
+
+static void
+s3_cli_cm_run_stdin(s3_cli_cm_run_t *run, const u_char *data, size_t len)
+{
+    u_char *grown;
+    size_t  cap;
+
+    if (run->stdin_cap - run->stdin_len < len) {
+
+        cap = run->stdin_cap != 0 ? run->stdin_cap : S3_CLI_CM_BUF_INIT;
+
+        while (cap - run->stdin_len < len) {
+            cap *= 2;
+        }
+
+        grown = realloc(run->stdin_buf, cap);
+
+        if (grown == NULL) {
+            s3_cli_cm_run_finalize(run, 255);
+            return;
+        }
+
+        run->stdin_buf = grown;
+        run->stdin_cap = cap;
+    }
+
+    memcpy(run->stdin_buf + run->stdin_len, data, len);
+    run->stdin_len += len;
+
+    s3_cli_cm_run_stdin_pump(run);
+}
+
+/* the exit status of the verdict, queued on the control conn */
+
+/* the pre-attach session bytes: the exec output may beat the slave
+ * attach conns, the buffers flush on the bridge */
+
+static void
+s3_cli_cm_run_pend(s3_cli_cm_run_t *run, unsigned err, const u_char *data, size_t n)
+{
+    u_char **buf = err ? &run->pend_err : &run->pend_out;
+    size_t  *len = err ? &run->pend_err_len : &run->pend_out_len;
+    size_t  *cap = err ? &run->pend_err_cap : &run->pend_out_cap;
+    u_char  *grown;
+    size_t   want;
+
+    if (*cap - *len < n) {
+
+        want = *cap != 0 ? *cap : S3_CLI_CM_BUF_INIT;
+
+        while (want - *len < n) {
+            want *= 2;
+        }
+
+        grown = realloc(*buf, want);
+
+        if (grown == NULL) {
+            s3_cli_cm_run_finalize(run, 255);
+            return;
+        }
+
+        *buf = grown;
+        *cap = want;
+    }
+
+    memcpy(*buf + *len, data, n);
+    *len += n;
+}
+
+static void
+s3_cli_cm_run_pend_flush(s3_cli_cm_run_t *run, unsigned err)
+{
+    u_char          **buf = err ? &run->pend_err : &run->pend_out;
+    size_t           *len = err ? &run->pend_err_len : &run->pend_out_len;
+    s3_cli_cm_conn_t *conn = err ? run->err : run->io;
+
+    if (conn != NULL && *len > 0) {
+        s3_cli_cm_conn_send(conn, *buf, *len);
+    }
+
+    free(*buf);
+    *buf = NULL;
+}
+
+static void
+s3_cli_cm_run_send_exit(s3_cli_cm_run_t *run, uint64_t code)
+{
+    u_char   es[8];
+    u_char   fr[S3_SSH3_CM_HEADER_LEN + sizeof(es)];
+    s3_str_t pl;
+    u_char  *p;
+
+    if (run->control == NULL || run->exit_queued) {
+        return;
+    }
+
+    run->exit_queued = 1;
+
+    pl.data = es;
+    pl.len = sizeof(es);
+
+    (void)s3_ssh3_cm_encode_exit_status(es, code);
+
+    p = fr;
+    p = (u_char *)s3_ssh3_cm_encode_frame(p, S3_SSH3_CM_MSG_EXIT_STATUS, &pl);
+
+    s3_cli_cm_conn_send(run->control, fr, (size_t)(p - fr));
+}
+
+/* the session teardown: the verdict, the slot release, the channel
+ * shut (the attach guards of the reference) */
+
+static void
+s3_cli_cm_run_finalize(s3_cli_cm_run_t *run, uint64_t code)
+{
+    if (run->finalized) {
+        return;
+    }
+
+    run->finalized = 1;
+    run->exit_code = code;
+
+    if (run->bridged) {
+        s3_cli_cm_run_send_exit(run, code);
+        (void)s3_ssh3_cm_sessions_release(&s3_cli_cm_table, run->token);
+    }
+
+    if (run->chan != NULL) {
+
+        /* the quic stream ops ride the live connection only */
+
+        if (s3_cli_conn != NULL && s3_quic_get_connection(s3_cli_conn) != NULL) {
+            (void)s3_quic_shutdown_stream(run->chan, S3_RDWR_SHUTDOWN);
+            s3_close_connection(run->chan);
+        }
+
+        run->chan = NULL;
+    }
+
+    printf("S3CM-MASTER-SESSION-DONE exit=%llu\n", (unsigned long long)code);
+    fflush(stdout);
+
+    if (!run->bridged) {
+
+        /* the attach is still ahead: the run, the token slot and
+         * the control conn live until the bridge arrives or the
+         * slave vanishes (the conn close paths answer both) */
+
+        return;
+    }
+
+    if (run->control != NULL) {
+        s3_cli_cm_conn_close(run->control);
+    }
+
+    if (run->io != NULL) {
+        s3_cli_cm_conn_close(run->io);
+    }
+
+    if (run->err != NULL) {
+        s3_cli_cm_conn_close(run->err);
+    }
+
+    if (run->used && run->finalized && run->control == NULL && run->io == NULL &&
+        run->err == NULL) {
+
+        (void)s3_ssh3_cm_sessions_release(&s3_cli_cm_table, run->token);
+        memset(run, 0, sizeof(*run));
+    }
+}
+
+/* the run channel reader: the 91, the 94 dispatch to the attached
+ * conns, the 98 exit-status request of the server */
+
+static void
+s3_cli_cm_run_read(s3_event_t *ev)
+{
+    s3_connection_t *chan = ev->data;
+    s3_cli_cm_run_t *run = s3_cli_cm_run_by_chan(chan);
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (run == NULL || run->finalized) {
+        /* the tail events of a finished session are noise */
+        return;
+    }
+
+    for (;;) {
+
+        if (run->ch_len == run->ch_cap) {
+
+            size_t  cap;
+            u_char *grown;
+
+            /* the accumulator bound: a full buffer with no complete
+             * frame inside is a peer trickling bytes */
+
+            if (run->ch_cap >= S3_CLI_FWD_PARK_MAX) {
+                s3_cli_cm_run_finalize(run, 255);
+                return;
+            }
+
+            cap = run->ch_cap + 262144;
+
+            grown = realloc(run->ch_buf, cap);
+
+            if (grown == NULL) {
+                s3_cli_cm_run_finalize(run, 255);
+                return;
+            }
+
+            run->ch_buf = grown;
+            run->ch_cap = cap;
+        }
+
+        n = chan->recv(chan, run->ch_buf + run->ch_len, run->ch_cap - run->ch_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n <= 0) {
+
+            /* the server fin before the exit status maps to 255 */
+
+            fprintf(stderr, "ssh3-cm: the run channel %s (n=%d)\n", n == 0 ? "closed" : "errored",
+                    (int)n);
+            s3_cli_cm_run_finalize(run, 255);
+            return;
+        }
+
+        run->ch_len += (size_t)n;
+
+        pos = run->ch_buf;
+        end = run->ch_buf + run->ch_len;
+
+        while (pos < end) {
+
+            uint64_t type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    break;
+                }
+
+                run->ch_confirmed = 1;
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t msg;
+
+                if (!run->ch_confirmed) {
+                    s3_cli_cm_run_finalize(run, 255);
+                    return;
+                }
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &msg) != S3_OK) {
+                    break;
+                }
+
+                /* the session stdout rides the io attachment (the
+                 * pre-attach bytes buffer) */
+
+                if (run->io != NULL) {
+                    s3_cli_cm_conn_send(run->io, msg.data.data, msg.data.len);
+                } else {
+                    s3_cli_cm_run_pend(run, 0, msg.data.data, msg.data.len);
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) {
+
+                s3_ssh3_msg_extended_data_t xmsg;
+
+                if (s3_ssh3_msg_parse_extended_data(&pos, end, &xmsg) != S3_OK) {
+                    break;
+                }
+
+                /* the session stderr rides the stderr attachment
+                 * (the pre-attach bytes buffer) */
+
+                if (run->err != NULL) {
+                    s3_cli_cm_conn_send(run->err, xmsg.data.data, xmsg.data.len);
+                } else {
+                    s3_cli_cm_run_pend(run, 1, xmsg.data.data, xmsg.data.len);
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_REQUEST) {
+
+                s3_ssh3_msg_request_t env;
+                s3_ssh3_request_t     body;
+                const u_char         *bpos;
+                s3_int_t              rc;
+
+                if (s3_ssh3_msg_parse_request_envelope(&pos, end, &env) != S3_OK) {
+
+                    /* a partial envelope, the parse left pos untouched */
+
+                    break;
+                }
+
+                bpos = pos;
+
+                rc = s3_ssh3_request_parse_body(&bpos, end, &env.request_type, &body);
+
+                if (rc == S3_OK) {
+
+                    if (body.kind == S3_SSH3_REQ_EXIT_STATUS) {
+                        s3_cli_cm_run_finalize(run, body.u.exit_status.status);
+                        return;
+                    }
+
+                    /* the request replies without the verdict drain */
+
+                    continue;
+                }
+
+                /* an unknown request type: its body has no length
+                 * prefix, the buffer tail drains */
+
+                pos = end;
+
+                continue;
+            }
+
+            /* the open failure or the unknown message ends the session */
+
+            s3_cli_cm_run_finalize(run, 255);
+
+            return;
+        }
+
+        run->ch_len = (size_t)(end - pos);
+        memmove(run->ch_buf, pos, run->ch_len);
+    }
+}
+
+/* the srv callbacks; the codec dispatch runs inside the feed of the
+ * current connection, s3_cli_cm_cur names it */
+
+static s3_int_t
+s3_cli_cm_cb_open_session(void *ctx, const s3_ssh3_cm_open_session_t *req,
+                          u_char token[S3_SSH3_CM_TOKEN_LEN], const char **err)
+{
+    s3_cli_cm_run_t  *run;
+    s3_connection_t  *chan;
+    s3_ssh3_channel_t hdr;
+    s3_ssh3_request_t exec;
+    u_char            frame[2048];
+    u_char           *p;
+    char              cmd[S3_CLI_CM_CMD_MAX];
+    size_t            cl, total;
+    ssize_t           m;
+    uint32_t          j;
+
+    (void)ctx;
+
+    /* the codec allocs the slot after this callback, the room
+     * checks here */
+
+    if (s3_cli_cm_table.count >= S3_SSH3_CM_SRV_SESSIONS) {
+        *err = "too many sessions";
+
+        return S3_ERROR;
+    }
+
+    if (req->ncommand == 0) {
+        *err = "empty command";
+
+        return S3_ERROR;
+    }
+
+    /* the command list joins with spaces, the reference strings.Join */
+
+    cl = 0;
+
+    for (j = 0; j < req->ncommand; j++) {
+
+        if (cl + req->command[j].len + 2 > sizeof(cmd)) {
+            *err = "command too long";
+
+            return S3_ERROR;
+        }
+
+        memcpy(cmd + cl, req->command[j].data, req->command[j].len);
+        cl += req->command[j].len;
+        cmd[cl++] = ' ';
+    }
+
+    cmd[cl - 1] = '\0';
+
+    run = s3_cli_cm_run_alloc();
+
+    if (run == NULL) {
+        *err = "too many sessions";
+
+        return S3_ERROR;
+    }
+
+    if (RAND_bytes(token, S3_SSH3_CM_TOKEN_LEN) != 1) {
+        *err = "token generation failed";
+        memset(run, 0, sizeof(*run));
+
+        return S3_ERROR;
+    }
+
+    /* the session channel of the shared connection: the header and
+     * the exec request in one send */
+
+    chan = s3_quic_open_stream(s3_cli_conn, 1);
+
+    if (chan == NULL) {
+        *err = "channel open failed";
+        memset(run, 0, sizeof(*run));
+
+        return S3_ERROR;
+    }
+
+    memset(&hdr, 0, sizeof(hdr));
+
+    hdr.conversation_stream_id = s3_cli_conv_id;
+    hdr.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+    hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_SESSION;
+    hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_SESSION);
+
+    memset(&exec, 0, sizeof(exec));
+
+    exec.kind = S3_SSH3_REQ_EXEC;
+    exec.u.exec.command.data = (u_char *)cmd;
+    exec.u.exec.command.len = strlen(cmd);
+
+    p = frame;
+    p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+    p = s3_cli_session_request(p, S3_SSH3_REQ_EXEC, 1, &exec);
+
+    total = (size_t)(p - frame);
+
+    m = s3_quic_stream_send(chan, frame, total);
+
+    if (m != (ssize_t)total) {
+        (void)s3_quic_shutdown_stream(chan, S3_RDWR_SHUTDOWN);
+        *err = "channel send failed";
+        memset(run, 0, sizeof(*run));
+
+        return S3_ERROR;
+    }
+
+    chan->read->handler = s3_cli_cm_run_read;
+    chan->read->data = chan;
+    chan->read->active = 1;
+
+    memcpy(run->token, token, S3_SSH3_CM_TOKEN_LEN);
+    run->chan = chan;
+    run->control = s3_cli_cm_cur;
+
+    if (run->control != NULL) {
+        run->control->run = run;
+        run->control->kind = S3_CLI_CM_CONN_CONTROL;
+    }
+
+    return S3_OK;
+}
+
+static void
+s3_cli_cm_cb_bridge(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    s3_cli_cm_run_t *run = s3_cli_cm_run_by_token(token);
+
+    (void)ctx;
+
+    if (run == NULL) {
+        return;
+    }
+
+    run->bridged = 1;
+
+    if (s3_cli_cm_cur != NULL) {
+        run->io = s3_cli_cm_cur;
+        s3_cli_cm_cur->run = run;
+        s3_cli_cm_cur->kind = S3_CLI_CM_CONN_IO;
+    }
+
+    /* the flush waits out the tick: the slave reads the attach
+     * reply with the serial cli, the raw behind it in one chunk
+     * would kill the parse */
+
+    run->pend_due_out = 1;
+
+    if (run->finalized) {
+
+        /* the verdict beat the attach: the attach replies are on
+         * the wire already, the exit status rides after them, the
+         * run unwinds when the slave conns close */
+
+        s3_cli_cm_run_send_exit(run, run->exit_code);
+    }
+}
+
+static void
+s3_cli_cm_cb_bridge_stderr(void *ctx, const u_char token[S3_SSH3_CM_TOKEN_LEN])
+{
+    s3_cli_cm_run_t *run = s3_cli_cm_run_by_token(token);
+
+    (void)ctx;
+
+    if (run == NULL) {
+        return;
+    }
+
+    if (s3_cli_cm_cur != NULL && s3_cli_cm_cur->run == NULL) {
+        run->err = s3_cli_cm_cur;
+        s3_cli_cm_cur->run = run;
+        s3_cli_cm_cur->kind = S3_CLI_CM_CONN_STDERR;
+    }
+
+    run->pend_due_err = 1;
+
+    if (run->finalized) {
+        s3_cli_cm_run_send_exit(run, run->exit_code);
+    }
+}
+
+static s3_int_t
+s3_cli_cm_cb_status(void *ctx, s3_ssh3_cm_status_t *st)
+{
+    (void)ctx;
+
+    st->path = s3_cli_cm_path;
+    st->pid = (int)GetCurrentProcessId();
+    st->protocol = S3_SSH3_CM_VERSION;
+    st->uptime_s = (double)(s3_current_msec - s3_cli_cm_started_ms) / 1000.0;
+    st->sessions = (int)s3_cli_cm_table.count;
+    st->forwards = 0;
+
+    return S3_OK;
+}
+
+/* the per-conn feed: the codec pumps until the io or the stderr
+ * bridge owns the attachment */
+
+static void
+s3_cli_cm_conn_feed(s3_cli_cm_conn_t *conn, const u_char *data, size_t n)
+{
+    u_char obuf[16384];
+    size_t off = 0;
+
+    while (off < n && !conn->dead) {
+
+        size_t piece = n - off;
+
+        if (piece > sizeof(obuf)) {
+            piece = sizeof(obuf);
+        }
+
+        s3_cli_cm_activity = s3_current_msec;
+
+        if (conn->kind != S3_CLI_CM_CONN_IO || conn->run == NULL || !conn->run->bridged) {
+
+            s3_cli_cm_cur = conn;
+
+            if (s3_ssh3_cm_srv_input(&conn->srv, data + off, piece) != S3_OK) {
+                s3_cli_cm_cur = NULL;
+                s3_cli_cm_conn_close(conn);
+                return;
+            }
+
+            s3_cli_cm_cur = NULL;
+
+            for (;;) {
+
+                ssize_t m = s3_ssh3_cm_srv_output(&conn->srv, obuf, sizeof(obuf));
+
+                if (m <= 0) {
+                    break;
+                }
+
+                s3_cli_cm_conn_send(conn, obuf, (size_t)m);
+
+                if (conn->dead) {
+                    return;
+                }
+            }
+
+            if (s3_ssh3_cm_srv_done(&conn->srv)) {
+
+                if (s3_ssh3_cm_srv_shutdown(&conn->srv)) {
+                    s3_cli_cm_shutdown();
+                }
+
+                /* the reply is on the wire: the close waits a few
+                   ticks, the serial client reads it before the
+                   disconnect */
+
+                conn->close_due = 3;
+
+                return;
+            }
+
+        } else if (conn->run->chan == NULL) {
+
+            /* the verdict beat the attach: the late stdin drops */
+
+        } else {
+
+            /* the bridged io attachment feeds the session stdin */
+
+            s3_cli_cm_run_stdin(conn->run, data + off, piece);
+
+            if (conn->run->finalized) {
+                return;
+            }
+        }
+
+        off += piece;
+    }
+}
+
+/* the new conn of one connected pipe instance */
+
+static void
+s3_cli_cm_conn_new(HANDLE h)
+{
+    static s3_ssh3_cm_srv_cbs_t cbs;
+    s3_pool_t                  *pool;
+    s3_cli_cm_conn_t           *conn;
+
+    if (cbs.open_session == NULL) {
+        cbs.open_session = s3_cli_cm_cb_open_session;
+        cbs.bridge = s3_cli_cm_cb_bridge;
+        cbs.bridge_stderr = s3_cli_cm_cb_bridge_stderr;
+        cbs.status = s3_cli_cm_cb_status;
+    }
+
+    pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (pool == NULL) {
+        CloseHandle(h);
+        return;
+    }
+
+    conn = s3_pcalloc(pool, sizeof(*conn));
+
+    if (conn == NULL) {
+        s3_destroy_pool(pool);
+        CloseHandle(h);
+        return;
+    }
+
+    conn->h = h;
+    conn->pool = pool;
+    conn->kind = S3_CLI_CM_CONN_CONTROL;
+
+    if (s3_ssh3_cm_srv_init(&conn->srv, pool, &s3_cli_cm_table, &cbs, NULL) != S3_OK) {
+        s3_destroy_pool(pool);
+        CloseHandle(h);
+        return;
+    }
+
+    conn->next = s3_cli_cm_conns;
+    s3_cli_cm_conns = conn;
+
+    s3_cli_cm_activity = s3_current_msec;
+}
+
+/* the accepted handles of the accept thread drain into the conns */
+
+static void
+s3_cli_cm_accepts_drain(void)
+{
+    LONG head, tail;
+
+    if (s3_cli_cm_stop) {
+        return;
+    }
+
+    EnterCriticalSection(&s3_cli_cm_acc_cs);
+
+    for (head = s3_cli_cm_acc_head, tail = s3_cli_cm_acc_tail; tail < head; tail++) {
+
+        HANDLE h = s3_cli_cm_acc_queue[tail % S3_CLI_CM_ACC_QUEUE];
+
+        s3_cli_cm_acc_queue[tail % S3_CLI_CM_ACC_QUEUE] = NULL;
+
+        LeaveCriticalSection(&s3_cli_cm_acc_cs);
+
+        s3_cli_cm_conn_new(h);
+
+        EnterCriticalSection(&s3_cli_cm_acc_cs);
+    }
+
+    s3_cli_cm_acc_tail = tail;
+
+    LeaveCriticalSection(&s3_cli_cm_acc_cs);
+}
+
+/* the per-conn tick: the sync peek/read of the arrived bytes, the
+ * reply flush, the shutdown drain */
+
+static void
+s3_cli_cm_conn_tick(s3_cli_cm_conn_t *conn)
+{
+    DWORD avail = 0, got = 0;
+
+    if (conn->dead) {
+        return;
+    }
+
+    if (conn->close_due) {
+
+        /* the done reply drained: the close waits out the counter,
+           the client polls the pipe every tick */
+
+        conn->close_due--;
+
+        if (conn->close_due == 0) {
+            s3_cli_cm_conn_close(conn);
+        }
+
+        return;
+    }
+
+    s3_cli_cm_conn_flush(conn);
+
+    if (conn->dead) {
+        return;
+    }
+
+    if (conn->out_len == 0 && s3_ssh3_cm_srv_shutdown(&conn->srv)) {
+
+        /* the stop reply drained, the master closes with it */
+
+        s3_cli_cm_shutdown();
+        s3_cli_cm_conn_close(conn);
+        return;
+    }
+
+    if (!PeekNamedPipe(conn->h, NULL, 0, NULL, &avail, NULL)) {
+        s3_cli_cm_conn_eof(conn);
+        return;
+    }
+
+    while (avail > 0 && !conn->dead) {
+
+        if (!ReadFile(conn->h, conn->rbuf, sizeof(conn->rbuf), &got, NULL) || got == 0) {
+            s3_cli_cm_conn_eof(conn);
+            return;
+        }
+
+        s3_cli_cm_conn_feed(conn, conn->rbuf, got);
+
+        if (conn->dead) {
+            return;
+        }
+
+        avail -= got;
+
+        if (avail == 0 && !PeekNamedPipe(conn->h, NULL, 0, NULL, &avail, NULL)) {
+            s3_cli_cm_conn_eof(conn);
+            return;
+        }
+    }
+}
+
+/* the master tick: the accept drain, the conn pumps, the idle close
+ * with no live sessions and no control traffic */
+
+static void
+s3_cli_cm_tick(void)
+{
+    uint32_t i;
+
+    s3_cli_cm_accepts_drain();
+
+    if (s3_cli_cm_stop) {
+        return;
+    }
+
+    {
+        s3_cli_cm_conn_t *conn = s3_cli_cm_conns;
+
+        while (conn != NULL) {
+
+            s3_cli_cm_conn_t *next = conn->next;
+
+            s3_cli_cm_conn_tick(conn);
+
+            conn = next;
+        }
+    }
+
+    for (i = 0; i < S3_SSH3_CM_SRV_SESSIONS; i++) {
+
+        s3_cli_cm_run_t *run = &s3_cli_cm_runs[i];
+
+        if (!run->used) {
+            continue;
+        }
+
+        if (run->pend_due_out && run->io != NULL) {
+            run->pend_due_out = 0;
+            s3_cli_cm_run_pend_flush(run, 0);
+        }
+
+        if (run->pend_due_err && run->err != NULL) {
+            run->pend_due_err = 0;
+            s3_cli_cm_run_pend_flush(run, 1);
+        }
+
+        if (run->bridged && !run->finalized &&
+            (run->stdin_len > 0 || run->frame_sent < run->frame_total)) {
+            s3_cli_cm_run_stdin_pump(run);
+        }
+
+        if (run->finalized && run->bridged && run->exit_queued && !run->pend_due_out &&
+            !run->pend_due_err) {
+
+            /* the verdict beat the bridge: the exit status is on the
+               control conn, the pending output drained - one tick of
+               grace for the slave reads, then the conns close and
+               the slave sees the EOFs */
+
+            if (run->close_lag) {
+
+                if (run->control != NULL) {
+                    s3_cli_cm_conn_close(run->control);
+                }
+
+                if (run->io != NULL) {
+                    s3_cli_cm_conn_close(run->io);
+                }
+
+                if (run->err != NULL) {
+                    s3_cli_cm_conn_close(run->err);
+                }
+
+                if (run->used && run->control == NULL && run->io == NULL && run->err == NULL) {
+                    (void)s3_ssh3_cm_sessions_release(&s3_cli_cm_table, run->token);
+                    memset(run, 0, sizeof(*run));
+                }
+
+            } else {
+                run->close_lag = 1;
+            }
+        }
+    }
+
+    /* the graveyard: the dead conns' pools die here, a tick after
+     * the close (the srv frames of the close may still unwind) */
+
+    if (s3_cli_cm_graveyard != NULL) {
+
+        s3_cli_cm_conn_t *grave = s3_cli_cm_graveyard;
+
+        s3_cli_cm_graveyard = NULL;
+
+        while (grave != NULL) {
+
+            s3_cli_cm_conn_t *next_grave = grave->grave_next;
+
+            if (grave->pool != NULL) {
+                s3_destroy_pool(grave->pool);
+            }
+
+            grave = next_grave;
+        }
+    }
+
+    if (s3_cli_cm_runs_live() == 0 && s3_current_msec - s3_cli_cm_activity >= 60000) {
+
+        /* the idle master closes: the clean stop */
+
+        s3_cli_cm_shutdown();
+        s3_cli_verdict = 1;
+        s3_cli_exit_code = 0;
+    }
+}
+
+/* the pipe dial of the slave and the control ops: the wait and the
+ * open, the handle is sync (the sequential client) */
+
+static HANDLE
+s3_cli_cm_dial(const char *path)
+{
+    wchar_t w[256];
+    int     wn;
+
+    wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 256);
+
+    if (wn <= 0) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    for (;;) {
+
+        HANDLE h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+        if (h != INVALID_HANDLE_VALUE) {
+            return h;
+        }
+
+        if (GetLastError() != ERROR_PIPE_BUSY) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        if (!WaitNamedPipeW(w, 2000)) {
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
+/* one sequential Call of the protocol: the frame out, the reply
+ * back (the sync handle, the poll loop of the reference) */
+
+static s3_int_t
+s3_cli_cm_call(HANDLE h, s3_ssh3_cm_cli_t *cli, uint8_t type, const s3_str_t *payload,
+               s3_str_t *reply, unsigned *is_error, s3_msec_t deadline, const char *what)
+{
+    u_char  buf[8192];
+    ssize_t m;
+
+    if (s3_ssh3_cm_cli_call(cli, type, payload) != S3_OK) {
+        fprintf(stderr, "ssh3: %s: the call queue failed\n", what);
+        return S3_ERROR;
+    }
+
+    for (;;) {
+
+        /* the requests drain */
+
+        for (;;) {
+
+            m = s3_ssh3_cm_cli_output(cli, buf, sizeof(buf));
+
+            if (m <= 0) {
+                break;
+            }
+
+            {
+                DWORD put = 0;
+
+                if (!WriteFile(h, buf, (DWORD)m, &put, NULL) || put != (DWORD)m) {
+                    fprintf(stderr, "ssh3: %s: the pipe write failed\n", what);
+                    return S3_ERROR;
+                }
+            }
+        }
+
+        /* the reply poll */
+
+        for (;;) {
+
+            DWORD avail = 0, got = 0;
+
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+                fprintf(stderr, "ssh3: %s: the pipe closed\n", what);
+
+                return S3_ERROR;
+            }
+
+            if (avail == 0) {
+                break;
+            }
+
+            if (avail > sizeof(buf)) {
+                avail = sizeof(buf);
+            }
+
+            if (!ReadFile(h, buf, avail, &got, NULL) || got == 0) {
+                fprintf(stderr, "ssh3: %s: the pipe read failed\n", what);
+                return S3_ERROR;
+            }
+
+            if (s3_ssh3_cm_cli_input(cli, buf, got) != S3_OK) {
+                fprintf(stderr, "ssh3: %s: the protocol input failed\n", what);
+                return S3_ERROR;
+            }
+        }
+
+        {
+            s3_str_t r;
+            unsigned err_flag;
+
+            if (cli->has_reply) {
+
+                /* the reply landed, possibly with the bridge tail of
+                   an attach conn in the same chunk: the violation
+                   flag then names the raw tail (it stays in the pend
+                   for the raw pump), the call itself won */
+
+                if (reply != NULL) {
+                    reply->data = cli->reply;
+                    reply->len = cli->reply_len;
+                }
+
+                if (is_error != NULL) {
+                    *is_error = cli->is_error;
+                }
+
+                return S3_OK;
+            }
+
+            if (s3_ssh3_cm_cli_reply(cli, &r, &err_flag) == S3_OK) {
+
+                if (reply != NULL) {
+                    reply->data = r.data;
+                    reply->len = r.len;
+                }
+
+                if (is_error != NULL) {
+                    *is_error = err_flag;
+                }
+
+                return S3_OK;
+            }
+        }
+
+        if (s3_ssh3_cm_cli_protocol_error(cli)) {
+            fprintf(stderr, "ssh3: %s: the protocol violation\n", what);
+            return S3_ERROR;
+        }
+
+        /* no event loop runs here, the clock ticks by hand */
+
+        s3_time_update();
+
+        if (s3_current_msec >= deadline) {
+            fprintf(stderr, "ssh3: %s: timed out\n", what);
+            return S3_ERROR;
+        }
+
+        Sleep(10);
+    }
+}
+
+/* one attach conn of the slave: the hello and the ATTACH of the
+ * token (stderr first, like the reference) */
+
+static s3_int_t
+s3_cli_cm_attach(HANDLE *h_out, const char *path, const u_char token[S3_SSH3_CM_TOKEN_LEN],
+                 uint8_t kind, s3_msec_t deadline, u_char **leftover, size_t *leftover_len)
+{
+    s3_pool_t       *pool;
+    s3_ssh3_cm_cli_t cli;
+    u_char           enc[S3_SSH3_CM_TOKEN_LEN + 1];
+    s3_str_t         pl, reply;
+    unsigned         is_error;
+    HANDLE           h;
+
+    pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (pool == NULL) {
+        return S3_ERROR;
+    }
+
+    h = s3_cli_cm_dial(path);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ssh3: attach: could not reach the control master\n");
+        s3_destroy_pool(pool);
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_cm_cli_init(&cli, pool) != S3_OK) {
+        CloseHandle(h);
+        s3_destroy_pool(pool);
+        return S3_ERROR;
+    }
+
+    if (s3_cli_cm_call(h, &cli, S3_SSH3_CM_MSG_HELLO, NULL, &reply, &is_error, deadline,
+                       "attach hello") != S3_OK ||
+        is_error) {
+        CloseHandle(h);
+        s3_destroy_pool(pool);
+        return S3_ERROR;
+    }
+
+    memcpy(enc, token, S3_SSH3_CM_TOKEN_LEN);
+    enc[S3_SSH3_CM_TOKEN_LEN] = kind;
+
+    pl.data = enc;
+    pl.len = sizeof(enc);
+
+    if (s3_cli_cm_call(h, &cli, S3_SSH3_CM_MSG_ATTACH, &pl, &reply, &is_error, deadline,
+                       "attach") != S3_OK ||
+        is_error) {
+        fprintf(stderr, "ssh3: attach refused: %.*s\n", is_error ? (int)reply.len : 0,
+                is_error ? (const char *)reply.data : "");
+        CloseHandle(h);
+        s3_destroy_pool(pool);
+        return S3_ERROR;
+    }
+
+    /* the pre-attach session bytes may ride behind the reply (the
+     * master flushes the bridge at once): the cli leftover hands
+     * them to the raw pump */
+
+    *leftover = NULL;
+    *leftover_len = 0;
+
+    if (cli.pend_len > 0) {
+        u_char *copy = malloc(cli.pend_len);
+
+        if (copy != NULL) {
+            memcpy(copy, cli.pend, cli.pend_len);
+            *leftover = copy;
+            *leftover_len = cli.pend_len;
+        }
+    }
+
+    s3_destroy_pool(pool);
+
+    *h_out = h;
+
+    return S3_OK;
+}
+
+/* the slave (-U pipe -e cmd): the control conn carries the session
+ * request and the exit status, the stderr and io attachments bridge
+ * on their own connections (stderr first); the io rides fd 1, the
+ * err rides fd 2 */
+
+static int
+s3_cli_cm_slave_run(void)
+{
+    s3_pool_t       *pool;
+    s3_ssh3_cm_cli_t cli;
+    HANDLE control = INVALID_HANDLE_VALUE, hio = INVALID_HANDLE_VALUE, herr = INVALID_HANDLE_VALUE;
+    s3_ssh3_cm_open_session_t req;
+    s3_str_t                  payload, reply;
+    u_char                   *enc;
+    unsigned                  is_error;
+    u_char                   *out_buf = NULL, *err_buf = NULL;
+    size_t                    out_len = 0, out_cap = 0, err_len = 0, err_cap = 0;
+    s3_msec_t                 deadline;
+    uint64_t                  code = 256;
+    unsigned                  got_exit = 0, io_eof = 0, err_eof = 0;
+    u_char                   *io_left = NULL, *err_left = NULL;
+    size_t                    io_left_len = 0, err_left_len = 0;
+    int                       rc_exit = 1;
+    s3_ssh3_cm_frame_t        fr;
+    s3_int_t                  rc;
+    uintptr_t                 size;
+    static u_char             tin[8192]; /* the control conn frame scanner */
+    static size_t             tin_len;
+
+    pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (pool == NULL) {
+        return 1;
+    }
+
+    /* the sequential run starts cold: the monotonic clock never
+     * ticked here, the deadlines ride the first update */
+
+    s3_time_update();
+
+    deadline = s3_current_msec + 30000;
+
+    control = s3_cli_cm_dial(s3_cli_cm_path);
+
+    if (control == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ssh3: no control master is listening on %s\n", s3_cli_cm_path);
+        goto done;
+    }
+
+    if (s3_ssh3_cm_cli_init(&cli, pool) != S3_OK) {
+        goto done;
+    }
+
+    /* the version handshake */
+
+    if (s3_cli_cm_call(control, &cli, S3_SSH3_CM_MSG_HELLO, NULL, &reply, &is_error, deadline,
+                       "hello") != S3_OK ||
+        is_error) {
+        fprintf(stderr, "ssh3: the peer on %s is not a control master\n", s3_cli_cm_path);
+        goto done;
+    }
+
+    /* the session request: one command string, no env, no agent */
+
+    memset(&req, 0, sizeof(req));
+
+    req.ncommand = 1;
+    req.command[0].data = (u_char *)s3_cli_cm_exec;
+    req.command[0].len = strlen(s3_cli_cm_exec);
+
+    size = s3_ssh3_cm_encode_open_session(NULL, &req);
+    enc = s3_pnalloc(pool, size);
+
+    if (enc == NULL) {
+        goto done;
+    }
+
+    (void)s3_ssh3_cm_encode_open_session(enc, &req);
+
+    payload.data = enc;
+    payload.len = size;
+
+    if (s3_cli_cm_call(control, &cli, S3_SSH3_CM_MSG_OPEN_SESSION, &payload, &reply, &is_error,
+                       deadline, "open_session") != S3_OK) {
+        goto done;
+    }
+
+    if (is_error) {
+        fprintf(stderr, "ssh3: session refused: %.*s\n", (int)reply.len, (const char *)reply.data);
+        goto done;
+    }
+
+    if (reply.len != S3_SSH3_CM_TOKEN_LEN) {
+        fprintf(stderr, "ssh3: malformed session token reply (%zu bytes)\n", reply.len);
+        goto done;
+    }
+
+    /* the stderr stream attaches before the io stream (the
+     * reference order) */
+
+    if (s3_cli_cm_attach(&herr, s3_cli_cm_path, reply.data, S3_SSH3_CM_STREAM_STDERR, deadline,
+                         &err_left, &err_left_len) != S3_OK ||
+        s3_cli_cm_attach(&hio, s3_cli_cm_path, reply.data, S3_SSH3_CM_STREAM_IO, deadline, &io_left,
+                         &io_left_len) != S3_OK) {
+        goto done;
+    }
+
+    /* the pre-read leftovers of the attach conns (the master may
+     * flush the bridge behind the attach reply) */
+
+    if (io_left_len > 0) {
+        out_buf = realloc(out_buf, io_left_len);
+        memcpy(out_buf, io_left, io_left_len);
+        out_len = io_left_len;
+        out_cap = io_left_len;
+        free(io_left);
+    }
+
+    if (err_left_len > 0) {
+        err_buf = realloc(err_buf, err_left_len);
+        memcpy(err_buf, err_left, err_left_len);
+        err_len = err_left_len;
+        err_cap = err_left_len;
+        free(err_left);
+    }
+
+    /* the control conn tail: the frames that rode behind the
+       open_session reply stay in the cli pend, the exit scanner
+       takes them before the pipe reads */
+
+    if (cli.pend_len > 0 && cli.pend_len <= sizeof(tin)) {
+        memcpy(tin + tin_len, cli.pend, cli.pend_len);
+        tin_len += cli.pend_len;
+
+        {
+            const u_char *scan2 = tin;
+            const u_char *end2 = tin + tin_len;
+
+            while (scan2 < end2) {
+
+                rc = s3_ssh3_cm_frame(&scan2, end2, &fr);
+
+                if (rc == S3_AGAIN) {
+                    break;
+                }
+
+                if (rc != S3_OK) {
+                    goto done;
+                }
+
+                if (fr.type == S3_SSH3_CM_MSG_EXIT_STATUS &&
+                    s3_ssh3_cm_decode_exit_status(&fr.payload, &code) == S3_OK) {
+                    got_exit = 1;
+                }
+            }
+
+            tin_len = (size_t)(end2 - scan2);
+            memmove(tin, scan2, tin_len);
+        }
+    }
+
+    while (!got_exit || !io_eof || !err_eof) {
+
+        /* no event loop runs here, the clock ticks by hand */
+
+        s3_time_update();
+
+        if (s3_current_msec >= deadline) {
+            fprintf(stderr, "ssh3: slave timed out\n");
+            goto done;
+        }
+
+        /* the control conn: the exit status of the bridge */
+
+        if (!got_exit) {
+
+            DWORD avail = 0, got = 0;
+
+            if (PeekNamedPipe(control, NULL, 0, NULL, &avail, NULL)) {
+
+                while (avail > 0) {
+
+                    u_char buf[8192];
+
+                    if (avail > sizeof(buf)) {
+                        avail = sizeof(buf);
+                    }
+
+                    if (!ReadFile(control, buf, avail, &got, NULL) || got == 0) {
+                        code = 255;
+                        got_exit = 1;
+                        break;
+                    }
+
+                    /* the session tail: the exit status frame */
+
+                    {
+                        const u_char *scan2, *end2;
+
+                        if (tin_len + got <= sizeof(tin)) {
+                            memcpy(tin + tin_len, buf, got);
+                            tin_len += got;
+                        }
+
+                        scan2 = tin;
+                        end2 = tin + tin_len;
+
+                        while (scan2 < end2) {
+
+                            rc = s3_ssh3_cm_frame(&scan2, end2, &fr);
+
+                            if (rc == S3_AGAIN) {
+                                break;
+                            }
+
+                            if (rc != S3_OK) {
+                                goto done;
+                            }
+
+                            if (fr.type == S3_SSH3_CM_MSG_EXIT_STATUS &&
+                                s3_ssh3_cm_decode_exit_status(&fr.payload, &code) == S3_OK) {
+                                got_exit = 1;
+                            }
+                        }
+
+                        tin_len = (size_t)(end2 - scan2);
+                        memmove(tin, scan2, tin_len);
+                    }
+
+                    if (PeekNamedPipe(control, NULL, 0, NULL, &avail, NULL) == 0) {
+                        code = 255;
+                        got_exit = 1;
+                        break;
+                    }
+                }
+
+            } else {
+                code = 255;
+                got_exit = 1;
+            }
+        }
+
+        /* the io and err conns: the session streams */
+
+        {
+            struct {
+                HANDLE    h;
+                unsigned *eof;
+                u_char  **buf;
+                size_t   *len;
+                size_t   *cap;
+                int       fd;
+            } sides[2];
+
+            unsigned k;
+
+            sides[0].h = hio;
+            sides[0].eof = &io_eof;
+            sides[0].buf = &out_buf;
+            sides[0].len = &out_len;
+            sides[0].cap = &out_cap;
+            sides[0].fd = 1;
+
+            sides[1].h = herr;
+            sides[1].eof = &err_eof;
+            sides[1].buf = &err_buf;
+            sides[1].len = &err_len;
+            sides[1].cap = &err_cap;
+            sides[1].fd = 2;
+
+            for (k = 0; k < 2; k++) {
+
+                DWORD avail = 0, got = 0;
+
+                if (*sides[k].eof) {
+                    continue;
+                }
+
+                if (!PeekNamedPipe(sides[k].h, NULL, 0, NULL, &avail, NULL)) {
+                    *sides[k].eof = 1;
+                    continue;
+                }
+
+                while (avail > 0) {
+
+                    u_char sbuf[16384];
+
+                    if (avail > sizeof(sbuf)) {
+                        avail = sizeof(sbuf);
+                    }
+
+                    if (!ReadFile(sides[k].h, sbuf, avail, &got, NULL) || got == 0) {
+                        *sides[k].eof = 1;
+                        break;
+                    }
+
+                    /* the stream bytes grow the side accum */
+
+                    {
+                        u_char *grown;
+                        size_t  want = *sides[k].cap != 0 ? *sides[k].cap : S3_CLI_CM_BUF_INIT;
+
+                        while (want - *sides[k].len < got) {
+                            want *= 2;
+                        }
+
+                        grown = realloc(*sides[k].buf, want);
+
+                        if (grown == NULL) {
+                            goto done;
+                        }
+
+                        *sides[k].buf = grown;
+                        *sides[k].cap = want;
+                    }
+
+                    memcpy(*sides[k].buf + *sides[k].len, sbuf, got);
+                    *sides[k].len += got;
+
+                    if (PeekNamedPipe(sides[k].h, NULL, 0, NULL, &avail, NULL) == 0) {
+                        *sides[k].eof = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!got_exit || !io_eof || !err_eof) {
+            Sleep(5);
+        }
+    }
+
+    /* the session verdict: the io to fd 1, the err to fd 2 */
+
+    if (out_len > 0) {
+        DWORD put = 0;
+
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), out_buf, (DWORD)out_len, &put, NULL);
+    }
+
+    if (err_len > 0) {
+        DWORD put = 0;
+
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), err_buf, (DWORD)err_len, &put, NULL);
+    }
+
+    rc_exit = (code == 0) ? 0 : (int)(code & 0xff);
+
+    printf("S3CM-SLAVE-DONE exit=%llu\n", (unsigned long long)code);
+    fflush(stdout);
+
+done:
+
+    if (control != INVALID_HANDLE_VALUE) {
+        CloseHandle(control);
+    }
+
+    if (hio != INVALID_HANDLE_VALUE) {
+        CloseHandle(hio);
+    }
+
+    if (herr != INVALID_HANDLE_VALUE) {
+        CloseHandle(herr);
+    }
+
+    free(out_buf);
+    free(err_buf);
+    s3_destroy_pool(pool);
+
+    return rc_exit;
+}
+
+/* the control ops (-O check|stop|exit): the sequential client, the
+ * check prints the status JSON, the stop/exit drain the reply */
+
+static int
+s3_cli_cm_control_op(void)
+{
+    s3_pool_t       *pool;
+    s3_ssh3_cm_cli_t cli;
+    HANDLE           h;
+    s3_str_t         op, reply;
+    unsigned         is_error;
+    s3_msec_t        deadline;
+    int              rc = 1;
+
+    pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (pool == NULL) {
+        return 1;
+    }
+
+    /* the sequential run starts cold: the monotonic clock never
+     * ticked here, the deadlines ride the first update */
+
+    s3_time_update();
+
+    deadline = s3_current_msec + 10000;
+
+    h = s3_cli_cm_dial(s3_cli_cm_path);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ssh3: no control master is listening on %s\n", s3_cli_cm_path);
+        s3_destroy_pool(pool);
+        return 1;
+    }
+
+    if (s3_ssh3_cm_cli_init(&cli, pool) != S3_OK) {
+        s3_destroy_pool(pool);
+        return 1;
+    }
+
+    if (s3_cli_cm_call(h, &cli, S3_SSH3_CM_MSG_HELLO, NULL, &reply, &is_error, deadline, "hello") !=
+            S3_OK ||
+        is_error) {
+        s3_destroy_pool(pool);
+        return 1;
+    }
+
+    op.data = (u_char *)s3_cli_cm_op;
+    op.len = strlen(s3_cli_cm_op);
+
+    {
+        /* the wire payload: the u32 length plus the op name */
+
+        u_char   *enc;
+        uintptr_t n = s3_ssh3_cm_encode_control_op(NULL, &op);
+        s3_str_t  pl;
+
+        enc = s3_pnalloc(pool, n);
+
+        if (enc == NULL) {
+            s3_destroy_pool(pool);
+            return 1;
+        }
+
+        (void)s3_ssh3_cm_encode_control_op(enc, &op);
+
+        pl.data = enc;
+        pl.len = n;
+
+        if (s3_cli_cm_call(h, &cli, S3_SSH3_CM_MSG_CONTROL_OP, &pl, &reply, &is_error, deadline,
+                           s3_cli_cm_op) != S3_OK) {
+            s3_destroy_pool(pool);
+            return 1;
+        }
+    }
+
+    if (is_error) {
+        fprintf(stderr, "ssh3: %s refused: %.*s\n", s3_cli_cm_op, (int)reply.len,
+                (const char *)reply.data);
+
+    } else {
+        printf("%.*s\n", (int)reply.len, (const char *)reply.data);
+        rc = 0;
+    }
+
+    CloseHandle(h);
+    s3_destroy_pool(pool);
+
+    return rc;
+}
+
 /*
  * the pump tick of the session and of the sftp run: one timer event
  * on the connection pool, the handler re-arms itself
@@ -3149,6 +5850,36 @@ s3_cli_tick_handler(s3_event_t *ev)
         return;
     }
 
+    if (s3_cli_cm_master) {
+
+        /* the control master run: the accept poll and the conn
+         * pumps ride the tick, the stop and the idle close set the
+         * verdict */
+
+        s3_cli_cm_tick();
+
+        if (s3_cli_cm_stop && !s3_cli_verdict) {
+
+            /* the stop op reply is on the wire: the master lives a
+               few ticks more, the serial stop client reads it
+               before the process exit closes the pipe */
+
+            if (s3_cli_cm_stop_lag == 0) {
+                s3_cli_cm_stop_lag = 4;
+
+            } else if (--s3_cli_cm_stop_lag == 0) {
+                s3_cli_verdict = 1;
+                s3_cli_exit_code = 0;
+            }
+        }
+
+        if (!s3_cli_stop && !s3_cli_verdict) {
+            s3_event_add_timer(ev, S3_CLI_CM_TICK_MS);
+        }
+
+        return;
+    }
+
     if (s3_cli_sftp_mode) {
 
         /* the sftp run: the pump rides the tick (the window reopens
@@ -3172,6 +5903,12 @@ s3_cli_tick_handler(s3_event_t *ev)
 
     if (s3_cli_chan == NULL) {
         return;
+    }
+
+    /* the agent bridge pump rides the session tick */
+
+    if (s3_cli_agent_bridged) {
+        s3_cli_agent_pump();
     }
 
     /* the parked tail first: the window may have opened */
@@ -3301,7 +6038,7 @@ main(int argc, char **argv)
     s3_cli_log.fd = S3_INVALID_FILE;
     s3_cli_log.log_level = S3_LOG_WARN;
 
-    while ((opt = getopt(argc, argv, "i:U:J:L:rvl:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:U:J:L:rMl:e:O:XVh")) != -1) {
 
         switch (opt) {
 
@@ -3312,32 +6049,75 @@ main(int argc, char **argv)
 
         case 'U': {
 
-            const char *sep = strchr(optarg, ':');
-            size_t      ulen = strlen(optarg);
+            /* the value shape decides: the backslash head names the
+             * control master pipe (the -U of the slave and of the
+             * -O ops), anything else is the Basic user:pass */
 
-            if (sep == NULL || ulen > 300) {
-                fprintf(stderr, "ssh3: -U wants user:pass\n");
-                return S3_CLI_EXIT_ERROR;
+            if (optarg[0] == '\\' && optarg[1] == '\\') {
+
+                if (strlen(optarg) >= sizeof(s3_cli_cm_path)) {
+                    fprintf(stderr, "ssh3: -U control path is too long\n");
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                snprintf(s3_cli_cm_path, sizeof(s3_cli_cm_path), "%s", optarg);
+                s3_cli_cm_pipe_name_called = 1;
+
+                break;
             }
 
-            memcpy(s3_cli_basic, "Basic ", sizeof("Basic ") - 1);
-            s3_cli_b64std((const u_char *)optarg, ulen, s3_cli_basic + sizeof("Basic ") - 1);
+            {
 
-            /* the username before the colon feeds the ?user= target */
+                const char *sep = strchr(optarg, ':');
+                size_t      ulen = strlen(optarg);
 
-            if ((size_t)(sep - optarg) >= sizeof(s3_cli_user)) {
-                fprintf(stderr, "ssh3: -U user is too long\n");
-                return S3_CLI_EXIT_ERROR;
+                if (sep == NULL || ulen > 300) {
+                    fprintf(stderr, "ssh3: -U wants user:pass\n");
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                memcpy(s3_cli_basic, "Basic ", sizeof("Basic ") - 1);
+                s3_cli_b64std((const u_char *)optarg, ulen, s3_cli_basic + sizeof("Basic ") - 1);
+
+                /* the username before the colon feeds the ?user= target */
+
+                if ((size_t)(sep - optarg) >= sizeof(s3_cli_user)) {
+                    fprintf(stderr, "ssh3: -U user is too long\n");
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                memcpy(s3_cli_user, optarg, (size_t)(sep - optarg));
+                s3_cli_user[sep - optarg] = '\0';
+
+                s3_cli_auth = S3_CLI_AUTH_BASIC;
+                s3_cli_auth_value = s3_cli_basic;
             }
-
-            memcpy(s3_cli_user, optarg, (size_t)(sep - optarg));
-            s3_cli_user[sep - optarg] = '\0';
-
-            s3_cli_auth = S3_CLI_AUTH_BASIC;
-            s3_cli_auth_value = s3_cli_basic;
 
             break;
         }
+
+        case 'M':
+            s3_cli_cm_master = 1;
+            break;
+
+        case 'e':
+
+            if (strlen(optarg) >= 1024) {
+                fprintf(stderr, "ssh3: -e command is too long\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            free(s3_cli_cm_exec);
+            s3_cli_cm_exec = strdup(optarg);
+            break;
+
+        case 'O':
+            s3_cli_cm_op = optarg;
+            break;
+
+        case 'X':
+            s3_cli_agent_mode = 1;
+            break;
 
         case 'J': {
 
@@ -3435,6 +6215,25 @@ main(int argc, char **argv)
             WSACleanup();
             return S3_CLI_EXIT_ERROR;
         }
+    }
+
+    /* the slave and the control ops ride no server connection: the
+     * control pipe serves them, the run returns before the dial */
+
+    if (s3_cli_cm_op != NULL) {
+
+        if (!s3_cli_cm_pipe_name_called) {
+            fprintf(stderr, "ssh3: -O wants -U \\\\pipe-name\n");
+            WSACleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        return s3_cli_cm_control_op();
+    }
+
+    if (s3_cli_cm_exec != NULL && s3_cli_cm_pipe_name_called && !s3_cli_cm_master) {
+
+        return s3_cli_cm_slave_run();
     }
 
     if (optind >= argc) {
@@ -3567,10 +6366,27 @@ main(int argc, char **argv)
 
     (void)s3_cli_tofu_prepare();
 
+    /* the mode interlocks of the stage B shapes */
+
+    if (s3_cli_cm_master && (s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_cm_exec != NULL)) {
+        fprintf(stderr, "ssh3: -M rides no -J, -L or -e\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    if (s3_cli_cm_exec != NULL && (!s3_cli_cm_pipe_name_called || s3_cli_cm_master)) {
+        fprintf(stderr, "ssh3: -e wants -U \\\\pipe-name of a control master\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    if (s3_cli_cm_op != NULL && (s3_cli_cm_master || s3_cli_sftp_mode || s3_cli_fwd_count)) {
+        fprintf(stderr, "ssh3: -O rides no -M, -J or -L\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
     /* the sftp transfer and the forwards carry no exec words */
 
-    if ((s3_cli_sftp_mode || s3_cli_fwd_count) && optind < argc) {
-        fprintf(stderr, "ssh3: -J and -L take no command\n");
+    if ((s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_cm_master) && optind < argc) {
+        fprintf(stderr, "ssh3: -J, -L and -M take no command\n");
         return S3_CLI_EXIT_ERROR;
     }
 
@@ -3833,9 +6649,32 @@ main(int argc, char **argv)
             }
         }
 
-        /* the 200 opens the session channel */
+        /* the 200 opens the control pipe of the master: the sessions
+         * of the slaves ride the same connection */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count &&
+        if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_cm_master &&
+            !s3_cli_cm_listening && !s3_cli_cm_stop) {
+
+            s3_cli_cm_listen_open();
+
+            if (s3_cli_rc != 0) {
+                break;
+            }
+
+            s3_cli_phase = S3_CLI_PH_SESSION;
+
+            s3_cli_tick_arm();
+
+            if (s3_cli_tick == NULL) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+        }
+
+        /* the 200 opens the session channel (the forwards and the
+         * master carry no session of their own) */
+
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
             s3_cli_chan == NULL) {
 
             s3_cli_chan = s3_quic_open_stream(cli, 1);
@@ -3872,7 +6711,8 @@ main(int argc, char **argv)
 
         /* the header plus the session requests ride one send */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_ch_sent) {
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
+            !s3_cli_ch_sent) {
 
             u_char            frame[2048];
             u_char           *p;
@@ -3909,11 +6749,27 @@ main(int argc, char **argv)
             } else if (s3_cli_cmd != NULL) {
 
                 /* the exec: the command with the reply wanted, the
-                 * fin rides right behind it */
+                 * fin rides right behind it; the -X mode announces
+                 * the agent trigger on the LARVAL session first */
 
                 s3_ssh3_request_t exec;
 
                 memset(&exec, 0, sizeof(exec));
+
+                if (s3_cli_agent_mode) {
+
+                    static const char trigger[] = S3_SSH3_AGENT_TRIGGER;
+
+                    s3_ssh3_msg_data_t marker;
+
+                    memset(&marker, 0, sizeof(marker));
+
+                    marker.data.data = (u_char *)trigger;
+                    marker.data.len = sizeof(trigger) - 1;
+
+                    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                    p = (u_char *)s3_ssh3_msg_encode_data(p, &marker);
+                }
 
                 exec.kind = S3_SSH3_REQ_EXEC;
                 exec.u.exec.command.data = (u_char *)s3_cli_cmd;
@@ -4095,10 +6951,40 @@ s3_cli_teardown(void)
 {
     s3_quic_connection_t *qc;
     unsigned              i;
+    unsigned              quic_alive;
 
     s3_cli_console_done();
 
-    /* the -L listeners and the bridges close before the wire */
+    /* the agent bridge and the control pipe close before the wire */
+
+    s3_cli_agent_teardown("teardown");
+
+    if (s3_cli_cm_master) {
+
+        s3_cli_cm_conn_t *conn = s3_cli_cm_conns;
+
+        s3_cli_cm_shutdown();
+
+        while (conn != NULL) {
+
+            s3_cli_cm_conn_t *next = conn->next;
+
+            if (conn->h != NULL && conn->h != INVALID_HANDLE_VALUE) {
+                DisconnectNamedPipe(conn->h);
+                CloseHandle(conn->h);
+                conn->h = NULL;
+            }
+
+            conn = next;
+        }
+    }
+
+    /* the -L listeners and the bridges close before the wire; the
+     * quic stream ops ride the live connection only (the idle close
+     * already tore the streams down, the shutdown would deref the
+     * freed state) */
+
+    quic_alive = (s3_cli_conn != NULL && s3_quic_get_connection(s3_cli_conn) != NULL) ? 1u : 0u;
 
     if (s3_cli_fwd_ready) {
 
@@ -4125,7 +7011,11 @@ s3_cli_teardown(void)
                 s3_cli_fwd_udp_src_t *src = &s3_cli_fwd_udp[k].srcs[j];
 
                 if (src->used && src->chan != NULL) {
-                    (void)s3_quic_shutdown_stream(src->chan, S3_RDWR_SHUTDOWN);
+
+                    if (quic_alive) {
+                        (void)s3_quic_shutdown_stream(src->chan, S3_RDWR_SHUTDOWN);
+                    }
+
                     s3_close_connection(src->chan);
                     src->chan = NULL;
                 }
@@ -4204,6 +7094,9 @@ s3_cli_teardown(void)
 
     free(s3_cli_cmd);
     s3_cli_cmd = NULL;
+
+    free(s3_cli_cm_exec);
+    s3_cli_cm_exec = NULL;
 
     free(s3_cli_sftp_out);
     s3_cli_sftp_out = NULL;
