@@ -52,8 +52,10 @@
 
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -124,6 +126,13 @@
 /* the fresh window of the Bearer JWT, the reference jwtExpiryMinutes
  * tightened to the session length */
 #define S3_CLI_JWT_EXP_FRESH 600
+
+/* the key file cap of the -i loader (the PEM and the OpenSSH armor
+ * both, an identity is a few KiB) */
+#define S3_CLI_KEY_FILE_MAX (64 * 1024)
+
+/* the OpenSSH private key container magic (PROTOCOL.key of OpenSSH) */
+#define S3_CLI_OSSH_MAGIC "openssh-key-v1"
 
 /* the console input flags the raw mode drops and adds */
 #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
@@ -529,6 +538,12 @@ static size_t    s3_cli_b64dec(const char *src, u_char *dst, size_t cap);
 static void      s3_cli_sha256_fp(const u_char *der, size_t len, char *fp);
 static s3_int_t  s3_cli_jwt_sign(EVP_PKEY *key, const char *alg, const u_char *msg, size_t msglen,
                                  u_char *sig, size_t *siglen);
+static s3_int_t  s3_cli_ssh_u32(const u_char **pos, const u_char *end, uint32_t *val);
+static s3_int_t  s3_cli_ssh_string(const u_char **pos, const u_char *end, s3_str_t *out);
+static EVP_PKEY *s3_cli_ossh_ed25519(const u_char **pos, const u_char *end);
+static EVP_PKEY *s3_cli_ossh_ec256(const u_char **pos, const u_char *end);
+static EVP_PKEY *s3_cli_ossh_rsa(const u_char **pos, const u_char *end);
+static EVP_PKEY *s3_cli_openssh_key(const char *buf);
 static s3_int_t  s3_cli_jwt_build(SSL *ssl);
 static uintptr_t s3_cli_h3_field_l(u_char *p, const char *name, const char *value);
 static size_t    s3_cli_h3_section(u_char *p);
@@ -881,6 +896,381 @@ done:
     return rc;
 }
 
+/* the ssh wire primitives of the openssh container walk: the
+ * big-endian uint32 and the length-prefixed string as a view over the
+ * decode buffer (no intermediate allocations) */
+
+static s3_int_t
+s3_cli_ssh_u32(const u_char **pos, const u_char *end, uint32_t *val)
+{
+    if (end - *pos < 4) {
+        return S3_ERROR;
+    }
+
+    *val = ((uint32_t)(*pos)[0] << 24) | ((uint32_t)(*pos)[1] << 16) | ((uint32_t)(*pos)[2] << 8) |
+           (uint32_t)(*pos)[3];
+
+    *pos += 4;
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_cli_ssh_string(const u_char **pos, const u_char *end, s3_str_t *out)
+{
+    uint32_t len;
+
+    if (s3_cli_ssh_u32(pos, end, &len) != S3_OK || (size_t)(end - *pos) < len) {
+        return S3_ERROR;
+    }
+
+    out->data = (u_char *)*pos;
+    out->len = len;
+
+    *pos += len;
+
+    return S3_OK;
+}
+
+/* the ssh-ed25519 privkey: the 64-byte blob of seed||pub, the seed
+ * rides the first half */
+
+static EVP_PKEY *
+s3_cli_ossh_ed25519(const u_char **pos, const u_char *end)
+{
+    s3_str_t pub, priv;
+
+    if (s3_cli_ssh_string(pos, end, &pub) != S3_OK || s3_cli_ssh_string(pos, end, &priv) != S3_OK ||
+        priv.len != 64) {
+        return NULL;
+    }
+
+    return EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, priv.data, 32);
+}
+
+/*
+ * the ecdsa-sha2-nistp256 privkey: string "nistp256", string point
+ * (the 0x04 uncompressed form), mpint scalar, into the provider key
+ * (the s3_ssh3_jwt_key_ec256 shape plus the private param); the param
+ * builder takes the scalar, the plain construct_BN drops the private
+ * half when the wire mpint carries its sign guard byte
+ */
+
+static EVP_PKEY *
+s3_cli_ossh_ec256(const u_char **pos, const u_char *end)
+{
+    static s3_str_t curve = s3_string("nistp256");
+
+    OSSL_PARAM_BLD *bld;
+    OSSL_PARAM     *params = NULL;
+    EVP_PKEY_CTX   *ctx;
+    EVP_PKEY       *key = NULL;
+    BIGNUM         *d = NULL;
+    s3_str_t        name, q, priv;
+
+    if (s3_cli_ssh_string(pos, end, &name) != S3_OK || name.len != curve.len ||
+        s3_memcmp(name.data, curve.data, curve.len) != 0 ||
+        s3_cli_ssh_string(pos, end, &q) != S3_OK || q.len == 0 || q.data[0] != 0x04 ||
+        s3_cli_ssh_string(pos, end, &priv) != S3_OK || priv.len == 0 || priv.len > 66) {
+        return NULL;
+    }
+
+    /* the mpint sign guard byte rides out with the BIGNUM convert */
+
+    d = BN_bin2bn(priv.data, (int)priv.len, NULL);
+
+    if (d == NULL) {
+        return NULL;
+    }
+
+    bld = OSSL_PARAM_BLD_new();
+
+    if (bld != NULL) {
+
+        if (OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0) ==
+                1 &&
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, q.data, q.len) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, d) == 1 &&
+            (params = OSSL_PARAM_BLD_to_param(bld)) != NULL) {
+
+            ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+
+            if (ctx != NULL) {
+
+                if (EVP_PKEY_fromdata_init(ctx) == 1) {
+                    (void)EVP_PKEY_fromdata(ctx, &key, EVP_PKEY_KEYPAIR, params);
+                }
+
+                EVP_PKEY_CTX_free(ctx);
+            }
+        }
+
+        OSSL_PARAM_BLD_free(bld);
+    }
+
+    OSSL_PARAM_free(params);
+    BN_clear_free(d);
+
+    return key;
+}
+
+/*
+ * the ssh-rsa privkey: mpint n, e, d, iqmp, p, q in this order, into
+ * the provider key through the param builder (the
+ * s3_ssh3_jwt_key_rsa shape); the CRT exponents the wire omits derive
+ * from the factors, the coefficient rides the blob
+ */
+
+static EVP_PKEY *
+s3_cli_ossh_rsa(const u_char **pos, const u_char *end)
+{
+    OSSL_PARAM_BLD *bld;
+    OSSL_PARAM     *params = NULL;
+    EVP_PKEY_CTX   *ctx;
+    EVP_PKEY       *key = NULL;
+    BN_CTX         *bnctx = NULL;
+    BIGNUM         *n, *e, *d, *iqmp, *p, *q, *pm1, *qm1, *dmp1, *dmq1;
+    s3_str_t        n_s, e_s, d_s, iqmp_s, p_s, q_s;
+
+    n = e = d = iqmp = p = q = pm1 = qm1 = dmp1 = dmq1 = NULL;
+
+    if (s3_cli_ssh_string(pos, end, &n_s) != S3_OK || s3_cli_ssh_string(pos, end, &e_s) != S3_OK ||
+        s3_cli_ssh_string(pos, end, &d_s) != S3_OK ||
+        s3_cli_ssh_string(pos, end, &iqmp_s) != S3_OK ||
+        s3_cli_ssh_string(pos, end, &p_s) != S3_OK || s3_cli_ssh_string(pos, end, &q_s) != S3_OK) {
+        return NULL;
+    }
+
+    /* the mpint sign guard byte rides out with the BIGNUM convert */
+
+    n = BN_bin2bn(n_s.data, (int)n_s.len, NULL);
+    e = BN_bin2bn(e_s.data, (int)e_s.len, NULL);
+    d = BN_bin2bn(d_s.data, (int)d_s.len, NULL);
+    iqmp = BN_bin2bn(iqmp_s.data, (int)iqmp_s.len, NULL);
+    p = BN_bin2bn(p_s.data, (int)p_s.len, NULL);
+    q = BN_bin2bn(q_s.data, (int)q_s.len, NULL);
+
+    if (n == NULL || e == NULL || d == NULL || iqmp == NULL || p == NULL || q == NULL) {
+        goto done;
+    }
+
+    bnctx = BN_CTX_new();
+
+    if (bnctx == NULL) {
+        goto done;
+    }
+
+    pm1 = BN_new();
+    qm1 = BN_new();
+    dmp1 = BN_new();
+    dmq1 = BN_new();
+
+    if (pm1 == NULL || qm1 == NULL || dmp1 == NULL || dmq1 == NULL) {
+        goto done;
+    }
+
+    /* dP = d mod (p-1), dQ = d mod (q-1): the wire keeps the factors
+     * and the coefficient only */
+
+    if (BN_sub(pm1, p, BN_value_one()) != 1 || BN_sub(qm1, q, BN_value_one()) != 1 ||
+        BN_mod(dmp1, d, pm1, bnctx) != 1 || BN_mod(dmq1, d, qm1, bnctx) != 1) {
+        goto done;
+    }
+
+    bld = OSSL_PARAM_BLD_new();
+
+    if (bld != NULL) {
+
+        if (OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D, d) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR1, p) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR2, q) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_EXPONENT1, dmp1) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_EXPONENT2, dmq1) == 1 &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, iqmp) == 1 &&
+            (params = OSSL_PARAM_BLD_to_param(bld)) != NULL) {
+
+            ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+
+            if (ctx != NULL) {
+
+                if (EVP_PKEY_fromdata_init(ctx) == 1) {
+                    (void)EVP_PKEY_fromdata(ctx, &key, EVP_PKEY_KEYPAIR, params);
+                }
+
+                EVP_PKEY_CTX_free(ctx);
+            }
+        }
+
+        OSSL_PARAM_BLD_free(bld);
+    }
+
+done:
+
+    BN_clear_free(d);
+    BN_clear_free(p);
+    BN_clear_free(q);
+    BN_free(n);
+    BN_free(e);
+    BN_free(iqmp);
+    BN_free(pm1);
+    BN_free(qm1);
+    BN_clear_free(dmp1);
+    BN_clear_free(dmq1);
+    BN_CTX_free(bnctx);
+    OSSL_PARAM_free(params);
+
+    return key;
+}
+
+/*
+ * the OpenSSH private key container (PROTOCOL.key of OpenSSH): the
+ * armor wraps the base64 of
+ *
+ *   "openssh-key-v1\0" string ciphername string kdfname
+ *   string kdfoptions uint32 nkeys string pubkey string privkey
+ *
+ * the unencrypted privkey (both "none") opens with the checkint
+ * pair, then string alg, string pub, string priv, string comment,
+ * the 1.. padding.  Only the single-key unencrypted container parses
+ * here -- the Go fork behaviour; an encrypted one names the
+ * ssh-keygen conversion instead of failing as "not a PEM private
+ * key".  The buffer is the NUL-terminated key file text
+ */
+
+static EVP_PKEY *
+s3_cli_openssh_key(const char *buf)
+{
+    static const char begin[] = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    static const char end[] = "-----END OPENSSH PRIVATE KEY-----";
+
+    char          b64[S3_CLI_KEY_FILE_MAX];
+    u_char        blob[S3_CLI_KEY_FILE_MAX];
+    u_char        algname[64];
+    const u_char *bpos, *bend;
+    const char   *p, *stop;
+    EVP_PKEY     *key = NULL;
+    s3_str_t      cipher, kdf, kdfopt, pub, priv, algs;
+    size_t        i, blen;
+    uint32_t      check1, check2, nkeys;
+
+    p = strstr(buf, begin);
+
+    if (p == NULL) {
+        return NULL;
+    }
+
+    p += sizeof(begin) - 1;
+
+    stop = strstr(p, end);
+
+    if (stop == NULL) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s ends inside the OpenSSH armor",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    /* the armor body rides as one line: the breaks (and the CR of a
+     * windows-written file) drop before the decode */
+
+    for (i = 0; p < stop && i + 1 < sizeof(b64); p++) {
+
+        if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') {
+            b64[i++] = *p;
+        }
+    }
+
+    b64[i] = '\0';
+
+    blen = s3_cli_b64dec(b64, blob, sizeof(blob));
+
+    if (blen < sizeof(S3_CLI_OSSH_MAGIC) ||
+        s3_memcmp(blob, S3_CLI_OSSH_MAGIC, sizeof(S3_CLI_OSSH_MAGIC) - 1) != 0) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s is not an openssh-key-v1 blob",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    /* the magic is the NUL-terminated 15 bytes, the walk starts
+     * behind it */
+
+    bpos = blob + sizeof(S3_CLI_OSSH_MAGIC);
+    bend = blob + blen;
+
+    if (s3_cli_ssh_string(&bpos, bend, &cipher) != S3_OK ||
+        s3_cli_ssh_string(&bpos, bend, &kdf) != S3_OK ||
+        s3_cli_ssh_string(&bpos, bend, &kdfopt) != S3_OK ||
+        s3_cli_ssh_u32(&bpos, bend, &nkeys) != S3_OK ||
+        s3_cli_ssh_string(&bpos, bend, &pub) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s is a truncated openssh-key-v1 blob",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    if (cipher.len != 4 || s3_memcmp(cipher.data, "none", 4) != 0 || kdf.len != 4 ||
+        s3_memcmp(kdf.data, "none", 4) != 0) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                     "the key is passphrase-protected, convert:"
+                     " ssh-keygen -p -m PEM -f %s -N \"\"",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    if (nkeys != 1) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the multi-key container of %s is not supported",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    if (s3_cli_ssh_string(&bpos, bend, &priv) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s is a truncated openssh-key-v1 blob",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    bpos = priv.data;
+    bend = priv.data + priv.len;
+
+    if (s3_cli_ssh_u32(&bpos, bend, &check1) != S3_OK ||
+        s3_cli_ssh_u32(&bpos, bend, &check2) != S3_OK || check1 != check2) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                     "the checkint pair of %s does not match (a corrupt key)", s3_cli_keyfile);
+        return NULL;
+    }
+
+    if (s3_cli_ssh_string(&bpos, bend, &algs) != S3_OK || algs.len == 0 ||
+        algs.len >= sizeof(algname)) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s has no algorithm in the private section",
+                     s3_cli_keyfile);
+        return NULL;
+    }
+
+    memcpy(algname, algs.data, algs.len);
+    algname[algs.len] = '\0';
+
+    if (s3_memcmp(algname, "ssh-ed25519", sizeof("ssh-ed25519") - 1) == 0) {
+        key = s3_cli_ossh_ed25519(&bpos, bend);
+
+    } else if (s3_memcmp(algname, "ssh-rsa", sizeof("ssh-rsa") - 1) == 0) {
+        key = s3_cli_ossh_rsa(&bpos, bend);
+
+    } else if (s3_memcmp(algname, "ecdsa-sha2-nistp256", sizeof("ecdsa-sha2-nistp256") - 1) == 0) {
+        key = s3_cli_ossh_ec256(&bpos, bend);
+
+    } else {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the unsupported openssh key type %s", algname);
+        return NULL;
+    }
+
+    if (key == NULL) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the %s private section of %s did not parse",
+                     algname, s3_cli_keyfile);
+    }
+
+    return key;
+}
+
 /*
  * the Bearer JWT of the -i mode, built once after the handshake (the
  * jti binds the live TLS exporter) and before the CONNECT; the claim
@@ -897,23 +1287,78 @@ s3_cli_jwt_build(SSL *ssl)
     u_char      conv[32], sig[1024];
     BIO        *bio;
     EVP_PKEY   *key = NULL;
+    FILE       *kf;
+    char       *buf;
+    const char *ossh;
+    size_t      len;
+    unsigned    ok;
     const char *alg;
     long long   iat, exp;
     size_t      hlen, plen, tlen, siglen;
 
-    bio = BIO_new_file(s3_cli_keyfile, "r");
+    /* the file loads once: the OpenSSH container takes its parser,
+     * the PEM and PKCS#8 bodies stay with the OpenSSL reader */
 
-    if (bio == NULL) {
+    kf = fopen(s3_cli_keyfile, "rb");
+
+    if (kf == NULL) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "cannot open key file %s", s3_cli_keyfile);
         return S3_ERROR;
     }
 
-    key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    buf = malloc(S3_CLI_KEY_FILE_MAX + 1);
 
-    if (key == NULL) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s is not a PEM private key", s3_cli_keyfile);
+    if (buf == NULL) {
+        fclose(kf);
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the key file buffer failed");
         return S3_ERROR;
+    }
+
+    len = fread(buf, 1, S3_CLI_KEY_FILE_MAX, kf);
+    ok = (ferror(kf) == 0);
+    fclose(kf);
+
+    if (!ok) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the key file %s read failed", s3_cli_keyfile);
+        free(buf);
+        return S3_ERROR;
+    }
+
+    buf[len] = '\0';
+
+    ossh = strstr(buf, "-----BEGIN OPENSSH PRIVATE KEY-----");
+
+    if (ossh != NULL) {
+        key = s3_cli_openssh_key(buf);
+        free(buf);
+
+        /* the parser logs the specific reason, the generic line does
+         * not repeat it */
+
+        if (key == NULL) {
+            return S3_ERROR;
+        }
+
+    } else {
+        /* the mem BIO is a view: the buffer lives until the PEM
+         * reader is done with it */
+
+        bio = BIO_new_mem_buf(buf, (int)len);
+
+        if (bio == NULL) {
+            free(buf);
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the key file buffer failed");
+            return S3_ERROR;
+        }
+
+        key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        free(buf);
+
+        if (key == NULL) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "%s is not a PEM private key", s3_cli_keyfile);
+            return S3_ERROR;
+        }
     }
 
     switch (EVP_PKEY_get_base_id(key)) {
