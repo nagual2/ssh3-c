@@ -1,0 +1,21 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": ["icon.png"]
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "info": {
+          "0409": {
+            "ProductName": "ssh3",
+            "FileDescription": "ssh3 client - secure shell over HTTP/3",
+            "OriginalFilename": "ssh3.exe",
+            "LegalCopyright": "Apache-2.0"
+          }
+        }
+      }
+    }
+  }
+}

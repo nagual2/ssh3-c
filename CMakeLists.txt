@@ -159,6 +159,12 @@ if(WIN32)
     target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3 PRIVATE s3core)
 
+    # the icon + VERSIONINFO object (go-winres, app/winres/): linked
+    # as an external COFF object, regenerate on a version bump
+    set_source_files_properties(app/winres/rsrc_windows_amd64.syso
+        PROPERTIES EXTERNAL_OBJECT TRUE LANGUAGE C)
+    target_sources(ssh3 PRIVATE app/winres/rsrc_windows_amd64.syso)
+
     return()
 endif()
 
