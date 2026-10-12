@@ -1,23 +1,27 @@
 # ssh3-c
 
-Реализация SSH3 на чистом C17 в стиле nginx: пулы памяти, буферы-вьюхи,
-chain-интерфейс всего I/O, zero-copy data path. Целевая позиция — «OpenSSH
-среди Linux-систем» (см. [docs/PLAN.md](docs/PLAN.md)).
+**English** | [Русский](README.ru.md) | [Deutsch](README.de.md)
 
-Текущий статус: фазы **P0–P1** готовы (core + event/UDP-слой, GSO-бенч);
-идёт подготовка **P2** — адаптация QUIC-слоя nginx (см. [docs/PLAN.md](docs/PLAN.md)).
+A pure-C17 SSH3 implementation in the nginx style: memory pools, buffer
+views, a chain interface for all I/O, a zero-copy data path. The target
+position is "OpenSSH among Linux systems" (see
+[docs/PLAN.md](docs/PLAN.md)).
 
-## Структура
+Current status: phases **P0–P1** are done (the core + the event/UDP
+layer, the GSO bench); **P2** preparation is underway — adapting the
+nginx QUIC layer (see [docs/PLAN.md](docs/PLAN.md)).
 
-| № | Каталог | Содержимое |
-|---|---------|------------|
-| 1 | `src/core/` | пул памяти (`s3_palloc`), буферы и цепочки (`s3_buf`), строки (`s3_string`, `s3_str`), rbtree (`s3_rbtree`), интрузивный список (`s3_queue`), лог (`s3_log`), агрегатор `s3_core.h` |
-| 2 | `src/event/` | event loop, таймеры, posted events (`s3_event`), соединения (`s3_connection`), UDP-псевдо-коннекции (`s3_event_udp`), epoll-бэкенд (`modules/s3_epoll_module`) |
-| 3 | `src/os/unix/` | errno-слой (`s3_errno`), UDP sendmsg-chain (`s3_udp_sendmsg_chain`), UDP recv (`s3_udp_recv`) |
-| 4 | `bench/` | `gso_bench` — микробенч UDP GSO (`UDP_SEGMENT`) против plain sendmsg |
-| 5 | `tests/` | юнит-тесты (микро-фреймворк `s3_test.h`, без зависимостей) |
+## Layout
 
-## Сборка (из WSL)
+| № | Directory | Contents |
+|---|-----------|----------|
+| 1 | `src/core/` | memory pool (`s3_palloc`), buffers and chains (`s3_buf`), strings (`s3_string`, `s3_str`), rbtree (`s3_rbtree`), intrusive list (`s3_queue`), logging (`s3_log`), the `s3_core.h` aggregator |
+| 2 | `src/event/` | event loop, timers, posted events (`s3_event`), connections (`s3_connection`), UDP pseudo-connections (`s3_event_udp`), the epoll backend (`modules/s3_epoll_module`) |
+| 3 | `src/os/unix/` | errno layer (`s3_errno`), UDP sendmsg chain (`s3_udp_sendmsg_chain`), UDP recv (`s3_udp_recv`) |
+| 4 | `bench/` | `gso_bench` — a UDP GSO (`UDP_SEGMENT`) micro-benchmark against plain sendmsg |
+| 5 | `tests/` | unit tests (the dependency-free `s3_test.h` micro-framework) |
+
+## Build (from WSL)
 
 ```bash
 cd /mnt/c/Git/project/ssh3-c
@@ -45,14 +49,14 @@ sudo apt install ssh3-server
 
 The package layout:
 
-| № | Файл | Назначение |
-|---|------|------------|
-| 1 | `/usr/sbin/ssh3-server` | демон |
-| 2 | `/etc/ssh3/cert.pem` | TLS-сертификат (PEM) |
-| 3 | `/etc/ssh3/key.pem` | приватный ключ (PEM, `0640 root:ssh3`) |
-| 4 | `/etc/ssh3/authorized_keys` | ключи для Bearer-JWT-входа (`-K`) |
-| 5 | `/usr/share/man/man8/ssh3-server.8` | man-страница |
-| 6 | `/usr/lib/systemd/system/ssh3-server.{socket,service}` | systemd-юниты |
+| № | File | Purpose |
+|---|------|---------|
+| 1 | `/usr/sbin/ssh3-server` | the daemon |
+| 2 | `/etc/ssh3/cert.pem` | TLS certificate (PEM) |
+| 3 | `/etc/ssh3/key.pem` | private key (PEM, `0640 root:ssh3`) |
+| 4 | `/etc/ssh3/authorized_keys` | keys for Bearer-JWT login (`-K`) |
+| 5 | `/usr/share/man/man8/ssh3-server.8` | the man page |
+| 6 | `/usr/lib/systemd/system/ssh3-server.{socket,service}` | systemd units |
 
 From source (no install rule yet, the binary stays in the build tree):
 
@@ -115,46 +119,46 @@ sudo systemctl edit ssh3-c-server.socket
 
 CLI flags (defaults from `ssh3-server -h`):
 
-| Флаг | По умолчанию | Описание |
-|------|--------------|----------|
-| `-l addr:port` | — | UDP-listen (IPv4), порт `0` — эфемерный; не нужен при socket-активации |
-| `-c cert.pem` | — | TLS-сертификат (PEM), обязателен |
-| `-k key.pem` | — | приватный ключ (PEM), обязателен |
-| `-A alpn` | `h3` | ALPN-имя |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-l addr:port` | — | UDP listen (IPv4), port `0` — ephemeral; not needed under socket activation |
+| `-c cert.pem` | — | TLS certificate (PEM), required |
+| `-k key.pem` | — | private key (PEM), required |
+| `-A alpn` | `h3` | the ALPN name |
 | `-d dg_size` | `1200` | QUIC `max_datagram_frame_size` |
-| `-i idle_ms` | `60000` | QUIC idle timeout, мс |
-| `-L level` | `info` | уровень лога: `debug\|info\|warn\|error\|all` или числовой |
-| `-P pwfile` | — | файл паролей `user:secret` (Basic-аутентификация) |
-| `-K authorized_keys` | — | authorized_keys для Bearer-JWT (`%u` — имя пользователя в пути) |
-| `-H dir` | home пользователя | sftp-jail каталог |
-| `--oidc-issuer url` | — | OIDC-провайдер (id_token) |
-| `--oidc-audience id` | — | ожидаемый audience (client id) |
-| `--oidc-jwks-ttl sec` | `3600` | время жизни JWKS-набора |
-| `--run-as-user on\|off` | `on` при euid 0 | per-session setuid: сессия с резолвящимся пользователем CONNECT переходит на его идентичность перед спавном |
-| `-v` / `-V` / `-h` | — | debug-лог / версия / usage |
+| `-i idle_ms` | `60000` | QUIC idle timeout, ms |
+| `-L level` | `info` | log level: `debug\|info\|warn\|error\|all` or numeric |
+| `-P pwfile` | — | the `user:secret` password file (Basic authentication) |
+| `-K authorized_keys` | — | authorized_keys for Bearer-JWT (`%u` — the username in the path) |
+| `-H dir` | the user home | the sftp-jail directory |
+| `--oidc-issuer url` | — | the OIDC provider (id_token) |
+| `--oidc-audience id` | — | the expected audience (client id) |
+| `--oidc-jwks-ttl sec` | `3600` | the JWKS set lifetime |
+| `--run-as-user on\|off` | `on` under euid 0 | per-session setuid: a session with a resolvable CONNECT user drops onto its identity before the spawn |
+| `-v` / `-V` / `-h` | — | debug logging / version / usage |
 
 Environment:
 
-| Переменная | По умолчанию | Описание |
-|------------|--------------|----------|
-| `SSH3_LOG_LEVEL` | как `-L` | уровень лога |
-| `SSH3_LOG_FILE` | stderr | файл лога (игнорируется под systemd) |
-| `SSH3_SHUTDOWN_DRAIN` | `5` сек | дренаж при SIGTERM, `0` — сразу |
-| `SSH3C_PROTO=1` | выкл | runner-маркеры `INTEROP-*` в stdout |
-| `S3_OIDC_CA_FILE` | системный store | CA для OIDC discovery/JWKS |
-| `LISTEN_PID`/`LISTEN_FDS` | — | протокол `sd_listen_fds(3)`, read-only |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SSH3_LOG_LEVEL` | as `-L` | the log level |
+| `SSH3_LOG_FILE` | stderr | the log file (ignored under systemd) |
+| `SSH3_SHUTDOWN_DRAIN` | `5` s | the drain on SIGTERM, `0` — immediately |
+| `SSH3C_PROTO=1` | off | the `INTEROP-*` runner markers on stdout |
+| `S3_OIDC_CA_FILE` | the system store | the CA for OIDC discovery/JWKS |
+| `LISTEN_PID`/`LISTEN_FDS` | — | the `sd_listen_fds(3)` protocol, read-only |
 
 Full reference: `man 8 ssh3-server`.
 
-## Стиль кода
+## Code style
 
-- `.clang-format` / `.clang-tidy` — в корне; проверка:
+- `.clang-format` / `.clang-tidy` live in the root; the check:
   `clang-format --dry-run --Werror src/core/*.c src/core/*.h tests/*.c`.
-- Сборка идёт с `-Wall -Wextra -Werror`; пресет `linux-asan` добавляет
-  `-fsanitize=address,undefined -fno-sanitize-recover=all`.
+- The build runs with `-Wall -Wextra -Werror`; the `linux-asan` preset
+  adds `-fsanitize=address,undefined -fno-sanitize-recover=all`.
 
-## Лицензия
+## License
 
-Собственный код — BSD 2-clause (`LICENSE`). Код, адаптированный из nginx
-(BSD 2-clause), перечислен в `THIRD-PARTY-NOTICES.md` — его заголовки
-сохраняют `Copyright (C) Nginx, Inc.`.
+The project's own code — BSD 2-clause (`LICENSE`). The code adapted
+from nginx (BSD 2-clause) is listed in `THIRD-PARTY-NOTICES.md` — its
+headers keep `Copyright (C) Nginx, Inc.`.

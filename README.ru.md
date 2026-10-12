@@ -1,5 +1,7 @@
 # ssh3-c
 
+[English](README.md) | **Русский** | [Deutsch](README.de.md)
+
 Реализация SSH3 на чистом C17 в стиле nginx: пулы памяти, буферы-вьюхи,
 chain-интерфейс всего I/O, zero-copy data path. Целевая позиция — «OpenSSH
 среди Linux-систем» (см. [docs/PLAN.md](docs/PLAN.md)).
