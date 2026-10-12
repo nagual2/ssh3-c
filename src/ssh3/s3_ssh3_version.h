@@ -33,12 +33,12 @@
 
 #define S3_SSH3_IMPLEMENTATION_NAME "ssh3-c"
 #define S3_SSH3_SOFTWARE_MAJOR      0
-#define S3_SSH3_SOFTWARE_MINOR      1
-#define S3_SSH3_SOFTWARE_PATCH      1
+#define S3_SSH3_SOFTWARE_MINOR      2
+#define S3_SSH3_SOFTWARE_PATCH      0
 
 #define S3_SSH3_VERSION_STRING                                                                     \
     S3_SSH3_PROTOCOL_NAME " 3.0 " S3_SSH3_IMPLEMENTATION_NAME                                      \
-                          " 0.1.1 experimental_spec_version=" S3_SSH3_SPEC_VERSION
+                          " 0.2.0 experimental_spec_version=" S3_SSH3_SPEC_VERSION
 
 /*
  * the parsed view of a version string; the strings are zero-copy

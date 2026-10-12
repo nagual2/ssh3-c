@@ -1,0 +1,167 @@
+# Build and release ssh3-c via GitHub Actions.
+#
+# Triggers:
+#   - push of a v* tag: full matrix + GitHub Release with the assets
+#   - workflow_dispatch: build matrix only (no release), for testing
+#
+# Both jobs run on Linux runners (the Windows client is a mingw-w64
+# cross build, the preset windows-core): Linux minutes are the 1x
+# billed kind on a private repo.  The QUIC TLS API needs OpenSSL 3.5+,
+# which the runners do not ship -- each job builds its own OpenSSL
+# (native / mingw64 cross) into ~/opt, cached across runs.
+#
+# Single source of truth of the version: src/ssh3/s3_ssh3_version.h.
+# The release assets carry it; a tag must match the binary version
+# (checked in the linux job) and the deb control file (checked by
+# packaging/build.sh itself).
+
+name: build-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  linux-release:
+    name: linux (server, deb/rpm/apk)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf rpm
+
+      - name: Cache OpenSSL 3.5.9 (native)
+        id: openssl
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/openssl-3.5
+          key: openssl-3.5.9-linux-x86_64
+
+      - name: Build OpenSSL 3.5.9 (native)
+        if: steps.openssl.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          tar -C /tmp -xzf /tmp/openssl.tar.gz
+          cd /tmp/openssl-3.5.9
+          ./Configure --prefix="$HOME/opt/openssl-3.5" --openssldir="$HOME/opt/openssl-3.5/ssl"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Build and test (linux-release)
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release
+          ctest --preset linux-release
+
+      - name: Check the tag matches the binary version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER=$(build/linux-release/ssh3-server -V | awk '{print $3}')
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::tag v$TAG does not match the binary version $VER"
+            exit 1
+          fi
+
+      - name: Package (deb/rpm/apk)
+        run: bash packaging/build.sh all
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp packaging/_build/*.deb packaging/_build/*.rpm packaging/_build/*.apk dist/
+          cp build/linux-release/ssh3-server dist/ssh3-server_linux_amd64
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: dist/
+
+  windows-client:
+    name: windows (client exe, mingw cross)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build mingw-w64
+
+      - name: Cache OpenSSL 3.5.9 (mingw64 cross)
+        id: openssl
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/openssl-3.5-mingw
+          key: openssl-3.5.9-mingw64-x86_64
+
+      - name: Cross-build OpenSSL 3.5.9 (mingw64)
+        if: steps.openssl.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          tar -C /tmp -xzf /tmp/openssl.tar.gz
+          cd /tmp/openssl-3.5.9
+          ./Configure mingw64 --cross-compile-prefix=x86_64-w64-mingw32- \
+            --prefix="$HOME/opt/openssl-3.5-mingw" no-tests
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Build ssh3.exe (windows-core)
+        run: |
+          cmake --preset windows-core
+          cmake --build --preset windows-core
+
+      - name: Verify the icon + version resource is linked
+        run: |
+          x86_64-w64-mingw32-objdump -h build/windows-core/ssh3.exe | grep -i '\.rsrc'
+          x86_64-w64-mingw32-objdump -p build/windows-core/ssh3.exe | grep -m1 '0\.2\.0' || true
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp build/windows-core/ssh3.exe dist/ssh3_windows_amd64.exe
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/
+
+  release:
+    name: publish GitHub Release
+    needs: [linux-release, windows-client]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.apk
+            dist/ssh3-server_linux_amd64
+            dist/ssh3_windows_amd64.exe
+          body: |
+            ssh3-c ${{ github.ref_name }}
+
+            - `ssh3-server`: deb / rpm / apk packages (amd64); the deb bundles
+              OpenSSL 3.5 for OpenSSL 3.0.x targets (mint 22.x, ubuntu 24.04)
+            - `ssh3-server_linux_amd64`: raw server binary
+            - `ssh3_windows_amd64.exe`: static Windows client, icon and
+              version resources embedded
+          generate_release_notes: true
