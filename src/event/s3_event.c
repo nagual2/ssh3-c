@@ -11,6 +11,9 @@
 /* current monotonic time in milliseconds */
 s3_msec_t s3_current_msec;
 
+/* the event method capabilities, set by the event module init() */
+s3_uint_t s3_event_flags = 0;
+
 #if (S3_WIN32)
 void
 s3_time_update(void)

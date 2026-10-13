@@ -33,4 +33,17 @@ typedef struct s3_udp_msg_s {
 
 ssize_t s3_udp_recvmsg(s3_fd_t fd, s3_udp_msg_t *msg);
 
+#if (S3_USE_IOCP)
+
+/*
+ * the overlapped arm of the receive shim for the iocp backend: the
+ * s3_event_recvmsg() seam posts the receive and consumes the completed
+ * one through it, the event carries the completion state (s3_event.h)
+ */
+typedef struct s3_event_s s3_event_t;
+
+ssize_t s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev);
+
+#endif
+
 #endif /* _S3_UDP_MSG_H_INCLUDED_ */

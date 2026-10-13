@@ -144,6 +144,20 @@ jobs:
           cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
           ctest --preset windows-core --output-on-failure
 
+      # the iocp backend rides the same sources with the S3_USE_IOCP
+      # option: the iocp event module replaces the select module, the
+      # udp receive goes overlapped
+      - name: Build and test (windows-iocp under wine)
+        env:
+          WINEDEBUG: fixme-all
+        run: |
+          cmake --preset windows-iocp -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
+          cmake --build --preset windows-iocp
+          find "$HOME/opt/openssl-3.5-mingw" \
+            \( -name "libcrypto-3-x64.dll" -o -name "libssl-3-x64.dll" \) \
+            -exec cp -v {} build/windows-iocp/ \;
+          ctest --preset windows-iocp --output-on-failure
+
       - name: Verify the icon + version resource is linked
         run: |
           x86_64-w64-mingw32-objdump -h build/windows-core/ssh3.exe | grep -i '\.rsrc'

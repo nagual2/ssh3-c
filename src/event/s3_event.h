@@ -19,6 +19,30 @@
 typedef struct s3_connection_s s3_connection_t;
 typedef struct s3_event_s      s3_event_t;
 
+#if (S3_WIN32)
+
+/* the iocp event method flag, the NGX_USE_IOCP_EVENT port */
+#define S3_USE_IOCP_EVENT 1
+
+/*
+ * the carrier of an overlapped operation: the WSAOVERLAPPED is passed
+ * to the kernel and handed back by GetQueuedCompletionStatus(), the
+ * event backlink resolves a completion to its event
+ * (the reference ngx_event_ovlp_t).  data is the target of a posted
+ * receive: the completion writes it long after the call, the callers
+ * receive buffers are shared statics, so the carrier holds the buffer
+ * (deviation from the reference, which posts into per-connection
+ * c->buffer)
+ */
+typedef struct {
+    WSAOVERLAPPED ovlp;
+    s3_event_t   *event;
+    s3_err_t      error;
+    u_char       *data;
+} s3_event_ovlp_t;
+
+#endif
+
 typedef void (*s3_event_handler_pt)(s3_event_t *ev);
 
 struct s3_event_s {
@@ -49,7 +73,20 @@ struct s3_event_s {
     /* the pending eof reported by epoll */
     unsigned pending_eof : 1;
 
+    /* the posted overlapped operation completed (the iocp module) */
+    unsigned complete : 1;
+
+    /* the bytes transferred by the completed overlapped operation */
+    ssize_t available;
+
     s3_event_handler_pt handler;
+
+#if (S3_WIN32)
+
+    /* the carrier of the posted overlapped operation */
+    s3_event_ovlp_t ovlp;
+
+#endif
 
     s3_log_t *log;
 
@@ -87,6 +124,13 @@ typedef struct {
 } s3_event_actions_t;
 
 extern s3_event_actions_t s3_event_actions;
+
+/*
+ * the event method capabilities, set by the module init(): the
+ * S3_USE_IOCP_EVENT bit marks the iocp backend, the overlapped
+ * receives complete through the port
+ */
+extern s3_uint_t s3_event_flags;
 
 /*
  * process_events() flags

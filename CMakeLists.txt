@@ -22,6 +22,18 @@ add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 # the select module (P9 wave 2+).  the unix path below is untouched
 if(WIN32)
 
+    # the event backend: exactly one s3_event_actions provider is
+    # compiled in, the select module by default and the iocp port of
+    # ngx_iocp_module behind S3_USE_IOCP (the overlapped udp receive)
+    option(S3_USE_IOCP "IOCP event backend" OFF)
+
+    if(S3_USE_IOCP)
+        set(S3_EVENT_MODULE src/event/modules/s3_iocp_module.c)
+
+    else()
+        set(S3_EVENT_MODULE src/event/modules/s3_select_module.c)
+    endif()
+
     add_library(s3core STATIC
         src/core/s3_string.c
         src/core/s3_palloc.c
@@ -41,7 +53,7 @@ if(WIN32)
         src/event/s3_event_timer.c
         src/event/s3_connection.c
         src/event/s3_event_udp.c
-        src/event/modules/s3_select_module.c
+        ${S3_EVENT_MODULE}
         src/event/quic/s3_quic_transport.c
         src/event/quic/s3_quic_frames.c
         src/event/quic/s3_quic_protection.c
@@ -89,6 +101,12 @@ if(WIN32)
     # the quic branch of the udp event path; the quic layer rides the
     # cross-built OpenSSL like the unix build below
     target_compile_definitions(s3core PUBLIC S3_HAVE_QUIC=1)
+
+    # the iocp event backend, visible to the tests and the app so the
+    # seam headers see the same switches as s3core
+    if(S3_USE_IOCP)
+        target_compile_definitions(s3core PUBLIC S3_USE_IOCP=1)
+    endif()
 
     target_link_libraries(s3core PUBLIC ws2_32)
     target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)

@@ -46,6 +46,8 @@ s3_epoll_init(s3_event_ctx_t *ctx)
         }
     }
 
+    s3_event_flags = 0;
+
     ctx->impl = (void *)(intptr_t)s3_ep;
 
     return S3_OK;

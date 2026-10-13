@@ -63,6 +63,14 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_EXE_LINKER_FLAGS": "-static"
       }
+    },
+    {
+      "name": "windows-iocp",
+      "displayName": "Windows IOCP Backend (mingw-w64 cross, Ninja)",
+      "inherits": "windows-core",
+      "cacheVariables": {
+        "S3_USE_IOCP": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -81,6 +89,10 @@
     {
       "name": "windows-core",
       "configurePreset": "windows-core"
+    },
+    {
+      "name": "windows-iocp",
+      "configurePreset": "windows-iocp"
     }
   ],
   "testPresets": [
@@ -101,6 +113,13 @@
     {
       "name": "windows-core",
       "configurePreset": "windows-core",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-iocp",
+      "configurePreset": "windows-iocp",
       "output": {
         "outputOnFailure": true
       }

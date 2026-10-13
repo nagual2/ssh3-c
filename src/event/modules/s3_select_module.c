@@ -103,6 +103,8 @@ s3_select_init(s3_event_ctx_t *ctx)
         return S3_ERROR;
     }
 
+    s3_event_flags = 0;
+
     ctx->impl = NULL;
 
     return S3_OK;

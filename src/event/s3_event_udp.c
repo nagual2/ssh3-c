@@ -53,6 +53,9 @@ static void             s3_close_accepted_udp_connection(s3_connection_t *c);
 static s3_int_t         s3_insert_udp_connection(s3_udp_listen_t *ul, s3_connection_t *c);
 static s3_connection_t *s3_lookup_udp_connection(s3_udp_listen_t *ul, s3_connection_t *lc,
                                                  struct sockaddr *sockaddr, socklen_t socklen);
+static void             s3_udp_dispatch(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul,
+                                        s3_udp_msg_t *msg, u_char *buffer, ssize_t n, struct sockaddr *sockaddr,
+                                        socklen_t socklen);
 static s3_int_t         s3_udp_key_text(u_char *buf, size_t max, s3_str_t *key, struct sockaddr *sa,
                                         socklen_t salen, struct sockaddr *local_sa, unsigned wildcard);
 static s3_uint32_t      s3_udp_key_hash(s3_str_t *key);
@@ -62,18 +65,18 @@ void
 s3_event_recvmsg(s3_event_t *ev)
 {
     ssize_t                 n;
-    s3_log_t               *log;
-    s3_err_t                err;
     socklen_t               socklen;
-    s3_event_t             *rev, *wev;
     s3_udp_iov_t            iov[1];
     s3_udp_msg_t            msg;
     struct sockaddr_storage sa;
     struct sockaddr        *sockaddr;
     s3_udp_listen_t        *ul;
-    s3_event_ctx_t         *ctx;
-    s3_connection_t        *c, *lc;
+    s3_connection_t        *lc;
     static u_char           buffer[S3_UDP_DGRAM_SIZE];
+
+#if !(S3_USE_IOCP)
+    s3_err_t err;
+#endif
 
 #if (S3_HAVE_ADDRINFO_CMSG)
     /* the local address ancillary data of a wildcard listener */
@@ -86,7 +89,6 @@ s3_event_recvmsg(s3_event_t *ev)
 
     lc = (s3_connection_t *)ev->data;
     ul = (s3_udp_listen_t *)lc->data;
-    ctx = ul->ctx;
 
     ev->ready = 0;
 
@@ -108,6 +110,47 @@ s3_event_recvmsg(s3_event_t *ev)
     }
 #endif
 
+#if (S3_USE_IOCP)
+
+    /*
+     * the iocp seam: the handler is entered by a completion.  the
+     * entry without a completion arms the overlapped receive and
+     * returns; the completion of the receive delivers the datagram,
+     * it is dispatched from the static buffer and the receive is
+     * re-armed on every exit of the dispatch below.  the completion
+     * with no bytes (the add_event kick) arms the receive too, so a
+     * zero-length datagram is indistinguishable from the kick and is
+     * dropped.
+     */
+
+    if (!ev->complete) {
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+
+        return;
+    }
+
+    /* the consume: s3_udp_recvmsg_o() clears ev->complete itself */
+
+    n = s3_udp_recvmsg_o(lc->fd, &msg, ev);
+
+    if (n == -1) {
+        s3_log_error(S3_LOG_ALERT, ev->log, ev->ovlp.error, "WSARecvFrom() failed");
+
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+
+        return;
+    }
+
+    if (n == 0) {
+        /* the kick: no datagram yet, arm the receive */
+
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+
+        return;
+    }
+
+#else
+
     n = s3_udp_recvmsg(lc->fd, &msg);
 
     if (n == -1) {
@@ -122,6 +165,8 @@ s3_event_recvmsg(s3_event_t *ev)
 
         return;
     }
+
+#endif
 
     sockaddr = (struct sockaddr *)&sa;
     socklen = msg.msg_namelen;
@@ -142,9 +187,35 @@ s3_event_recvmsg(s3_event_t *ev)
         sa.ss_family = lc->sockaddr != NULL ? lc->sockaddr->sa_family : AF_INET;
     }
 
+    s3_udp_dispatch(ev, lc, ul, &msg, buffer, n, sockaddr, socklen);
+
+#if (S3_USE_IOCP)
+
+    /* re-arm the receive: the next completion re-enters the seam */
+
+    (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+
+#endif
+}
+
+/*
+ * the delivery of one received datagram: the quic branch keys the
+ * rbtree by the packet dcid and hands the datagram over through the
+ * quic sockets (porting map 1.12.3), the plain branch looks the pseudo
+ * connection up by the peer address; the datagram is a view into the
+ * caller buffer, the handlers must consume it before the return
+ */
+static void
+s3_udp_dispatch(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul, s3_udp_msg_t *msg,
+                u_char *buffer, ssize_t n, struct sockaddr *sockaddr, socklen_t socklen)
+{
+    s3_log_t        *log;
+    s3_event_t      *rev, *wev;
+    s3_connection_t *c;
+
 #if (S3_HAVE_QUIC)
     if (ul->quic) {
-        (void)s3_quic_recvmsg(ev, lc, ul, &msg, buffer, n, sockaddr, socklen);
+        (void)s3_quic_recvmsg(ev, lc, ul, msg, buffer, n, sockaddr, socklen);
         return;
     }
 #endif
@@ -182,7 +253,7 @@ s3_event_recvmsg(s3_event_t *ev)
 
     /* a new client */
 
-    c = s3_get_connection(ctx, lc->fd);
+    c = s3_get_connection(ul->ctx, lc->fd);
     if (c == NULL) {
         return;
     }
