@@ -119,6 +119,14 @@ jobs:
           cmake --preset windows-core
           cmake --build --preset windows-core
 
+      - name: Install wine (binfmt for the test exes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine64 wine-binfmt
+
+      - name: Test (windows-core under wine)
+        run: ctest --preset windows-core --output-on-failure
+
       - name: Verify the icon + version resource is linked
         run: |
           x86_64-w64-mingw32-objdump -h build/windows-core/ssh3.exe | grep -i '\.rsrc'
