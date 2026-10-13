@@ -173,14 +173,23 @@ start_sshd() {
 }
 
 stop_servers() {
-    local pidfile
+    local pidfile pid
     for pidfile in "$WORK/c-server.pid" "$WORK/go-server.pid" "$WORK/sshd.pid"; do
         if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
             if [ "$pidfile" = "$WORK/sshd.pid" ]; then
-                sudo -n kill "$(cat "$pidfile")" 2>/dev/null || true
+                sudo -n kill "$pid" 2>/dev/null || true
             else
-                kill "$(cat "$pidfile")" 2>/dev/null || true
+                kill "$pid" 2>/dev/null || true
             fi
+            # the graceful drain keeps the udp port up to
+            # SSH3_SHUTDOWN_DRAIN (5 s default): the next stage's bind
+            # races the dying daemon without the wait (wait_gone
+            # escalates to kill -9 at the deadline)
+            wait_gone "$pid" 8 || {
+                kill -9 "$pid" 2>/dev/null || true
+                sleep 0.5
+            }
             rm -f "$pidfile"
         fi
     done
@@ -690,7 +699,7 @@ start_servers() {
     probe os
 }
 
-if [ "$STAGE" = mux ]; then
+if [ "$STAGE" = mux ] || [ "$STAGE" = handshake ]; then
     start_servers
 elif [ "$STAGE" = all ] || [ "$STAGE" = throughput ] || [ "$STAGE" = cpu ]; then
     start_servers

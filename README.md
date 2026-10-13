@@ -157,6 +157,24 @@ Full reference: `man 8 ssh3-server`.
 - The build runs with `-Wall -Wextra -Werror`; the `linux-asan` preset
   adds `-fsanitize=address,undefined -fno-sanitize-recover=all`.
 
+## Performance
+
+Medians of the control benchmark (methodology R3, `bench/p7-compare.sh`):
+WSL2 loopback, one ed25519 keypair for all three implementations,
+sha-verified transfers, 7 rounds per cell (the first is the warmup).
+The full tables and the environment notes —
+[docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md).
+
+| № | Metric | ssh3-c | Go fork 0.1.34 | OpenSSH 9.6 |
+|---|--------|--------|----------------|-------------|
+| 1 | 512 MiB sftp push / pull, MB/s | 354 / 265 | 29 / 37 | **414 / 456** |
+| 2 | Handshake, cold connect+auth+exec, ms | **113** (min 12) | 180 | 220 |
+| 3 | ControlMaster warm exec, ms | **7.5** | 8.8 | 12.9 |
+| 4 | Server CPU / RSS peak, 512 MiB push | 80% / 526 MB \* | 96% / 21 MB | 106% / 28 MB |
+
+\* the sftp server path buffers the whole inbound file — a known issue
+(backlog §8.12 in [docs/PLAN.md](docs/PLAN.md)).
+
 ## License
 
 The project's own code — BSD 2-clause (`LICENSE`). The code adapted

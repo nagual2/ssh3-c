@@ -163,6 +163,25 @@ Vollständige Referenz: `man 8 ssh3-server`.
 - Der Build läuft mit `-Wall -Wextra -Werror`; das Preset `linux-asan`
   ergänzt `-fsanitize=address,undefined -fno-sanitize-recover=all`.
 
+## Leistung
+
+Mediane der Kontrollbenchmarks (Methodik R3, `bench/p7-compare.sh`):
+WSL2-Loopback, ein ed25519-Schlüsselpaar für alle drei
+Implementierungen, sha-verifizierte Übertragungen, 7 Runden pro Zelle
+(die erste ist die Aufwärmrunde). Die vollständigen Tabellen und die
+Hinweise zur Umgebung —
+[docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md).
+
+| № | Metrik | ssh3-c | Go-Fork 0.1.34 | OpenSSH 9.6 |
+|---|--------|--------|----------------|-------------|
+| 1 | 512 MiB sftp push / pull, MB/s | 354 / 265 | 29 / 37 | **414 / 456** |
+| 2 | Handshake, cold connect+auth+exec, ms | **113** (min 12) | 180 | 220 |
+| 3 | ControlMaster warm exec, ms | **7.5** | 8.8 | 12.9 |
+| 4 | Server-CPU / RSS-Spitze, 512-MiB-push | 80% / 526 MB \* | 96% / 21 MB | 106% / 28 MB |
+
+\* der sftp-Serverpfad puffert die gesamte eingehende Datei — ein
+bekanntes Problem (Backlog §8.12 in [docs/PLAN.md](docs/PLAN.md)).
+
 ## Lizenz
 
 Eigener Code — BSD 2-clause (`LICENSE`). Der aus nginx adaptierte Code
