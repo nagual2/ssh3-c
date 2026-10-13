@@ -119,13 +119,20 @@ jobs:
           cmake --preset windows-core
           cmake --build --preset windows-core
 
-      - name: Install wine (binfmt for the test exes)
+      - name: Install wine
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine64 wine-binfmt
+          sudo apt-get install -y --no-install-recommends wine64
 
+      # the cross-emulator cache variable makes add_test() run every test
+      # exe through wine64: no binfmt_misc dependency, the dev workflow
+      # (WSL interop) keeps running the exes directly
       - name: Test (windows-core under wine)
-        run: ctest --preset windows-core --output-on-failure
+        env:
+          WINEDEBUG: fixme-all
+        run: |
+          cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR=/usr/bin/wine64
+          ctest --preset windows-core --output-on-failure
 
       - name: Verify the icon + version resource is linked
         run: |
