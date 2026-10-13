@@ -134,6 +134,13 @@ jobs:
         env:
           WINEDEBUG: fixme-all
         run: |
+          # the cross build links through the import libs: the exes that
+          # reference OpenSSL symbols import libcrypto/libssl-3-x64.dll,
+          # the dev tree ships them in the build dir, the CI tree gets
+          # them from the cached OpenSSL install
+          find "$HOME/opt/openssl-3.5-mingw" \
+            \( -name "libcrypto-3-x64.dll" -o -name "libssl-3-x64.dll" \) \
+            -exec cp -v {} build/windows-core/ \;
           cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
           ctest --preset windows-core --output-on-failure
 
