@@ -82,7 +82,7 @@ gen_payload() { # $1 = MiB, $2 = path; an existing file of the right size stays
     if [ -f "$path" ] && [ "$(stat -c%s "$path")" -eq "$((mb * 1024 * 1024))" ]; then
         return 0
     fi
-    dd if=/dev/urandom of="$path" bs=4M count="$mb" status=none
+    dd if=/dev/urandom of="$path" bs=1M count="$mb" status=none
     chmod 644 "$path"
 }
 
@@ -356,9 +356,8 @@ stage_throughput() { # $1 = MiB, $2 = impl list, $3 = csv tag
     [ "$mb" = "$SIZE_SMALL" ] && payload="$DEV_SHM/p7bench8.bin" || payload="$DEV_SHM/p7bench.bin"
     ref=$(sha_of "$payload")
     echo "impl,dir,run,sec,mbps" > "$csv"
-    # the C sftp deadline: the 50 ms timer pump caps the rate (~8 MiB in
-    # 40 s), the put verdict never completes so the attempt burns the whole
-    # deadline — keep it just above the data completion time
+    # the C sftp deadline cap: the post-P7.1 pipeline completes the put
+    # verdict at 56-137 MB/s, the cap only guards a hung attempt
     C_TIMEOUT=60000
     log "throughput: ${mb} MiB, impls: $impls"
     for dir in push pull; do
@@ -511,7 +510,7 @@ stage_cpu() {
     local csv="$RES/cpu.csv"
     echo "impl,sample,ts_ms,jiffies,rss_kb" > "$csv"
     log "cpu/ram: one dedicated verified push per impl"
-    cpu_run c "$DEV_SHM/p7bench8.bin" "sftp 8 MiB put"
+    cpu_run c "$DEV_SHM/p7bench.bin" "sftp 512 MiB push"
     cpu_run go "$DEV_SHM/p7bench.bin" "sftp 512 MiB push"
     cpu_run os "$DEV_SHM/p7bench.bin" "scp 512 MiB push"
     log "cpu/ram summary:"
@@ -698,9 +697,9 @@ elif [ "$STAGE" = all ] || [ "$STAGE" = throughput ] || [ "$STAGE" = cpu ]; then
 fi
 
 if [ "$STAGE" = all ] || [ "$STAGE" = throughput ]; then
-    # 512 MiB: OpenSSH vs the Go sftp subsystem (the C sftp timer pump makes
-    # 512 MiB a tens-of-minutes affair, the 8 MiB table carries ssh3-c)
-    stage_throughput "$SIZE_BIG" "os go" "512m"
+    # 512 MiB: all three impls (the post-P7.1 C sftp pipeline holds
+    # 56-137 MB/s, the 512 MiB round trip is seconds, not tens of minutes)
+    stage_throughput "$SIZE_BIG" "c go os" "512m"
     stage_throughput "$SIZE_SMALL" "c go os" "8m"
 fi
 
