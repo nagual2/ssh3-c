@@ -122,16 +122,19 @@ jobs:
       - name: Install wine
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine64
+          sudo apt-get install -y --no-install-recommends wine wine64
+          WINE64=$(command -v wine || command -v wine64)
+          echo "wine at: $WINE64"
+          echo "WINE64=$WINE64" >> "$GITHUB_ENV"
 
       # the cross-emulator cache variable makes add_test() run every test
-      # exe through wine64: no binfmt_misc dependency, the dev workflow
+      # exe through wine: no binfmt_misc dependency, the dev workflow
       # (WSL interop) keeps running the exes directly
       - name: Test (windows-core under wine)
         env:
           WINEDEBUG: fixme-all
         run: |
-          cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR=/usr/bin/wine64
+          cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
           ctest --preset windows-core --output-on-failure
 
       - name: Verify the icon + version resource is linked
