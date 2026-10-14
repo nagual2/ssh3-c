@@ -6,14 +6,23 @@
  * the authorization header, the username of the CONNECT target, the
  * default identities chain of the session user, the harness password
  * file (the plaintext fixture form standing in for the unix shadow
- * check) and the sshd authorized_keys iterator; the wiring picks the
- * checks it speaks
+ * check), the unix shadow check itself (the second password backend,
+ * PLAN.md 8.2: getpwnam + getspnam + crypt_r) and the sshd
+ * authorized_keys iterator; the wiring picks the checks it speaks
  */
 
 #include <s3_core.h>
 
 #include <pwd.h>
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#ifdef S3_HAVE_CRYPT_R
+#include <crypt.h>
+#endif
+
+#include <shadow.h>
 
 #include <s3_ssh3_auth_srv.h>
 
@@ -416,6 +425,177 @@ s3_ssh3_auth_password_file_check(const char *path, const s3_str_t *user, const s
     s3_free(buf);
 
     return rc;
+}
+
+/*
+ * the system password verifier (the shadow step, PLAN.md 8.2).  The
+ * name guard is the plain-name charset of the identities chain (the
+ * username never reaches the NSS as a path fragment), the hash
+ * resolves from the shadow entry with the passwd field as the
+ * fallback of the shadow-less systems, the crypt verdict rides the
+ * check below; the euid 0 gate is the fail-closed shape - the
+ * unprivileged daemon cannot read the shadow and answers nothing but
+ * the decline
+ */
+
+static s3_int_t
+s3_ssh3_auth_name_copy(const s3_str_t *user, char *name, size_t size)
+{
+    if (s3_ssh3_auth_plain_name(user) != S3_OK || user->len >= size) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(name, user->data, user->len);
+    name[user->len] = '\0';
+
+    return S3_OK;
+}
+
+/*
+ * the non-password records of the password databases refuse before
+ * any crypt: the empty field, the "x" of a hash living in the shadow
+ * file that was not fetched, the "*" of the disabled login and the
+ * "!" prefix of the locked one ("!!" rides the prefix)
+ */
+
+static s3_int_t
+s3_ssh3_auth_hash_usable(const char *hash)
+{
+    if (hash == NULL || hash[0] == '\0') {
+        return S3_DECLINED;
+    }
+
+    if (hash[0] == '*' || hash[0] == '!') {
+        return S3_DECLINED;
+    }
+
+    if (hash[0] == 'x' && hash[1] == '\0') {
+        return S3_DECLINED;
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_auth_password_hash_check(const s3_str_t *pass, const char *hash)
+{
+#ifdef S3_HAVE_CRYPT_R
+    char              key[512];
+    struct crypt_data data;
+    char             *got;
+    size_t            n;
+#endif
+
+    if (s3_ssh3_auth_hash_usable(hash) != S3_OK) {
+        return S3_DECLINED;
+    }
+
+#ifdef S3_HAVE_CRYPT_R
+
+    /*
+     * the crypt key is a C string: the zero-copy view of the Basic
+     * payload copies into the bounded buffer, an over-cap key is a
+     * refusal (an unusable credential never matches)
+     */
+
+    if (pass->data == NULL || pass->len == 0 || pass->len >= sizeof(key)) {
+        return S3_DECLINED;
+    }
+
+    s3_memcpy(key, pass->data, pass->len);
+    key[pass->len] = '\0';
+
+    s3_memzero(&data, sizeof(data));
+
+    got = crypt_r(key, hash, &data);
+
+    if (got == NULL) {
+        return S3_DECLINED;
+    }
+
+    /*
+     * the equal-length comparison: crypt_r answers the "*0" failure
+     * string instead of NULL when the salt does not parse (the shape
+     * check above keeps the marker records out), a mismatching shape
+     * is a decline like a mismatching digest
+     */
+
+    n = strlen(hash);
+
+    if (strlen(got) != n) {
+        return S3_DECLINED;
+    }
+
+    return (s3_memcmp(got, hash, n) == 0) ? S3_OK : S3_DECLINED;
+
+#else
+
+    /*
+     * the build without crypt_r verifies nothing: the fail-closed
+     * decline, the deployment keeps the file backend
+     */
+
+    (void)pass;
+
+    return S3_DECLINED;
+
+#endif
+}
+
+s3_int_t
+s3_ssh3_auth_password_system_check(const s3_str_t *user, const s3_str_t *pass)
+{
+    char           name[256];
+    struct passwd *pw;
+    struct spwd   *sp;
+    const char    *hash;
+
+    /* the fail-closed privilege gate: the shadow is the root read,
+     * the unprivileged daemon never answers a verdict from it (the
+     * wiring warns at the startup, the attempts decline here) */
+
+    if (geteuid() != 0) {
+        return S3_DECLINED;
+    }
+
+    if (s3_ssh3_auth_name_copy(user, name, sizeof(name)) != S3_OK) {
+        return S3_DECLINED;
+    }
+
+    pw = getpwnam(name);
+
+    if (pw == NULL) {
+        return S3_DECLINED;
+    }
+
+    /* the shadow entry overrides the passwd field: the "x" of the
+     * passwd line points here, the shadow-less systems keep the real
+     * hash in the passwd field itself */
+
+    hash = pw->pw_passwd;
+
+    sp = getspnam(name);
+
+    if (sp != NULL && sp->sp_pwdp != NULL && sp->sp_pwdp[0] != '\0') {
+        hash = sp->sp_pwdp;
+    }
+
+    return s3_ssh3_auth_password_hash_check(pass, hash);
+}
+
+s3_int_t
+s3_ssh3_auth_system_user_known(const s3_str_t *user)
+{
+    char           name[256];
+    struct passwd *pw;
+
+    if (s3_ssh3_auth_name_copy(user, name, sizeof(name)) != S3_OK) {
+        return S3_DECLINED;
+    }
+
+    pw = getpwnam(name);
+
+    return (pw != NULL) ? S3_OK : S3_DECLINED;
 }
 
 /*

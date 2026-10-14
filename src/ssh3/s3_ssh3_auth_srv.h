@@ -12,8 +12,9 @@
  * 7), the wire-level steps only: the version and the 0-RTT gates live
  * in the h3 layer (P3).  The reference pubkey/JWT verification lives
  * in s3_ssh3_auth_jwt.h; this module covers the
- * username extraction, the Basic credentials and the sshd authorized
- * keys file shape, the wiring picks the checks it speaks
+ * username extraction, the Basic credentials, the sshd authorized
+ * keys file shape and the unix shadow check (the second password
+ * backend, PLAN.md 8.2), the wiring picks the checks it speaks
  */
 
 /*
@@ -61,6 +62,48 @@ s3_int_t s3_ssh3_auth_default_chain(const s3_str_t *user, char *buf, size_t size
 
 s3_int_t s3_ssh3_auth_password_file_check(const char *path, const s3_str_t *user,
                                           const s3_str_t *pass);
+
+/*
+ * the crypt(3) check of one stored password record (the pw_passwd /
+ * sp_pwdp shape): the non-password records refuse first - the empty
+ * field, the "x" of a hash that lives in the shadow file and was not
+ * fetched, the "*" of the disabled login and the "!" prefix of the
+ * locked one; behind that the password rides crypt_r (the reentrant
+ * form, the state buffer stays on the stack) with the stored record
+ * as the salt and the verdict is the equal-length comparison;
+ * S3_OK on a match, S3_DECLINED otherwise (the wrong password, the
+ * unusable record, a key over the internal cap).  A build without
+ * crypt_r never matches - the fail-closed shape, the deployment
+ * keeps the file backend
+ */
+
+s3_int_t s3_ssh3_auth_password_hash_check(const s3_str_t *pass, const char *hash);
+
+/*
+ * the system account verifier (the shadow step, PLAN.md 8.2, the
+ * parity of the fork 0.1.34 password login): the session user
+ * resolves through getpwnam(3), the hash comes from the shadow entry
+ * (getspnam(3)) with the passwd field as the fallback of the
+ * shadow-less systems, the match rides the crypt check above; the
+ * verifier answers only under the euid 0 - an unprivileged daemon
+ * cannot read the shadow and every attempt declines (the fail-closed
+ * shape, the wiring warns at the startup); S3_OK on a match,
+ * S3_DECLINED otherwise (the unknown user, the unusable record, the
+ * wrong password, the missing privilege)
+ */
+
+s3_int_t s3_ssh3_auth_password_system_check(const s3_str_t *user, const s3_str_t *pass);
+
+/*
+ * the presence probe of the system account database: the booking gate
+ * of the brute-force lockout (the passfile probe of the daemon serves
+ * the file backend the same way, only the accounts the backend
+ * resolves accumulate toward the lockout); S3_OK when getpwnam(3)
+ * resolves the name, S3_DECLINED otherwise (the unknown name, the
+ * name outside the plain-name charset)
+ */
+
+s3_int_t s3_ssh3_auth_system_user_known(const s3_str_t *user);
 
 /*
  * the authorized_keys iterator (the sshd format): skips empty lines

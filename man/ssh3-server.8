@@ -19,6 +19,7 @@
 .Op Fl -sftp-jail Cm chroot | lexical
 .Op Fl -url-path Ar path
 .Op Fl -enable-password-login
+.Op Fl -password-system Cm on | off
 .Op Fl -oidc-issuer Ar url
 .Op Fl -oidc-audience Ar id
 .Op Fl -oidc-jwks-ttl Ar seconds
@@ -49,7 +50,9 @@ authorized_keys keys (the conversation binds through the TLS
 .Ev EXPORTER-SSH3
 exporter), or Basic credentials against
 .Pq Fl P
-with the password login opted into.
+the password file and, when opted in
+.Pq Fl -password-system ,
+the unix accounts, with the password login opted into.
 Without any
 .Fl K
 the Bearer JWTs verify against the default identities chain of the
@@ -114,6 +117,10 @@ password login opted into (the
 flag or
 .Ev SSH3_ENABLE_PASSWORD_LOGIN ,
 the reference default is off).
+When the system verifier is wired too
+.Pq Fl -password-system ,
+this file answers first: a user listed in both places follows the
+file verdict.
 .It Fl K Ar authorized_keys
 Authorized_keys file, repeatable: the CONNECT passes only with a
 Bearer JWT signed by one of the keys of any listed file, the files
@@ -136,6 +143,41 @@ the username and does not affect the route.
 .It Fl -enable-password-login
 Opt into the Basic password method
 .Pq the reference enablePasswordLogin .
+.It Fl -password-system Cm on | off
+The system account verifier of the Basic method (the parity of the
+reference fork 0.1.34 password login): the CONNECT username resolves
+through
+.Fn getpwnam ,
+the hash comes from the shadow entry
+.Pq Fn getspnam
+with the passwd field as the fallback of the shadow-less systems and
+the verdict is the
+.Xr crypt 3
+check.
+The default is
+.Cm off :
+the deployment owner opts in, turning it on exposes the system
+accounts to the Basic brute-force surface (the
+.Fl -max-password-failures
+lockout books them the same way as the file backend, the invented
+usernames book nothing).
+An explicit
+.Cm on
+also opts the password login in (no
+.Fl -enable-password-login
+needed), an explicit
+.Cm off
+kills the
+.Ev SSH3_PASSWORD_SYSTEM
+opt-in too.
+The chain order is fixed: the
+.Fl P
+file answers first, the system accounts second; a wrong password for
+a user known to either backend counts one failure.
+An unprivileged daemon cannot read the shadow: the startup logs a
+warning and every Basic attempt against the system accounts fails
+closed (the decline before any lookup), the file backend serves as
+usual.
 .It Fl H Ar dir
 SFTP jail directory override (the default resolves from the session
 identity, see
@@ -204,13 +246,14 @@ Zero is the legitimate kill-switch: every CONNECT answers 503.
 The number of failed Basic verdicts that locks the account out of
 the password backend, default 10 (the reference
 .Cm -max-password-failures ) .
-Only the users the password file knows accumulate toward the
-lockout, the invented usernames book nothing.
+Only the users the password backends know (the passfile line or the
+passwd entry) accumulate toward the lockout, the invented usernames
+book nothing.
 .It Fl -password-lockout-seconds Ar s
 The lockout window of a failed account, default 60 (the reference
 .Cm -password-lockout-seconds ) .
 While it lasts the locked account answers 429 without the password
-file being read; a successful authentication clears the record.
+backends being touched; a successful authentication clears the record.
 .It Fl -permit-open Ar spec
 The forward target policy of the
 .Cm direct-tcp
@@ -322,6 +365,14 @@ With a truthy value
 the Basic password method is opted in without the flag; the flag
 overrides it (the reference env default for systemd
 EnvironmentFile installs).
+.It Ev SSH3_PASSWORD_SYSTEM
+With a truthy value
+.Pf ( Li 1 ,
+.Li true ,
+.Li t ) ,
+the system account verifier is wired without the flag; the explicit
+.Fl -password-system Cm on | off
+overrides it (the env default for systemd EnvironmentFile installs).
 .It Ev SSH3_MAX_UNAUTH_CONVERSATIONS
 The env default of
 .Fl -max-unauth-conversations ,

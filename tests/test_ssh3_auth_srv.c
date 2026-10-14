@@ -3,7 +3,8 @@
  *
  * the server auth verifiers (docs/P4-WIRE.md 7): the Basic
  * credentials decode, the ?user= extraction from the CONNECT target,
- * the harness password file and the sshd authorized_keys iterator
+ * the harness password file, the unix shadow step (the crypt check
+ * and the fail-closed verifier) and the sshd authorized_keys iterator
  */
 
 #include <s3_core.h>
@@ -236,6 +237,141 @@ s3_test_password_file_missing(void)
     return s3_test_failures;
 }
 
+/* the recorded vectors of the crypt check (openssl passwd -6/-5 -salt
+ * s3saltsalt s3testpw), the fixtures of the shadow step */
+
+static const char s3_test_hash_sha512[] =
+    "$6$s3saltsalt$YbF/Cru.RUspxTy4VkyMybmBXEtQQd112pzJIU7QBJBmYRFE4vI1/"
+    "RZwJvjHx5jrohCsYy2.MI7t6oK/NFC5h1";
+static const char s3_test_hash_sha256[] =
+    "$5$s3saltsalt$sJm5S7BWK0qjXuSDcGseqPfg9f.FEOO5JpwHnTLOSGC";
+
+static int
+s3_test_expect_hash(const char *pass, const char *hash, s3_int_t expect)
+{
+    s3_str_t p;
+
+    p.data = (u_char *)pass;
+    p.len = strlen(pass);
+
+    S3_ASSERT(s3_ssh3_auth_password_hash_check(&p, hash) == expect);
+
+    return s3_test_failures;
+}
+
+static int
+s3_test_password_hash_check(void)
+{
+    /* the non-password records refuse before any crypt: the empty
+     * field, the shadow pointer "x", the disabled "*" and the locked
+     * "!" shapes (the rule holds without crypt_r too) */
+
+    (void)s3_test_expect_hash("s3testpw", "", S3_DECLINED);
+    (void)s3_test_expect_hash("s3testpw", "x", S3_DECLINED);
+    (void)s3_test_expect_hash("s3testpw", "*", S3_DECLINED);
+    (void)s3_test_expect_hash("s3testpw", "!", S3_DECLINED);
+    (void)s3_test_expect_hash("s3testpw", "!!", S3_DECLINED);
+    (void)s3_test_expect_hash("s3testpw", "!$6$s3saltsalt$deadbeef", S3_DECLINED);
+
+    /* the empty credential never matches */
+
+    (void)s3_test_expect_hash("", s3_test_hash_sha512, S3_DECLINED);
+
+#ifdef S3_HAVE_CRYPT_R
+
+    (void)s3_test_expect_hash("s3testpw", s3_test_hash_sha512, S3_OK);
+    (void)s3_test_expect_hash("s3testpw", s3_test_hash_sha256, S3_OK);
+
+    /* the near misses decline: the extra byte, the truncation */
+
+    (void)s3_test_expect_hash("s3testpwX", s3_test_hash_sha512, S3_DECLINED);
+    (void)s3_test_expect_hash("s3testp", s3_test_hash_sha512, S3_DECLINED);
+
+    /* the key over the internal cap is a refusal, not a truncation */
+
+    {
+        char big[600];
+
+        s3_memset(big, 'a', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+
+        (void)s3_test_expect_hash(big, s3_test_hash_sha512, S3_DECLINED);
+    }
+
+#else
+
+    /* the build without crypt_r verifies nothing: the fail-closed
+     * decline, the deployment keeps the file backend */
+
+    (void)s3_test_expect_hash("s3testpw", s3_test_hash_sha512, S3_DECLINED);
+
+#endif
+
+    return s3_test_failures;
+}
+
+static int
+s3_test_password_system(void)
+{
+    struct passwd *pw;
+    s3_str_t       user, pass;
+
+    pass.data = (u_char *)"whatever";
+    pass.len = 8;
+
+    /* the names the plain-name guard rejects never reach the lookup
+     * (the path fragments, the hidden, the empty) */
+
+    user.data = (u_char *)"../etc";
+    user.len = 6;
+    S3_ASSERT(s3_ssh3_auth_password_system_check(&user, &pass) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_auth_system_user_known(&user) == S3_DECLINED);
+
+    user.data = (u_char *)".hidden";
+    user.len = 7;
+    S3_ASSERT(s3_ssh3_auth_password_system_check(&user, &pass) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_auth_system_user_known(&user) == S3_DECLINED);
+
+    user.data = (u_char *)"a b";
+    user.len = 3;
+    S3_ASSERT(s3_ssh3_auth_system_user_known(&user) == S3_DECLINED);
+
+    user.data = (u_char *)"root";
+    user.len = 0;
+    S3_ASSERT(s3_ssh3_auth_password_system_check(&user, &pass) == S3_DECLINED);
+
+    /* the user the passwd database does not resolve declines, the
+     * probe (the lockout booking gate) answers the same */
+
+    user.data = (u_char *)"s3no-such-user-777";
+    user.len = 18;
+    S3_ASSERT(s3_ssh3_auth_password_system_check(&user, &pass) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_auth_system_user_known(&user) == S3_DECLINED);
+
+    /* the privilege gate: the unprivileged run cannot read the
+     * shadow, even a resolvable account fails closed before the
+     * lookup (the ctest rider runs non-root; a root run keeps the
+     * assertion out instead of probing the real account) */
+
+    if (geteuid() != 0) {
+        user.data = (u_char *)"root";
+        user.len = 4;
+        S3_ASSERT(s3_ssh3_auth_password_system_check(&user, &pass) == S3_DECLINED);
+    }
+
+    /* the probe resolves the running user (the booking gate shape) */
+
+    pw = getpwuid(geteuid());
+
+    if (pw != NULL) {
+        user.data = (u_char *)pw->pw_name;
+        user.len = strlen(pw->pw_name);
+        S3_ASSERT(s3_ssh3_auth_system_user_known(&user) == S3_OK);
+    }
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_keys_next(char *block, const u_char **pos, const u_char *end, const char *keytype,
                   const char *b64)
@@ -437,6 +573,8 @@ s3_test_ssh3_auth_srv(void)
     (void)s3_test_user_from_path();
     (void)s3_test_password_file();
     (void)s3_test_password_file_missing();
+    (void)s3_test_password_hash_check();
+    (void)s3_test_password_system();
     (void)s3_test_authorized_keys();
     (void)s3_test_default_chain();
 

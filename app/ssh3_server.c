@@ -167,12 +167,6 @@ static unsigned s3_srv_proto_mode;
 
 /*
  * the password file (-P): the CONNECT passes only with the correct
- * Basic credentials against its user:secret lines
- */
-static const char *s3_srv_passfile;
-
-/*
- * the password file (-P): the CONNECT passes only with the correct
  * Basic credentials against its user:secret lines; the method itself
  * stays off until the password login is opted into
  * (--enable-password-login or SSH3_ENABLE_PASSWORD_LOGIN=1, the
@@ -180,6 +174,21 @@ static const char *s3_srv_passfile;
  */
 static const char *s3_srv_passfile;
 static unsigned    s3_srv_password_enabled;
+
+/*
+ * the system account verifier (--password-system on|off, PLAN.md
+ * 8.2, the parity of the fork 0.1.34 password login): the Basic
+ * credentials verify against the unix accounts - getpwnam(3) for the
+ * identity, the shadow entry for the hash, the crypt(3) check for
+ * the verdict.  The default is off, the deployment owner opts in:
+ * turning it on exposes the system accounts to the Basic brute-force
+ * surface (the lockout books the same way as for the file backend);
+ * the verifier opts the password login in on its own, the chain
+ * order is the -P file first, the system accounts second; the
+ * unprivileged daemon cannot read the shadow - the flag warns at the
+ * startup and every attempt fails closed
+ */
+static unsigned s3_srv_password_system;
 
 /*
  * the authorized_keys files (-K, repeatable): the CONNECT passes only
@@ -1362,19 +1371,22 @@ s3_srv_passfile_has_user(const char *path, const s3_str_t *user)
 }
 
 /*
- * the Basic verdict against the -P password file (docs/P4-WIRE.md 7,
+ * the Basic verdict against the password backends (docs/P4-WIRE.md 7,
  * the Basic step of the reference chain): the credentials decode from
  * the authorization header, the username comes from the CONNECT
- * target (?user=), the harness file answers the match; the
- * brute-force lockout of the reference CheckBasicAuth sits in front
- * of the file (429 without touching the backend), the failures of
- * the known users book and the success clears
+ * target (?user=), the -P file answers first and the system accounts
+ * (--password-system, the shadow step of PLAN.md 8.2) second - both
+ * serve when both are wired, the first S3_OK wins; the brute-force
+ * lockout of the reference CheckBasicAuth sits in front of the
+ * backends (429 without touching them), the failures of the known
+ * users book (the passfile line or the passwd entry) and the success
+ * clears
  */
 static unsigned
 s3_srv_h3_basic_verdict(void)
 {
     s3_str_t header, path, basic_user, basic_pass, user;
-    s3_int_t rc;
+    s3_int_t rc, known;
 
     header.data = s3_srv_h3_auth;
     header.len = s3_srv_h3_auth_len;
@@ -1410,17 +1422,42 @@ s3_srv_h3_basic_verdict(void)
         return 429;
     }
 
-    rc = s3_ssh3_auth_password_file_check(s3_srv_passfile, &user, &basic_pass);
+    rc = S3_DECLINED;
+    known = 0;
 
-    if (rc != S3_OK) {
-        fprintf(stderr, "ssh3-server: basic auth: user=%.*s rejected rc=%d\n", (int)user.len,
-                (const char *)user.data, (int)rc);
+    if (s3_srv_passfile != NULL) {
+
+        rc = s3_ssh3_auth_password_file_check(s3_srv_passfile, &user, &basic_pass);
 
         /* only the users the backend knows accumulate toward the
          * lockout; the unreadable file (S3_ERROR) is a server
          * misconfiguration, not an attempt of the account */
 
         if (rc == S3_DECLINED && s3_srv_passfile_has_user(s3_srv_passfile, &user) == S3_OK) {
+            known = 1;
+        }
+    }
+
+    if (rc != S3_OK && s3_srv_password_system) {
+
+        /* the second backend of the chain: the system accounts, the
+         * same booking gate - the names the passwd database resolves
+         * book, the invented ones lock nobody (the anti
+         * user-enumeration rule of the reference); the unprivileged
+         * daemon rides the fail-closed decline of the verifier */
+
+        rc = s3_ssh3_auth_password_system_check(&user, &basic_pass);
+
+        if (rc == S3_DECLINED && s3_ssh3_auth_system_user_known(&user) == S3_OK) {
+            known = 1;
+        }
+    }
+
+    if (rc != S3_OK) {
+        fprintf(stderr, "ssh3-server: basic auth: user=%.*s rejected rc=%d\n", (int)user.len,
+                (const char *)user.data, (int)rc);
+
+        if (known) {
             s3_dos_pw_failure(&user, s3_current_msec);
         }
 
@@ -1851,11 +1888,12 @@ s3_srv_h3_respond(s3_connection_t *pc)
 
                 code = s3_srv_h3_jwt_verdict();
 
-            } else if (s3_srv_passfile != NULL) {
+            } else if (s3_srv_passfile != NULL || s3_srv_password_system) {
 
-                /* the Basic step: the password file decides, but the
-                 * method itself stays off until the login is opted
-                 * into (the reference enablePasswordLogin default) */
+                /* the Basic step: the password backends decide (the
+                 * -P file, then the system accounts), but the method
+                 * itself stays off until the login is opted into
+                 * (the reference enablePasswordLogin default) */
 
                 code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict() : 401;
 
@@ -5016,7 +5054,23 @@ s3_srv_usage(const char *prog)
             " user:secret AND the\n"
             "      password login opted into (--enable-password-login or"
             " SSH3_ENABLE_PASSWORD_LOGIN=1,\n"
-            "      the reference default is off)\n"
+            "      the reference default is off); the file backend answers"
+            " before the system\n"
+            "      one when both are wired (--password-system)\n"
+            "  --password-system on|off: the system account verifier of the"
+            " Basic method\n"
+            "      (PLAN.md 8.2, the parity of the fork 0.1.34): the unix"
+            " accounts - getpwnam\n"
+            "      for the identity, the shadow entry for the hash, the"
+            " crypt(3) check for the\n"
+            "      verdict; default off, the deployment owner opts in (on"
+            " also opts the\n"
+            "      password login in); the unprivileged daemon cannot read"
+            " the shadow - the\n"
+            "      startup warns and every attempt fails closed; the"
+            " brute-force lockout\n"
+            "      (--max-password-failures) books the system accounts the"
+            " same way\n"
             "  -K  authorized_keys file, repeatable: the CONNECT passes only with a"
             " Bearer JWT\n"
             "      signed by one of their keys; %%u in the path is the session"
@@ -5099,6 +5153,7 @@ s3_srv_usage(const char *prog)
             "      above),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
             "      SSH3_SFTP_JAIL=chroot|lexical (the --sftp-jail flag overrides),\n"
+            "      SSH3_PASSWORD_SYSTEM=1 (the --password-system default),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
             "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
             " the passed UDP\n"
@@ -5269,6 +5324,22 @@ main(int argc, char **argv)
     }
 
     /*
+     * the system verifier env default (PLAN.md 8.2): the same
+     * ParseBool forms of the reference, it parses here - before the
+     * pre-scan - so the explicit --password-system on|off overrides
+     * it either way (the pattern of the DoS guard knobs)
+     */
+    {
+        const char *env = getenv("SSH3_PASSWORD_SYSTEM");
+
+        if (env != NULL &&
+            (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0 ||
+             strcmp(env, "True") == 0 || strcmp(env, "t") == 0 || strcmp(env, "T") == 0)) {
+            s3_srv_password_system = 1;
+        }
+    }
+
+    /*
      * the OIDC options and the ssh3 routes ride the long form (the
      * daemon keeps the names of the reference), the pre-scan pulls
      * them out of argv before the short getopt loop
@@ -5307,6 +5378,22 @@ main(int argc, char **argv)
 
                 s3_srv_password_enabled = 1;
                 drop = 1;
+
+            } else if (strcmp(argv[n], "--password-system") == 0 && n + 1 < argc) {
+
+                /* the on|off form: anything else stays in the argv
+                 * for the getopt loop to reject with the usage; the
+                 * env default parsed above has already run, the
+                 * explicit off kills the opt-in of the env too */
+
+                if (strcmp(argv[n + 1], "on") == 0) {
+                    s3_srv_password_system = 1;
+                    value = argv[n + 1];
+
+                } else if (strcmp(argv[n + 1], "off") == 0) {
+                    s3_srv_password_system = 0;
+                    value = argv[n + 1];
+                }
 
             } else if (strcmp(argv[n], "--permit-open") == 0 && n + 1 < argc) {
 
@@ -5600,6 +5687,25 @@ main(int argc, char **argv)
         s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "sftp chroot jail enabled");
     }
 
+    /*
+     * the system verifier privilege check: the shadow is the root
+     * read, the unprivileged daemon keeps the operator's opt-in
+     * visible (no fold like the run-as and the jail) and answers the
+     * one-time warning - the verifier declines every attempt before
+     * the lookup (the fail-closed shape), the file backend serves as
+     * usual
+     */
+
+    if (s3_srv_password_system && geteuid() != 0) {
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "system password auth without the root privilege: the shadow is"
+                     " unreadable, every Basic attempt against the system accounts"
+                     " fails closed");
+
+    } else if (s3_srv_password_system) {
+        s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "system password auth enabled");
+    }
+
     if (cert_path == NULL || key_path == NULL) {
         s3_srv_usage(argv[0]);
         return 1;
@@ -5654,6 +5760,17 @@ main(int argc, char **argv)
              strcmp(env, "True") == 0 || strcmp(env, "t") == 0 || strcmp(env, "T") == 0)) {
             s3_srv_password_enabled = 1;
         }
+    }
+
+    /*
+     * the system verifier opts the password login in on its own: one
+     * opt-in covers both backends (the file and the system), an
+     * operator wiring --password-system on never needs the second
+     * flag to hear the Basic verdicts
+     */
+
+    if (s3_srv_password_system) {
+        s3_srv_password_enabled = 1;
     }
 
     if (s3_srv_passfile != NULL && !s3_srv_password_enabled) {

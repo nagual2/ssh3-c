@@ -225,6 +225,32 @@ check_c_source_compiles(
 
 unset(CMAKE_REQUIRED_DEFINITIONS)
 
+# the system password verifier (the shadow step, PLAN.md 8.2): the
+# crypt(3) hash check rides crypt_r of <crypt.h> (libcrypt), the
+# shadow entry comes through getspnam(3) of <shadow.h>; both are
+# unix-only - the win beachhead never compiles the auth module.  A
+# build without crypt_r keeps the verifier fail-closed (every attempt
+# declines), the file backend stays untouched
+find_library(S3_CRYPT_LIBRARY NAMES crypt)
+mark_as_advanced(S3_CRYPT_LIBRARY)
+
+if(S3_CRYPT_LIBRARY)
+    set(CMAKE_REQUIRED_LIBRARIES ${S3_CRYPT_LIBRARY})
+endif()
+
+check_c_source_compiles(
+    "
+    #include <crypt.h>
+    int main(void) {
+        struct crypt_data data;
+        data.initialized = 0;
+        return crypt_r (\"key\", \"aa\", &data) == 0;
+    }
+    "
+    S3_HAVE_CRYPT_R)
+
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 set(S3_CORE_SOURCES
     src/core/s3_string.c
     src/core/s3_palloc.c
@@ -296,6 +322,19 @@ target_include_directories(s3core
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ssh3
         ${CMAKE_CURRENT_SOURCE_DIR}/src/os/unix
     )
+
+# the crypt link of the system password verifier (the check above);
+# a libcrypt-less host (crypt lives in libc there) still defines the
+# switch when the compile check passed
+if(S3_HAVE_CRYPT_R)
+
+    if(S3_CRYPT_LIBRARY)
+        target_link_libraries(s3core PUBLIC ${S3_CRYPT_LIBRARY})
+    endif()
+
+    target_compile_definitions(s3core PUBLIC S3_HAVE_CRYPT_R=1)
+
+endif()
 
 if(S3_HAVE_UDP_SEGMENT)
     target_compile_definitions(s3core PUBLIC S3_HAVE_UDP_SEGMENT=1)
