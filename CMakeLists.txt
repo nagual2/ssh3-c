@@ -79,6 +79,7 @@ if(WIN32)
         src/ssh3/s3_ssh3_dgram.c
         src/ssh3/s3_ssh3_forward.c
         src/ssh3/s3_ssh3_forward_policy.c
+        src/ssh3/s3_ssh3_reverse.c
         src/ssh3/s3_ssh3_dos_guard.c
         src/ssh3/s3_ssh3_sftp_codec.c
         src/ssh3/s3_ssh3_sftp_cli.c
@@ -156,6 +157,7 @@ if(WIN32)
         test_ssh3_dos_guard
         test_ssh3_sftp_codec
         test_ssh3_cm
+        test_ssh3_reverse
         test_os_win
     )
 
@@ -303,6 +305,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_session_cli.c
     src/ssh3/s3_ssh3_forward.c
     src/ssh3/s3_ssh3_forward_policy.c
+    src/ssh3/s3_ssh3_reverse.c
     src/ssh3/s3_ssh3_agent.c
     src/ssh3/s3_ssh3_sftp_codec.c
     src/ssh3/s3_ssh3_sftp_srv.c
@@ -483,6 +486,7 @@ set(S3_TESTS
     test_ssh3_forward
     test_ssh3_forward_policy
     test_ssh3_agent
+    test_ssh3_reverse
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
     test_ssh3_sftp_jail
