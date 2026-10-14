@@ -38,11 +38,17 @@ ssize_t s3_udp_recvmsg(s3_fd_t fd, s3_udp_msg_t *msg);
 /*
  * the overlapped arm of the receive shim for the iocp backend: the
  * s3_event_recvmsg() seam posts the receive and consumes the completed
- * one through it, the event carries the completion state (s3_event.h)
+ * one through it, the event carries the completion state (s3_event.h);
+ * the holder is the per-listener receive storage of s3_udp_listen_t
+ * (s3_udp_recv_t: the datagram buffer and the from address the kernel
+ * writes at completion time), one process-wide holder would cross the
+ * listeners
  */
 typedef struct s3_event_s s3_event_t;
+struct s3_udp_recv_s;
 
-ssize_t s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev);
+ssize_t s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev,
+                         struct s3_udp_recv_s *holder);
 
 #endif
 

@@ -70,9 +70,10 @@ s3_event_recvmsg(s3_event_t *ev)
     s3_udp_msg_t            msg;
     struct sockaddr_storage sa;
     struct sockaddr        *sockaddr;
+    s3_udp_recv_t          *holder;
+    s3_pool_t              *pool;
     s3_udp_listen_t        *ul;
     s3_connection_t        *lc;
-    static u_char           buffer[S3_UDP_DGRAM_SIZE];
 
 #if !(S3_USE_IOCP)
     s3_err_t err;
@@ -92,10 +93,35 @@ s3_event_recvmsg(s3_event_t *ev)
 
     ev->ready = 0;
 
+    /*
+     * the per-listener receive holder: the datagram of the armed
+     * receive lands there long after the call (the iocp completion),
+     * one process-wide buffer would cross the listeners running their
+     * posts at the same time; the holder dies with the context pool
+     */
+    holder = ul->recv_holder;
+
+    if (holder == NULL) {
+        pool = ul->ctx != NULL ? ul->ctx->pool : NULL;
+
+        holder = pool != NULL ? s3_pcalloc(pool, sizeof(s3_udp_recv_t)) : NULL;
+
+        if (holder != NULL) {
+            holder->buffer = s3_palloc(pool, S3_UDP_DGRAM_SIZE);
+        }
+
+        if (holder == NULL || holder->buffer == NULL) {
+            s3_log_error(S3_LOG_ALERT, ev->log, 0, "udp recv holder alloc failed");
+            return;
+        }
+
+        ul->recv_holder = holder;
+    }
+
     s3_memzero(&msg, sizeof(s3_udp_msg_t));
 
-    iov[0].iov_base = (void *)buffer;
-    iov[0].iov_len = sizeof(buffer);
+    iov[0].iov_base = (void *)holder->buffer;
+    iov[0].iov_len = S3_UDP_DGRAM_SIZE;
 
     msg.msg_name = &sa;
     msg.msg_namelen = sizeof(sa);
@@ -116,27 +142,27 @@ s3_event_recvmsg(s3_event_t *ev)
      * the iocp seam: the handler is entered by a completion.  the
      * entry without a completion arms the overlapped receive and
      * returns; the completion of the receive delivers the datagram,
-     * it is dispatched from the static buffer and the receive is
-     * re-armed on every exit of the dispatch below.  the completion
-     * with no bytes (the add_event kick) arms the receive too, so a
-     * zero-length datagram is indistinguishable from the kick and is
-     * dropped.
+     * it is dispatched from the holder buffer of this listener and
+     * the receive is re-armed on every exit of the dispatch below.
+     * the completion with no bytes (the add_event kick) arms the
+     * receive too, so a zero-length datagram is indistinguishable
+     * from the kick and is dropped.
      */
 
     if (!ev->complete) {
-        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev, holder);
 
         return;
     }
 
     /* the consume: s3_udp_recvmsg_o() clears ev->complete itself */
 
-    n = s3_udp_recvmsg_o(lc->fd, &msg, ev);
+    n = s3_udp_recvmsg_o(lc->fd, &msg, ev, holder);
 
     if (n == -1) {
         s3_log_error(S3_LOG_ALERT, ev->log, ev->ovlp.error, "WSARecvFrom() failed");
 
-        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev, holder);
 
         return;
     }
@@ -144,7 +170,7 @@ s3_event_recvmsg(s3_event_t *ev)
     if (n == 0) {
         /* the kick: no datagram yet, arm the receive */
 
-        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+        (void)s3_udp_recvmsg_o(lc->fd, &msg, ev, holder);
 
         return;
     }
@@ -187,13 +213,13 @@ s3_event_recvmsg(s3_event_t *ev)
         sa.ss_family = lc->sockaddr != NULL ? lc->sockaddr->sa_family : AF_INET;
     }
 
-    s3_udp_dispatch(ev, lc, ul, &msg, buffer, n, sockaddr, socklen);
+    s3_udp_dispatch(ev, lc, ul, &msg, holder->buffer, n, sockaddr, socklen);
 
 #if (S3_USE_IOCP)
 
     /* re-arm the receive: the next completion re-enters the seam */
 
-    (void)s3_udp_recvmsg_o(lc->fd, &msg, ev);
+    (void)s3_udp_recvmsg_o(lc->fd, &msg, ev, holder);
 
 #endif
 }

@@ -38,6 +38,30 @@ s3_ssl_keylog_cb(const SSL *ssl, const char *line)
     }
 }
 
+/*
+ * the keylog of the file set by s3_ssl_set_keylog_file(): the s3 conf
+ * rides the ctx app data, every secret line appends and flushes (a
+ * reader may follow the file while the handshake runs)
+ */
+static void
+s3_ssl_keylog_file_cb(const SSL *ssl, const char *line)
+{
+    s3_ssl_t *ssl_conf;
+    FILE     *file;
+
+    ssl_conf = SSL_CTX_get_app_data(SSL_get_SSL_CTX((SSL *)ssl));
+
+    file = ssl_conf != NULL ? ssl_conf->keylog_file : NULL;
+
+    if (file == NULL) {
+        return;
+    }
+
+    (void)fputs(line, file);
+    (void)fputc('\n', file);
+    (void)fflush(file);
+}
+
 s3_ssl_t *
 s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key, size_t key_len,
               const s3_str_t *alpn)
@@ -144,6 +168,10 @@ s3_ssl_free(s3_ssl_t *ssl)
         SSL_CTX_free(ssl->ctx);
     }
 
+    if (ssl->keylog_file != NULL) {
+        (void)fclose(ssl->keylog_file);
+    }
+
     if (ssl->alpn.data != NULL) {
         s3_free(ssl->alpn.data);
     }
@@ -192,6 +220,42 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
     SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
 
     return ssl;
+}
+
+s3_int_t
+s3_ssl_set_keylog_file(s3_ssl_t *ssl, const char *path)
+{
+    FILE *file;
+
+    if (ssl == NULL || ssl->ctx == NULL) {
+        return S3_ERROR;
+    }
+
+    if (path == NULL) {
+
+        /* the clear: the default probe callback comes back */
+
+        ssl->keylog_file = NULL;
+        SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
+
+        return S3_OK;
+    }
+
+    file = fopen(path, "a");
+
+    if (file == NULL) {
+        s3_ssl_error(ssl->log, 0, "fopen(\"%s\") failed", path);
+        return S3_ERROR;
+    }
+
+    ssl->keylog_file = file;
+
+    /* the callback resolves the conf (and the file) through the ctx */
+
+    SSL_CTX_set_app_data(ssl->ctx, ssl);
+    SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_file_cb);
+
+    return S3_OK;
 }
 
 static int

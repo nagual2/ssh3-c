@@ -138,6 +138,16 @@ struct s3_quic_conf_s {
 
     size_t stream_buffer_size;
 
+    /*
+     * the receive windows of the client tuning (the harness flags),
+     * 0 keeps the derived defaults of s3_quic_init_transport_params()
+     * (nstreams * stream_buffer_size for the connection level,
+     * stream_buffer_size per stream); set through the
+     * s3_quic_conf_*_rx_window() setters
+     */
+    size_t conn_rx_window;
+    size_t stream_rx_window;
+
     s3_uint_t max_concurrent_streams_bidi;
     s3_uint_t max_concurrent_streams_uni;
     s3_uint_t active_connection_id_limit;
@@ -207,6 +217,15 @@ void s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf);
 
 /* the client role: initiates the handshake towards c->sockaddr */
 s3_int_t s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf);
+
+/*
+ * the receive window setters of the client tuning, to call before the
+ * handshake: the connection-level MAX_DATA and the per-stream
+ * MAX_STREAM_DATA advertised in the transport parameters, in bytes;
+ * bytes = 0 restores the derived defaults
+ */
+void s3_quic_conf_conn_rx_window(s3_quic_conf_t *conf, size_t bytes);
+void s3_quic_conf_stream_rx_window(s3_quic_conf_t *conf, size_t bytes);
 
 void s3_quic_finalize_connection(s3_connection_t *c, s3_uint_t err, const char *reason);
 void s3_quic_shutdown_connection(s3_connection_t *c, s3_uint_t err, const char *reason);

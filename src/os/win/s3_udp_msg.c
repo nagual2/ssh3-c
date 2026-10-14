@@ -51,32 +51,28 @@ s3_udp_recvmsg(s3_fd_t fd, s3_udp_msg_t *msg)
  *   ev->complete set by the iocp module;
  *
  *   ev->complete  -- the datagram is already in msg->msg_iov[0] (the
- *   static post buffer), ev->available holds the byte count and the
- *   from address is copied out of the post holder;
+ *   post buffer of the listener holder), ev->available holds the byte
+ *   count and the from address is copied out of the holder;
  *
  * an inline completion still returns S3_AGAIN: the socket is bound to
  * the completion port, the status is delivered through it anyway
  * (the reference comment on the WSARecv() inline case).
  *
- * the kernel writes the from address at completion time, so the post
- * holder must outlive the completion; the event loop is single
- * threaded and one post is in flight across the process (the static
- * datagram buffer of s3_event_recvmsg() is shared the same way), the
- * module static holder mirrors that lifetime.  a multi-listener iocp
- * path needs per-event holders, it is not in scope here.
+ * the kernel writes the from address at completion time, so the
+ * holder must outlive the completion; the holder lives per listener
+ * (s3_udp_listen_t.recv_holder), every listener posts into its own
+ * buffer and from address and the posts of the other listeners stay
+ * untouched.
  *
  * the second post of an in-flight receive cannot happen: the seam only
  * posts from a handler entry without a completion or after a consumed
  * one, and the handler is entered by a completion of exactly the one
- * post in flight.
+ * post of this listener in flight.
  */
 
 ssize_t
-s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev)
+s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev, struct s3_udp_recv_s *holder)
 {
-    static struct sockaddr_storage from;
-    static INT                     from_len;
-
     int     rc;
     DWORD   bytes, flags;
     WSABUF  wbuf;
@@ -97,16 +93,16 @@ s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev)
         if (msg->msg_name != NULL) {
             size_t len;
 
-            len = (size_t)from_len;
+            len = (size_t)holder->from_len;
 
             if (len > sizeof(struct sockaddr_storage)) {
                 len = sizeof(struct sockaddr_storage);
             }
 
-            s3_memcpy(msg->msg_name, &from, len);
+            s3_memcpy(msg->msg_name, &holder->from, len);
         }
 
-        msg->msg_namelen = (socklen_t)from_len;
+        msg->msg_namelen = holder->from_len;
 
         n = ev->available;
 
@@ -125,15 +121,16 @@ s3_udp_recvmsg_o(s3_fd_t fd, s3_udp_msg_t *msg, s3_event_t *ev)
     /*
      * the capacity, the kernel writes the actual length back; the
      * msg_namelen of the caller is an in-out field already polluted by
-     * a consume, the capacity is always the full holder
+     * a consume, the capacity is always the full holder; socklen_t is
+     * int on winsock, the kernel writes the holder field in place
      */
-    from_len = (INT)sizeof(struct sockaddr_storage);
+    holder->from_len = (socklen_t)sizeof(struct sockaddr_storage);
 
     bytes = 0;
     flags = 0;
 
-    rc = WSARecvFrom((SOCKET)fd, &wbuf, 1, &bytes, &flags, (struct sockaddr *)&from, &from_len,
-                     &ev->ovlp.ovlp, NULL);
+    rc = WSARecvFrom((SOCKET)fd, &wbuf, 1, &bytes, &flags, (struct sockaddr *)&holder->from,
+                     (int *)&holder->from_len, &ev->ovlp.ovlp, NULL);
 
     if (rc != 0) {
         int err;

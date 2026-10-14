@@ -2043,10 +2043,25 @@ s3_quic_parse_transport_params(u_char *p, u_char *end, s3_quic_tp_t *tp, s3_log_
     return S3_OK;
 }
 
+void
+s3_quic_conf_conn_rx_window(s3_quic_conf_t *conf, size_t bytes)
+{
+    /* 0 restores the derived default, see s3_quic_init_transport_params() */
+
+    conf->conn_rx_window = bytes;
+}
+
+void
+s3_quic_conf_stream_rx_window(s3_quic_conf_t *conf, size_t bytes)
+{
+    conf->stream_rx_window = bytes;
+}
+
 s3_int_t
 s3_quic_init_transport_params(s3_quic_tp_t *tp, s3_quic_conf_t *qcf)
 {
     s3_uint_t nstreams;
+    size_t    stream_rx;
 
     s3_memzero(tp, sizeof(s3_quic_tp_t));
 
@@ -2068,10 +2083,18 @@ s3_quic_init_transport_params(s3_quic_tp_t *tp, s3_quic_conf_t *qcf)
 
     nstreams = qcf->max_concurrent_streams_bidi + qcf->max_concurrent_streams_uni;
 
-    tp->initial_max_data = nstreams * qcf->stream_buffer_size;
-    tp->initial_max_stream_data_bidi_local = qcf->stream_buffer_size;
-    tp->initial_max_stream_data_bidi_remote = qcf->stream_buffer_size;
-    tp->initial_max_stream_data_uni = qcf->stream_buffer_size;
+    /*
+     * the client tuning (s3_quic_conf_*_rx_window): 0 keeps the
+     * derived defaults
+     */
+
+    stream_rx = qcf->stream_rx_window ? qcf->stream_rx_window : qcf->stream_buffer_size;
+
+    tp->initial_max_data =
+        qcf->conn_rx_window ? qcf->conn_rx_window : nstreams * qcf->stream_buffer_size;
+    tp->initial_max_stream_data_bidi_local = stream_rx;
+    tp->initial_max_stream_data_bidi_remote = stream_rx;
+    tp->initial_max_stream_data_uni = stream_rx;
 
     tp->initial_max_streams_bidi = qcf->max_concurrent_streams_bidi;
     tp->initial_max_streams_uni = qcf->max_concurrent_streams_uni;

@@ -6,6 +6,8 @@
 #ifndef _S3_SSL_H_INCLUDED_
 #define _S3_SSL_H_INCLUDED_
 
+#include <stdio.h>
+
 #include <openssl/ssl.h>
 
 #include <s3_base.h>
@@ -37,6 +39,13 @@ struct s3_ssl_s {
     SSL_CTX  *ctx;
     s3_str_t  alpn; /* the wire-format protocol list */
     s3_log_t *log;
+
+    /*
+     * the NSS keylog file of the client debug (s3_ssl_set_keylog_file),
+     * the callback of the ctx writes the secrets there; the file is
+     * closed by s3_ssl_free()
+     */
+    FILE *keylog_file;
 };
 
 /*
@@ -53,6 +62,15 @@ void      s3_ssl_free(s3_ssl_t *ssl);
  * uses a self-signed certificate)
  */
 s3_ssl_t *s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn);
+
+/*
+ * the NSS keylog file for the Wireshark/Tshark decoding of the TLS
+ * secrets: the file opens in the append mode, the keylog callback of
+ * the ctx appends every secret line to it (flushed per line); the
+ * file rides on the ssl conf and closes in s3_ssl_free(), NULL
+ * restores the default probe callback
+ */
+s3_int_t s3_ssl_set_keylog_file(s3_ssl_t *ssl, const char *path);
 
 s3_int_t s3_ssl_create_connection(s3_ssl_t *ssl, s3_connection_t *c);
 s3_int_t s3_ssl_shutdown(s3_connection_t *c);

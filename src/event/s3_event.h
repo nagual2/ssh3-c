@@ -12,6 +12,11 @@
 #include <s3_queue.h>
 #include <s3_rbtree.h>
 
+#if !(S3_WIN32)
+/* the sockaddr_storage of the udp receive holder, winsock comes with s3_base.h */
+#include <sys/socket.h>
+#endif
+
 #define S3_TIMER_INFINITE (s3_msec_t) - 1
 
 #define S3_TIMER_LAZY_DELAY 300
@@ -192,6 +197,23 @@ void s3_event_process_posted(s3_event_ctx_t *ctx, s3_queue_t *posted);
 
 typedef void (*s3_connection_handler_pt)(s3_connection_t *c);
 
+/* the maximum udp datagram size, the receive holder is sized for it */
+#define S3_UDP_DGRAM_SIZE 65535
+
+/*
+ * the receive holder of a udp listener: the buffer one armed receive
+ * lands in plus the from address the kernel writes at completion time
+ * (the iocp backend).  The holder lives per listener - one
+ * process-wide pair would cross the listeners running their posts at
+ * the same time - and is allocated from the context pool on the first
+ * arm of the receive (s3_event_recvmsg)
+ */
+typedef struct s3_udp_recv_s {
+    u_char                 *buffer; /* S3_UDP_DGRAM_SIZE bytes */
+    struct sockaddr_storage from;
+    socklen_t               from_len;
+} s3_udp_recv_t;
+
 /*
  * the per-listening-socket state of the udp shared-socket model; it is
  * attached to the listening connection (connection->data) by the user
@@ -203,6 +225,12 @@ typedef struct {
     s3_rbtree_t              rbtree;  /* the pseudo connections */
     s3_rbtree_node_t         sentinel;
     unsigned                 wildcard : 1;
+
+    /*
+     * the receive holder of the listener (s3_udp_recv_t), NULL until
+     * the first arm allocated it from the context pool
+     */
+    s3_udp_recv_t *recv_holder;
 
     /*
      * the quic listener: the rbtree is keyed by the packet dcid

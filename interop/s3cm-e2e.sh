@@ -13,6 +13,9 @@
 #   7. the stale socket file of a SIGKILLed master unlinks on the next
 #      listen (the ListenControlMaster probe), the new master stops
 #      clean
+#   8. -P persist: the master detaches (S3CM-MASTER-PERSIST), the
+#      client exits, -M auto reuses the detached master as the slave,
+#      -O stop closes it; -M auto on the dead path becomes the master
 #
 # usage: s3cm-e2e.sh [worktree]
 set -u
@@ -274,13 +277,111 @@ else
     pass "master 3 exited on stop"
 fi
 
+echo "== 8: -P persist detaches, -M auto reuses the live master"
+
+setsid nohup "$BUILD/s3interop_client" -3 -C -M yes -P yes -i 0 -U "$SOCK" \
+    -a "127.0.0.1:$PORT" -t 60000 > "$W/masterp.log" 2>&1 < /dev/null &
+
+MASTERP1PID=$!
+
+if wait_for "$W/masterp.log" "S3CM-MASTER-PERSIST"; then
+    MASTERPPID=$(grep -oE 'pid=[0-9]+' "$W/masterp.log" | head -1 | cut -d= -f2)
+
+    if [ -n "$MASTERPPID" ] && master_alive "$MASTERPPID"; then
+        pass "the detached master lives (pid $MASTERPPID)"
+    else
+        fail "the detached master is not alive"
+    fi
+
+    sleep 0.3
+
+    if master_alive "$MASTERP1PID"; then
+        fail "the client did not exit after the detach"
+        kill "$MASTERP1PID" 2>/dev/null
+    else
+        pass "the client exited, the master carries on detached"
+    fi
+
+else
+    fail "the persist master did not detach"
+    tail -5 "$W/masterp.log" | sed 's/^/      /'
+    MASTERPPID=""
+fi
+
+if timeout 15 "$BUILD/s3interop_client" -M auto -U "$SOCK" -e "printf s3cm-auto-slave" \
+    -t 10000 > "$W/auto1.log" 2>&1; then
+
+    if grep -q "S3CM-SLAVE-DONE exit=0" "$W/auto1.log" \
+        && grep -q "S3CM-SLAVE-OUT s3cm-auto-slave" "$W/auto1.log"; then
+        pass "-M auto reused the live master as the slave"
+    else
+        fail "the auto slave output incomplete"
+        cat "$W/auto1.log" | sed 's/^/      /'
+    fi
+
+else
+    fail "the auto slave exited non-zero"
+    cat "$W/auto1.log" | sed 's/^/      /'
+fi
+
+if grep -q "S3CM-MASTER-SESSION-DONE exit=0" "$W/masterp.log"; then
+    pass "the detached master served the auto session"
+else
+    fail "no session marker in the detached master log"
+fi
+
+if [ -n "$MASTERPPID" ]; then
+
+    if "$BUILD/s3interop_client" -O stop -U "$SOCK" > "$W/stopp.log" 2>&1; then
+        pass "stop acknowledged on the detached master"
+    else
+        fail "stop failed on the detached master"
+        cat "$W/stopp.log" | sed 's/^/      /'
+    fi
+
+    sleep 0.5
+
+    if master_alive "$MASTERPPID"; then
+        fail "the detached master still lives"
+        kill "$MASTERPPID" 2>/dev/null
+    else
+        pass "the detached master exited on stop"
+    fi
+fi
+
+# -M auto on the dead path: no live master, no stale file, the client
+# becomes the master itself
+
+setsid nohup "$BUILD/s3interop_client" -3 -C -M auto -P yes -i 0 -U "$SOCK" \
+    -a "127.0.0.1:$PORT" -t 60000 > "$W/mastera.log" 2>&1 < /dev/null &
+
+MASTERAPID=$!
+
+if wait_for "$W/mastera.log" "S3CM-MASTER-LISTEN"; then
+    pass "-M auto became the master on the dead path"
+else
+    fail "-M auto did not become the master"
+    tail -5 "$W/mastera.log" | sed 's/^/      /'
+fi
+
+"$BUILD/s3interop_client" -O stop -U "$SOCK" > "$W/stopa.log" 2>&1 || fail "stop auto failed"
+
+sleep 0.3
+
+if master_alive "$MASTERAPID"; then
+    fail "the auto master still lives"
+    kill "$MASTERAPID" 2>/dev/null
+else
+    pass "the auto master exited on stop"
+fi
+
 kill "$SRVPID" 2>/dev/null
 pkill -f "s3interop_server -3" 2>/dev/null
 
 rm -rf "$W"
 
 if [ "$FAILURES" -eq 0 ]; then
-    echo "S3CM-E2E OK (control master, two slaves, check, stop)"
+    echo "S3CM-E2E OK (control master, two slaves, check, stop, persist, auto)"
     exit 0
 fi
 

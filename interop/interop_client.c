@@ -394,6 +394,20 @@ static char        s3_interop_oidc_bearer[256 + S3_SSH3_OIDC_CLI_TOKEN_MAX];
 static const char *s3_interop_pubkey_path;
 static char        s3_interop_h3_bearer[2048];
 
+/*
+ * the keylog file (--keylog): the NSS keylog of the client TLS, the
+ * Wireshark decoding of the handshakes; the file opens at the start
+ * and closes on the exit (the s3_ssl_set_keylog_file contract)
+ */
+static const char *s3_interop_keylog_path;
+
+/*
+ * the rx window tuning (--conn-rx-mb / --stream-rx-mb), MiB; 0 keeps
+ * the derived transport parameter defaults
+ */
+static long s3_interop_conn_rx_mb;
+static long s3_interop_stream_rx_mb;
+
 /* the -U value, the identity of every auth mode (the Basic
  * user:pass, the pubkey username, the cm socket path) */
 static const char *s3_interop_u_raw;
@@ -3086,6 +3100,19 @@ static const char *s3_interop_cm_path;
 static const char *s3_interop_cm_op;
 static long        s3_interop_cm_idle_ms = 5000;
 
+/*
+ * the -M auto mode: the dial probe resolves slave against master (a
+ * live master wins, the stale or absent path turns the client into
+ * the master); the -P persist: the listening master detaches through
+ * fork + setsid and serves past the client exit, until the persist
+ * deadline (-P sec) or the idle close (-P yes)
+ */
+static int       s3_interop_cm_auto;
+static unsigned  s3_interop_cm_persist;
+static long      s3_interop_cm_persist_sec; /* 0 = until idle-close */
+static unsigned  s3_interop_cm_forked;
+static s3_msec_t s3_interop_cm_persist_deadline;
+
 static s3_ssh3_cm_sessions_t s3_interop_cm_table;
 static s3_interop_cm_run_t   s3_interop_cm_runs[S3_SSH3_CM_SRV_SESSIONS];
 static s3_interop_cm_conn_t *s3_interop_cm_conns;
@@ -4237,6 +4264,19 @@ s3_interop_cm_tick(s3_event_t *ev)
 
         fprintf(stderr, "interop-client: control master idle for %ldms, closing\n",
                 s3_interop_cm_idle_ms);
+
+        s3_interop_cm_shutdown();
+
+        return;
+    }
+
+    /*
+     * the persist deadline (-P sec): the detached master exits even
+     * with the live sessions, the bound the caller asked for
+     */
+    if (s3_interop_cm_persist_deadline != 0 && s3_current_msec >= s3_interop_cm_persist_deadline) {
+
+        fprintf(stderr, "interop-client: control master persist deadline reached\n");
 
         s3_interop_cm_shutdown();
 
@@ -6101,8 +6141,9 @@ s3_interop_usage(const char *prog)
             " [-m min] [-t ms] [-A alpn] [-U user:pass] [-K privkey.pem] [-X] [-e cmd]"
             " [-J put|get:local:remote (get too: local first), -r: the directory"
             " form] [-j jump-addr:port]"
-            " [-M [-i ms]] [-O op] (cm modes: -U is the socket path)\n"
+            " [-M [auto|yes]] [-P sec|yes] [-i ms] [-O op] (cm modes: -U is the socket path)\n"
             "     [--oidc-issuer url --oidc-audience id | --oidc-token raw]\n"
+            "     [--keylog file] [--conn-rx-mb N] [--stream-rx-mb N]\n"
             "  -a  peer UDP address\n"
             "  -3  h3 mode: RFC 9220 extended CONNECT (ssh3), the verdict is :status\n"
             "  -C  h3 mode: after the 200 open the ssh3 session channel, send the\n"
@@ -6119,7 +6160,18 @@ s3_interop_usage(const char *prog)
             "  -M  with -3 -C: the control master, the UDS listener at the -U path\n"
             "      (0600, a stale file unlinks, a live master refuses) serves the\n"
             "      control channel, the slave sessions run as session channels of\n"
-            "      the shared connection, the verdict is S3CM-MASTER-LISTEN\n"
+            "      the shared connection, the verdict is S3CM-MASTER-LISTEN;\n"
+            "      \"-M yes\" is the explicit master form, the bare -M is the same\n"
+            "  -M auto\n"
+            "      the dial probe against the -U path first: a live master wins\n"
+            "      and the client runs as its slave (the -U path [-e cmd] branch,\n"
+            "      no quic), a refused or absent path unlinks the stale file and\n"
+            "      the client becomes the master (then -3 -C -a are required)\n"
+            "  -P  with a master (-M, -M auto): the master outlives the client,\n"
+            "      detached through fork + setsid right after S3CM-MASTER-LISTEN\n"
+            "      (the client reports S3CM-MASTER-PERSIST pid=N and exits);\n"
+            "      a number bounds the detached master to N seconds, \"yes\"\n"
+            "      serves until the idle close (-i, default 5000ms) or -O stop\n"
             "  -i  the master idle timeout in ms (no control traffic and no live\n"
             "      sessions), default 5000, 0 serves until the deadline\n"
             "  -O  the control op (check|stop|exit) against the master at the -U\n"
@@ -6151,6 +6203,16 @@ s3_interop_usage(const char *prog)
             "  -A  ALPN name, default s3interop/1 (h3 in the -3 mode)\n"
             "  -W  sleep this many usec in the stream echo reader; shrinks the\n"
             "      receive window, the deadlock repro with stream_buffer_size >= 64K\n"
+            "  --keylog <file>\n"
+            "      append the NSS keylog lines of the client TLS to the file\n"
+            "      (opened at the start, closed on the exit), the Wireshark\n"
+            "      decoding of the quic handshakes\n"
+            "  --conn-rx-mb <N>\n"
+            "      the connection-level flow control receive window in MiB\n"
+            "      (the MAX_DATA the client advertises), default: derived\n"
+            "  --stream-rx-mb <N>\n"
+            "      the per-stream flow control receive window in MiB (the\n"
+            "      MAX_STREAM_DATA), default: derived\n"
             "  -L  log level: 0..8 or \"all\", default 7 (info)\n"
             "  -T  offline h3 wire-format selftest, no network (TEMPORARY)\n",
             prog);
@@ -6218,6 +6280,18 @@ main(int argc, char **argv)
             } else if (strcmp(argv[i], "--oidc-token") == 0 && i + 1 < argc) {
                 s3_interop_oidc_raw = argv[i + 1];
                 value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--keylog") == 0 && i + 1 < argc) {
+                s3_interop_keylog_path = argv[i + 1];
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--conn-rx-mb") == 0 && i + 1 < argc) {
+                s3_interop_conn_rx_mb = atol(argv[i + 1]);
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--stream-rx-mb") == 0 && i + 1 < argc) {
+                s3_interop_stream_rx_mb = atol(argv[i + 1]);
+                value = argv[i + 1];
             }
 
             if (value != NULL) {
@@ -6238,7 +6312,8 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:r3CMTSXh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
+           -1) {
 
         switch (opt) {
 
@@ -6256,7 +6331,52 @@ main(int argc, char **argv)
             break;
 
         case 'M':
+
+            /*
+             * the optional argument: auto resolves at the dial probe
+             * below, yes is the explicit master form; the taken token
+             * of the bare -M is the next option, it goes back for the
+             * parse
+             */
+            if (optarg != NULL && strcmp(optarg, "auto") == 0) {
+                s3_interop_cm_auto = 1;
+                break;
+            }
+
+            if (optarg != NULL && strcmp(optarg, "yes") == 0) {
+                s3_interop_cm_master = 1;
+                break;
+            }
+
             s3_interop_cm_master = 1;
+
+            if (optarg != NULL) {
+                optind--;
+            }
+
+            break;
+
+        case 'P':
+
+            /*
+             * the master persists past the client exit: a number
+             * bounds the detached master to so many seconds, yes
+             * serves until the idle close
+             */
+            if (optarg != NULL && strcmp(optarg, "yes") == 0) {
+                s3_interop_cm_persist = 1;
+                break;
+            }
+
+            s3_interop_cm_persist_sec = atol(optarg);
+
+            if (s3_interop_cm_persist_sec <= 0) {
+                s3_interop_usage(argv[0]);
+                return 1;
+            }
+
+            s3_interop_cm_persist = 1;
+
             break;
 
         case 'O':
@@ -6505,12 +6625,13 @@ main(int argc, char **argv)
     /*
      * the meanings of -U: the Basic auth of the CONNECT in the h3
      * runs, the bare username in the pubkey mode (-K), the control
-     * socket path in the cm modes (the master, the control ops and
-     * the slave that never touches quic)
+     * socket path in the cm modes (the master, the auto mode, the
+     * control ops and the slave that never touches quic)
      */
     if (s3_interop_u_raw != NULL) {
 
-        if (s3_interop_cm_master || s3_interop_cm_op != NULL || !s3_interop_h3_mode) {
+        if (s3_interop_cm_master || s3_interop_cm_auto || s3_interop_cm_op != NULL ||
+            !s3_interop_h3_mode) {
             s3_interop_cm_path = s3_interop_u_raw;
 
         } else if (s3_interop_pubkey_path != NULL) {
@@ -6592,6 +6713,42 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * the -M auto resolution: the dial probe first, a live master
+     * turns the client into its slave (no quic), the refused or
+     * absent path unlinks on the listen below and the client becomes
+     * the master
+     */
+    if (s3_interop_cm_auto) {
+
+        int probe;
+
+        if (s3_interop_cm_path == NULL) {
+            s3_interop_usage(argv[0]);
+            return 1;
+        }
+
+        probe = s3_interop_cm_dial(s3_interop_cm_path);
+
+        if (probe >= 0) {
+            (void)close(probe);
+
+            /* the live master: the slave branch of the same socket */
+
+            return s3_interop_cm_slave(timeout);
+        }
+
+        if (!s3_interop_h3_mode || !s3_interop_h3_channel_mode || peer_text == NULL) {
+            fprintf(stderr,
+                    "interop-client: -M auto: no live master on %s, the master branch"
+                    " needs -3 -C -a\n",
+                    s3_interop_cm_path);
+            return 1;
+        }
+
+        s3_interop_cm_master = 1;
+    }
+
     /* the master rides the channel phase of the h3 mode */
 
     if (s3_interop_cm_master &&
@@ -6599,6 +6756,13 @@ main(int argc, char **argv)
          s3_interop_h3_session_mode || s3_interop_fwd_mode || s3_interop_sftp_mode ||
          s3_interop_agent_mode || s3_interop_jump_phase || s3_interop_streams_mode ||
          s3_interop_cm_op != NULL || s3_interop_cm_idle_ms < 0)) {
+        s3_interop_usage(argv[0]);
+        return 1;
+    }
+
+    /* the persist rides a master (the auto slave branch ignores it) */
+
+    if (s3_interop_cm_persist && !s3_interop_cm_master) {
         s3_interop_usage(argv[0]);
         return 1;
     }
@@ -6833,6 +6997,17 @@ main(int argc, char **argv)
         goto teardown;
     }
 
+    /*
+     * the keylog file opens at the client start, the s3_ssl_free()
+     * below closes it (the exit contract)
+     */
+    if (s3_interop_keylog_path != NULL &&
+        s3_ssl_set_keylog_file(conf.ssl, s3_interop_keylog_path) != S3_OK) {
+        fprintf(stderr, "interop-client: keylog file failed\n");
+        rc = 1;
+        goto teardown;
+    }
+
     conf.gso_enabled = 1;
     conf.ctx = &ctx;
     conf.handshake_timeout = (s3_msec_t)timeout;
@@ -6847,6 +7022,16 @@ main(int argc, char **argv)
     conf.active_connection_id_limit = 8;
     conf.max_datagram_frame_size = dg_size;
     conf.datagram_handler = s3_interop_client_datagram;
+
+    /* the rx window tuning, before the handshake (the transport parameters) */
+
+    if (s3_interop_conn_rx_mb > 0) {
+        s3_quic_conf_conn_rx_window(&conf, (size_t)s3_interop_conn_rx_mb * 1024 * 1024);
+    }
+
+    if (s3_interop_stream_rx_mb > 0) {
+        s3_quic_conf_stream_rx_window(&conf, (size_t)s3_interop_stream_rx_mb * 1024 * 1024);
+    }
 
     if (s3_interop_h3_mode) {
         /* the server's uni streams go to the session port, see above */
@@ -7037,6 +7222,53 @@ main(int argc, char **argv)
                     s3_interop_cm_listen_open(&ctx) != S3_OK) {
                     rc = 1;
                     goto teardown;
+                }
+
+                if (s3_interop_cm_persist && s3_interop_cm_listening && !s3_interop_cm_forked) {
+
+                    /*
+                     * the detach (-P): the child keeps the whole event
+                     * loop (the quic connection, the listener, the
+                     * sessions) in the copied memory and carries on as
+                     * the master; the client exits without the
+                     * teardown - the close of the fds or the unlink of
+                     * the path would reach into the child state, the
+                     * _exit() skips the cleanup and the exit leak
+                     * check by design
+                     */
+                    pid_t pid;
+
+                    s3_interop_cm_forked = 1;
+
+                    if (s3_interop_cm_persist_sec > 0) {
+                        s3_interop_cm_persist_deadline =
+                            s3_current_msec + (s3_msec_t)s3_interop_cm_persist_sec * 1000;
+                    }
+
+                    fflush(stdout);
+                    fflush(stderr);
+
+                    pid = fork();
+
+                    if (pid < 0) {
+                        fprintf(stderr, "interop-client: fork() failed\n");
+                        rc = 1;
+                        goto teardown;
+                    }
+
+                    if (pid > 0) {
+
+                        /* the client: the detached master answers in pid */
+
+                        printf("S3CM-MASTER-PERSIST pid=%ld\n", (long)pid);
+                        fflush(stdout);
+
+                        _exit(0);
+                    }
+
+                    /* the detached master: the own session, no tty */
+
+                    (void)setsid();
                 }
 
                 if (s3_interop_cm_stop) {
