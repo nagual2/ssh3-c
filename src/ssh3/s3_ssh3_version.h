@@ -38,7 +38,7 @@
 
 #define S3_SSH3_VERSION_STRING                                                                     \
     S3_SSH3_PROTOCOL_NAME " 3.0 " S3_SSH3_IMPLEMENTATION_NAME                                      \
-                          " 0.2.1 experimental_spec_version=" S3_SSH3_SPEC_VERSION
+                          " 0.3.0 experimental_spec_version=" S3_SSH3_SPEC_VERSION
 
 /*
  * the parsed view of a version string; the strings are zero-copy
