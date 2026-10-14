@@ -35,12 +35,24 @@
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_UDP "direct-udp"
 
 /*
- * the server-to-client channel types (the reverse forward, the -R of
- * the reference): a client opening them towards the server breaks the
- * role table and is refused on the inbound path (S2-03, the pass-2
- * audit); the C server has no reverse forward yet, the refusal is the
- * whole handling of the names
+ * the control channel of the reverse forward (the -R of the
+ * reference, message/reverse_forward.go): the client opens it
+ * towards the server and carries the bind request as the channel
+ * data; the server binds and answers with the result as the channel
+ * data too
  */
+
+#define S3_SSH3_CHANNEL_TYPE_REVERSE_FORWARD "reverse-forward"
+
+/*
+ * the server-to-client channel types (the reverse forward, the -R of
+ * the reference): the server opens one per accepted connection or
+ * datagram of a bound -R listener, the header extension carries the
+ * client-side target; a client opening them towards the server breaks
+ * the role table and is refused on the inbound path (S2-03, the
+ * pass-2 audit)
+ */
+
 #define S3_SSH3_CHANNEL_TYPE_FORWARDED_TCP "forwarded-tcp"
 #define S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP "forwarded-udp"
 

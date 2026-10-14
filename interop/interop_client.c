@@ -101,6 +101,7 @@
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_oidc_client.h>
 #include <s3_ssh3_request.h>
+#include <s3_ssh3_reverse.h>
 #include <s3_ssh3_sftp.h>
 #include <s3_ssh3_sftp_cli.h>
 #include <s3_ssh3_version.h>
@@ -944,6 +945,11 @@ s3_interop_fwd_udp_init(void)
  * the same prefix (docs/P4-WIRE.md 3.2), the index opens the payload,
  * the verdict is the count of the byte-exact echoes
  */
+
+/* the reverse bridge router rides the datagram dispatch first */
+
+static unsigned s3_interop_reverse_datagram(s3_chain_t *data);
+
 static void
 s3_interop_fwd_udp_datagram(s3_chain_t *data)
 {
@@ -1016,6 +1022,13 @@ s3_interop_client_datagram(s3_connection_t *c, s3_chain_t *data)
     uint32_t    idx;
     size_t      len, n;
     s3_chain_t *cl;
+
+    /* the udp bridges of the -R forwards route first, the direct
+     * shapes follow */
+
+    if (s3_interop_reverse_datagram(data)) {
+        return;
+    }
 
     if (s3_interop_fwd_mode == S3_INTEROP_FWD_UDP) {
         s3_interop_fwd_udp_datagram(data);
@@ -2988,6 +3001,1363 @@ s3_interop_agent_pump_timer(s3_event_t *ev)
     }
 
     s3_event_add_timer(ev, 50);
+}
+
+/*
+ * === the reverse port forwarding (-R, the reference
+ * client/reverse_forward.go): the client opens one "reverse-forward"
+ * control channel per -R spec, the bind request rides as the channel
+ * data, the reply comes back the same way; every server-initiated
+ * forwarded-tcp/forwarded-udp channel whose header target matches a
+ * resolved -R spec bridges into the local target ===
+ */
+
+/*
+ * the -R specs of the run, resolved at the parse (the reference
+ * resolveTarget: the -R target resolves where the client runs, a bad
+ * target refuses before anything is sent); the request carries the
+ * canonical text of the resolution
+ */
+
+#define S3_INTEROP_REVERSE_MAX     16
+#define S3_INTEROP_REVERSE_BRIDGES 16
+
+static s3_ssh3_reverse_spec_t   s3_interop_rspec[S3_INTEROP_REVERSE_MAX];
+static unsigned                 s3_interop_rspec_count;
+static unsigned                 s3_interop_rspec_opened;
+static s3_ssh3_forward_target_t s3_interop_rtarget[S3_INTEROP_REVERSE_MAX];
+static char                     s3_interop_rtarget_text[S3_INTEROP_REVERSE_MAX][64];
+
+/* the control channels: one per spec, the request waits the reply */
+
+typedef struct {
+    s3_connection_t *sc;
+    u_char           frame[160]; /* the header + the bind request */
+    size_t           frame_len;
+    size_t           frame_sent;
+    u_char           acc[512]; /* the 91 and the reply accumulate */
+    size_t           acc_len;
+    unsigned         replied;
+    unsigned         ok;
+} s3_interop_rctrl_t;
+
+static s3_interop_rctrl_t s3_interop_rctrl[S3_INTEROP_REVERSE_MAX];
+
+/*
+ * the bridges: one server-initiated forwarded-* channel each; the
+ * accumulator bounds follow the channel buffer bound of the harness
+ * (S2-01), an overgrown accumulator tears the bridge down
+ */
+
+#define S3_INTEROP_REVERSE_BUF_MAX 65536
+
+typedef struct {
+    unsigned           used;
+    unsigned           kind; /* S3_SSH3_REVERSE_PROTO_TCP/UDP */
+    unsigned           spec;
+    s3_connection_t   *sc;
+    uint64_t           ch_id;
+    int                fd;
+    unsigned           confirmed;
+    unsigned           chan_fin;      /* the channel saw the fin */
+    unsigned           local_eof;     /* the socket saw the eof */
+    unsigned           chan_fin_sent; /* the channel fin rode once */
+    u_char            *acc;           /* the channel payloads awaiting the socket */
+    size_t             acc_len;       /* the total bytes (the ready + the tail) */
+    size_t             acc_pay;       /* the ready bytes at the acc front */
+    size_t             acc_cap;
+    u_char            *to_chan; /* the socket bytes awaiting the 94 */
+    size_t             to_chan_len;
+    size_t             to_chan_cap;
+    u_char             frame[S3_INTEROP_FWD_FRAME];
+    size_t             frame_sent;
+    size_t             frame_total;
+    struct sockaddr_in target;
+} s3_interop_rbridge_t;
+
+static s3_interop_rbridge_t s3_interop_rbridge[S3_INTEROP_REVERSE_BRIDGES];
+
+/*
+ * the parked datagrams of the bridges not armed yet: the server
+ * forwards the first datagrams while the channel header still parses
+ * (the stream and the QUIC datagrams race), the park replays them
+ * when the bridge arms
+ */
+
+#define S3_INTEROP_REVERSE_PARK_MAX 16
+
+/* the ::ffff:0.0.0.0/96 prefix of the v4-mapped v6 form (the wire
+ * shape of the fork forwarded-* headers, the net.IP.To16() shape) */
+
+static const u_char s3_reverse_v4_mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+#define S3_INTEROP_REVERSE_PARK_DG 1300
+
+typedef struct {
+    unsigned used;
+    uint64_t ch_id;
+    size_t   len;
+    u_char   dg[S3_INTEROP_REVERSE_PARK_DG];
+} s3_interop_rpark_t;
+
+static s3_interop_rpark_t s3_interop_rpark[S3_INTEROP_REVERSE_PARK_MAX];
+
+static s3_event_t s3_interop_reverse_timer;
+
+/* the pump pair and the accept reader, defined below */
+
+static void s3_interop_reverse_stream_read(s3_event_t *ev);
+
+static void s3_interop_reverse_pump(s3_event_t *ev);
+
+static void s3_interop_rctrl_read(s3_event_t *ev);
+
+/*
+ * the verdict of the -R run rides the deadline exit inline (the ok /
+ * denied counters of the control channels), no helper state
+ */
+
+/* the bridge of a channel id, NULL when none rides it */
+
+static s3_interop_rbridge_t *
+s3_interop_reverse_bridge_of(uint64_t ch_id)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_INTEROP_REVERSE_BRIDGES; i++) {
+
+        if (s3_interop_rbridge[i].used && s3_interop_rbridge[i].ch_id == ch_id) {
+            return &s3_interop_rbridge[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* the bridge of a stream connection, NULL when none rides it */
+
+static s3_interop_rbridge_t *
+s3_interop_reverse_bridge_of_sc(s3_connection_t *sc)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_INTEROP_REVERSE_BRIDGES; i++) {
+
+        if (s3_interop_rbridge[i].used && s3_interop_rbridge[i].sc == sc) {
+            return &s3_interop_rbridge[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* the control channel of a stream connection, NULL when none rides it */
+
+static s3_interop_rctrl_t *
+s3_interop_rctrl_of(s3_connection_t *sc)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_interop_rspec_count; i++) {
+
+        if (s3_interop_rctrl[i].sc == sc) {
+            return &s3_interop_rctrl[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * one bridge dies: the socket and the stream close, the buffers free
+ * (the harness lives one run, the process exit reaps the rest)
+ */
+
+static void
+s3_interop_reverse_bridge_kill(s3_interop_rbridge_t *b, const char *why)
+{
+    if (why != NULL) {
+        fprintf(stderr, "interop-client: reverse bridge down: %s\n", why);
+    }
+
+    if (b->fd >= 0) {
+        (void)close(b->fd);
+        b->fd = -1;
+    }
+
+    if (b->sc != NULL) {
+        (void)s3_quic_shutdown_stream(b->sc, S3_RDWR_SHUTDOWN);
+        b->sc = NULL;
+    }
+
+    free(b->acc);
+    free(b->to_chan);
+
+    b->acc = NULL;
+    b->to_chan = NULL;
+    b->acc_len = 0;
+    b->to_chan_len = 0;
+    b->frame_sent = b->frame_total = 0;
+    b->used = 0;
+}
+
+/* the whole reverse state dies (the run teardown) */
+
+static void
+s3_interop_reverse_teardown(void)
+{
+    unsigned i;
+
+    if (s3_interop_reverse_timer.timer_set) {
+        s3_event_del_timer(&s3_interop_reverse_timer);
+    }
+
+    for (i = 0; i < S3_INTEROP_REVERSE_BRIDGES; i++) {
+
+        if (s3_interop_rbridge[i].used) {
+            s3_interop_reverse_bridge_kill(&s3_interop_rbridge[i], NULL);
+        }
+    }
+
+    for (i = 0; i < s3_interop_rspec_count; i++) {
+
+        if (s3_interop_rctrl[i].sc != NULL) {
+            (void)s3_quic_shutdown_stream(s3_interop_rctrl[i].sc, S3_RDWR_SHUTDOWN);
+            s3_interop_rctrl[i].sc = NULL;
+        }
+    }
+}
+
+/*
+ * the -R spec of the resolved target: the authorization of the
+ * incoming forwarded-* channels (the reference authorizeForwardedTarget,
+ * a compromised server must not reach the local endpoints uninvited);
+ * returns the spec index, -1 when nothing matches
+ */
+
+static int
+s3_interop_reverse_spec_of(unsigned proto, const s3_ssh3_forward_target_t *t)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_interop_rspec_count; i++) {
+
+        const s3_ssh3_forward_target_t *rt = &s3_interop_rtarget[i];
+
+        if (s3_interop_rspec[i].proto != proto || rt->port != t->port) {
+            continue;
+        }
+
+        /* the exact ip of the resolution, or the v4-mapped form the
+         * reference server sends in the forwarded-* headers (the
+         * net.IP.To16() shape: every v4 target rides the 16-byte
+         * ::ffff:a.b.c.d, family 6) */
+
+        if (rt->family == t->family && rt->ip_len == t->ip_len &&
+            s3_memcmp(rt->ip, t->ip, t->ip_len) == 0) {
+            return (int)i;
+        }
+
+        if (t->family == 6 && t->ip_len == 16 && rt->family == 4 && rt->ip_len == 4 &&
+            s3_memcmp(t->ip, s3_reverse_v4_mapped_prefix, 10) == 0 &&
+            s3_memcmp(t->ip + 12, rt->ip, 4) == 0) {
+            return (int)i;
+        }
+
+        /* the plain v4 zero (the unspecified 0.0.0.0) matches too */
+
+        if (t->ip_len == (t->family == 6 ? 16u : 4u)) {
+
+            size_t z;
+
+            for (z = 0; z < t->ip_len; z++) {
+
+                if (t->ip[z] != 0) {
+                    break;
+                }
+            }
+
+            if (z == t->ip_len) {
+                return (int)i;
+            }
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * one server-initiated forwarded-* channel bridges: the 91 answers
+ * the opener header, the local target dials, the pump rides the tick
+ */
+
+static void
+s3_interop_reverse_bridge_start(s3_connection_t *sc, unsigned spec_ix, unsigned proto,
+                                const u_char *tail, size_t tail_len)
+{
+    s3_interop_rbridge_t *b;
+    u_char                out[32];
+    u_char               *p;
+    size_t                total;
+    ssize_t               m;
+
+    b = &s3_interop_rbridge[0]; /* the take below fills it */
+
+    {
+        unsigned i;
+
+        for (i = 0; i < S3_INTEROP_REVERSE_BRIDGES; i++) {
+
+            if (!s3_interop_rbridge[i].used) {
+                b = &s3_interop_rbridge[i];
+                break;
+            }
+        }
+
+        if (b->used) {
+            fprintf(stderr, "interop-client: the reverse bridge table is full\n");
+            (void)s3_quic_cancelable_stream(sc);
+            (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+            return;
+        }
+    }
+
+    s3_memzero(b, sizeof(*b));
+
+    b->fd = -1;
+
+    /* the 91 with our maxPacketSize, the shape of the server */
+
+    {
+        s3_ssh3_msg_open_confirmation_t conf;
+
+        s3_memzero(&conf, sizeof(conf));
+        conf.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+
+        p = out;
+        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION);
+        p = (u_char *)s3_ssh3_msg_encode_open_confirmation(p, &conf);
+
+        total = (size_t)(p - out);
+
+        m = s3_quic_stream_send(sc, out, total);
+
+        if (m != (ssize_t)total) {
+            fprintf(stderr, "interop-client: reverse bridge confirmation send failed\n");
+            (void)s3_quic_cancelable_stream(sc);
+            (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+            return;
+        }
+    }
+
+    /* the local half: the spec target is an ipv4 literal in the
+     * harness (the loopback echo services), the plain blocking
+     * connect of the direct-tcp shape */
+
+    if (s3_interop_rtarget[spec_ix].family != 4) {
+        fprintf(stderr, "interop-client: the -R bridge bridges the ipv4 targets only\n");
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return;
+    }
+
+    s3_memzero(&b->target, sizeof(b->target));
+
+    b->target.sin_family = AF_INET;
+    s3_memcpy(&b->target.sin_addr, s3_interop_rtarget[spec_ix].ip, 4);
+    b->target.sin_port = htons(s3_interop_rtarget[spec_ix].port);
+
+    b->fd = socket(AF_INET, (proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
+
+    if (b->fd == -1) {
+        fprintf(stderr, "interop-client: reverse bridge socket failed\n");
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return;
+    }
+
+    if (connect(b->fd, (const struct sockaddr *)&b->target, sizeof(b->target)) != 0 ||
+        s3_nonblocking(b->fd) != S3_OK) {
+        fprintf(stderr, "interop-client: the local -R target is unreachable\n");
+        (void)close(b->fd);
+        b->fd = -1;
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return;
+    }
+
+    b->used = 1;
+    b->kind = proto;
+    b->spec = spec_ix;
+    b->sc = sc;
+    b->ch_id = ((s3_quic_stream_t *)sc->data)->id;
+    b->confirmed = 1;
+
+    /* the parked datagrams of the startup race replay into the
+     * socket at once (the router parked them while the header
+     * parsed) */
+
+    if (proto == S3_SSH3_REVERSE_PROTO_UDP) {
+
+        unsigned k;
+
+        for (k = 0; k < S3_INTEROP_REVERSE_PARK_MAX; k++) {
+
+            s3_interop_rpark_t *pk = &s3_interop_rpark[k];
+
+            if (pk->used && pk->ch_id == b->ch_id) {
+                (void)send(b->fd, pk->dg, pk->len, 0);
+                pk->used = 0;
+            }
+        }
+    }
+
+    /* the header tail (the first bytes of the stream after the
+     * header) rides the accumulator, the bridge never loses them */
+
+    if (tail_len > 0) {
+
+        b->acc_cap = tail_len + 16384;
+        b->acc = malloc(b->acc_cap);
+
+        if (b->acc == NULL) {
+            s3_interop_reverse_bridge_kill(b, "the bridge buffer growth failed");
+            (void)s3_quic_cancelable_stream(sc);
+            (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+            return;
+        }
+
+        s3_memcpy(b->acc, tail, tail_len);
+        b->acc_len = tail_len;
+    }
+
+    printf("INTEROP-RFWD-BRIDGE kind=%s spec=%u ch=%llu\n",
+           (proto == S3_SSH3_REVERSE_PROTO_UDP) ? "udp" : "tcp", spec_ix,
+           (unsigned long long)b->ch_id);
+    fflush(stdout);
+
+    /* the stream read: the 94 payloads ride the local socket, the
+     * fin closes the write side (the half-close contract of the
+     * relay) */
+
+    sc->read->handler = s3_interop_reverse_stream_read;
+    sc->read->data = sc;
+    sc->read->active = 1;
+
+    if (sc->read->ready) {
+        sc->read->handler(sc->read);
+    }
+
+    if (!s3_interop_reverse_timer.timer_set) {
+
+        s3_interop_reverse_timer.data = &s3_interop_reverse_timer;
+        s3_interop_reverse_timer.log = &s3_interop_log;
+        s3_interop_reverse_timer.handler = s3_interop_reverse_pump;
+
+        s3_event_add_timer(&s3_interop_reverse_timer, 50);
+    }
+}
+
+/*
+ * the accept reader of the server-initiated bidi streams: the header
+ * parses here, the agent-connection keeps its own path (the singleton
+ * bridge of -X arms it in the stream handler), the forwarded-* types
+ * bridge through the -R table, everything else refuses
+ */
+
+static void
+s3_interop_reverse_accept_read(s3_event_t *ev)
+{
+    s3_connection_t  *sc = ev->data;
+    static u_char     hdrbuf[128];
+    static size_t     hdrlen;
+    const u_char     *pos, *end;
+    s3_ssh3_channel_t hdr;
+    ssize_t           n;
+
+    for (;;) {
+
+        if (hdrlen == sizeof(hdrbuf)) {
+            s3_interop_reverse_teardown();
+            fprintf(stderr, "interop-client: the server channel header is too big\n");
+            exit(1);
+        }
+
+        n = sc->recv(sc, hdrbuf + hdrlen, sizeof(hdrbuf) - hdrlen);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n <= 0) {
+            s3_interop_reverse_teardown();
+            fprintf(stderr, "interop-client: the server channel closed before the header\n");
+            exit(1);
+        }
+
+        hdrlen += (size_t)n;
+
+        pos = hdrbuf;
+        end = hdrbuf + hdrlen;
+
+        if (s3_ssh3_channel_parse_header(&pos, end, &hdr) != S3_OK) {
+            continue; /* the header tail waits for the next recv */
+        }
+
+        if (hdr.conversation_stream_id != s3_interop_fwd_conv_id) {
+            s3_interop_reverse_teardown();
+            fprintf(stderr, "interop-client: the server channel conversation mismatch\n");
+            exit(1);
+        }
+
+        if (hdr.type.len == strlen(S3_SSH3_CHANNEL_TYPE_FORWARDED_TCP) &&
+            s3_memcmp(hdr.type.data, S3_SSH3_CHANNEL_TYPE_FORWARDED_TCP, hdr.type.len) == 0) {
+
+            s3_ssh3_forward_target_t target;
+            int                      spec_ix;
+
+            if (s3_ssh3_forward_parse_target(&pos, end, &target) != S3_OK) {
+                s3_interop_reverse_teardown();
+                fprintf(stderr, "interop-client: bad forwarded-tcp target\n");
+                exit(1);
+            }
+
+            spec_ix = s3_interop_reverse_spec_of(S3_SSH3_REVERSE_PROTO_TCP, &target);
+
+            if (spec_ix < 0) {
+
+                /* the allow-list of the client (S2-03 symmetric): a
+                 * forwarded-* channel of a target no -R asked for
+                 * refuses */
+
+                fprintf(stderr,
+                        "interop-client: rejecting unexpected server channel towards "
+                        "target=%u.%u.%u.%u:%u\n",
+                        target.ip[0], target.ip[1], target.ip[2], target.ip[3],
+                        (unsigned)target.port);
+
+                (void)s3_quic_cancelable_stream(sc);
+                (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+
+                hdrlen = 0;
+                return;
+            }
+
+            hdrlen = 0;
+
+            s3_interop_reverse_bridge_start(sc, (unsigned)spec_ix, S3_SSH3_REVERSE_PROTO_TCP, pos,
+                                            (size_t)(end - pos));
+            return;
+        }
+
+        if (hdr.type.len == strlen(S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP) &&
+            s3_memcmp(hdr.type.data, S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP, hdr.type.len) == 0) {
+
+            s3_ssh3_forward_target_t target;
+            int                      spec_ix;
+
+            if (s3_ssh3_forward_parse_target(&pos, end, &target) != S3_OK) {
+                s3_interop_reverse_teardown();
+                fprintf(stderr, "interop-client: bad forwarded-udp target\n");
+                exit(1);
+            }
+
+            spec_ix = s3_interop_reverse_spec_of(S3_SSH3_REVERSE_PROTO_UDP, &target);
+
+            if (spec_ix < 0) {
+
+                fprintf(stderr,
+                        "interop-client: rejecting unexpected server channel towards "
+                        "target=%u.%u.%u.%u:%u\n",
+                        target.ip[0], target.ip[1], target.ip[2], target.ip[3],
+                        (unsigned)target.port);
+
+                (void)s3_quic_cancelable_stream(sc);
+                (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+
+                hdrlen = 0;
+                return;
+            }
+
+            hdrlen = 0;
+
+            s3_interop_reverse_bridge_start(sc, (unsigned)spec_ix, S3_SSH3_REVERSE_PROTO_UDP, pos,
+                                            (size_t)(end - pos));
+            return;
+        }
+
+        /* the unexpected type: the refusal of the reference loop */
+
+        fprintf(stderr, "interop-client: rejecting unexpected server channel of type %.*s\n",
+                (int)hdr.type.len, (const char *)hdr.type.data);
+
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+
+        hdrlen = 0;
+
+        return;
+    }
+}
+
+/*
+ * the channel side of a tcp bridge: the 94 payloads ride the local
+ * socket, the fin of the peer closes the write side of the socket and
+ * the drain finishes the bridge (the half-close contract)
+ */
+
+static void
+s3_interop_reverse_stream_read(s3_event_t *ev)
+{
+    s3_connection_t      *sc = ev->data;
+    s3_interop_rbridge_t *b = s3_interop_reverse_bridge_of_sc(sc);
+    const u_char         *pos, *end;
+    ssize_t               n;
+
+    if (b == NULL) {
+        return; /* the bridge died, the tail events are noise */
+    }
+
+    for (;;) {
+
+        if (b->acc_len == b->acc_cap) {
+
+            size_t  cap;
+            u_char *grown;
+
+            if (b->acc_cap >= S3_INTEROP_REVERSE_BUF_MAX) {
+                s3_interop_reverse_bridge_kill(b, "the bridge buffer overgrown");
+                return;
+            }
+
+            cap = b->acc_cap + 32768;
+
+            if (cap > S3_INTEROP_REVERSE_BUF_MAX) {
+                cap = S3_INTEROP_REVERSE_BUF_MAX;
+            }
+
+            grown = realloc(b->acc, cap);
+
+            if (grown == NULL) {
+                s3_interop_reverse_bridge_kill(b, "the bridge buffer growth failed");
+                return;
+            }
+
+            b->acc = grown;
+            b->acc_cap = cap;
+        }
+
+        n = sc->recv(sc, b->acc + b->acc_len, b->acc_cap - b->acc_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+
+            /* the channel fin: the local write side closes (the
+             * half-close of the reference relay), the tick drains
+             * the tail and ends the bridge */
+
+            b->chan_fin = 1;
+
+            if (b->fd >= 0) {
+                (void)shutdown(b->fd, SHUT_WR);
+            }
+
+            return;
+        }
+
+        if (n < 0) {
+            s3_interop_reverse_bridge_kill(b, "the bridge stream recv error");
+            return;
+        }
+
+        b->acc_len += (size_t)n;
+
+        /*
+         * the message walk with the write cursor: the payload of
+         * every 94 compacts to the front (behind the bytes the pump
+         * still owes the socket), the partial tail rides behind; the
+         * udp bridge carries no stream payloads (the datagrams ride
+         * the QUIC datagram path), a 94 there is a protocol break
+         */
+
+        {
+            u_char *w = b->acc + b->acc_pay;
+
+            pos = b->acc + b->acc_pay;
+            end = b->acc + b->acc_len;
+
+            while (pos < end) {
+
+                const u_char *msg = pos;
+                uint64_t      type;
+
+                if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                    s3_ssh3_msg_open_confirmation_t conf;
+
+                    if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    b->confirmed = 1;
+                    continue;
+                }
+
+                if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                    s3_ssh3_msg_data_t data;
+
+                    if (!b->confirmed) {
+                        s3_interop_reverse_bridge_kill(b,
+                                                       "the bridge data before the confirmation");
+                        return;
+                    }
+
+                    if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                        pos = msg;
+                        break;
+                    }
+
+                    if (b->kind == S3_SSH3_REVERSE_PROTO_UDP) {
+                        s3_interop_reverse_bridge_kill(b, "the bridge udp stream data");
+                        return;
+                    }
+
+                    if (data.data.len > 0) {
+                        s3_memmove(w, data.data.data, data.data.len);
+                        w += data.data.len;
+                    }
+
+                    continue;
+                }
+
+                s3_interop_reverse_bridge_kill(b, "the bridge unexpected message");
+                return;
+            }
+
+            /* the ready bytes and the unparsed tail ride the front */
+
+            b->acc_pay = (size_t)(w - b->acc);
+
+            if (pos < end) {
+                s3_memmove(w, pos, (size_t)(end - pos));
+                w += (size_t)(end - pos);
+            }
+
+            b->acc_len = (size_t)(w - b->acc);
+
+            /*
+             * the inline flush of the ready bytes: the read loop would
+             * otherwise outrun the 50 ms pump and overgrow the
+             * accumulator (the probe writes back-to-back); the loopback
+             * target sends drain at once, the EAGAIN case waits for
+             * the pump tick
+             */
+
+            while (b->acc_pay > 0) {
+
+                ssize_t m = send(b->fd, b->acc, b->acc_pay, 0);
+
+                if (m > 0) {
+
+                    size_t tail = b->acc_len - b->acc_pay;
+
+                    s3_memmove(b->acc, b->acc + m, b->acc_pay - (size_t)m + tail);
+                    b->acc_pay -= (size_t)m;
+                    b->acc_len -= (size_t)m;
+
+                    continue;
+                }
+
+                break; /* EAGAIN or error, the pump tick resumes */
+            }
+        }
+    }
+}
+
+/*
+ * the tick of the bridges: the channel payloads ride the sockets, the
+ * socket bytes wrap into the 94 frames (the tail parks), the udp
+ * bridges pump their datagrams
+ */
+
+static void
+s3_interop_reverse_pump(s3_event_t *ev)
+{
+    static u_char buf[16384];
+    unsigned      i, live = 0;
+
+    ev->timedout = 0;
+
+    for (i = 0; i < S3_INTEROP_REVERSE_BRIDGES; i++) {
+
+        s3_interop_rbridge_t *b = &s3_interop_rbridge[i];
+
+        if (!b->used) {
+            continue;
+        }
+
+        live = 1;
+
+        if (b->kind == S3_SSH3_REVERSE_PROTO_UDP) {
+
+            /* the udp bridge: the socket datagrams ride the channel
+             * with the ids prefix (docs/P4-WIRE.md 3.2), the inbound
+             * ones came through the datagram router */
+
+            for (;;) {
+
+                ssize_t n = recv(b->fd, buf, sizeof(buf), 0);
+                u_char  dg[2048];
+                u_char *p;
+
+                if (n > 0 && (size_t)n + 16 > sizeof(dg)) {
+                    continue; /* the datagram path is lossy by design */
+                }
+
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    break;
+                }
+
+                if (n <= 0) {
+                    s3_interop_reverse_bridge_kill(b, "the local -R udp target closed");
+                    break;
+                }
+
+                p = s3_ssh3_dgram_encode(dg, s3_interop_fwd_conv_id, b->ch_id, buf, (size_t)n);
+
+                if (s3_quic_send_datagram(((s3_quic_stream_t *)b->sc->data)->parent, dg,
+                                          (size_t)(p - dg)) != S3_OK) {
+                    break;
+                }
+            }
+
+            continue;
+        }
+
+        /* the tcp bridge, the ready channel payloads first (the
+         * partial tail stays behind them) */
+
+        while (b->acc_pay > 0) {
+
+            ssize_t m = send(b->fd, b->acc, b->acc_pay, 0);
+
+            if (m > 0) {
+
+                size_t tail = b->acc_len - b->acc_pay;
+
+                s3_memmove(b->acc, b->acc + m, b->acc_pay - (size_t)m + tail);
+                b->acc_pay -= (size_t)m;
+                b->acc_len -= (size_t)m;
+
+                continue;
+            }
+
+            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+
+            s3_interop_reverse_bridge_kill(b, "the local -R target write failed");
+            break;
+        }
+
+        if (!b->used) {
+            continue;
+        }
+
+        /* the socket replies, the 94 frames under the maxPacketSize */
+
+        if (!b->local_eof) {
+
+            for (;;) {
+
+                ssize_t n = recv(b->fd, buf, sizeof(buf), 0);
+
+                if (n > 0) {
+
+                    if (b->to_chan_len + (size_t)n > S3_INTEROP_REVERSE_BUF_MAX) {
+                        s3_interop_reverse_bridge_kill(b, "the bridge buffer overgrown");
+                        break;
+                    }
+
+                    if (b->to_chan_cap == 0) {
+                        b->to_chan_cap = 16384;
+                        b->to_chan = malloc(b->to_chan_cap);
+                    }
+
+                    while (b->to_chan_len + (size_t)n > b->to_chan_cap) {
+                        u_char *grown = realloc(b->to_chan, b->to_chan_cap + 32768);
+
+                        if (grown == NULL) {
+                            s3_interop_reverse_bridge_kill(b, "the bridge buffer growth failed");
+                            break;
+                        }
+
+                        b->to_chan = grown;
+                        b->to_chan_cap += 32768;
+                    }
+
+                    if (!b->used) {
+                        break;
+                    }
+
+                    s3_memcpy(b->to_chan + b->to_chan_len, buf, (size_t)n);
+                    b->to_chan_len += (size_t)n;
+
+                    continue;
+                }
+
+                if (n == 0) {
+
+                    /* the local target closed its write side: the
+                     * channel fin rides once the tail drained (the
+                     * half-close of the reference relay) */
+
+                    b->local_eof = 1;
+                    break;
+                }
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+
+                s3_interop_reverse_bridge_kill(b, "the local -R target read error");
+                break;
+            }
+
+            if (!b->used) {
+                continue;
+            }
+        }
+
+        while (b->to_chan_len > 0 || b->frame_sent < b->frame_total) {
+
+            if (b->frame_sent == b->frame_total) {
+
+                u_char *p;
+                size_t  chunk;
+
+                chunk = s3_ssh3_channel_chunk_size(S3_INTEROP_CHANNEL_MAX_PACKET, 0);
+
+                if (chunk > b->to_chan_len) {
+                    chunk = b->to_chan_len;
+                }
+
+                p = b->frame;
+                p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+                p = (u_char *)s3_ssh3_encode_varint(p, chunk);
+                s3_memcpy(p, b->to_chan, chunk);
+
+                b->frame_total = (size_t)(p - b->frame) + chunk;
+                b->frame_sent = 0;
+
+                s3_memmove(b->to_chan, b->to_chan + chunk, b->to_chan_len - chunk);
+                b->to_chan_len -= chunk;
+            }
+
+            {
+                ssize_t m = s3_quic_stream_send(b->sc, b->frame + b->frame_sent,
+                                                b->frame_total - b->frame_sent);
+
+                if (m == (ssize_t)S3_AGAIN) {
+                    break; /* the window reopens on the next tick */
+                }
+
+                if (m <= 0) {
+                    s3_interop_reverse_bridge_kill(b, "the bridge stream send failed");
+                    break;
+                }
+
+                b->frame_sent += (size_t)m;
+            }
+        }
+
+        if (!b->used) {
+            continue;
+        }
+
+        /* the local eof: the channel fin rides once the tail is out */
+
+        if (b->local_eof && !b->chan_fin_sent && b->to_chan_len == 0 &&
+            b->frame_sent == b->frame_total) {
+
+            (void)s3_quic_shutdown_stream(b->sc, S3_WRITE_SHUTDOWN);
+            b->chan_fin_sent = 1;
+        }
+
+        /* the both-sides-closed bridge ends (the partial tail is a
+         * loss, the channel is closing) */
+
+        if (b->chan_fin && b->local_eof && b->acc_pay == 0 && b->to_chan_len == 0 &&
+            b->frame_sent == b->frame_total) {
+            s3_interop_reverse_bridge_kill(b, NULL);
+            continue;
+        }
+    }
+
+    if (live) {
+        s3_event_add_timer(ev, 50);
+
+    } else if (s3_interop_rspec_count > 0) {
+
+        /* the -R hold keeps ticking while the binds serve (the
+         * deadline exit rides the wake) */
+
+        s3_event_add_timer(ev, 50);
+
+    } else if (s3_interop_reverse_timer.timer_set) {
+        s3_event_del_timer(&s3_interop_reverse_timer);
+    }
+}
+
+/*
+ * the datagram router of the udp bridges: the datagrams prefixed with
+ * a bridge channel id ride into the local socket, the return value
+ * says the datagram was consumed
+ */
+
+static unsigned
+s3_interop_reverse_datagram(s3_chain_t *data)
+{
+    u_char                flat[S3_INTEROP_FWD_UDP_SIZE + 16];
+    u_char               *p;
+    size_t                len = 0;
+    s3_chain_t           *cl;
+    const u_char         *pos, *end;
+    uint64_t              csid, chid;
+    s3_str_t              payload;
+    s3_interop_rbridge_t *b;
+
+    if (s3_interop_rspec_count == 0) {
+        return 0;
+    }
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    if (len > sizeof(flat)) {
+        return 0;
+    }
+
+    p = flat;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+    }
+
+    pos = flat;
+    end = flat + len;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return 0;
+    }
+
+    if (csid != s3_interop_fwd_conv_id) {
+
+        return 0;
+    }
+
+    b = s3_interop_reverse_bridge_of(chid);
+
+    if (b == NULL || b->kind != S3_SSH3_REVERSE_PROTO_UDP) {
+
+        /* the bridge not armed yet: the datagram parks for the
+         * replay (the startup race), an unknown id parks too — the
+         * table is small and the replay clears it */
+
+        unsigned k;
+
+        for (k = 0; k < S3_INTEROP_REVERSE_PARK_MAX; k++) {
+
+            s3_interop_rpark_t *pk = &s3_interop_rpark[k];
+
+            if (!pk->used) {
+
+                if (payload.len <= S3_INTEROP_REVERSE_PARK_DG) {
+
+                    pk->used = 1;
+                    pk->ch_id = chid;
+                    pk->len = payload.len;
+                    s3_memcpy(pk->dg, payload.data, payload.len);
+                }
+
+                break;
+            }
+        }
+
+        return 1;
+    }
+
+    if (payload.len > 0 && send(b->fd, payload.data, payload.len, 0) < 0) {
+
+        /* the udp loss stays a loss (RFC 768) */
+    }
+
+    return 1;
+}
+
+/*
+ * the control channel of one -R spec: the header and the bind request
+ * ride one frame, the reply comes back as the channel data
+ */
+
+static s3_int_t
+s3_interop_rctrl_open(s3_connection_t *cli, unsigned i)
+{
+    s3_interop_rctrl_t       *rc = &s3_interop_rctrl[i];
+    s3_connection_t          *sc;
+    s3_ssh3_channel_t         hdr;
+    s3_ssh3_reverse_request_t req;
+    s3_str_t                  bind, target;
+    u_char                    reqbuf[256];
+    u_char                   *rp;
+    u_char                   *p;
+    ssize_t                   m;
+
+    if (rc->sc != NULL) {
+        return S3_OK;
+    }
+
+    sc = s3_quic_open_stream(cli, 1);
+
+    if (sc == NULL) {
+        return S3_ERROR;
+    }
+
+    /* the conversation id of the CONNECT stream, the accept
+     * validation and the datagram prefixes ride it */
+
+    s3_interop_fwd_conv_id = ((s3_quic_stream_t *)s3_interop_h3_stream->data)->id;
+
+    sc->read->handler = s3_interop_rctrl_read;
+    sc->read->data = sc;
+    sc->read->active = 1;
+
+    s3_memzero(&hdr, sizeof(hdr));
+
+    hdr.conversation_stream_id = s3_interop_fwd_conv_id;
+    hdr.max_packet_size = S3_INTEROP_CHANNEL_MAX_PACKET;
+    hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_REVERSE_FORWARD;
+    hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_REVERSE_FORWARD);
+
+    bind.data = (u_char *)s3_interop_rspec[i].bind_host;
+    bind.len = strlen(s3_interop_rspec[i].bind_host);
+
+    target.data = (u_char *)s3_interop_rtarget_text[i];
+    target.len = strlen(s3_interop_rtarget_text[i]);
+
+    req.proto = s3_interop_rspec[i].proto;
+    req.bind_address = bind;
+    req.bind_port = s3_interop_rspec[i].bind_port;
+    req.target_address = target;
+    req.target_port = s3_interop_rspec[i].target_port;
+
+    /* the request rides the channel data (the reference WriteData):
+     * one 94 message, the payload is the SSHString of the request */
+
+    rp = s3_ssh3_reverse_build_request(reqbuf, &req);
+
+    if (rp == NULL) {
+        fprintf(stderr, "interop-client: the reverse request build failed\n");
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return S3_ERROR;
+    }
+
+    p = rc->frame;
+    p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+    p = (u_char *)s3_ssh3_encode_sshstring(p, reqbuf, (size_t)(rp - reqbuf));
+    rc->frame_len = (size_t)(p - rc->frame);
+
+    m = s3_quic_stream_send(sc, rc->frame, rc->frame_len);
+
+    if (m != (ssize_t)rc->frame_len) {
+        fprintf(stderr, "interop-client: the reverse request send failed\n");
+        (void)s3_quic_cancelable_stream(sc);
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return S3_ERROR;
+    }
+
+    rc->sc = sc;
+
+    if (sc->read->ready) {
+        sc->read->handler(sc->read);
+    }
+
+    return S3_OK;
+}
+
+/* the reply read of a control channel (the 91 rides first) */
+
+static void
+s3_interop_rctrl_read(s3_event_t *ev)
+{
+    s3_connection_t    *sc = ev->data;
+    s3_interop_rctrl_t *rc = s3_interop_rctrl_of(sc);
+    const u_char       *pos, *end;
+    ssize_t             n;
+    unsigned            ix = 0;
+
+    if (rc == NULL) {
+        return;
+    }
+
+    ix = (unsigned)(rc - s3_interop_rctrl);
+
+    for (;;) {
+
+        if (rc->acc_len == sizeof(rc->acc)) {
+            fprintf(stderr, "interop-client: the reverse reply is too big\n");
+            exit(1);
+        }
+
+        n = sc->recv(sc, rc->acc + rc->acc_len, sizeof(rc->acc) - rc->acc_len);
+
+        if (n == (ssize_t)S3_AGAIN) {
+            return;
+        }
+
+        if (n == 0) {
+
+            /* the server closed the control channel: a reply-less
+             * close is the unsupported-server shape (the reference
+             * comment), a post-reply close is the normal end */
+
+            if (!rc->replied) {
+                fprintf(stderr, "interop-client: the server does not support reverse"
+                                " forwarding (the control channel closed without a reply)\n");
+                printf("INTEROP-RFWD-FAIL spec=%u unsupported\n", ix);
+                fflush(stdout);
+                exit(1);
+            }
+
+            rc->sc = NULL;
+            return;
+        }
+
+        if (n < 0) {
+            fprintf(stderr, "interop-client: the reverse control channel recv error\n");
+            exit(1);
+        }
+
+        rc->acc_len += (size_t)n;
+
+        pos = rc->acc;
+        end = rc->acc + rc->acc_len;
+
+        while (pos < end) {
+
+            const u_char *msg = pos;
+            uint64_t      type;
+
+            if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+                pos = msg;
+                break;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+                s3_ssh3_msg_open_confirmation_t conf;
+
+                if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                continue;
+            }
+
+            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                s3_ssh3_msg_data_t      data;
+                s3_ssh3_reverse_reply_t reply;
+
+                if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                    pos = msg;
+                    break;
+                }
+
+                {
+                    const u_char *rpos = data.data.data;
+                    const u_char *rend = data.data.data + data.data.len;
+
+                    if (s3_ssh3_reverse_parse_reply(&rpos, rend, &reply) != S3_OK) {
+                        fprintf(stderr, "interop-client: the reverse reply parse failed\n");
+                        exit(1);
+                    }
+                }
+
+                rc->replied = 1;
+
+                if (s3_ssh3_reverse_reply_ok(&reply)) {
+
+                    rc->ok = 1;
+
+                    printf("INTEROP-RFWD-OK spec=%u port=%u\n", ix, (unsigned)reply.bound_port);
+                    fflush(stdout);
+
+                } else {
+
+                    printf("INTEROP-RFWD-DENIED spec=%u reason=%.*s\n", ix,
+                           (int)reply.error_utf8.len, (const char *)reply.error_utf8.data);
+                    fflush(stdout);
+                }
+
+                /* the reference client closes the control channel
+                 * after the reply, the fin rides the write side */
+
+                (void)s3_quic_shutdown_stream(sc, S3_WRITE_SHUTDOWN);
+
+                continue;
+            }
+
+            fprintf(stderr, "interop-client: the reverse control unexpected message %llu\n",
+                    (unsigned long long)type);
+            exit(1);
+        }
+
+        rc->acc_len = (size_t)(end - pos);
+        s3_memmove(rc->acc, pos, rc->acc_len);
+    }
+}
+
+/* the next pending control channel opens, one per call */
+
+static s3_int_t
+s3_interop_reverse_open_pending(s3_connection_t *cli)
+{
+    while (s3_interop_rspec_opened < s3_interop_rspec_count) {
+
+        if (s3_interop_rctrl_open(cli, s3_interop_rspec_opened) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        s3_interop_rspec_opened++;
+
+        /* the tick wakes the run loop for the -R hold (the deadline
+         * exit and the bridges both ride it, the -N shape) */
+
+        if (!s3_interop_reverse_timer.timer_set) {
+
+            s3_interop_reverse_timer.data = &s3_interop_reverse_timer;
+            s3_interop_reverse_timer.log = &s3_interop_log;
+            s3_interop_reverse_timer.handler = s3_interop_reverse_pump;
+
+            s3_event_add_timer(&s3_interop_reverse_timer, 50);
+        }
+    }
+
+    return S3_OK;
 }
 
 /*
@@ -5458,28 +6828,41 @@ s3_interop_h3_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
      * the wave 2: the server-initiated BIDI streams are the ssh3
      * channels the server opens (the agent connections); the bridge
      * half of the forwarding lives in s3_interop_agent_read()
+     *
+     * the reverse forward (-R): the forwarded-* channels dispatch
+     * through the accept reader by their header type; the agent
+     * bridge keeps its own header phase (the singleton), the agent
+     * connection arrives first in the -X runs
      */
 
     pc = qs->parent;
 
     if ((qs->id & 0x3) == 0x1) {
 
-        if (!s3_interop_agent_mode || s3_interop_agent_sc != NULL) {
+        if (s3_interop_agent_mode && s3_interop_agent_sc == NULL) {
 
-            /* one bridge at a time, the unexpected channels shut down */
+            rev = c->read;
+            rev->handler = s3_interop_agent_read;
+            rev->data = c;
+            rev->active = 1;
 
-            (void)s3_quic_cancelable_stream(c);
-            (void)s3_quic_shutdown_stream(c, S3_RDWR_SHUTDOWN);
+            /* the header may have landed before the arming, same as the
+             * channel accept path reads right in the handler */
+
+            if (rev->ready) {
+                rev->handler(rev);
+            }
+
             return;
         }
 
+        /* the reverse accept reader: the forwarded-* types bridge, the
+         * unexpected types refuse (the reference acceptLoop shape) */
+
         rev = c->read;
-        rev->handler = s3_interop_agent_read;
+        rev->handler = s3_interop_reverse_accept_read;
         rev->data = c;
         rev->active = 1;
-
-        /* the header may have landed before the arming, same as the
-         * channel accept path reads right in the handler */
 
         if (rev->ready) {
             rev->handler(rev);
@@ -6153,6 +7536,11 @@ s3_interop_usage(const char *prog)
             "  -F  with -3 -C: the direct-tcp or direct-udp channel to the target\n"
             "      127.0.0.1@port on the server side; tcp verifies the echo of the\n"
             "      hello plus 64 KiB, udp the echo of 20 datagrams\n"
+            "  -R  with -3: the reverse forward [bind:]port[/udp]:target_host:target_port\n"
+            "      (repeatable), the server binds and the server-initiated\n"
+            "      forwarded-tcp/forwarded-udp channels bridge to the local target;\n"
+            "      the run holds until the -t deadline, the verdicts are\n"
+            "      INTEROP-RFWD-OK/DENIED per spec and INTEROP-RFWD-DONE\n"
             "  -j  the proxy jump with -3 -C: the first connection dials the jump\n"
             "      host, a direct-udp channel tunnels the inner connection to the\n"
             "      -a target; the jump peer needs -d 1352 (the inner 1200-byte\n"
@@ -6312,7 +7700,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:R:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
            -1) {
 
         switch (opt) {
@@ -6463,6 +7851,45 @@ main(int argc, char **argv)
                 s3_interop_usage(argv[0]);
                 return 1;
             }
+
+            break;
+
+        case 'R':
+
+            /*
+             * the reverse forward spec (repeatable, the -R of the
+             * reference): the parse and the target resolution run
+             * here, a bad spec or an unresolvable target refuses
+             * before anything is sent
+             */
+
+            if (s3_interop_rspec_count >= S3_INTEROP_REVERSE_MAX) {
+                fprintf(stderr, "interop-client: too many -R specs\n");
+                return 1;
+            }
+
+            if (s3_ssh3_reverse_parse_spec(optarg, &s3_interop_rspec[s3_interop_rspec_count]) !=
+                S3_OK) {
+                fprintf(stderr, "interop-client: invalid -R specification \"%s\"\n", optarg);
+                return 1;
+            }
+
+            if (s3_ssh3_reverse_resolve_target(&s3_interop_rspec[s3_interop_rspec_count],
+                                               &s3_interop_rtarget[s3_interop_rspec_count]) !=
+                S3_OK) {
+                fprintf(stderr, "interop-client: could not resolve the -R target of \"%s\"\n",
+                        optarg);
+                return 1;
+            }
+
+            if (s3_ssh3_reverse_target_ntop(&s3_interop_rtarget[s3_interop_rspec_count],
+                                            s3_interop_rtarget_text[s3_interop_rspec_count],
+                                            sizeof(s3_interop_rtarget_text[0])) != S3_OK) {
+                fprintf(stderr, "interop-client: the -R target text failed\n");
+                return 1;
+            }
+
+            s3_interop_rspec_count++;
 
             break;
 
@@ -7677,11 +9104,15 @@ main(int argc, char **argv)
 
             /*
              * the plain -3 run completes on the 200; the -C, the sftp
-             * and the forward runs go on until their verdict came back
+             * and the forward runs go on until their verdict came back;
+             * the -R runs hold until the deadline (the -N shape, the
+             * binds serve while the run lives) and the verdict rides
+             * the deadline exit
              */
             if (!s3_interop_cm_master && s3_interop_h3_status_seen &&
                 (!(s3_interop_h3_channel_mode || s3_interop_fwd_mode || s3_interop_sftp_mode) ||
-                 s3_interop_h3_ch_ok)) {
+                 s3_interop_h3_ch_ok) &&
+                s3_interop_rspec_count == 0) {
 
                 if (s3_interop_jump_phase == S3_INTEROP_JUMP_INNER) {
 
@@ -7692,6 +9123,15 @@ main(int argc, char **argv)
                 }
 
                 break;
+            }
+
+            /* the reverse control channels open one pass at a time
+             * right after the 200 (the request rides the open) */
+
+            if (s3_interop_h3_status_seen && s3_interop_rspec_opened < s3_interop_rspec_count &&
+                s3_interop_reverse_open_pending(cli) != S3_OK) {
+                rc = 1;
+                goto teardown;
             }
 
         } else if (s3_interop_streams_mode) {
@@ -7802,6 +9242,34 @@ main(int argc, char **argv)
 
         if (s3_current_msec - start > (s3_msec_t)timeout) {
             if (s3_interop_h3_mode) {
+
+                /*
+                 * the -R runs end on the deadline by design (the -N
+                 * hold shape): the verdict is the bind set, the all-ok
+                 * run exits clean, a denied or missing reply fails
+                 */
+
+                if (s3_interop_rspec_count > 0) {
+
+                    unsigned denied = 0, nok = 0, i;
+
+                    for (i = 0; i < s3_interop_rspec_count; i++) {
+
+                        if (s3_interop_rctrl[i].ok) {
+                            nok++;
+                        } else if (s3_interop_rctrl[i].replied) {
+                            denied++;
+                        }
+                    }
+
+                    printf("INTEROP-RFWD-DONE ok=%u denied=%u total=%u\n", nok, denied,
+                           s3_interop_rspec_count);
+                    fflush(stdout);
+
+                    rc = (nok == s3_interop_rspec_count) ? 0 : 1;
+                    goto teardown;
+                }
+
                 fprintf(stderr,
                         "interop-client: h3 timeout sent=%u status_seen=%u ch_sent=%u "
                         "ch_confirmed=%u ch_ok=%u\n",
@@ -7896,6 +9364,11 @@ teardown:
     s3_interop_client_stream_close(s3_interop_stream);
     s3_interop_client_stream_close(s3_interop_jump_stream);
     s3_interop_client_stream_close(s3_interop_jump_channel);
+
+    /* the reverse forward state dies with the run (the fds, the
+     * bridges, the control channels) */
+
+    s3_interop_reverse_teardown();
 
     (void)s3_quic_close_connection(cli, S3_ABORT);
 

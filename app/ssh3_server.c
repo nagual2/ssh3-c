@@ -81,6 +81,7 @@
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_oidc.h>
 #include <s3_ssh3_request.h>
+#include <s3_ssh3_reverse.h>
 #include <s3_ssh3_session_srv.h>
 #include <s3_ssh3_sftp_jail.h>
 #include <s3_ssh3_sftp_srv.h>
@@ -308,6 +309,85 @@ static int s3_srv_max_conns = 0;
 /* the handshake timeout in ms (S2-06, --handshake-timeout-ms) */
 
 static int s3_srv_hs_ms = 30000;
+
+/*
+ * the reverse forward (-R) DoS guards (S2-04, the pass-2 audit
+ * grafted onto the new binds, the reference cmd/reverse_forward_server.go
+ * maxForwardedChannelsPerConversation and maxReverseForwardsPerUser):
+ *
+ *   - at most S3_SRV_REVERSE_LISTENERS_MAX bound listeners ride one
+ *     conversation (the reference books 10 per authenticated user
+ *     across their conversations, the C daemon serves one
+ *     conversation per bookkeeping slot, the denial shape is the
+ *     same: the slot is taken after the policy passed, so a refused
+ *     request never consumes one)
+ *   - at most S3_SRV_REVERSE_FORWARDED_MAX server-initiated
+ *     forwarded-* channels stay open per conversation, over the cap
+ *     the accepted connection is dropped (the datagram the same)
+ *
+ * the reference carries both knobs behind flags/env (-max-reverse-
+ * forwards, SSH3_MAX_REVERSE_FORWARDS), the C shape pins the
+ * constants; the flags are the parity tail
+ */
+
+#define S3_SRV_REVERSE_LISTENERS_MAX 10
+#define S3_SRV_REVERSE_FORWARDED_MAX 64
+
+/*
+ * the per-listener peer table of the udp listeners: one
+ * forwarded-udp channel per remote peer, the map is fixed and the
+ * peers over it drop their datagrams (the same lossy shape as the
+ * direct-udp path)
+ */
+
+#define S3_SRV_REVERSE_UDP_PEERS_MAX 8
+
+/*
+ * the reverse forward (-R) state of the conversation: the listener
+ * table fills on the "reverse-forward" control channel requests, the
+ * listeners and their channels die with the conversation (the
+ * conv-id change and the dead quic connection both tear the state
+ * down, the ticks self-check)
+ */
+
+typedef struct s3_srv_reverse_peer_s s3_srv_reverse_peer_t;
+
+struct s3_srv_reverse_peer_s {
+    unsigned           used;
+    s3_connection_t   *sc; /* the forwarded-udp channel */
+    struct sockaddr_in from;
+    socklen_t          from_len;
+};
+
+typedef struct {
+    unsigned                 used;
+    unsigned                 proto; /* S3_SSH3_REVERSE_PROTO_TCP/UDP */
+    int                      fd;    /* the listening/bound socket */
+    s3_event_t               timer; /* the accept / recvfrom tick */
+    uint16_t                 bound_port;
+    s3_ssh3_forward_target_t target; /* the client-side target */
+    struct sockaddr_in       bind_sa;
+    unsigned                 used_peers;
+    s3_srv_reverse_peer_t    peers[S3_SRV_REVERSE_UDP_PEERS_MAX];
+} s3_srv_reverse_listener_t;
+
+static struct {
+    uint64_t                  conv_id; /* the conversation of the state, 0 = empty */
+    s3_connection_t          *pc;      /* its quic connection */
+    unsigned                  listeners;
+    unsigned                  forwarded; /* the live forwarded-* channels */
+    s3_srv_reverse_listener_t listener[S3_SRV_REVERSE_LISTENERS_MAX];
+} s3_srv_reverse;
+
+/*
+ * the listen-side policy (--permit-listen / SSH3_PERMIT_LISTEN, the
+ * S2-04 PermitListen analog): the server-side binds the -R requests
+ * take pass only the entries it allows; the empty default keeps the
+ * unrestricted bind, the gate runs on the post-GatewayPorts address
+ * (the one actually bound) and before the budget slot
+ */
+
+static s3_ssh3_forward_policy_t s3_srv_listen_policy;
 
 /*
  * the zerolog-style level name of the reference SSH3_LOG_LEVEL; an
@@ -748,6 +828,16 @@ static s3_srv_h3_channel_t *s3_srv_h3_udp_fwd;
 
 static void s3_srv_udp_fwd_datagram(s3_connection_t *c, const u_char *buf, size_t len);
 
+/*
+ * the reverse forward (-R) wiring, defined below the channel table:
+ * the datagram router rides the echo handler (the first dispatcher of
+ * a received datagram), the request handler the channel message loop
+ */
+
+static unsigned s3_srv_reverse_datagram_route(s3_connection_t *c, const u_char *buf, size_t len);
+
+static void s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload);
+
 static void
 s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 {
@@ -755,48 +845,22 @@ s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
     size_t      len;
     s3_chain_t *cl;
 
-    if (s3_srv_h3_udp_fwd != NULL) {
+    if (s3_srv_reverse.listeners == 0 && s3_srv_h3_udp_fwd == NULL) {
 
         /*
-         * the direct-udp channel owns the datagrams prefixed with its
-         * ids (docs/P4-WIRE.md 3.2), the rest falls through to the
-         * plain echo; the flatten below is the rare fragmented path
+         * no udp channel is routed: a datagram almost always lands in
+         * a single link of the receive buffer, echo it straight from
+         * there, no intermediate block
          */
-        len = 0;
 
-        for (cl = data; cl != NULL; cl = cl->next) {
-            len += s3_buf_size(cl->buf);
+        if (data->next == NULL) {
+            (void)s3_quic_send_datagram(c, data->buf->pos, s3_buf_size(data->buf));
+            return;
         }
-
-        buf = s3_palloc(c->pool, len);
-
-        if (buf != NULL) {
-
-            u_char *p = buf;
-
-            for (cl = data; cl != NULL; cl = cl->next) {
-                p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
-            }
-
-            s3_srv_udp_fwd_datagram(c, buf, len);
-
-            (void)s3_pfree(c->pool, buf);
-        }
-
-        return;
     }
 
-    /*
-     * a datagram almost always lands in a single link of the receive
-     * buffer: echo it straight from there, no intermediate block
-     */
-
-    if (data->next == NULL) {
-        (void)s3_quic_send_datagram(c, data->buf->pos, s3_buf_size(data->buf));
-        return;
-    }
-
-    /* a fragmented datagram: flatten it once, into the connection pool */
+    /* the routed shapes (the reverse -R peers, the direct-udp
+     * channel) need the contiguous bytes: one flatten covers them */
 
     len = 0;
 
@@ -805,6 +869,7 @@ s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
     }
 
     buf = s3_palloc(c->pool, len);
+
     if (buf == NULL) {
         return;
     }
@@ -815,6 +880,17 @@ s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
         for (cl = data; cl != NULL; cl = cl->next) {
             p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
         }
+    }
+
+    if (s3_srv_reverse_datagram_route(c, buf, len)) {
+        (void)s3_pfree(c->pool, buf);
+        return;
+    }
+
+    if (s3_srv_h3_udp_fwd != NULL) {
+        s3_srv_udp_fwd_datagram(c, buf, len);
+        (void)s3_pfree(c->pool, buf);
+        return;
     }
 
     (void)s3_quic_send_datagram(c, buf, len);
@@ -923,9 +999,11 @@ struct s3_srv_h3_channel_s {
      * pending buffers decouple the quic stream from the socket and
      * the 50 ms timer pumps the remaining directions - the same
      * harness scheme as the session pump above; the AGENT kind reuses
-     * the tcp pump against the accepted agent socket
+     * the tcp pump against the accepted agent socket, the reverse
+     * (-R) channels ride the same shapes (the RCTRL control channel,
+     * the RUDP per-peer datagram channel)
      */
-    unsigned           fwd_kind; /* S3_SRV_FWD_NONE/TCP/UDP/AGENT */
+    unsigned           fwd_kind; /* S3_SRV_FWD_NONE/TCP/UDP/AGENT/RCTRL/RUDP */
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
     struct sockaddr_in fwd_sa;
@@ -938,6 +1016,19 @@ struct s3_srv_h3_channel_s {
     size_t             fwd_frame_sent; /* the partial 94 frame in flight */
     size_t             fwd_frame_total;
     s3_event_t         fwd_timer;
+
+    /*
+     * the server-initiated channels (the agent bridge, the reverse
+     * forward): the 91 of the client answers the opener header (the
+     * consume sits in the message loop), the reverse_fwd flag counts
+     * the channel into the forwarded-* budget and clears its listener
+     * peer on the free
+     */
+    unsigned opened_by_server : 1;
+    unsigned reverse_fwd : 1;
+    unsigned reverse_served : 1; /* the RCTRL request already handled */
+    unsigned reverse_l;          /* the listener index of a RUDP channel */
+    unsigned reverse_peer;       /* the peer index of a RUDP channel */
 
     /*
      * the sftp side ("sftp" channels): the pool owns the request
@@ -979,6 +1070,8 @@ struct s3_srv_h3_channel_s {
 #define S3_SRV_FWD_UDP   2
 #define S3_SRV_FWD_AGENT 3
 #define S3_SRV_FWD_SFTP  4 /* the chroot child pipes, no target socket */
+#define S3_SRV_FWD_RCTRL 5 /* the reverse-forward control channel */
+#define S3_SRV_FWD_RUDP  6 /* the per-peer forwarded-udp channel of a reverse listener */
 
 /*
  * the frame buffer of the socket->channel direction: one 94 frame
@@ -1003,6 +1096,10 @@ static unsigned s3_srv_sftp_budget_take(const char *user);
 static void s3_srv_sftp_budget_give(const char *user);
 
 static void s3_srv_agent_accept_timer(s3_event_t *ev);
+
+/* the reverse forward (-R) wiring, defined below */
+
+static void s3_srv_reverse_teardown(void);
 
 static s3_srv_h3_channel_t *s3_srv_h3_channel_alloc(s3_connection_t *sc);
 
@@ -1049,10 +1146,16 @@ s3_srv_busy_channels(void)
         }
 
         if ((ch->sess != NULL && !ch->sess_exit_sent) || ch->sftp != NULL ||
-            (ch->fwd_kind != S3_SRV_FWD_NONE && !ch->fwd_eof)) {
+            (ch->fwd_kind != S3_SRV_FWD_NONE && ch->fwd_kind != S3_SRV_FWD_RCTRL &&
+             ch->fwd_kind != S3_SRV_FWD_RUDP && !ch->fwd_eof)) {
             n++;
         }
     }
+
+    /* the reverse listeners are the unfinished work of their own: a
+     * bound -R port serves until the conversation is over */
+
+    n += s3_srv_reverse.listeners;
 
     return n;
 }
@@ -1073,6 +1176,11 @@ s3_srv_teardown_channels(void)
             s3_srv_h3_channel_free(&s3_srv_h3_channels[i]);
         }
     }
+
+    /* the -R listeners close with the daemon (the conversation shape
+     * of the shutdown drain ends everything anyway) */
+
+    s3_srv_reverse_teardown();
 }
 
 /* the StreamID of the CONNECT stream, the channels must quote it */
@@ -2146,6 +2254,33 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
 
     if (ch->fwd_fd >= 0) {
         (void)close(ch->fwd_fd);
+    }
+
+    /* the reverse forward bookkeeping: the forwarded-* budget gives
+     * the slot back, the udp peer entry clears (the listener keeps
+     * serving the remaining peers) */
+
+    if (ch->reverse_fwd) {
+
+        if (s3_srv_reverse.forwarded > 0) {
+            s3_srv_reverse.forwarded--;
+        }
+
+        if (ch->fwd_kind == S3_SRV_FWD_RUDP && ch->reverse_l < S3_SRV_REVERSE_LISTENERS_MAX) {
+
+            s3_srv_reverse_listener_t *l = &s3_srv_reverse.listener[ch->reverse_l];
+
+            if (l->used && ch->reverse_peer < S3_SRV_REVERSE_UDP_PEERS_MAX &&
+                l->peers[ch->reverse_peer].sc == ch->sc) {
+
+                l->peers[ch->reverse_peer].used = 0;
+                l->peers[ch->reverse_peer].sc = NULL;
+
+                if (l->used_peers > 0) {
+                    l->used_peers--;
+                }
+            }
+        }
     }
 
     if (ch == s3_srv_h3_udp_fwd) {
@@ -3679,6 +3814,7 @@ s3_srv_agent_conn_open(s3_srv_h3_channel_t *sess_ch, int fd)
 
     nch->fwd_fd = fd;
     nch->fwd_kind = S3_SRV_FWD_AGENT;
+    nch->opened_by_server = 1;
 
     rev = nsc->read;
     rev->handler = s3_srv_h3_channel_read;
@@ -3734,6 +3870,772 @@ s3_srv_agent_accept_timer(s3_event_t *ev)
     if (ch->sc != NULL && ch->agent_l != NULL) {
         s3_event_add_timer(ev, 50);
     }
+}
+
+/*
+ * the reverse port forwarding (-R, the reference
+ * cmd/reverse_forward_server.go): the "reverse-forward" control
+ * channel carries the bind request, the server binds the port (the
+ * permit-listen gate first, the GatewayPorts=no rewrite on top) and
+ * mirrors every accepted connection or datagram back as a
+ * server-initiated forwarded-tcp/forwarded-udp channel whose header
+ * extension carries the client-side target
+ */
+
+/* the reverse state died with its conversation: the ticks self-check */
+
+static unsigned
+s3_srv_reverse_live(void)
+{
+    return s3_srv_reverse.listeners > 0 && s3_srv_reverse.pc != NULL &&
+           s3_srv_conn_alive(s3_srv_reverse.pc);
+}
+
+/*
+ * the shared teardown: the listener sockets close, the timer leaves
+ * the rbtree, the udp peer channels free through the channel table
+ * (the free clears the peer entries back); safe to run on an empty
+ * state, every caller either tears down or arms nothing after
+ */
+
+static void
+s3_srv_reverse_teardown(void)
+{
+    unsigned i, j;
+
+    for (i = 0; i < S3_SRV_REVERSE_LISTENERS_MAX; i++) {
+
+        s3_srv_reverse_listener_t *l = &s3_srv_reverse.listener[i];
+
+        if (!l->used) {
+            continue;
+        }
+
+        if (l->timer.timer_set) {
+            s3_event_del_timer(&l->timer);
+        }
+
+        if (l->fd >= 0) {
+            (void)close(l->fd);
+        }
+
+        /* the udp peer channels ride the channel table: the free
+         * clears the peer entries (the reverse_fwd walk) */
+
+        for (j = 0; j < S3_SRV_REVERSE_UDP_PEERS_MAX; j++) {
+
+            if (l->peers[j].used && l->peers[j].sc != NULL) {
+
+                s3_srv_h3_channel_t *pch = s3_srv_h3_channel_of(l->peers[j].sc);
+
+                if (pch != NULL) {
+                    s3_srv_h3_channel_free(pch);
+                }
+            }
+        }
+
+        s3_memzero(l, sizeof(*l));
+    }
+
+    s3_srv_reverse.listeners = 0;
+    s3_srv_reverse.pc = NULL;
+    s3_srv_reverse.conv_id = 0;
+}
+
+/*
+ * the reply of the bind result: one 94 data message on the control
+ * channel, the shape of the reference writeReverseForwardReply
+ */
+
+static s3_int_t
+s3_srv_reverse_reply(s3_srv_h3_channel_t *ch, const s3_ssh3_reverse_reply_t *r)
+{
+    u_char  replybuf[256];
+    u_char  buf[512];
+    u_char *rp;
+    u_char *p;
+    size_t  total;
+    ssize_t m;
+
+    rp = s3_ssh3_reverse_build_reply(replybuf, r);
+
+    if (rp == NULL || (size_t)(rp - replybuf) + s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) +
+                              s3_ssh3_sshstring_size(rp - replybuf) >
+                          sizeof(buf)) {
+        return S3_ERROR;
+    }
+
+    /* the reply rides the channel data (the reference
+     * writeReverseForwardReply): one 94 message, the payload is the
+     * SSHString of the reply */
+
+    p = buf;
+    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+    p = (u_char *)s3_ssh3_encode_sshstring(p, replybuf, (size_t)(rp - replybuf));
+    total = (size_t)(p - buf);
+
+    m = s3_quic_stream_send(ch->sc, buf, total);
+
+    /* the reply is a few dozen bytes, the window never stalls it
+     * (the same small-volume assumption as the channel echo) */
+
+    if (m != (ssize_t)total) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+/*
+ * the GatewayPorts=no rewrite of the reference resolveReverseForwardBind:
+ * the empty bind defaults to the loopback, a loopback literal keeps,
+ * everything else is forced back to the loopback (the daemon never
+ * exposes a client -R bind without the operator's say-so; the
+ * clientspecified/yes policies ride the --gateway-ports tail)
+ */
+
+static void
+s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len,
+                            unsigned *rewritten)
+{
+    struct in_addr  a4;
+    struct in6_addr a6;
+
+    *rewritten = 0;
+
+    if (requested->len == 0) {
+        snprintf(out, out_len, "127.0.0.1");
+        *rewritten = 1;
+        return;
+    }
+
+    if (inet_pton(AF_INET, (const char *)requested->data, &a4) == 1 &&
+        (ntohl(a4.s_addr) >> 24) == 127) {
+        snprintf(out, out_len, "%s", (const char *)requested->data);
+        return;
+    }
+
+    if (inet_pton(AF_INET6, (const char *)requested->data, &a6) == 1 && IN6_IS_ADDR_LOOPBACK(&a6)) {
+        snprintf(out, out_len, "%s", (const char *)requested->data);
+        return;
+    }
+
+    /* a non-loopback request rides the no policy back to the
+     * loopback; the address may be a name the client sent, the
+     * rewrite does not need to resolve it */
+
+    snprintf(out, out_len, "127.0.0.1");
+    *rewritten = 1;
+}
+
+/*
+ * one server-initiated forwarded-* channel: the opener header (the
+ * type plus the target extension) rides a fresh client bidi stream,
+ * the confirm step of the read path must not run (the 91 of the
+ * acceptor answers), the pump reuses the direct-tcp shapes
+ */
+
+static s3_srv_h3_channel_t *
+s3_srv_reverse_channel_open(s3_srv_reverse_listener_t *l, const char *type)
+{
+    s3_connection_t     *nsc;
+    s3_srv_h3_channel_t *nch;
+    s3_quic_stream_t    *qs;
+    s3_ssh3_channel_t    hdr;
+    u_char               frame[96];
+    u_char              *p;
+    size_t               total;
+    ssize_t              m;
+    s3_event_t          *rev;
+
+    if (s3_srv_reverse.forwarded >= S3_SRV_REVERSE_FORWARDED_MAX) {
+        return NULL;
+    }
+
+    nsc = s3_quic_open_stream(s3_srv_reverse.pc, 1);
+
+    if (nsc == NULL) {
+        return NULL;
+    }
+
+    nch = s3_srv_h3_channel_alloc(nsc);
+
+    if (nch == NULL) {
+        (void)s3_quic_cancelable_stream(nsc);
+        (void)s3_quic_shutdown_stream(nsc, S3_RDWR_SHUTDOWN);
+        return NULL;
+    }
+
+    /*
+     * the opener side: no channel header comes back to us, the
+     * confirm step of the read path must not run (the 91 of the
+     * acceptor rides the message loop instead)
+     */
+
+    nch->confirmed = 1;
+    nch->pc = s3_srv_reverse.pc;
+    nch->opened_by_server = 1;
+    nch->reverse_fwd = 1;
+
+    s3_memzero(&hdr, sizeof(hdr));
+
+    hdr.conversation_stream_id = s3_srv_h3_conv_id;
+    hdr.max_packet_size = S3_SRV_CHANNEL_MAX_PACKET;
+    hdr.type.data = (u_char *)type;
+    hdr.type.len = strlen(type);
+
+    p = frame;
+    p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+    p = s3_ssh3_forward_build_target(p, &l->target);
+    total = (size_t)(p - frame);
+
+    m = s3_quic_stream_send(nsc, frame, total);
+
+    if (m != (ssize_t)total) {
+        s3_srv_h3_channel_free(nch);
+        return NULL;
+    }
+
+    if (strcmp(type, S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP) == 0) {
+        nch->fwd_kind = S3_SRV_FWD_RUDP;
+    } else {
+        nch->fwd_kind = S3_SRV_FWD_TCP;
+    }
+
+    rev = nsc->read;
+    rev->handler = s3_srv_h3_channel_read;
+    rev->data = nsc;
+    rev->active = 1;
+
+    qs = nsc->data;
+
+    s3_srv_report("INTEROP-RFWD-CHANNEL kind=%s id=%llu\n", type, (unsigned long long)qs->id);
+
+    s3_srv_reverse.forwarded++;
+
+    if (nch->fwd_kind == S3_SRV_FWD_TCP) {
+        s3_srv_fwd_arm(nch);
+    }
+
+    return nch;
+}
+
+/*
+ * one accepted tcp connection of the reverse listener rides its own
+ * forwarded-tcp channel (the bridge into the client-side target)
+ */
+
+static void
+s3_srv_reverse_conn_open(s3_srv_reverse_listener_t *l, int fd)
+{
+    s3_srv_h3_channel_t *nch;
+
+    nch = s3_srv_reverse_channel_open(l, S3_SSH3_CHANNEL_TYPE_FORWARDED_TCP);
+
+    if (nch == NULL) {
+        s3_ssh3_agent_close_fd(fd);
+        return;
+    }
+
+    nch->fwd_fd = fd;
+}
+
+/* the accept tick of a bound tcp listener */
+
+static void
+s3_srv_reverse_tcp_timer(s3_event_t *ev)
+{
+    s3_srv_reverse_listener_t *l = ev->data;
+
+    ev->timedout = 0;
+
+    if (!s3_srv_reverse_live()) {
+
+        /* the conversation is gone: the state tears down, the timers
+         * stop (the live check covers the listener the timer rode) */
+
+        s3_srv_reverse_teardown();
+        return;
+    }
+
+    if (!l->used) {
+        return;
+    }
+
+    for (;;) {
+
+        int fd = accept(l->fd, NULL, NULL);
+
+        if (fd < 0) {
+            /* S3_AGAIN or a failed accept: the next tick retries */
+            break;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            (void)close(fd);
+            continue;
+        }
+
+        s3_srv_reverse_conn_open(l, fd);
+    }
+
+    if (l->used) {
+        s3_event_add_timer(ev, 50);
+    }
+}
+
+/*
+ * one datagram of a bound udp listener: the peer without a channel
+ * gets one (the per-peer forwarded-udp), the datagram rides it with
+ * the ids prefix (docs/P4-WIRE.md 3.2)
+ */
+
+static void
+s3_srv_reverse_udp_datagram(s3_srv_reverse_listener_t *l, const u_char *buf, size_t len,
+                            const struct sockaddr_in *from)
+{
+    s3_srv_reverse_peer_t *peer = NULL;
+    unsigned               i;
+    s3_quic_stream_t      *qs;
+    u_char                 dg[1400];
+    u_char                *p;
+
+    /* the datagram path is lossy by design: a datagram over the QUIC
+     * datagram limit of the path drops loudly (the reference shape) */
+
+    if (len + 16 > sizeof(dg)) {
+        s3_srv_report("INTEROP-RFWD-UDP-DROP bytes=%zu\n", len);
+        return;
+    }
+
+    for (i = 0; i < S3_SRV_REVERSE_UDP_PEERS_MAX; i++) {
+
+        s3_srv_reverse_peer_t *cand = &l->peers[i];
+
+        if (!cand->used) {
+
+            if (peer == NULL) {
+                peer = cand; /* the free slot, taken below when new */
+            }
+
+            continue;
+        }
+
+        if (cand->from.sin_addr.s_addr == from->sin_addr.s_addr &&
+            cand->from.sin_port == from->sin_port) {
+            peer = cand;
+            break;
+        }
+    }
+
+    if (peer == NULL || !peer->used) {
+
+        s3_srv_h3_channel_t *nch;
+
+        if (peer == NULL || s3_srv_reverse.forwarded >= S3_SRV_REVERSE_FORWARDED_MAX) {
+            s3_srv_report("INTEROP-RFWD-UDP-DROP bytes=%zu reason=peers\n", len);
+            return; /* the peer table or the channel budget is full: the loss */
+        }
+
+        nch = s3_srv_reverse_channel_open(l, S3_SSH3_CHANNEL_TYPE_FORWARDED_UDP);
+
+        if (nch == NULL) {
+            return;
+        }
+
+        peer->used = 1;
+        peer->sc = nch->sc;
+        peer->from = *from;
+        peer->from_len = sizeof(*from);
+
+        nch->reverse_l = (unsigned)(l - s3_srv_reverse.listener);
+        nch->reverse_peer = (unsigned)(peer - l->peers);
+    }
+
+    qs = peer->sc->data;
+
+    p = s3_ssh3_dgram_encode(dg, s3_srv_h3_conv_id, qs->id, buf, len);
+
+    if (s3_quic_send_datagram(qs->parent, dg, (size_t)(p - dg)) != S3_OK) {
+        s3_srv_report("INTEROP-RFWD-UDP-DROP bytes=%zu reason=transport\n", len);
+    }
+}
+
+/* the recvfrom tick of a bound udp listener */
+
+static void
+s3_srv_reverse_udp_timer(s3_event_t *ev)
+{
+    s3_srv_reverse_listener_t *l = ev->data;
+    static u_char              buf[S3_UDP_DGRAM_SIZE];
+    struct sockaddr_in         from;
+    socklen_t                  from_len;
+    ssize_t                    n;
+
+    ev->timedout = 0;
+
+    if (!s3_srv_reverse_live()) {
+
+        s3_srv_reverse_teardown();
+        return;
+    }
+
+    if (!l->used) {
+        return;
+    }
+
+    for (;;) {
+
+        from_len = sizeof(from);
+
+        n = recvfrom(l->fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+
+        if (n <= 0) {
+            break; /* EAGAIN or the gone listener */
+        }
+
+        s3_srv_reverse_udp_datagram(l, buf, (size_t)n, &from);
+    }
+
+    if (l->used) {
+        s3_event_add_timer(ev, 50);
+    }
+}
+
+/*
+ * the router side of the udp listeners: the datagrams prefixed with a
+ * reverse channel id ride back to their peer, everything else falls
+ * through to the direct-udp routing and the echo (the return value
+ * says the datagram was consumed)
+ */
+
+static unsigned
+s3_srv_reverse_datagram_route(s3_connection_t *c, const u_char *buf, size_t len)
+{
+    const u_char *pos = buf, *end = buf + len;
+    uint64_t      csid, chid;
+    s3_str_t      payload;
+    unsigned      i, j;
+
+    if (s3_srv_reverse.listeners == 0 ||
+        s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return 0;
+    }
+
+    if (csid != s3_srv_h3_conv_id) {
+
+        return 0;
+    }
+
+    for (i = 0; i < S3_SRV_REVERSE_LISTENERS_MAX; i++) {
+
+        s3_srv_reverse_listener_t *l = &s3_srv_reverse.listener[i];
+
+        if (!l->used || l->proto != S3_SSH3_REVERSE_PROTO_UDP) {
+            continue;
+        }
+
+        for (j = 0; j < S3_SRV_REVERSE_UDP_PEERS_MAX; j++) {
+
+            s3_srv_reverse_peer_t *peer = &l->peers[j];
+            s3_quic_stream_t      *qs;
+
+            if (!peer->used || peer->sc == NULL) {
+                continue;
+            }
+
+            qs = peer->sc->data;
+
+            if (qs == NULL || qs->id != chid) {
+
+                continue;
+            }
+
+            if (payload.len > 0) {
+                (void)sendto(l->fd, payload.data, payload.len, 0,
+                             (const struct sockaddr *)&peer->from, peer->from_len);
+            }
+
+            (void)c;
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * the bind request on the control channel (the reference
+ * handleReverseForwardChannel): the gate order is the target literal,
+ * the GatewayPorts rewrite, the permit-listen policy and the listener
+ * budget, all before the bind; every refusal answers with the reason
+ * and closes the control channel (the reference shape)
+ */
+
+static void
+s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
+{
+    const u_char              *pos = payload->data, *end = payload->data + payload->len;
+    s3_ssh3_reverse_request_t  req;
+    s3_ssh3_forward_target_t   target;
+    char                       target_text[64];
+    char                       bind_host[256] = {0};
+    char                       reason[320];
+    const char                *kind;
+    s3_ssh3_reverse_reply_t    reply;
+    s3_srv_reverse_listener_t *l = NULL;
+    struct sockaddr_in         sa;
+    int                        fd = -1;
+    unsigned                   rewritten;
+    unsigned                   i;
+
+    /* the string views ride the channel accumulator: the next recv
+     * may move it, everything needed copies before the handler runs */
+
+    if (s3_ssh3_reverse_parse_request(&pos, end, &req) != S3_OK) {
+        s3_srv_h3_channel_cancel(ch, "bad reverse forward request");
+        return;
+    }
+
+    kind = (req.proto == S3_SSH3_REVERSE_PROTO_UDP) ? "udp" : "tcp";
+
+    /* the target is the ip literal only (the reference net.ParseIP
+     * gate, the client resolved the name locally) */
+
+    {
+        char taddr[S3_SSH3_REVERSE_HOST_MAX + 1];
+
+        if (req.target_address.len == 0 || req.target_address.len > S3_SSH3_REVERSE_HOST_MAX) {
+            s3_srv_h3_channel_cancel(ch, "bad reverse forward target");
+            return;
+        }
+
+        s3_memcpy(taddr, req.target_address.data, req.target_address.len);
+        taddr[req.target_address.len] = '\0';
+
+        s3_memzero(&target, sizeof(target));
+
+        if (inet_pton(AF_INET, taddr, &target.ip) == 1) {
+            target.family = 4;
+            target.ip_len = 4;
+
+        } else if (inet_pton(AF_INET6, taddr, &target.ip) == 1) {
+            target.family = 6;
+            target.ip_len = 16;
+
+        } else {
+            snprintf(reason, sizeof(reason), "invalid target address %s", taddr);
+            goto refuse;
+        }
+
+        target.port = req.target_port;
+
+        if (s3_ssh3_reverse_target_ntop(&target, target_text, sizeof(target_text)) != S3_OK) {
+            snprintf(reason, sizeof(reason), "invalid target address %s", taddr);
+            goto refuse;
+        }
+    }
+
+    /* the GatewayPorts=no rewrite: the bind text copies first, the
+     * views die with the handler */
+
+    {
+        char     bind_text[S3_SSH3_REVERSE_HOST_MAX + 1];
+        s3_str_t bind_str;
+
+        if (req.bind_address.len > S3_SSH3_REVERSE_HOST_MAX) {
+            s3_srv_h3_channel_cancel(ch, "bad reverse forward bind");
+            return;
+        }
+
+        s3_memcpy(bind_text, req.bind_address.data, req.bind_address.len);
+        bind_text[req.bind_address.len] = '\0';
+
+        bind_str.data = (u_char *)bind_text;
+        bind_str.len = req.bind_address.len;
+
+        s3_srv_reverse_bind_rewrite(&bind_str, bind_host, sizeof(bind_host), &rewritten);
+
+        if (rewritten && bind_text[0] != '\0') {
+            s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
+                         "reverse forward: the GatewayPorts=no policy restricted the bind %s to %s",
+                         bind_text, bind_host);
+        }
+    }
+
+    /* the permit-listen gate (S2-04): the post-rewrite bind, before
+     * the budget and before any socket() */
+
+    if (s3_ssh3_forward_policy_check(&s3_srv_listen_policy, bind_host, req.bind_port) != S3_OK) {
+        snprintf(reason, sizeof(reason), "%s listen on %s:%u denied by -permit-listen policy", kind,
+                 bind_host, (unsigned)req.bind_port);
+        goto refuse;
+    }
+
+    /* the listener budget of the conversation (S2-04) */
+
+    if (s3_srv_reverse.listeners >= S3_SRV_REVERSE_LISTENERS_MAX) {
+        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
+                 S3_SRV_REVERSE_LISTENERS_MAX);
+        goto refuse;
+    }
+
+    /* the bind text is a literal (the rewrite produced one), the
+     * family follows it */
+
+    s3_memzero(&sa, sizeof(sa));
+
+    if (strcmp(bind_host, "::") == 0 || strchr(bind_host, ':') != NULL) {
+
+        /* the ipv6 bind rides the v4-mapped loopback under the no
+         * policy: the rewrite above produced 127.0.0.1 for every
+         * non-loopback request, a "::" here means the client asked
+         * for the wildcard and the no policy forced the loopback
+         * already - the v6 branch is dead unless the policy relaxes */
+
+        snprintf(reason, sizeof(reason), "unsupported ipv6 bind %s", bind_host);
+        goto refuse;
+    }
+
+    if (inet_pton(AF_INET, bind_host, &sa.sin_addr) != 1) {
+        snprintf(reason, sizeof(reason), "invalid bind address %s", bind_host);
+        goto refuse;
+    }
+
+    /* the conversation bookkeeping: a new conversation tears the old
+     * listeners down (the single-conversation shape of the daemon) */
+
+    if (s3_srv_reverse.conv_id != s3_srv_h3_conv_id && s3_srv_reverse.listeners > 0) {
+        s3_srv_reverse_teardown();
+    }
+
+    if (s3_srv_reverse.conv_id == 0) {
+        s3_srv_reverse.conv_id = s3_srv_h3_conv_id;
+        s3_srv_reverse.pc = ch->pc;
+    }
+
+    for (i = 0; i < S3_SRV_REVERSE_LISTENERS_MAX; i++) {
+
+        if (!s3_srv_reverse.listener[i].used) {
+            l = &s3_srv_reverse.listener[i];
+            break;
+        }
+    }
+
+    if (l == NULL) {
+        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
+                 S3_SRV_REVERSE_LISTENERS_MAX);
+        goto refuse;
+    }
+
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(req.bind_port);
+
+    fd = socket(AF_INET, (req.proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
+
+    if (fd == -1) {
+        snprintf(reason, sizeof(reason), "socket() failed");
+        goto refuse;
+    }
+
+    {
+        int on = 1;
+
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    }
+
+    if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) == -1 ||
+        (req.proto == S3_SSH3_REVERSE_PROTO_TCP && listen(fd, SOMAXCONN) == -1) ||
+        s3_nonblocking(fd) != S3_OK) {
+
+        snprintf(reason, sizeof(reason), "bind %s:%u failed: %s", bind_host,
+                 (unsigned)req.bind_port, strerror(errno));
+
+        (void)close(fd);
+
+        goto refuse;
+    }
+
+    {
+        struct sockaddr_in got;
+        socklen_t          got_len = sizeof(got);
+
+        if (getsockname(fd, (struct sockaddr *)&got, &got_len) == -1) {
+            snprintf(reason, sizeof(reason), "getsockname failed: %s", strerror(errno));
+            (void)close(fd);
+            goto refuse;
+        }
+
+        l->bound_port = ntohs(got.sin_port);
+    }
+
+    l->used = 1;
+    l->proto = req.proto;
+    l->fd = fd;
+    l->bind_sa = sa;
+    l->target = target;
+    l->used_peers = 0;
+
+    s3_memzero(l->peers, sizeof(l->peers));
+
+    s3_srv_reverse.listeners++;
+
+    s3_memzero(&reply, sizeof(reply));
+
+    reply.bound_port = l->bound_port;
+    reply.error_utf8.data = (u_char *)"";
+    reply.error_utf8.len = 0;
+
+    if (s3_srv_reverse_reply(ch, &reply) != S3_OK) {
+        fprintf(stderr, "ssh3-server: reverse forward reply send failed\n");
+        s3_srv_h3_channel_free(ch);
+        return;
+    }
+
+    ch->reverse_served = 1;
+
+    {
+        char bip[INET_ADDRSTRLEN];
+
+        (void)inet_ntop(AF_INET, &sa.sin_addr, bip, sizeof(bip));
+
+        s3_srv_report("INTEROP-RFWD-OPEN kind=%s bind=%s:%u port=%u target=%s:%u\n", kind, bip,
+                      (unsigned)req.bind_port, (unsigned)l->bound_port, target_text,
+                      (unsigned)target.port);
+    }
+
+    /* the serve tick: the tcp accept loop or the udp recvfrom loop */
+
+    l->timer.data = l;
+    l->timer.log = &s3_srv_log;
+    l->timer.handler = (req.proto == S3_SSH3_REVERSE_PROTO_TCP) ? s3_srv_reverse_tcp_timer
+                                                                : s3_srv_reverse_udp_timer;
+
+    s3_event_add_timer(&l->timer, 50);
+
+    return;
+
+refuse:
+
+    s3_memzero(&reply, sizeof(reply));
+
+    reply.bound_port = 0;
+    reply.error_utf8.data = (u_char *)reason;
+    reply.error_utf8.len = strlen(reason);
+
+    (void)s3_srv_reverse_reply(ch, &reply);
+
+    s3_log_error(S3_LOG_WARN, &s3_srv_log, 0, "refusing reverse-forward bind: %s", reason);
+
+    s3_srv_report("INTEROP-RFWD-DENIED kind=%s bind=%s:%u\n", kind, bind_host,
+                  (unsigned)req.bind_port);
+
+    /* the reference closes the control channel after the refusal */
+
+    (void)s3_quic_shutdown_stream(ch->sc, S3_RDWR_SHUTDOWN);
+
+    s3_srv_h3_channel_free(ch);
 }
 
 /* the runner marker on the open target */
@@ -3976,16 +4878,18 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
 
     /*
      * the allow-list (P3-03): the client-role surface is exactly the
-     * session, the two direct forwards and the sftp channel; any
-     * other string would take a tracked slot and a 91 for a channel
-     * the server never meant to serve (the pass-3 audit), the
-     * refusal sits before the confirmation like the role table above
+     * session, the two direct forwards, the sftp channel and the
+     * reverse-forward control channel; any other string would take a
+     * tracked slot and a 91 for a channel the server never meant to
+     * serve (the pass-3 audit), the refusal sits before the
+     * confirmation like the role table above
      */
     is_session = s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SESSION);
 
     if (!is_session && !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_SFTP) &&
         !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_TCP) &&
-        !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_UDP)) {
+        !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_DIRECT_UDP) &&
+        !s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_REVERSE_FORWARD)) {
 
         s3_srv_report("CHROLE-UNKNOWN-DENIED id=%llu type=%.*s\n", (unsigned long long)qs->id,
                       (int)hdr.type.len, (const char *)hdr.type.data);
@@ -4067,6 +4971,14 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
             s3_srv_h3_channel_cancel(ch, "sftp subsystem failed");
             return S3_ERROR;
         }
+
+    } else if (s3_srv_h3_type_is(&hdr.type, S3_SSH3_CHANNEL_TYPE_REVERSE_FORWARD)) {
+
+        /* the reverse forward control channel (the -R): the bind
+         * request arrives as the first data message, the serve loop
+         * reads it there */
+
+        ch->fwd_kind = S3_SRV_FWD_RCTRL;
     }
 
     s3_srv_report("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s\n", (unsigned long long)qs->id,
@@ -4135,6 +5047,24 @@ s3_srv_h3_channel_read(s3_event_t *ev)
         }
 
         if (n == 0) {
+
+            if (ch->fwd_kind == S3_SRV_FWD_RCTRL) {
+
+                /* the control channel of the reverse forward: the
+                 * client closes it after the reply (the reference
+                 * shape), the bind lives with the conversation */
+
+                s3_srv_h3_channel_free(ch);
+                return;
+            }
+
+            if (ch->fwd_kind == S3_SRV_FWD_RUDP) {
+
+                /* the udp channels carry no eof, the channel ends */
+
+                s3_srv_h3_channel_free(ch);
+                return;
+            }
 
             if (ch->fwd_kind == S3_SRV_FWD_AGENT) {
 
@@ -4264,6 +5194,31 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     break;
                 }
 
+                if (ch->fwd_kind == S3_SRV_FWD_RCTRL) {
+
+                    /*
+                     * the reverse forward control channel: the first
+                     * data message is the bind request, the further
+                     * ones are a protocol violation (the served
+                     * channel stays open until the peer closes)
+                     */
+
+                    if (ch->reverse_served) {
+                        s3_srv_h3_channel_cancel(ch, "data on a served reverse-forward channel");
+                        return;
+                    }
+
+                    s3_srv_reverse_request(ch, &msg_data.data);
+
+                    /* the refusal freed the channel, the bind stays */
+
+                    if (ch->sc == NULL) {
+                        return;
+                    }
+
+                    continue;
+                }
+
                 if (ch->fwd_kind == S3_SRV_FWD_TCP || ch->fwd_kind == S3_SRV_FWD_AGENT) {
 
                     /* the relay: the payload rides the target socket
@@ -4281,10 +5236,10 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     continue;
                 }
 
-                if (ch->fwd_kind == S3_SRV_FWD_UDP) {
+                if (ch->fwd_kind == S3_SRV_FWD_UDP || ch->fwd_kind == S3_SRV_FWD_RUDP) {
 
                     /* the udp channels carry the datagram path only */
-                    s3_srv_h3_channel_cancel(ch, "data on a direct-udp channel");
+                    s3_srv_h3_channel_cancel(ch, "data on a udp channel");
                     return;
                 }
 
@@ -4558,11 +5513,12 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 continue;
             }
 
-            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION && ch->fwd_kind == S3_SRV_FWD_AGENT) {
+            if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION && ch->opened_by_server) {
 
                 /*
                  * the 91 of the acceptor side on the server-initiated
-                 * agent channels: consume and move on
+                 * channels (the agent bridge, the reverse forward
+                 * bridges): consume and move on
                  */
 
                 s3_ssh3_msg_open_confirmation_t conf;
@@ -5128,6 +6084,13 @@ s3_srv_usage(const char *prog)
             " the bracketed ipv6\n"
             "      literal [v6]:port; an empty spec keeps the"
             " unrestricted default\n"
+            "  --permit-listen spec: the listen policy of the reverse"
+            " (-R) binds\n"
+            "      (the sshd_config PermitListen semantics, the same"
+            " entry shapes); the\n"
+            "      gate runs on the post-GatewayPorts bind before any"
+            " socket, an empty\n"
+            "      spec keeps the unrestricted bind\n"
             "  --max-sftp-sessions-per-user n: the concurrent sftp"
             " channels of one\n"
             "      user, default 16, 0 disables the budget (S2-02)\n"
@@ -5152,6 +6115,7 @@ s3_srv_usage(const char *prog)
             " of the flags\n"
             "      above),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
+            "      SSH3_PERMIT_LISTEN (the --permit-listen default),\n"
             "      SSH3_SFTP_JAIL=chroot|lexical (the --sftp-jail flag overrides),\n"
             "      SSH3_PASSWORD_SYSTEM=1 (the --password-system default),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
@@ -5170,6 +6134,7 @@ main(int argc, char **argv)
     const char             *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
     const char             *alpn_name = "h3";
     const char             *url_path_arg = NULL, *permit_open_arg = NULL;
+    const char             *permit_listen_arg = NULL;
     unsigned                dg_size = 1200, idle_ms = 60000;
     u_char                 *cert, *key, alpn_wire[256];
     size_t                  cert_len = 0, key_len = 0;
@@ -5402,6 +6367,13 @@ main(int argc, char **argv)
                  * default below */
 
                 permit_open_arg = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--permit-listen") == 0 && n + 1 < argc) {
+
+                /* the reverse bind policy, the same spec shape */
+
+                permit_listen_arg = argv[n + 1];
                 value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--run-as-user") == 0 && n + 1 < argc) {
@@ -5742,6 +6714,24 @@ main(int argc, char **argv)
     if (permit_open_arg != NULL &&
         s3_ssh3_forward_policy_parse(&s3_srv_fwd_policy, permit_open_arg) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad permit-open spec \"%s\"", permit_open_arg);
+        return 1;
+    }
+
+    /*
+     * the reverse bind policy (--permit-listen, S2-04): the env
+     * default parses first, the flag above has overridden it already;
+     * a bad spec stops the daemon before the sockets open, the
+     * config-error shape of the permit-open check
+     */
+
+    if (permit_listen_arg == NULL) {
+        permit_listen_arg = getenv("SSH3_PERMIT_LISTEN");
+    }
+
+    if (permit_listen_arg != NULL &&
+        s3_ssh3_forward_policy_parse(&s3_srv_listen_policy, permit_listen_arg) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad permit-listen spec \"%s\"",
+                     permit_listen_arg);
         return 1;
     }
 
