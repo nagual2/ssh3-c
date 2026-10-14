@@ -1,4 +1,4 @@
-# ssh3-c
+| 1 | 512 МиБ sftp push / pull, МБ/с | 353 / 354 | 28 / 33 | **358 / 421** |# ssh3-c
 
 **English** | [Русский](README.ru.md) | [Deutsch](README.de.md)
 
@@ -163,19 +163,15 @@ Medians of the control benchmark (methodology R3, `bench/p7-compare.sh`):
 WSL2 loopback, one ed25519 keypair for all three implementations,
 sha-verified transfers, 7 rounds per cell (the first is the warmup).
 The full tables and the environment notes —
-[docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md).
+[docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md).
 
-| № | Metric | ssh3-c | Go fork 0.1.34 | OpenSSH 9.6 |
+| № | Metric | ssh3-c | Go fork 0.1.35 | OpenSSH 9.6 |
 |---|--------|--------|----------------|-------------|
-| 1 | 512 MiB sftp push / pull, MB/s | 354 / 265 | 29 / 37 | **414 / 456** |
-| 5 | Каталог 4000×4 КиБ push / pull, files/s | 1843 / 1887 | **4329 / 3565** | 1339 / 1251 |
-| 2 | Handshake, cold connect+auth+exec, ms | **113** (min 12) | 180 | 220 |
-| 3 | ControlMaster warm exec, ms | **7.5** | 8.8 | 12.9 |
-| 4 | Server CPU / RSS peak, 512 MiB push | 80% / 526 MB \* | 96% / 21 MB | 106% / 28 MB |
-
-\* the sftp server path buffers the whole inbound file — a known issue
-(backlog §8.12 in [docs/PLAN.md](docs/PLAN.md)).
-
+| 1 | 512 MiB sftp push / pull, MB/s | 353 / 354 | 28 / 33 | **358 / 421** |
+| 2 | Handshake, cold connect+auth+exec, ms | **117** (min 15) | 172 | 221 |
+| 3 | ControlMaster warm exec, ms | **7.6** | 9.0 | 13.8 |
+| 4 | Server CPU / RSS peak, 512 MiB push | **75% / 81 MB** | 104% / 26 MB | 104% / 26 MB |
+| 5 | Many-file directory 4000×4 KiB push / pull, files/s | **4667 / 4624** | 4103 / 3518 | 1175 / 1284 |
 ## License
 
 The project's own code — BSD 2-clause (`LICENSE`). The code adapted
