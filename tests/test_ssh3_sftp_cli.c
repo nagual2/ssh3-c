@@ -1702,6 +1702,74 @@ s3_test_cli_get_missing(void)
     return s3_test_failures;
 }
 
+/*
+ * the missing roots of the walks: the -r download over the absent
+ * remote tree fails clean (the root stat dies on the empty frame
+ * stack, the terminal FAIL of the file_fail fix), the -r upload over
+ * the absent local tree refuses before the wire
+ */
+
+static int
+s3_test_cli_walk_missing(void)
+{
+    s3_log_t           log;
+    s3_pool_t         *pool;
+    s3_ssh3_sftp_cli_t cli;
+    s3_test_fs_t       fs;
+    char               dir[64], local[160];
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&fs, sizeof(fs));
+    fs.corrupt = -1;
+    fs.shrink = -1;
+    fs.read_cap = -1;
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(dir, sizeof(dir), "/tmp/s3sftpcliXXXXXX");
+    S3_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(local, sizeof(local), "%s/dl", dir);
+
+    /* the absent remote root: the root stat fails, the walk cannot
+     * resume the empty frame stack, the op dies with the code */
+
+    S3_ASSERT(s3_ssh3_sftp_cli_get_r(&cli, "/absent-tree", local, 0, 0) == S3_OK);
+
+    s3_test_cli_run(&fs, &cli);
+
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_NO_SUCH_FILE);
+
+    /* the absent local root: the immediate refusal, before the wire */
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_IDLE);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put_r(&cli, local, "/tree", 0, 0) == S3_ERROR);
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_FAILURE);
+
+    /* the plain file of the -r upload: the walk cannot start either */
+
+    S3_ASSERT(s3_ssh3_sftp_cli_init(&cli, pool, NULL, NULL) == S3_OK);
+
+    snprintf(local, sizeof(local), "%s/plain.bin", dir);
+    s3_test_write_local(local, (const u_char *)"x", 1);
+
+    S3_ASSERT(s3_ssh3_sftp_cli_put_r(&cli, local, "/tree", 0, 0) == S3_ERROR);
+    S3_ASSERT(cli.state == S3_SSH3_SFTP_CLI_FAIL);
+    S3_ASSERT(s3_ssh3_sftp_cli_status(&cli) == S3_SSH3_SFTP_FX_FAILURE);
+
+    s3_test_fs_free(&fs);
+    s3_test_rm_rf(dir);
+
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
 /* the recursive upload: the local tree lands whole in the memory fs */
 
 static void
@@ -2476,6 +2544,7 @@ s3_test_ssh3_sftp_cli(void)
     (void)s3_test_cli_get_r_mtime_stale();
     (void)s3_test_cli_verify();
     (void)s3_test_cli_get_missing();
+    (void)s3_test_cli_walk_missing();
     (void)s3_test_cli_put_r();
     (void)s3_test_cli_get_r();
     (void)s3_test_cli_bad_id();
