@@ -171,8 +171,8 @@ if(WIN32)
 
     # the product client (P9 wave 3, stage A): the exec and the
     # interactive console session over the proved client modules;
-    # the unix client target does not exist yet, the beachhead is
-    # win-only (docs/PLAN.md P9)
+    # the win shape of the shared app body (the unix shape builds in
+    # the branch below, docs/PLAN.md 8.1)
     add_executable(ssh3 app/ssh3_client.c)
     target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3 PRIVATE s3core)
@@ -350,6 +350,14 @@ if(NOT S3_BUILD_FUZZ)
     add_executable(ssh3-server app/ssh3_server.c)
     target_compile_options(ssh3-server PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3-server PRIVATE s3core Threads::Threads)
+
+    # the product client (PLAN 8.1): the portable client logic of the
+    # P9 beachhead over the unix legs (the termios tty helpers, the
+    # SIGINT/SIGTERM stop flag and the SIGWINCH resize, the UDS agent
+    # and control-master transports)
+    add_executable(ssh3 app/ssh3_client.c)
+    target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3 PRIVATE s3core Threads::Threads)
 endif()
 
 # the fuzz harnesses link the libFuzzer runtime through their own
