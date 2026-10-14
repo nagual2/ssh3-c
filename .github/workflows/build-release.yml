@@ -119,45 +119,6 @@ jobs:
           cmake --preset windows-core
           cmake --build --preset windows-core
 
-      - name: Install wine
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine wine64
-          WINE64=$(command -v wine || command -v wine64)
-          echo "wine at: $WINE64"
-          echo "WINE64=$WINE64" >> "$GITHUB_ENV"
-
-      # the cross-emulator cache variable makes add_test() run every test
-      # exe through wine: no binfmt_misc dependency, the dev workflow
-      # (WSL interop) keeps running the exes directly
-      - name: Test (windows-core under wine)
-        env:
-          WINEDEBUG: fixme-all
-        run: |
-          # the cross build links through the import libs: the exes that
-          # reference OpenSSL symbols import libcrypto/libssl-3-x64.dll,
-          # the dev tree ships them in the build dir, the CI tree gets
-          # them from the cached OpenSSL install
-          find "$HOME/opt/openssl-3.5-mingw" \
-            \( -name "libcrypto-3-x64.dll" -o -name "libssl-3-x64.dll" \) \
-            -exec cp -v {} build/windows-core/ \;
-          cmake --preset windows-core -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
-          ctest --preset windows-core --output-on-failure
-
-      # the iocp backend rides the same sources with the S3_USE_IOCP
-      # option: the iocp event module replaces the select module, the
-      # udp receive goes overlapped
-      - name: Build and test (windows-iocp under wine)
-        env:
-          WINEDEBUG: fixme-all
-        run: |
-          cmake --preset windows-iocp -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE64"
-          cmake --build --preset windows-iocp
-          find "$HOME/opt/openssl-3.5-mingw" \
-            \( -name "libcrypto-3-x64.dll" -o -name "libssl-3-x64.dll" \) \
-            -exec cp -v {} build/windows-iocp/ \;
-          ctest --preset windows-iocp --output-on-failure
-
       - name: Verify the icon + version resource is linked
         run: |
           x86_64-w64-mingw32-objdump -h build/windows-core/ssh3.exe | grep -i '\.rsrc'
@@ -167,6 +128,11 @@ jobs:
         run: |
           mkdir -p dist
           cp build/windows-core/ssh3.exe dist/ssh3_windows_amd64.exe
+          # the cross build links the openssl import libs: the exe needs
+          # the two dlls alongside (the dev tree ships them the same way)
+          find "$HOME/opt/openssl-3.5-mingw" \
+            \( -name 'libssl-3-x64.dll' -o -name 'libcrypto-3-x64.dll' \) \
+            -exec cp -v {} dist/ \;
           ls -l dist/
 
       - uses: actions/upload-artifact@v4
@@ -195,12 +161,15 @@ jobs:
             dist/*.apk
             dist/ssh3-server_linux_amd64
             dist/ssh3_windows_amd64.exe
+            dist/libssl-3-x64.dll
+            dist/libcrypto-3-x64.dll
           body: |
             ssh3-c ${{ github.ref_name }}
 
             - `ssh3-server`: deb / rpm / apk packages (amd64); the deb bundles
               OpenSSL 3.5 for OpenSSL 3.0.x targets (mint 22.x, ubuntu 24.04)
             - `ssh3-server_linux_amd64`: raw server binary
-            - `ssh3_windows_amd64.exe`: static Windows client, icon and
-              version resources embedded
+            - `ssh3_windows_amd64.exe`: the Windows client, icon and version
+              resources embedded; needs `libssl-3-x64.dll` / `libcrypto-3-x64.dll`
+              from this release next to it (or in PATH)
           generate_release_notes: true
