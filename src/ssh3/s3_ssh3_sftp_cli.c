@@ -1093,6 +1093,20 @@ s3_cli_file_fail(s3_ssh3_sftp_cli_t *t, uint32_t code)
 
     t->status = code;
 
+    if (op->frame_count == 0) {
+
+        /*
+         * the walk has not started (the root stat of the -r download
+         * failed, or the root is not a directory): there are no
+         * frames to resume, the op dies -- the WALK resume would
+         * index the empty frame stack
+         */
+
+        t->state = S3_SSH3_SFTP_CLI_FAIL;
+
+        return;
+    }
+
     op->phase = (op->kind == S3_SSH3_SFTP_CLI_OP_PUT_R) ? PH_PUT_R_WALK : PH_GET_R_WALK;
 }
 

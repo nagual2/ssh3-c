@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # P7 control bench: ssh3-c vs Go fork vs OpenSSH on one loopback stand (R3 metrics).
 #
-#   p7-compare.sh [--stage all|throughput|handshake|mux|cpu] [--rounds 7]
+#   p7-compare.sh [--stage all|throughput|handshake|mux|cpu|manyfiles] [--rounds 7]
 #                 [--handshake-runs 30] [--mux-iters 100] [--mux-blocks 3]
-#                 [--work /tmp/p7bench] [--c-build DIR] [--go-bin DIR]
+#                 [--files N] [--work /tmp/p7bench] [--c-build DIR] [--go-bin DIR]
 #
 # Stages (CSV rows land in $WORK/results/, logs in $WORK/logs/):
 #   throughput: bulk transfers, sha256-verified, round-robin over the impls,
@@ -34,7 +34,7 @@ C_BUILD=/mnt/c/Git/temp/wt-bench/build/linux-release
 GO_BIN=/tmp/p7bench/bin
 STAGE=all ROUNDS=7 HS_RUNS=30 MUX_ITERS=100 MUX_BLOCKS=3
 PORT_C=8022 PORT_GO=8023 PORT_SSH=2222
-SIZE_BIG=512 SIZE_SMALL=8
+SIZE_BIG=512 SIZE_SMALL=8 FILES_N=2000
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
     --handshake-runs) HS_RUNS="$2"; shift 2 ;;
     --mux-iters) MUX_ITERS="$2"; shift 2 ;;
     --mux-blocks) MUX_BLOCKS="$2"; shift 2 ;;
+    --files) FILES_N="$2"; shift 2 ;;
     --work) WORK="$2"; shift 2 ;;
     --c-build) C_BUILD="$2"; shift 2 ;;
     --go-bin) GO_BIN="$2"; shift 2 ;;
@@ -87,6 +88,21 @@ gen_payload() { # $1 = MiB, $2 = path; an existing file of the right size stays
 }
 
 sha_of() { sha256sum "$1" | awk '{print $1}'; }
+
+gen_manyfiles() { # the many-small-files tree: FILES_N x 4096 B under $DEV_SHM/many-src
+    local src="$DEV_SHM/many-src/files" i
+    if [ -d "$src" ] && [ "$(find "$src" -type f 2>/dev/null | wc -l)" -eq "$FILES_N" ]; then
+        return 0
+    fi
+    rm -rf "$DEV_SHM/many-src"
+    mkdir -p "$src"
+    dd if=/dev/urandom of="$DEV_SHM/many-src/.tpl" bs=4096 count=1 status=none
+    for i in $(seq 1 "$FILES_N"); do
+        cp "$DEV_SHM/many-src/.tpl" "$src/f$(printf %05d "$i").bin"
+    done
+    rm -f "$DEV_SHM/many-src/.tpl"
+    log "manyfiles: generated $FILES_N files ($(du -sh "$DEV_SHM/many-src" | cut -f1))"
+}
 
 setup_stand() {
     cd "$WORK"
@@ -137,6 +153,7 @@ EOF
 
     gen_payload "$SIZE_BIG" "$DEV_SHM/p7bench.bin"
     gen_payload "$SIZE_SMALL" "$DEV_SHM/p7bench8.bin"
+    gen_manyfiles
     : > "$WORK/known_hosts"
 }
 
@@ -646,10 +663,135 @@ summary_cpu() { # $1 = csv (impl,sample,ts_ms,jiffies,rss_kb)
     done
 }
 
+# --- the many-small-files stage ------------------------------------------------
+
+# the recursive directory transfer (scp -r / the fork -f -r / the
+# harness -J -r): the per-file overhead of the protocol and the client
+# driver, not the bulk stream.  the go remote paths stay HOME-relative
+# (the fork -f rejects the absolute ones, the stand symlink ~/p7shm
+# points into /dev/shm), the c remote paths are jail-relative (-H).
+# the pull leg seeds the remote tree by the impl's own push OUTSIDE
+# the clock, then measures the download only.
+MANY_SRC="$DEV_SHM/many-src"
+
+many_verify() { # $1 = destination dir: the count and the byte size must match
+    [ "$(find "$1" -type f 2>/dev/null | wc -l)" -eq "$FILES_N" ] || return 1
+    [ "$(du -sb "$1" 2>/dev/null | cut -f1)" -eq "$((FILES_N * 4096))" ] || return 1
+}
+
+many_cleanup() { # one attempt's remote tree and local pull dir
+    rm -rf "$DEV_SHM/p7out/many-c" "$DEV_SHM/p7out/many-go" "$DEV_SHM/p7out/many-os"
+    rm -rf "$WORK/many-c-pull" "$WORK/many-go-pull" "$WORK/many-os-pull"
+}
+
+many_push() { # $1 = impl: the measured push, verified, cleaned
+    case "$1" in
+    c)
+        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -J "put:$MANY_SRC:p7out/many-c" -r \
+            -K "$WORK/bench_pkcs8.pem" -U user -t 60000 > /dev/null 2>&1 || return 1
+        many_verify "$DEV_SHM/p7out/many-c"
+        ;;
+    go)
+        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -f -r "$MANY_SRC" "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" \
+            < /dev/null > /dev/null 2>&1 || return 1
+        many_verify "$DEV_SHM/p7out/many-go"
+        ;;
+    os)
+        scp -q -r -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" \
+            -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o "UserKnownHostsFile=$WORK/known_hosts" -o IdentitiesOnly=yes \
+            "$MANY_SRC" "user@127.0.0.1:$DEV_SHM/p7out/many-os" || return 1
+        many_verify "$DEV_SHM/p7out/many-os"
+        ;;
+    esac
+}
+
+many_seed() { # $1 = impl: the unmeasured push that seeds the remote tree
+    many_push "$1"
+}
+
+many_pull() { # $1 = impl: the measured download of the seeded tree
+    case "$1" in
+    c)
+        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -J "get:$WORK/many-c-pull:p7out/many-c" -r \
+            -K "$WORK/bench_pkcs8.pem" -U user -t 60000 > /dev/null 2>&1 || return 1
+        many_verify "$WORK/many-c-pull"
+        ;;
+    go)
+        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -f -r "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" "$WORK/many-go-pull" \
+            < /dev/null > /dev/null 2>&1 || return 1
+        many_verify "$WORK/many-go-pull"
+        ;;
+    os)
+        scp -q -r -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" \
+            -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o "UserKnownHostsFile=$WORK/known_hosts" -o IdentitiesOnly=yes \
+            "user@127.0.0.1:$DEV_SHM/p7out/many-os" "$WORK/many-os-pull" || return 1
+        many_verify "$WORK/many-os-pull"
+        ;;
+    esac
+}
+
+stage_manyfiles() {
+    local csv="$RES/manyfiles.csv" round impl dir t0 t1 sec rc
+    echo "impl,dir,run,sec" > "$csv"
+    log "manyfiles: $FILES_N files x 4096 B, impls: c go os"
+    for dir in push pull; do
+        for round in $(seq 0 "$ROUNDS"); do
+            assert_alive
+            for impl in c go os; do
+                many_cleanup
+                if [ "$dir" = pull ]; then
+                    many_seed "$impl" || {
+                        log "manyfiles $impl seed FAILED, round $round discarded"
+                        continue
+                    }
+                fi
+                t0=$(date +%s%N)
+                if [ "$dir" = push ]; then
+                    many_push "$impl" && rc=0 || rc=1
+                else
+                    many_pull "$impl" && rc=0 || rc=1
+                fi
+                t1=$(date +%s%N)
+                sec=$(awk -v ns=$((t1 - t0)) 'BEGIN{printf "%.3f", ns/1e9}')
+                [ "$rc" = 0 ] || log "manyfiles $impl $dir round $round FAILED, discarded"
+                [ "$rc" = 0 ] || continue
+                [ "$round" = 0 ] && continue
+                echo "$impl,$dir,$round,$sec" >> "$csv"
+                sleep 0.2
+            done
+        done
+    done
+    many_cleanup
+    log "manyfiles summary ($FILES_N files):"
+    summary_manyfiles "$csv"
+}
+
+summary_manyfiles() { # $1 = csv (impl,dir,run,sec)
+    local impl dir vals
+    for dir in push pull; do
+        for impl in c go os; do
+            vals=$(awk -F, -v i="$impl" -v d="$dir" 'NR > 1 && $1 == i && $2 == d {print $4}' "$1" | sort -g)
+            [ -n "$vals" ] || continue
+            echo "$vals" | awk -v i="$impl" -v d="$dir" -v n="$FILES_N" '
+                {a[NR] = $1}
+                END {
+                    med = (NR % 2) ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2
+                    printf "  %-3s %-4s n=%d median=%.2fs files/s=%.0f MB/s=%.1f min=%.2f max=%.2f\n",
+                        i, d, NR, med, n / med, n * 4096 / 1e6 / med, a[1], a[NR]
+                }'
+        done
+    done
+}
+
+# --- main ----------------------------------------------------------------------
 # --- main ----------------------------------------------------------------------
 
 case "$STAGE" in
-all | throughput | handshake | mux | cpu) ;;
+all | throughput | handshake | mux | cpu | manyfiles) ;;
 *) die "bad stage: $STAGE" ;;
 esac
 
@@ -699,7 +841,7 @@ start_servers() {
     probe os
 }
 
-if [ "$STAGE" = mux ] || [ "$STAGE" = handshake ]; then
+if [ "$STAGE" = mux ] || [ "$STAGE" = handshake ] || [ "$STAGE" = manyfiles ]; then
     start_servers
 elif [ "$STAGE" = all ] || [ "$STAGE" = throughput ] || [ "$STAGE" = cpu ]; then
     start_servers
@@ -722,6 +864,10 @@ fi
 
 if [ "$STAGE" = all ] || [ "$STAGE" = mux ]; then
     stage_mux
+fi
+
+if [ "$STAGE" = all ] || [ "$STAGE" = manyfiles ]; then
+    stage_manyfiles
 fi
 
 stop_servers

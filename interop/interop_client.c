@@ -262,6 +262,7 @@ static const char *s3_interop_exec_cmd;
 #define S3_INTEROP_SFTP_GET  2
 
 static int                s3_interop_sftp_mode;
+static int                s3_interop_sftp_recurs;
 static const char        *s3_interop_sftp_local;
 static const char        *s3_interop_sftp_remote;
 static s3_pool_t         *s3_interop_sftp_pool;
@@ -2411,12 +2412,18 @@ s3_interop_sftp_start(void)
     s3_ssh3_sftp_cli_channel_max_packet(&s3_interop_sftp_cli, S3_INTEROP_CHANNEL_MAX_PACKET);
 
     if (s3_interop_sftp_mode == S3_INTEROP_SFTP_PUT) {
-        rc = s3_ssh3_sftp_cli_put(&s3_interop_sftp_cli, s3_interop_sftp_local,
-                                  s3_interop_sftp_remote, 0, 1);
+        rc = s3_interop_sftp_recurs
+                 ? s3_ssh3_sftp_cli_put_r(&s3_interop_sftp_cli, s3_interop_sftp_local,
+                                          s3_interop_sftp_remote, 0, 1)
+                 : s3_ssh3_sftp_cli_put(&s3_interop_sftp_cli, s3_interop_sftp_local,
+                                        s3_interop_sftp_remote, 0, 1);
 
     } else {
-        rc = s3_ssh3_sftp_cli_get(&s3_interop_sftp_cli, s3_interop_sftp_remote,
-                                  s3_interop_sftp_local, 0, 1);
+        rc = s3_interop_sftp_recurs
+                 ? s3_ssh3_sftp_cli_get_r(&s3_interop_sftp_cli, s3_interop_sftp_remote,
+                                          s3_interop_sftp_local, 0, 1)
+                 : s3_ssh3_sftp_cli_get(&s3_interop_sftp_cli, s3_interop_sftp_remote,
+                                        s3_interop_sftp_local, 0, 1);
     }
 
     if (rc != S3_OK) {
@@ -6092,7 +6099,8 @@ s3_interop_usage(const char *prog)
     fprintf(stderr,
             "usage: %s -a addr:port [-3] [-C] [-S] [-F tcp=@port|udp=@port] [-n count] [-s size]"
             " [-m min] [-t ms] [-A alpn] [-U user:pass] [-K privkey.pem] [-X] [-e cmd]"
-            " [-J put|get:local:remote (get too: local first)] [-j jump-addr:port]"
+            " [-J put|get:local:remote (get too: local first), -r: the directory"
+            " form] [-j jump-addr:port]"
             " [-M [-i ms]] [-O op] (cm modes: -U is the socket path)\n"
             "     [--oidc-issuer url --oidc-audience id | --oidc-token raw]\n"
             "  -a  peer UDP address\n"
@@ -6126,7 +6134,8 @@ s3_interop_usage(const char *prog)
             "      it through the master, the verdict is S3CM-SLAVE-DONE\n"
             "  -J  the sftp transfer mode: put|get:local:remote (get too: local first), the "
             "channel type\n"
-            "      is sftp and the verdict is INTEROP-SFTP-OK (verify on)\n"
+            "      is sftp and the verdict is INTEROP-SFTP-OK (verify on); -r selects the\n"
+            "      directory form (put_r/get_r), the local walk recurses\n"
             "  -U  the Basic auth of the CONNECT (RFC 7617), user:pass;\n"
             "      without it the Authorization is test-token; in the cm modes\n"
             "      (-M, -O, the slave without -3) it is the control socket path\n"
@@ -6229,7 +6238,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:3CMTSXh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:F:e:J:S:j:O:i:r3CMTSXh")) != -1) {
 
         switch (opt) {
 
@@ -6300,6 +6309,14 @@ main(int argc, char **argv)
                 s3_interop_sftp_local = sep1 + 1;
                 s3_interop_sftp_remote = sep2 + 1;
             }
+
+            break;
+
+        case 'r':
+
+            /* the -r directory form of the -J driver (put_r/get_r) */
+
+            s3_interop_sftp_recurs = 1;
 
             break;
 
@@ -6966,7 +6983,12 @@ main(int argc, char **argv)
             }
 
             if (hs_reported && !s3_interop_h3_req_sent) {
-                u_char  frame[512];
+                /* the section rides the auth value: the bearer JWT of the
+                 * ed25519 keys is ~350 B, the RSA ones run longer -- the
+                 * 512 B frame of the pre-0.2.0 harness overflowed the
+                 * stack silently (the ASan catch of the manyfiles run) */
+
+                u_char  frame[1024];
                 u_char *p;
                 size_t  sec_len, total;
                 ssize_t m;
@@ -6978,6 +7000,13 @@ main(int argc, char **argv)
                 p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
                 sec_len = (size_t)s3_interop_h3_request_section(p);
                 total = (size_t)(p - frame) + sec_len;
+
+                if (total > sizeof(frame)) {
+                    fprintf(stderr,
+                            "interop-client: the request section %zu exceeds the frame %zu\n",
+                            total, sizeof(frame));
+                    exit(1);
+                }
 
                 m = s3_quic_stream_send(s3_interop_h3_stream, frame, total);
 

@@ -168,6 +168,7 @@ The full tables and the environment notes —
 | № | Metric | ssh3-c | Go fork 0.1.34 | OpenSSH 9.6 |
 |---|--------|--------|----------------|-------------|
 | 1 | 512 MiB sftp push / pull, MB/s | 354 / 265 | 29 / 37 | **414 / 456** |
+| 5 | Каталог 4000×4 КиБ push / pull, files/s | 1843 / 1887 | **4329 / 3565** | 1339 / 1251 |
 | 2 | Handshake, cold connect+auth+exec, ms | **113** (min 12) | 180 | 220 |
 | 3 | ControlMaster warm exec, ms | **7.5** | 8.8 | 12.9 |
 | 4 | Server CPU / RSS peak, 512 MiB push | 80% / 526 MB \* | 96% / 21 MB | 106% / 28 MB |
