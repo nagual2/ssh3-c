@@ -33,8 +33,8 @@
 #define S3_SSH3_SFTP_SRV_HANDLES 64 /* the open files and dirs, hard cap */
 
 typedef struct {
-    int   fd;    /* the open file, -1 when the slot is free */
-    void *dir;   /* the DIR * of an open directory */
+    int    fd;    /* the open file, -1 when the slot is free */
+    void  *dir;   /* the DIR * of an open directory */
     u_char id[8]; /* the handle bytes on the wire */
 } s3_ssh3_sftp_srv_handle_t;
 
@@ -63,7 +63,14 @@ struct s3_ssh3_sftp_srv_s {
     size_t  out_len;
     size_t  out_cap;
 
-    unsigned negotiated : 1; /* the INIT exchange done */
+    /* the scratch READ buffer: the requests ride one at a time, the
+       single reuse keeps the pool flat (a per-READ block piles up to
+       the payload size over one transfer) */
+
+    u_char *read_buf;
+    size_t  read_cap;
+
+    unsigned negotiated : 1;     /* the INIT exchange done */
     unsigned protocol_error : 1; /* a hostile frame killed the loop */
 };
 

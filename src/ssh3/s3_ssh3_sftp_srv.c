@@ -986,11 +986,40 @@ s3_srv_read(s3_ssh3_sftp_srv_t *t, uint32_t id, const s3_str_t *body)
         len = S3_SSH3_SFTP_SRV_READ_MAX;
     }
 
-    buf = s3_pnalloc(t->pool, len ? len : 1);
+    /* the zero-length READ reads nothing: the EOF verdict, the
+       reference shape (the pread of a zero count answers 0) */
 
-    if (buf == NULL) {
-        return S3_ERROR;
+    if (len == 0) {
+        return s3_srv_reply_status(t, id, S3_SSH3_SFTP_FX_EOF);
     }
+
+    /*
+     * the scratch buffer rides the channel pool: the engine serves one
+     * request at a time, the reuse keeps the pool flat - a per-READ
+     * block lives until the channel closes and piles up to the payload
+     * size over one transfer (the RSS finding of the bench)
+     */
+
+    if (t->read_cap < len) {
+
+        u_char *grown;
+        size_t  cap = t->read_cap ? t->read_cap : S3_SSH3_SFTP_SRV_PEND_INIT;
+
+        while (cap < len) {
+            cap *= 2;
+        }
+
+        grown = s3_pnalloc(t->pool, cap);
+
+        if (grown == NULL) {
+            return S3_ERROR;
+        }
+
+        t->read_buf = grown;
+        t->read_cap = cap;
+    }
+
+    buf = t->read_buf;
 
     n = pread(slot->fd, buf, len, (off_t)offset);
 
