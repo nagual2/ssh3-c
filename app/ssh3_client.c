@@ -6932,7 +6932,11 @@ s3_cli_cm_control_op(void)
 
 /*
  * the pump tick of the session and of the sftp run: one timer event
- * on the connection pool, the handler re-arms itself
+ * on the ctx pool (it outlives the connection pool: the quic layer
+ * closes the connection inside the event loop, a tick node freed with
+ * the connection pool is walked by the next expire pass — the
+ * 2026-10-15 0xC0000005 in s3_event_expire_timers), the handler
+ * re-arms itself
  */
 
 static void
@@ -6942,7 +6946,7 @@ s3_cli_tick_arm(void)
         return;
     }
 
-    s3_cli_tick = s3_pnalloc(s3_cli_conn->pool, sizeof(s3_event_t));
+    s3_cli_tick = s3_pnalloc(s3_cli_ctx.pool, sizeof(s3_event_t));
 
     if (s3_cli_tick == NULL) {
         fprintf(stderr, "ssh3: out of memory\n");
@@ -7281,6 +7285,18 @@ s3_cli_tick_handler(s3_event_t *ev)
 #if (S3_WIN32)
     u_char frame[S3_CLI_RING_SIZE + 8];
 #endif
+
+    if (s3_quic_get_connection(s3_cli_conn) == NULL) {
+
+        /*
+         * the quic layer closed the connection (the idle timeout, the
+         * peer close, the error): the channels and the pools are gone
+         * under this tick — no tick work, no re-arm; the main loop
+         * picks the verdict up on its liveness check
+         */
+
+        return;
+    }
 
     if (s3_cli_fwd_count) {
 
