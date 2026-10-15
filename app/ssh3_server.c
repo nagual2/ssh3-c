@@ -5575,7 +5575,15 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
     s3_memzero(ch, sizeof(*ch));
     ch->sc = sc;
     ch->pc = ((s3_quic_stream_t *)sc->data)->parent;
+
+    /* the fd fields start closed: the memzero zeros turn into the
+     * fd 0 closes of the free path (the stdin of the daemon died
+     * with the first freed channel, the next socket() landed on it
+     * and the next free closed the listener) */
+
     ch->fwd_fd = -1;
+    ch->sftp_in = -1;
+    ch->sftp_out = -1;
 
     /* the session identity of the conversation (P7.3) */
 
