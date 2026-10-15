@@ -79,12 +79,12 @@ test_check(void)
     char  dir[S3_TEST_JAIL_CAP];
     char  file[S3_TEST_JAIL_CAP + 64];
     FILE *f;
-    int   failures = 0;
 
     if (s3_test_make_dir(dir) != 0) {
         printf("FAIL %s:%d: mkdtemp\n", __FILE__, __LINE__);
+        s3_test_failures++;
 
-        return 1;
+        return s3_test_failures;
     }
 
     snprintf(file, sizeof(file), "%s/f", dir);
@@ -119,7 +119,7 @@ test_check(void)
 
     s3_test_rmtree(dir);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
@@ -132,12 +132,12 @@ test_resolve_override(void)
     char     want[S3_TEST_JAIL_CAP];
     char    *real;
     uint32_t uid, gid;
-    int      failures = 0;
 
     if (s3_test_make_dir(dir) != 0) {
         printf("FAIL %s:%d: mkdtemp\n", __FILE__, __LINE__);
+        s3_test_failures++;
 
-        return 1;
+        return s3_test_failures;
     }
 
     /* the override serves verbatim (already canonical here), the
@@ -147,9 +147,11 @@ test_resolve_override(void)
     S3_ASSERT(real != NULL);
 
     if (real == NULL) {
+        printf("FAIL %s:%d: realpath\n", __FILE__, __LINE__);
+        s3_test_failures++;
         s3_test_rmtree(dir);
 
-        return 1;
+        return s3_test_failures;
     }
 
     snprintf(want, sizeof(want), "%s", real);
@@ -176,7 +178,7 @@ test_resolve_override(void)
     unlink(link);
     s3_test_rmtree(dir);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
@@ -188,14 +190,13 @@ test_resolve_home(void)
     char          *real;
     struct passwd *pw;
     uint32_t       uid, gid;
-    int            failures = 0;
 
     pw = getpwuid(geteuid());
 
     if (pw == NULL || pw->pw_dir == NULL || *pw->pw_dir == '\0') {
         /* no passwd entry of the runner: the home leg cannot run */
 
-        return 0;
+        return s3_test_failures;
     }
 
     real = realpath(pw->pw_dir, NULL);
@@ -203,7 +204,7 @@ test_resolve_home(void)
     if (real == NULL) {
         /* the home is gone (a deleted service user): nothing to pin */
 
-        return 0;
+        return s3_test_failures;
     }
 
     snprintf(want, sizeof(want), "%s", real);
@@ -218,7 +219,7 @@ test_resolve_home(void)
     S3_ASSERT(uid == (uint32_t)pw->pw_uid);
     S3_ASSERT(gid == (uint32_t)pw->pw_gid);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
@@ -227,7 +228,6 @@ test_resolve_refusals(void)
     char     jail[S3_TEST_JAIL_CAP];
     char     name[S3_TEST_NAME_CAP];
     uint32_t uid, gid;
-    int      failures = 0;
 
     /* no override and an unknown user: the root daemon refuses */
 
@@ -239,26 +239,26 @@ test_resolve_refusals(void)
     S3_ASSERT(s3_ssh3_sftp_jail_resolve("/tmp/s3jail-no-such-path", "s3jail-nobody-xyz", jail,
                                         sizeof(jail), name, sizeof(name), &uid, &gid) == S3_ERROR);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 test_enter_guard(void)
 {
     char     dir[S3_TEST_JAIL_CAP];
-    int      failures = 0;
     uint32_t uid, gid;
 
     if (geteuid() == 0) {
         /* the guard is unreachable under root: the e2e stand rides it */
 
-        return 0;
+        return s3_test_failures;
     }
 
     if (s3_test_make_dir(dir) != 0) {
         printf("FAIL %s:%d: mkdtemp\n", __FILE__, __LINE__);
+        s3_test_failures++;
 
-        return 1;
+        return s3_test_failures;
     }
 
     uid = (uint32_t)getuid();
@@ -271,21 +271,19 @@ test_enter_guard(void)
 
     s3_test_rmtree(dir);
 
-    return failures;
+    return s3_test_failures;
 }
 
 int
 test_ssh3_sftp_jail(void)
 {
-    int failures = 0;
+    (void)test_check();
+    (void)test_resolve_override();
+    (void)test_resolve_home();
+    (void)test_resolve_refusals();
+    (void)test_enter_guard();
 
-    failures += test_check();
-    failures += test_resolve_override();
-    failures += test_resolve_home();
-    failures += test_resolve_refusals();
-    failures += test_enter_guard();
-
-    return failures;
+    return s3_test_failures;
 }
 
 S3_TEST_MAIN(test_ssh3_sftp_jail)

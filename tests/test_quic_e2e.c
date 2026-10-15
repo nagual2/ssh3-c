@@ -896,10 +896,87 @@ s3_test_quic_e2e_run(void)
     return s3_test_failures;
 }
 
+/*
+ * the idle close regression: both endpoints idle out, the close path
+ * must drain every timer from the tree.  a stale node here is walked
+ * by the next s3_event_expire_timers() pass and dereferenced after
+ * the pool is gone (0xC0000005 in the walk, the 2026-10-15 client
+ * crash at offset 0xbbd3)
+ */
+
+static int
+s3_test_quic_e2e_idle_close(void)
+{
+    s3_test_e2e_env_t env;
+    int               i;
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    s3_memzero(&env, sizeof(env));
+
+    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+
+    /*
+     * compressed timeouts: the handshake must complete well inside
+     * handshake_timeout, the idle timeout must fire while both sides
+     * are idle
+     */
+
+    env.cli_conf.handshake_timeout = 2000;
+    env.cli_conf.idle_timeout = 300;
+    env.srv_conf.handshake_timeout = 2000;
+    env.srv_conf.idle_timeout = 300;
+
+    S3_ASSERT(s3_quic_connect(env.cli, &env.cli_conf) == S3_OK);
+
+    /* pump the handshake */
+
+    for (i = 0; i < 500; i++) {
+        s3_event_process_posted(&env.ctx, &env.ctx.posted_events);
+        s3_process_events_and_timers(&env.ctx);
+
+        if (env.cli->ssl != NULL && env.cli->ssl->handshaked) {
+            break;
+        }
+    }
+
+    S3_ASSERT(env.cli->ssl->handshaked);
+
+    /*
+     * idle out: the idle timers fire, both sides close and destroy
+     * their pools.  every expire pass after a handler must find the
+     * tree consistent; the loop ends only on a drained tree — a stale
+     * node either traps under the sanitizer or keeps the tree
+     * non-empty, which fails the assert below
+     */
+
+    for (i = 0; i < 300; i++) {
+        s3_event_process_posted(&env.ctx, &env.ctx.posted_events);
+        s3_process_events_and_timers(&env.ctx);
+
+        if (s3_event_find_timer(&env.ctx) == S3_TIMER_INFINITE) {
+            break;
+        }
+    }
+
+    S3_ASSERT(s3_event_find_timer(&env.ctx) == S3_TIMER_INFINITE);
+
+    /* both pools were destroyed by the idle close */
+
+    env.cli = NULL;
+    env.server = NULL;
+
+    s3_test_env_done(&env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_e2e(void)
 {
     (void)s3_test_quic_e2e_run();
+    (void)s3_test_quic_e2e_idle_close();
 
     OPENSSL_cleanup();
 

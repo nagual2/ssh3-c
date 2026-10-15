@@ -60,6 +60,7 @@
         "CMAKE_SYSTEM_NAME": "Windows",
         "CMAKE_C_COMPILER": "x86_64-w64-mingw32-gcc",
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -g -DNDEBUG",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_EXE_LINKER_FLAGS": "-static"
       }

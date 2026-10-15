@@ -52,21 +52,18 @@ s3_test_run_until(s3_event_ctx_t *ctx, int *flag)
 static int
 s3_test_ctx_init(s3_event_ctx_t *ctx)
 {
-    int failures = 0;
-
     S3_ASSERT(s3_event_ctx_init(ctx, &s3_stderr_log) == S3_OK);
     S3_ASSERT(ctx->pool != NULL);
     S3_ASSERT(ctx->impl != NULL);
     S3_ASSERT(s3_event_find_timer(ctx) == S3_TIMER_INFINITE);
     S3_ASSERT(s3_current_msec != 0);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 s3_test_single_timer(s3_event_ctx_t *ctx)
 {
-    int             failures = 0;
     s3_test_timer_t t, done;
 
     s3_test_timer_init(&t);
@@ -92,13 +89,12 @@ s3_test_single_timer(s3_event_ctx_t *ctx)
     S3_ASSERT(done.fired == 1);
     S3_ASSERT(t.fired == 1);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 s3_test_timer_order(s3_event_ctx_t *ctx)
 {
-    int             failures = 0;
     s3_test_timer_t a, b, done;
 
     s3_test_timer_init(&a);
@@ -121,13 +117,12 @@ s3_test_timer_order(s3_event_ctx_t *ctx)
     S3_ASSERT(b.seq < a.seq); /* the shorter timer fires first */
     S3_ASSERT(done.seq > a.seq);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 s3_test_del_timer(s3_event_ctx_t *ctx)
 {
-    int             failures = 0;
     s3_test_timer_t t, done;
 
     s3_test_timer_init(&t);
@@ -146,13 +141,12 @@ s3_test_del_timer(s3_event_ctx_t *ctx)
     S3_ASSERT(done.fired == 1);
     S3_ASSERT(t.fired == 0);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 s3_test_posted(s3_event_ctx_t *ctx)
 {
-    int             failures = 0;
     s3_test_timer_t e1, e2, e3;
 
     s3_test_timer_init(&e1);
@@ -191,13 +185,12 @@ s3_test_posted(s3_event_ctx_t *ctx)
     S3_ASSERT(e2.fired == 1);
     S3_ASSERT(e3.fired == 1);
 
-    return failures;
+    return s3_test_failures;
 }
 
 static int
 s3_test_timer_wraparound(s3_event_ctx_t *ctx)
 {
-    int             failures = 0;
     s3_test_timer_t t1, t2;
 
     /* the timer keys wrap around uint32; the signed difference of the
@@ -233,29 +226,26 @@ s3_test_timer_wraparound(s3_event_ctx_t *ctx)
     S3_ASSERT(t2.fired == 1);
     S3_ASSERT(s3_event_find_timer(ctx) == S3_TIMER_INFINITE);
 
-    return failures;
+    return s3_test_failures;
 }
 
 int
 s3_test_event(void)
 {
-    int            failures;
     s3_event_ctx_t ctx;
 
-    failures = 0;
+    (void)s3_test_ctx_init(&ctx);
 
-    failures += s3_test_ctx_init(&ctx);
+    (void)s3_test_single_timer(&ctx);
+    (void)s3_test_timer_order(&ctx);
+    (void)s3_test_del_timer(&ctx);
+    (void)s3_test_posted(&ctx);
 
-    failures += s3_test_single_timer(&ctx);
-    failures += s3_test_timer_order(&ctx);
-    failures += s3_test_del_timer(&ctx);
-    failures += s3_test_posted(&ctx);
-
-    failures += s3_test_timer_wraparound(&ctx);
+    (void)s3_test_timer_wraparound(&ctx);
 
     s3_destroy_pool(ctx.pool);
 
-    return failures;
+    return s3_test_failures;
 }
 
 S3_TEST_MAIN(s3_test_event)
