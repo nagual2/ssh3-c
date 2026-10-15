@@ -326,8 +326,10 @@ static int s3_srv_hs_ms = 30000;
  *     the accepted connection is dropped (the datagram the same)
  *
  * the reference carries both knobs behind flags/env (-max-reverse-
- * forwards, SSH3_MAX_REVERSE_FORWARDS), the C shape pins the
- * constants; the flags are the parity tail
+ * forwards, SSH3_MAX_REVERSE_FORWARDS); the C shape keeps the
+ * per-conversation constant pinned and wires the per-user knob as
+ * --max-reverse-forwards / SSH3_MAX_REVERSE_FORWARDS (0, the default,
+ * stays unbounded, the conversation constant stays on top)
  */
 
 #define S3_SRV_REVERSE_LISTENERS_MAX 10
@@ -377,7 +379,37 @@ static struct {
     unsigned                  listeners;
     unsigned                  forwarded; /* the live forwarded-* channels */
     s3_srv_reverse_listener_t listener[S3_SRV_REVERSE_LISTENERS_MAX];
+    char                      budget_user[S3_SRV_SFTP_USER_MAX + 1]; /* the cap owner of the live listeners */
 } s3_srv_reverse;
+
+/*
+ * the operator cap on the live reverse listeners of one user (the
+ * reference maxReverseForwardsPerUser, --max-reverse-forwards /
+ * SSH3_MAX_REVERSE_FORWARDS): every bound listener holds one slot of
+ * its user's budget for its lifetime, over the cap the bind refuses
+ * with the REVERSE-CAP-DENIED report before any socket().  0 (the
+ * default) keeps the unbounded shape, the hard per-conversation
+ * budget of S3_SRV_REVERSE_LISTENERS_MAX stays on top.  The table
+ * mirrors the sftp budget: the daemon serves one conversation at a
+ * time, the extra entries exist for the shape only
+ */
+
+#define S3_SRV_REVERSE_BUDGET_USERS 16
+
+typedef struct {
+    char     user[S3_SRV_SFTP_USER_MAX + 1];
+    unsigned n; /* the live reverse listeners of the user */
+} s3_srv_reverse_budget_t;
+
+static s3_srv_reverse_budget_t s3_srv_reverse_budgets[S3_SRV_REVERSE_BUDGET_USERS];
+
+/* the CONNECTs without a user serve under the daemon identity, their
+ * budget lives in its own counter (the empty key never occupies a
+ * table slot) */
+
+static unsigned s3_srv_reverse_budget_none;
+
+static unsigned s3_srv_reverse_cap = 0; /* 0 = the unlimited default */
 
 /*
  * the listen-side policy (--permit-listen / SSH3_PERMIT_LISTEN, the
@@ -388,6 +420,71 @@ static struct {
  */
 
 static s3_ssh3_forward_policy_t s3_srv_listen_policy;
+
+/*
+ * the GatewayPorts policy of the reverse binds (--gateway-ports /
+ * SSH3_GATEWAY_PORTS, the sshd_config semantics of the reference
+ * resolveReverseForwardBind): "no" (the default) forces every
+ * client-requested bind back to the loopback, "clientspecified"
+ * honors the bind address the client asked for, "yes" binds the
+ * wildcard address regardless of the request
+ */
+
+#define S3_SRV_GATEWAY_PORTS_NO              0
+#define S3_SRV_GATEWAY_PORTS_CLIENTSPECIFIED 1
+#define S3_SRV_GATEWAY_PORTS_YES             2
+
+static unsigned s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_NO;
+
+/* the policy name of the logs and the refusal reasons */
+
+static const char *
+s3_srv_gateway_ports_name(void)
+{
+    switch (s3_srv_gateway_ports) {
+
+    case S3_SRV_GATEWAY_PORTS_CLIENTSPECIFIED:
+        return "clientspecified";
+
+    case S3_SRV_GATEWAY_PORTS_YES:
+        return "yes";
+
+    default:
+        return "no";
+    }
+}
+
+/*
+ * the policy parse of the env default and the --gateway-ports flag:
+ * S3_OK sets the policy, S3_ERROR leaves the caller to warn (the env
+ * keeps the default) or to leave the argv pair for the getopt usage
+ * (the flag)
+ */
+
+static s3_int_t
+s3_srv_gateway_ports_parse(const char *text)
+{
+    if (text == NULL) {
+        return S3_ERROR;
+    }
+
+    if (strcmp(text, "no") == 0) {
+        s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_NO;
+        return S3_OK;
+    }
+
+    if (strcmp(text, "clientspecified") == 0) {
+        s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_CLIENTSPECIFIED;
+        return S3_OK;
+    }
+
+    if (strcmp(text, "yes") == 0) {
+        s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_YES;
+        return S3_OK;
+    }
+
+    return S3_ERROR;
+}
 
 /*
  * the zerolog-style level name of the reference SSH3_LOG_LEVEL; an
@@ -3876,10 +3973,10 @@ s3_srv_agent_accept_timer(s3_event_t *ev)
  * the reverse port forwarding (-R, the reference
  * cmd/reverse_forward_server.go): the "reverse-forward" control
  * channel carries the bind request, the server binds the port (the
- * permit-listen gate first, the GatewayPorts=no rewrite on top) and
- * mirrors every accepted connection or datagram back as a
- * server-initiated forwarded-tcp/forwarded-udp channel whose header
- * extension carries the client-side target
+ * GatewayPorts rewrite of --gateway-ports, then the permit-listen
+ * gate and the budgets) and mirrors every accepted connection or
+ * datagram back as a server-initiated forwarded-tcp/forwarded-udp
+ * channel whose header extension carries the client-side target
  */
 
 /* the reverse state died with its conversation: the ticks self-check */
@@ -3889,6 +3986,118 @@ s3_srv_reverse_live(void)
 {
     return s3_srv_reverse.listeners > 0 && s3_srv_reverse.pc != NULL &&
            s3_srv_conn_alive(s3_srv_reverse.pc);
+}
+
+/*
+ * the reverse listener budget (the shape of the sftp budget, the
+ * reference maxReverseForwardsPerUser): one slot per live listener of
+ * the user, the empty username (a CONNECT without a user) is a key of
+ * its own.  The table is scanned linearly, its size is a constant and
+ * the daemon serves one conversation at a time; a full table with no
+ * entry of the user refuses (fail-closed, unreachable in the
+ * single-conversation shape)
+ */
+
+static unsigned
+s3_srv_reverse_budget_take(const char *user)
+{
+    size_t len = strlen(user);
+
+    if (s3_srv_reverse_cap == 0) {
+        return 1;
+    }
+
+    if (len == 0) {
+
+        /* the daemon-identity CONNECTs, the key of their own */
+
+        if (s3_srv_reverse_budget_none >= s3_srv_reverse_cap) {
+            return 0;
+        }
+
+        s3_srv_reverse_budget_none++;
+        return 1;
+    }
+
+    if (len > S3_SRV_SFTP_USER_MAX) {
+        len = S3_SRV_SFTP_USER_MAX;
+    }
+
+    for (unsigned i = 0; i < S3_SRV_REVERSE_BUDGET_USERS; i++) {
+
+        s3_srv_reverse_budget_t *b = &s3_srv_reverse_budgets[i];
+
+        if (b->user[0] != '\0' && strlen(b->user) == len && memcmp(b->user, user, len) == 0) {
+
+            if (b->n >= s3_srv_reverse_cap) {
+                return 0;
+            }
+
+            b->n++;
+            return 1;
+        }
+    }
+
+    for (unsigned i = 0; i < S3_SRV_REVERSE_BUDGET_USERS; i++) {
+
+        s3_srv_reverse_budget_t *b = &s3_srv_reverse_budgets[i];
+
+        if (b->user[0] == '\0') {
+            s3_memcpy(b->user, user, len);
+            b->user[len] = '\0';
+            b->n = 1;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void
+s3_srv_reverse_budget_give(const char *user, unsigned n)
+{
+    size_t len;
+
+    if (s3_srv_reverse_cap == 0 || n == 0) {
+        return;
+    }
+
+    len = strlen(user);
+
+    if (len == 0) {
+
+        while (n > 0 && s3_srv_reverse_budget_none > 0) {
+            s3_srv_reverse_budget_none--;
+            n--;
+        }
+
+        return;
+    }
+
+    if (len > S3_SRV_SFTP_USER_MAX) {
+        len = S3_SRV_SFTP_USER_MAX;
+    }
+
+    for (unsigned i = 0; i < S3_SRV_REVERSE_BUDGET_USERS; i++) {
+
+        s3_srv_reverse_budget_t *b = &s3_srv_reverse_budgets[i];
+
+        if (b->user[0] != '\0' && strlen(b->user) == len && memcmp(b->user, user, len) == 0) {
+
+            /* the give clamps at zero: a listener that outlived its
+             * slot never invents a new one */
+
+            b->n = (b->n > n) ? b->n - n : 0;
+
+            /* the empty entry frees the table slot */
+
+            if (b->n == 0) {
+                b->user[0] = '\0';
+            }
+
+            return;
+        }
+    }
 }
 
 /*
@@ -3936,6 +4145,12 @@ s3_srv_reverse_teardown(void)
 
         s3_memzero(l, sizeof(*l));
     }
+
+    /* the cap slots of the live listeners ride back to the owner's
+     * budget (the no-op of the unlimited default) */
+
+    s3_srv_reverse_budget_give(s3_srv_reverse.budget_user, s3_srv_reverse.listeners);
+    s3_srv_reverse.budget_user[0] = '\0';
 
     s3_srv_reverse.listeners = 0;
     s3_srv_reverse.pc = NULL;
@@ -3987,11 +4202,14 @@ s3_srv_reverse_reply(s3_srv_h3_channel_t *ch, const s3_ssh3_reverse_reply_t *r)
 }
 
 /*
- * the GatewayPorts=no rewrite of the reference resolveReverseForwardBind:
- * the empty bind defaults to the loopback, a loopback literal keeps,
- * everything else is forced back to the loopback (the daemon never
- * exposes a client -R bind without the operator's say-so; the
- * clientspecified/yes policies ride the --gateway-ports tail)
+ * the GatewayPorts rewrite of the reference resolveReverseForwardBind
+ * (--gateway-ports / SSH3_GATEWAY_PORTS, the sshd_config semantics):
+ * the "no" policy forces every client-requested bind back to the
+ * loopback (the empty bind defaults to it, a loopback literal keeps),
+ * the "clientspecified" policy honors the bind as the client spelled
+ * it, the "yes" policy binds the wildcard regardless of the request
+ * (the daemon never exposes a client -R bind without the operator's
+ * say-so)
  */
 
 static void
@@ -4002,6 +4220,18 @@ s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len
     struct in6_addr a6;
 
     *rewritten = 0;
+
+    if (s3_srv_gateway_ports == S3_SRV_GATEWAY_PORTS_YES) {
+
+        /* the yes policy returns the wildcard for every request (the
+         * reference returns the empty bind, the net.Listen(":port")
+         * shape); the v4 wildcard is what the v4-only listener
+         * machinery binds */
+
+        snprintf(out, out_len, "0.0.0.0");
+        *rewritten = 1;
+        return;
+    }
 
     if (requested->len == 0) {
         snprintf(out, out_len, "127.0.0.1");
@@ -4020,7 +4250,19 @@ s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len
         return;
     }
 
-    /* a non-loopback request rides the no policy back to the
+    if (s3_srv_gateway_ports == S3_SRV_GATEWAY_PORTS_CLIENTSPECIFIED) {
+
+        /* the clientspecified policy honors the bind as the client
+         * spelled it (the non-loopback literal, the v4 wildcard or
+         * the v6 literal the family gate below answers); the address
+         * may be a name the client resolved locally, the rewrite
+         * passes it through */
+
+        snprintf(out, out_len, "%s", (const char *)requested->data);
+        return;
+    }
+
+    /* the no policy rides the non-loopback request back to the
      * loopback; the address may be a name the client sent, the
      * rewrite does not need to resolve it */
 
@@ -4368,9 +4610,10 @@ s3_srv_reverse_datagram_route(s3_connection_t *c, const u_char *buf, size_t len)
 /*
  * the bind request on the control channel (the reference
  * handleReverseForwardChannel): the gate order is the target literal,
- * the GatewayPorts rewrite, the permit-listen policy and the listener
- * budget, all before the bind; every refusal answers with the reason
- * and closes the control channel (the reference shape)
+ * the GatewayPorts rewrite, the permit-listen policy, the listener
+ * budget of the conversation and the user reverse cap, all before the
+ * bind; every refusal answers with the reason and closes the control
+ * channel (the reference shape)
  */
 
 static void
@@ -4388,6 +4631,7 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     struct sockaddr_in         sa;
     int                        fd = -1;
     unsigned                   rewritten;
+    unsigned                   booked = 0;
     unsigned                   i;
 
     /* the string views ride the channel accumulator: the next recv
@@ -4459,8 +4703,8 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
 
         if (rewritten && bind_text[0] != '\0') {
             s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
-                         "reverse forward: the GatewayPorts=no policy restricted the bind %s to %s",
-                         bind_text, bind_host);
+                         "reverse forward: the GatewayPorts=%s policy restricted the bind %s to %s",
+                         s3_srv_gateway_ports_name(), bind_text, bind_host);
         }
     }
 
@@ -4481,6 +4725,42 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         goto refuse;
     }
 
+    /* the operator cap on the live reverse listeners of the user
+     * (the reference maxReverseForwardsPerUser): the refusal rides
+     * before any socket(), the slot books here and gives back on the
+     * refuse paths below.  The user text stages into a fixed buffer:
+     * the empty name (a CONNECT under the daemon identity) prints as
+     * the "-" placeholder */
+
+    {
+        char ruser[S3_SRV_SFTP_USER_MAX + 2];
+
+        if (ch->sess_user[0] != '\0') {
+            snprintf(ruser, sizeof(ruser), "%s", ch->sess_user);
+
+        } else {
+            snprintf(ruser, sizeof(ruser), "-");
+        }
+
+        if (!s3_srv_reverse_budget_take(ch->sess_user)) {
+            s3_srv_report("REVERSE-CAP-DENIED kind=%s user=%s bind=%s:%u limit=%u\n", kind, ruser,
+                          bind_host, (unsigned)req.bind_port, (unsigned)s3_srv_reverse_cap);
+
+            snprintf(reason, sizeof(reason), "too many reverse forwards for user %s (limit %d)",
+                     ruser, s3_srv_reverse_cap);
+
+            goto refuse;
+        }
+
+        booked = 1;
+
+        /* the cap owner of the live listeners (the teardown rides it
+         * back into the budget) */
+
+        s3_memcpy(s3_srv_reverse.budget_user, ch->sess_user, sizeof(s3_srv_reverse.budget_user));
+        s3_srv_reverse.budget_user[sizeof(s3_srv_reverse.budget_user) - 1] = '\0';
+    }
+
     /* the bind text is a literal (the rewrite produced one), the
      * family follows it */
 
@@ -4488,11 +4768,12 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
 
     if (strcmp(bind_host, "::") == 0 || strchr(bind_host, ':') != NULL) {
 
-        /* the ipv6 bind rides the v4-mapped loopback under the no
-         * policy: the rewrite above produced 127.0.0.1 for every
-         * non-loopback request, a "::" here means the client asked
-         * for the wildcard and the no policy forced the loopback
-         * already - the v6 branch is dead unless the policy relaxes */
+        /* the ipv6 bind under the no policy is the rewritten loopback
+         * only: the rewrite turns every non-loopback request into
+         * 127.0.0.1 and the yes policy into 0.0.0.0, so a ":" here
+         * means the clientspecified policy passed an ipv6 literal
+         * through - the reverse listener machinery is v4-only, the
+         * bind refuses fail-closed */
 
         snprintf(reason, sizeof(reason), "unsupported ipv6 bind %s", bind_host);
         goto refuse;
@@ -4504,13 +4785,20 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     }
 
     /* the conversation bookkeeping: a new conversation tears the old
-     * listeners down (the single-conversation shape of the daemon) */
+     * listeners down (the single-conversation shape of the daemon).
+     * The identity is the quic connection itself - the CONNECT stream
+     * id restarts with every connection, an id-only comparison never
+     * told the conversations apart and left the stale listeners of a
+     * dead conversation riding under the fresh one (their live check
+     * then tore the fresh listeners down with them).  The re-anchor
+     * also covers the refused binds of a new conversation: they leave
+     * listeners == 0 with the pc of the dead conversation riding */
 
-    if (s3_srv_reverse.conv_id != s3_srv_h3_conv_id && s3_srv_reverse.listeners > 0) {
+    if (s3_srv_reverse.listeners > 0 && s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse_teardown();
     }
 
-    if (s3_srv_reverse.conv_id == 0) {
+    if (s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse.conv_id = s3_srv_h3_conv_id;
         s3_srv_reverse.pc = ch->pc;
     }
@@ -4617,6 +4905,13 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     return;
 
 refuse:
+
+    /* the booked cap slot rides back when a refusal below the gate
+     * killed the bind (the socket/getsockname failures) */
+
+    if (booked) {
+        s3_srv_reverse_budget_give(ch->sess_user, 1);
+    }
 
     s3_memzero(&reply, sizeof(reply));
 
@@ -5575,7 +5870,15 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
     s3_memzero(ch, sizeof(*ch));
     ch->sc = sc;
     ch->pc = ((s3_quic_stream_t *)sc->data)->parent;
+
+    /* the fd fields start closed: the memzero zeros turn into the
+     * fd 0 closes of the free path (the stdin of the daemon died
+     * with the first freed channel, the next socket() landed on it
+     * and the next free closed the listener) */
+
     ch->fwd_fd = -1;
+    ch->sftp_in = -1;
+    ch->sftp_out = -1;
 
     /* the session identity of the conversation (P7.3) */
 
@@ -6091,6 +6394,22 @@ s3_srv_usage(const char *prog)
             "      gate runs on the post-GatewayPorts bind before any"
             " socket, an empty\n"
             "      spec keeps the unrestricted bind\n"
+            "  --gateway-ports no|yes|clientspecified: the GatewayPorts"
+            " policy of the\n"
+            "      reverse (-R) binds (the sshd_config semantics): the"
+            " default \"no\"\n"
+            "      forces every client bind back to the loopback,"
+            " \"clientspecified\"\n"
+            "      honors the bind address the client asked for,"
+            " \"yes\" binds the\n"
+            "      wildcard address regardless of the request\n"
+            "  --max-reverse-forwards n: the live reverse (-R) listeners"
+            " of one user,\n"
+            "      default 0 (no cap, the per-conversation budget of 10"
+            " stays), over\n"
+            "      the cap the bind refuses with the REVERSE-CAP-DENIED"
+            " marker before\n"
+            "      any socket\n"
             "  --max-sftp-sessions-per-user n: the concurrent sftp"
             " channels of one\n"
             "      user, default 16, 0 disables the budget (S2-02)\n"
@@ -6116,6 +6435,10 @@ s3_srv_usage(const char *prog)
             "      above),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
             "      SSH3_PERMIT_LISTEN (the --permit-listen default),\n"
+            "      SSH3_GATEWAY_PORTS=no|yes|clientspecified (the"
+            " --gateway-ports default),\n"
+            "      SSH3_MAX_REVERSE_FORWARDS (the"
+            " --max-reverse-forwards default),\n"
             "      SSH3_SFTP_JAIL=chroot|lexical (the --sftp-jail flag overrides),\n"
             "      SSH3_PASSWORD_SYSTEM=1 (the --password-system default),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
@@ -6239,6 +6562,19 @@ main(int argc, char **argv)
         }
     }
 
+    if (getenv("SSH3_MAX_REVERSE_FORWARDS") != NULL) {
+        int n = atoi(getenv("SSH3_MAX_REVERSE_FORWARDS"));
+
+        if (n >= 0) {
+            s3_srv_reverse_cap = (unsigned)n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_MAX_REVERSE_FORWARDS \"%s\", using the default",
+                         getenv("SSH3_MAX_REVERSE_FORWARDS"));
+        }
+    }
+
     if (getenv("SSH3_MAX_CONNECTIONS") != NULL) {
         int n = atoi(getenv("SSH3_MAX_CONNECTIONS"));
 
@@ -6285,6 +6621,21 @@ main(int argc, char **argv)
                 s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                              "invalid SSH3_SFTP_JAIL \"%s\", keeping the default", jail);
             }
+        }
+    }
+
+    /*
+     * the GatewayPorts policy of the reference (-gateway-ports): the
+     * env default parses first, the flag of the pre-scan below
+     * overrides, an unknown value keeps the default (the "no")
+     */
+    {
+        const char *policy = getenv("SSH3_GATEWAY_PORTS");
+
+        if (policy != NULL && *policy != '\0' &&
+            s3_srv_gateway_ports_parse(policy) != S3_OK) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_GATEWAY_PORTS \"%s\", keeping the default", policy);
         }
     }
 
@@ -6374,6 +6725,33 @@ main(int argc, char **argv)
                 /* the reverse bind policy, the same spec shape */
 
                 permit_listen_arg = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--gateway-ports") == 0 && n + 1 < argc) {
+
+                /* the GatewayPorts policy (the on|off form): anything
+                 * else stays in the argv for the getopt loop to
+                 * reject with the usage, the sftp-jail shape */
+
+                if (s3_srv_gateway_ports_parse(argv[n + 1]) == S3_OK) {
+                    value = argv[n + 1];
+                }
+
+            } else if (strcmp(argv[n], "--max-reverse-forwards") == 0 && n + 1 < argc) {
+
+                /* the reverse listener budget of the user: 0 is the
+                 * legitimate unlimited (the per-conversation budget of
+                 * 10 stays) */
+
+                int k = atoi(argv[n + 1]);
+
+                if (k < 0) {
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                                 "bad --max-reverse-forwards \"%s\"", argv[n + 1]);
+                    return 1;
+                }
+
+                s3_srv_reverse_cap = (unsigned)k;
                 value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--run-as-user") == 0 && n + 1 < argc) {
