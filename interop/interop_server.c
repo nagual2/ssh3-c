@@ -82,6 +82,14 @@
  */
 #define S3_INTEROP_CHANNEL_MAX_PACKET 30000
 
+/*
+ * the shutdown tail bound: the bounded passes of the exit flush the
+ * queued frames and complete the connection teardowns, the tail
+ * never runs past it (the daemon flush/close grace, one phase: the
+ * harness has no drain window)
+ */
+#define S3_INTEROP_SHUTDOWN_GRACE 500
+
 static s3_log_t s3_interop_log;
 
 static s3_quic_conf_t s3_interop_conf;
@@ -91,6 +99,14 @@ static s3_connection_t *s3_interop_conns[S3_INTEROP_TRACKED];
 static unsigned         s3_interop_reported[S3_INTEROP_TRACKED];
 static unsigned         s3_interop_idle_reported[S3_INTEROP_TRACKED];
 static s3_uint_t        s3_interop_nconns;
+
+/*
+ * the shutdown signals: the handler only raises the flag, every real
+ * action happens in the main loop between the event passes (the
+ * daemon shape, the single phase: the first signal closes
+ * everything at once)
+ */
+static volatile sig_atomic_t s3_interop_quit;
 
 /* the h3 mode (-3): RFC 9220 extended CONNECT instead of the echo */
 static unsigned s3_interop_h3_mode;
@@ -164,6 +180,20 @@ s3_interop_log_init(void)
 {
     s3_interop_log.log_level = S3_LOG_INFO;
     s3_interop_log.fd = S3_INVALID_FILE;
+}
+
+/*
+ * the shutdown signals: the handler only counts them, every real
+ * action happens in the main loop between the event passes
+ */
+static void
+s3_interop_signal_handler(int sig)
+{
+    /* every signal of the handler means the same: the shutdown */
+
+    (void)sig;
+
+    s3_interop_quit = 1;
 }
 
 static u_char *
@@ -3513,6 +3543,39 @@ s3_interop_accept(s3_connection_t *c)
     s3_quic_run(c, &s3_interop_conf);
 }
 
+/* the connections that are still alive (the quic socket rides) */
+static unsigned
+s3_interop_alive_conns(void)
+{
+    unsigned i, n = 0;
+
+    for (i = 0; i < s3_interop_nconns; i++) {
+
+        if (s3_interop_conns[i]->udp != NULL) {
+            n++;
+        }
+    }
+
+    return n;
+}
+
+/*
+ * one bounded event pass of the shutdown tail: the plain
+ * s3_process_events_and_timers() may block in epoll_wait() up to the
+ * idle timer (a minute with the departed peers), a shutdown pass
+ * must not
+ */
+static void
+s3_interop_shutdown_pass(s3_event_ctx_t *ctx)
+{
+    s3_time_update();
+
+    (void)s3_event_actions.process_events(ctx, 20, S3_UPDATE_TIME);
+
+    s3_event_expire_timers(ctx);
+    s3_event_process_posted(ctx, &ctx->posted_events);
+}
+
 static void
 s3_interop_usage(const char *prog)
 {
@@ -3566,6 +3629,8 @@ main(int argc, char **argv)
     s3_event_ctx_t     ctx;
     s3_connection_t   *listener;
     s3_udp_listen_t    ul;
+    s3_msec_t          deadline;
+    struct sigaction   act;
 
     s3_interop_log_init();
 
@@ -3728,6 +3793,19 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* the shutdown signals and the process hygiene (the daemon shape) */
+
+    s3_memzero(&act, sizeof(act));
+
+    act.sa_handler = s3_interop_signal_handler;
+
+    if (sigaction(SIGTERM, &act, NULL) == -1 || sigaction(SIGINT, &act, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+
+    (void)signal(SIGPIPE, SIG_IGN);
+
     /* the verifier inits here: the timer below and the first token
      * share the ready state, the discovery stays lazy */
 
@@ -3886,6 +3964,15 @@ main(int argc, char **argv)
 
         s3_process_events_and_timers(&ctx);
 
+        /*
+         * the shutdown state: the handler only raises the flag, the
+         * work happens between the passes; the harness has no drain
+         * window, the first signal closes everything at once
+         */
+        if (s3_interop_quit) {
+            break;
+        }
+
         for (i = 0; i < s3_interop_nconns; i++) {
             s3_connection_t *c = s3_interop_conns[i];
 
@@ -3906,4 +3993,89 @@ main(int argc, char **argv)
             }
         }
     }
+
+    /*
+     * the shutdown tail (the single phase): the quic conns get the
+     * CONNECTION_CLOSE and the bounded passes flush the queued frames
+     * and complete the teardowns (the ssl, the keys, the pools); a
+     * quiet peer parks on the 3*PTO close timer, the drain below
+     * drops it and lets the teardown resume on the passes
+     */
+
+    for (i = 0; i < s3_interop_nconns; i++) {
+
+        if (s3_interop_conns[i]->udp != NULL) {
+            s3_quic_finalize_connection(s3_interop_conns[i], 0, "server shutdown");
+        }
+    }
+
+    deadline = s3_current_msec + S3_INTEROP_SHUTDOWN_GRACE;
+
+    while (s3_current_msec < deadline && s3_interop_alive_conns() > 0) {
+        s3_interop_shutdown_pass(&ctx);
+    }
+
+    for (i = 0; i < s3_interop_nconns; i++) {
+        s3_connection_t      *c = s3_interop_conns[i];
+        s3_quic_connection_t *qc;
+
+        if (c->udp == NULL) {
+            continue;
+        }
+
+        qc = s3_quic_get_connection(c);
+
+        if (qc != NULL && qc->close.timer_set) {
+            s3_event_del_timer(&qc->close);
+            s3_post_event(&qc->close, &ctx.posted_events);
+        }
+    }
+
+    deadline = s3_current_msec + S3_INTEROP_SHUTDOWN_GRACE;
+
+    while (s3_current_msec < deadline && s3_interop_alive_conns() > 0) {
+        s3_interop_shutdown_pass(&ctx);
+    }
+
+    /*
+     * the channels go after the conns (the daemon order): no stream
+     * event can fire on a closed connection, the session children
+     * die here, the agent sockets unlink, the pump buffers free
+     */
+
+    for (i = 0; i < S3_INTEROP_TRACKED; i++) {
+
+        if (s3_interop_h3_channels[i].sc != NULL) {
+            s3_interop_h3_channel_free(&s3_interop_h3_channels[i]);
+        }
+    }
+
+    /* the listener goes last: the port frees before the exit */
+
+    s3_close_connection(listener);
+
+    /*
+     * the exit hygiene: the pools died in the tail passes and the
+     * channel frees above, what is left here is the process-owned
+     * state - the echo and the h3 request buffers, the oidc provider
+     * keys, the ssl ctx and the event ctx
+     */
+
+    free(s3_interop_echo_buf);
+    s3_interop_echo_buf = NULL;
+
+    free(s3_interop_h3_buf);
+    s3_interop_h3_buf = NULL;
+
+    if (s3_interop_oidc_issuer != NULL) {
+        s3_ssh3_oidc_verifier_clear(&s3_interop_oidc_ver);
+    }
+
+    s3_ssl_free(s3_interop_conf.ssl);
+
+    s3_event_ctx_shutdown(&ctx);
+
+    fprintf(stderr, "interop-server: shutdown complete\n");
+
+    return 0;
 }
