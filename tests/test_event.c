@@ -193,8 +193,9 @@ s3_test_timer_wraparound(s3_event_ctx_t *ctx)
 {
     s3_test_timer_t t1, t2;
 
-    /* the timer keys wrap around uint32; the signed difference of the
-       keys must order the timers across the wrap point */
+    /* the timer keys are the full s3_msec_t width (64-bit): no wrap
+       at uint32; the signed-difference comparison must still order
+       the timers across the uint32 boundary and expire them in order */
 
     s3_current_msec = 0xFFFFFF00;
 
@@ -202,12 +203,13 @@ s3_test_timer_wraparound(s3_event_ctx_t *ctx)
     s3_test_timer_init(&t2);
 
     s3_event_add_timer(&t1.ev, 254); /* key: 0xFFFFFFFE */
-    s3_event_add_timer(&t2.ev, 261); /* key: 0x00000005, wrapped */
+    s3_event_add_timer(&t2.ev, 261); /* key: 0x100000005 */
 
     S3_ASSERT(t1.ev.timer.key == 0xFFFFFFFE);
-    S3_ASSERT(t2.ev.timer.key == 0x00000005);
+    S3_ASSERT(t2.ev.timer.key == 0x100000005);
 
-    /* the wrapped key sorts after 0xFFFFFFFE and before the overflow */
+    /* the key beyond the uint32 boundary sorts after 0xFFFFFFFE by the
+       signed difference and expires after it */
 
     S3_ASSERT(s3_event_find_timer(ctx) == 254);
 

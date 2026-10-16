@@ -907,15 +907,23 @@ s3_test_quic_e2e_run(void)
 static int
 s3_test_quic_e2e_idle_close(void)
 {
-    s3_test_e2e_env_t env;
-    int               i;
+    s3_test_e2e_env_t *env = &s3_test_e2e;
+    int                i;
 
     s3_test_cli_received_len = 0;
     s3_test_srv_received_len = 0;
 
-    s3_memzero(&env, sizeof(env));
+    /*
+     * the env must be the global s3_test_e2e: the listener accept
+     * handler carries no env and reads the global srv_conf, a local
+     * copy leaves the handler a stale (ssl-less) conf — the server
+     * rejects the Initial, the client times out and the pump loops
+     * block on epoll_wait with no timers left (the 2026-10-16 hang)
+     */
 
-    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+    s3_memzero(env, sizeof(*env));
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
 
     /*
      * compressed timeouts: the handshake must complete well inside
@@ -923,25 +931,25 @@ s3_test_quic_e2e_idle_close(void)
      * are idle
      */
 
-    env.cli_conf.handshake_timeout = 2000;
-    env.cli_conf.idle_timeout = 300;
-    env.srv_conf.handshake_timeout = 2000;
-    env.srv_conf.idle_timeout = 300;
+    env->cli_conf.handshake_timeout = 2000;
+    env->cli_conf.idle_timeout = 300;
+    env->srv_conf.handshake_timeout = 2000;
+    env->srv_conf.idle_timeout = 300;
 
-    S3_ASSERT(s3_quic_connect(env.cli, &env.cli_conf) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
 
     /* pump the handshake */
 
     for (i = 0; i < 500; i++) {
-        s3_event_process_posted(&env.ctx, &env.ctx.posted_events);
-        s3_process_events_and_timers(&env.ctx);
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
 
-        if (env.cli->ssl != NULL && env.cli->ssl->handshaked) {
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked) {
             break;
         }
     }
 
-    S3_ASSERT(env.cli->ssl->handshaked);
+    S3_ASSERT(env->cli->ssl->handshaked);
 
     /*
      * idle out: the idle timers fire, both sides close and destroy
@@ -952,22 +960,22 @@ s3_test_quic_e2e_idle_close(void)
      */
 
     for (i = 0; i < 300; i++) {
-        s3_event_process_posted(&env.ctx, &env.ctx.posted_events);
-        s3_process_events_and_timers(&env.ctx);
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
 
-        if (s3_event_find_timer(&env.ctx) == S3_TIMER_INFINITE) {
+        if (s3_event_find_timer(&env->ctx) == S3_TIMER_INFINITE) {
             break;
         }
     }
 
-    S3_ASSERT(s3_event_find_timer(&env.ctx) == S3_TIMER_INFINITE);
+    S3_ASSERT(s3_event_find_timer(&env->ctx) == S3_TIMER_INFINITE);
 
     /* both pools were destroyed by the idle close */
 
-    env.cli = NULL;
-    env.server = NULL;
+    env->cli = NULL;
+    env->server = NULL;
 
-    s3_test_env_done(&env);
+    s3_test_env_done(env);
 
     return s3_test_failures;
 }
