@@ -4404,7 +4404,7 @@ s3_cli_rev_spec_of(unsigned proto, const s3_ssh3_forward_target_t *t)
         }
 
         if (t->family == 6 && t->ip_len == 16 && rt->family == 4 && rt->ip_len == 4 &&
-            s3_memcmp(t->ip, s3_cli_rev_v4_mapped_prefix, 10) == 0 &&
+            s3_memcmp(t->ip, s3_cli_rev_v4_mapped_prefix, 12) == 0 &&
             s3_memcmp(t->ip + 12, rt->ip, 4) == 0) {
             return (int)i;
         }
