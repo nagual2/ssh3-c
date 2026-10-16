@@ -65,6 +65,9 @@ GO_CLIENT=$WORK/bin/p7go-client
 GO_SERVER=$WORK/bin/p7go-server
 CIPHER=aes128-gcm@openssh.com
 DEV_SHM=/dev/shm
+# the OS user the stand authenticates as: the sshd (AuthorizedKeysFile) and
+# both ssh3 servers accept the local user; override with BENCH_USER=<name>
+BENCH_USER="${BENCH_USER:-$(id -un)}"
 
 mkdir -p "$LOGS" "$RES" "$DEV_SHM/p7out"
 
@@ -222,14 +225,14 @@ probe() { # $1 = impl
     for i in $(seq 1 40); do
         case "$1" in
         c) "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -C -S exec \
-               -K "$WORK/bench_pkcs8.pem" -U user -t 10000 \
+               -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" -t 10000 \
                > /dev/null 2>&1 && return 0 ;;
         go) "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-                "user@127.0.0.1:$PORT_GO/ssh3-term" true \
+                "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term" true \
                 < /dev/null > /dev/null 2>&1 && return 0 ;;
         os) ssh -p "$PORT_SSH" -i "$WORK/bench_ed25519" -o BatchMode=yes \
                 -o StrictHostKeyChecking=no -o "UserKnownHostsFile=$WORK/known_hosts" \
-                -o IdentitiesOnly=yes user@127.0.0.1 true \
+                -o IdentitiesOnly=yes ${BENCH_USER}@127.0.0.1 true \
                 < /dev/null > /dev/null 2>&1 && return 0 ;;
         esac
         sleep 0.25
@@ -255,19 +258,19 @@ assert_alive() {
 
 c_exec() { # cold exec, the verdict marker rides (printf s3-exec-ok)
     "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -C -S exec \
-        -K "$WORK/bench_pkcs8.pem" -U user -t 10000 > /dev/null 2>&1
+        -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" -t 10000 > /dev/null 2>&1
 }
 
 go_exec() {
     "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-        "user@127.0.0.1:$PORT_GO/ssh3-term" true \
+        "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term" true \
         < /dev/null > /dev/null 2>"$LOGS/go-client.log"
 }
 
 os_exec() {
     ssh -p "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" -o BatchMode=yes \
         -o StrictHostKeyChecking=no -o "UserKnownHostsFile=$WORK/known_hosts" \
-        -o IdentitiesOnly=yes user@127.0.0.1 true < /dev/null > /dev/null 2>&1
+        -o IdentitiesOnly=yes ${BENCH_USER}@127.0.0.1 true < /dev/null > /dev/null 2>&1
 }
 
 # bulk transfer: $1 = impl, $2 = payload path, $3 = push|pull, $4 = out path
@@ -276,30 +279,30 @@ xfer() {
     os:push)
         scp -q -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" -o BatchMode=yes \
             -o StrictHostKeyChecking=no -o "UserKnownHostsFile=$WORK/known_hosts" \
-            -o IdentitiesOnly=yes "$2" "user@127.0.0.1:$4"
+            -o IdentitiesOnly=yes "$2" "${BENCH_USER}@127.0.0.1:$4"
         ;;
     os:pull)
         scp -q -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" -o BatchMode=yes \
             -o StrictHostKeyChecking=no -o "UserKnownHostsFile=$WORK/known_hosts" \
-            -o IdentitiesOnly=yes "user@127.0.0.1:$2" "$4"
+            -o IdentitiesOnly=yes "${BENCH_USER}@127.0.0.1:$2" "$4"
         ;;
     go:push)
         # the fork sftp paths are HOME-relative only, p7shm -> /dev/shm
         "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" -f "$2" \
-            "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${4#$DEV_SHM/}" \
+            "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${4#$DEV_SHM/}" \
             < /dev/null > /dev/null 2>"$LOGS/go-client.log"
         ;;
     go:pull)
         "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" -f \
-            "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${2#$DEV_SHM/}" "$4" \
+            "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${2#$DEV_SHM/}" "$4" \
             < /dev/null > /dev/null 2>"$LOGS/go-client.log"
         ;;
     c:push)
-        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U user \
+        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" \
             -J "put:$2:${4#$DEV_SHM/}" -t "$C_TIMEOUT" > /dev/null 2>&1
         ;;
     c:pull)
-        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U user \
+        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" \
             -J "get:$4:${2#$DEV_SHM/}" -t "$C_TIMEOUT" > /dev/null 2>&1
         ;;
     *) die "xfer: bad combination $1:$3" ;;
@@ -316,9 +319,9 @@ c_xfer_timed() { # $1 = payload, $2 = push|pull, $3 = out; echoes landing ns
     want=$(stat -c%s "$1")
     t0=$(date +%s%N)
     case "$2" in
-    push) "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U user \
+    push) "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" \
               -J "put:$1:${3#$DEV_SHM/}" -t "$C_TIMEOUT" > /dev/null 2>&1 & ;;
-    pull) "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U user \
+    pull) "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" \
               -J "get:$3:${1#$DEV_SHM/}" -t "$C_TIMEOUT" > /dev/null 2>&1 & ;;
     esac
     local cpid=$!
@@ -472,11 +475,11 @@ stage_mux() {
             go)
                 base=(-insecure -privkey "$WORK/bench_pkcs8.pem"
                     -control-master yes -control-persist yes -control-path "$sock")
-                "$GO_CLIENT" "${base[@]}" "user@127.0.0.1:$PORT_GO/ssh3-term" true \
+                "$GO_CLIENT" "${base[@]}" "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term" true \
                     < /dev/null > /dev/null 2>&1 || die "go master did not come up"
                 for it in $(seq 1 "$MUX_ITERS"); do
                     t0=$(date +%s%N)
-                    "$GO_CLIENT" "${base[@]}" "user@127.0.0.1:$PORT_GO/ssh3-term" true \
+                    "$GO_CLIENT" "${base[@]}" "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term" true \
                         < /dev/null > /dev/null 2>&1 && rc=0 || rc=1
                     t1=$(date +%s%N)
                     ms=$(awk -v ns=$((t1 - t0)) 'BEGIN{printf "%.1f", ns/1e6}')
@@ -490,19 +493,19 @@ stage_mux() {
                 ssh -p "$PORT_SSH" -i "$WORK/bench_ed25519" -o BatchMode=yes \
                     -o StrictHostKeyChecking=no -o "UserKnownHostsFile=$WORK/known_hosts" \
                     -o IdentitiesOnly=yes -o ControlMaster=auto -o ControlPath="$sock" \
-                    -o ControlPersist=yes -fN user@127.0.0.1 < /dev/null 2> /dev/null
+                    -o ControlPersist=yes -fN ${BENCH_USER}@127.0.0.1 < /dev/null 2> /dev/null
                 for it in $(seq 1 "$MUX_ITERS"); do
                     t0=$(date +%s%N)
                     ssh -p "$PORT_SSH" -i "$WORK/bench_ed25519" -o BatchMode=yes \
                         -o "ControlPath=$sock" -o "UserKnownHostsFile=$WORK/known_hosts" \
-                        -o IdentitiesOnly=yes user@127.0.0.1 true \
+                        -o IdentitiesOnly=yes ${BENCH_USER}@127.0.0.1 true \
                         < /dev/null > /dev/null 2>&1 && rc=0 || rc=1
                     t1=$(date +%s%N)
                     ms=$(awk -v ns=$((t1 - t0)) 'BEGIN{printf "%.1f", ns/1e6}')
                     [ "$rc" = 0 ] || log "mux os $blk/$it FAILED"
                     echo "os,$blk,$it,$ms" >> "$csv"
                 done
-                ssh -O exit -o ControlPath="$sock" user@127.0.0.1 \
+                ssh -O exit -o ControlPath="$sock" ${BENCH_USER}@127.0.0.1 \
                     < /dev/null > /dev/null 2>&1 || true
                 ;;
             esac
@@ -688,12 +691,12 @@ many_push() { # $1 = impl: the measured push, verified, cleaned
     case "$1" in
     c)
         "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -J "put:$MANY_SRC:p7out/many-c" -r \
-            -K "$WORK/bench_pkcs8.pem" -U user -t 60000 > /dev/null 2>&1 || return 1
+            -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" -t 60000 > /dev/null 2>&1 || return 1
         many_verify "$DEV_SHM/p7out/many-c"
         ;;
     go)
         "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-            -f -r "$MANY_SRC" "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" \
+            -f -r "$MANY_SRC" "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" \
             < /dev/null > /dev/null 2>&1 || return 1
         many_verify "$DEV_SHM/p7out/many-go"
         ;;
@@ -701,7 +704,7 @@ many_push() { # $1 = impl: the measured push, verified, cleaned
         scp -q -r -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" \
             -o BatchMode=yes -o StrictHostKeyChecking=no \
             -o "UserKnownHostsFile=$WORK/known_hosts" -o IdentitiesOnly=yes \
-            "$MANY_SRC" "user@127.0.0.1:$DEV_SHM/p7out/many-os" || return 1
+            "$MANY_SRC" "${BENCH_USER}@127.0.0.1:$DEV_SHM/p7out/many-os" || return 1
         many_verify "$DEV_SHM/p7out/many-os"
         ;;
     esac
@@ -715,12 +718,12 @@ many_pull() { # $1 = impl: the measured download of the seeded tree
     case "$1" in
     c)
         "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -J "get:$WORK/many-c-pull:p7out/many-c" -r \
-            -K "$WORK/bench_pkcs8.pem" -U user -t 60000 > /dev/null 2>&1 || return 1
+            -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" -t 60000 > /dev/null 2>&1 || return 1
         many_verify "$WORK/many-c-pull"
         ;;
     go)
         "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-            -f -r "user@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" "$WORK/many-go-pull" \
+            -f -r "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" "$WORK/many-go-pull" \
             < /dev/null > /dev/null 2>&1 || return 1
         many_verify "$WORK/many-go-pull"
         ;;
@@ -728,7 +731,7 @@ many_pull() { # $1 = impl: the measured download of the seeded tree
         scp -q -r -P "$PORT_SSH" -i "$WORK/bench_ed25519" -c "$CIPHER" \
             -o BatchMode=yes -o StrictHostKeyChecking=no \
             -o "UserKnownHostsFile=$WORK/known_hosts" -o IdentitiesOnly=yes \
-            "user@127.0.0.1:$DEV_SHM/p7out/many-os" "$WORK/many-os-pull" || return 1
+            "${BENCH_USER}@127.0.0.1:$DEV_SHM/p7out/many-os" "$WORK/many-os-pull" || return 1
         many_verify "$WORK/many-os-pull"
         ;;
     esac
