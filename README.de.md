@@ -1,4 +1,4 @@
-| 1 | 512 МиБ sftp push / pull, МБ/с | 353 / 354 | 28 / 33 | **358 / 421** |# ssh3-c
+# ssh3-c
 
 [English](README.md) | [Русский](README.ru.md) | **Deutsch**
 
