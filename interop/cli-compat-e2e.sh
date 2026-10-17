@@ -542,6 +542,10 @@ Host cli-alias
     Port $PORT
     User client
     LocalForward 127.0.0.1:$CFGPORT 127.0.0.1:$ECHOPORT
+Host cli-exec
+    HostName 127.0.0.1
+    Port $PORT
+    User client
 EOF
 
 start_hold -N -i "$WORK/priv.pem" -F "$WORK/config" cli-alias
@@ -557,11 +561,11 @@ fi
 stop_hold
 
 if HOME="$WORK/home" timeout 20 "$BUILD/ssh3" -F "$WORK/config" -i "$WORK/priv.pem" \
-    cli-alias "printf S3-F-ALIAS-OK" > "$WORK/leg-f2.out" 2>/dev/null &&
+    cli-exec "printf S3-F-ALIAS-OK" > "$WORK/leg-f2.out" 2>"$WORK/leg-f2.err" &&
     grep -q "S3-F-ALIAS-OK" "$WORK/leg-f2.out"; then
     pass "-F alias carried the exec"
 else
-    fail "-F exec leg: rc=$?"
+    fail "-F exec leg: rc=$? $(tail -1 "$WORK/leg-f2.err")"
 fi
 
 echo "== leg 14: -D socks5 (the curl through the proxy)"
