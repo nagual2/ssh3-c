@@ -33,6 +33,16 @@ Event/UDP-Schicht, der GSO-Benchmark); die Vorbereitung von **P2**
 läuft — die Anpassung der nginx-QUIC-Schicht (siehe
 [docs/PLAN.md](docs/PLAN.md)).
 
+## Start-Kompatibilität (Drop-in)
+
+ssh3-c ist ein Drop-in-Ersatz für ssh3-go (der Gabel im OpenSSH-Stil)
+und Nachbar OpenSSH (ssh2): die Binärdateien tragen identische Namen
+(`ssh3`, `ssh3-server`), die Start-Schlüssel stimmen dort überein, wo
+der Funktionsumfang gleich ist; die Pakete erklären
+`Provides`/`Conflicts`/`Replaces` gegen ssh3-go, sodass ein Paket ein
+anderes ersetzt (etwa beim Schließen einer Schwachstelle) ohne
+Neukonfiguration fremder Programme, die über ssh3 arbeiten.
+
 ## Aufbau
 
 | № | Verzeichnis | Inhalt |
@@ -92,8 +102,8 @@ cmake --preset linux-release && cmake --build --preset linux-release
 ## systemd (Socket-Aktivierung)
 
 Das Unit-Paar teilt die Port-Privilegie vom Dienst: das root-eigene
-`ssh3-c-server.socket` bindet UDP/443, und systemd übergibt das
-fertige Datagram-fd an `ssh3-c-server.service`.  Seit P7.3 läuft der
+`ssh3-server.socket` bindet UDP/443, und systemd übergibt das
+fertige Datagram-fd an `ssh3-server.service`.  Seit P7.3 läuft der
 Dienst als root mit **per-session setuid**: nach der Authentifizierung
 wechselt jede Sitzung mit einem auflösbaren CONNECT-Benutzernamen vor
 dem Spawn auf diese Identität (`initgroups`, `setgid`, `setuid`,
@@ -104,12 +114,12 @@ ein minimales Bounding-Set
 fd, er ruft `bind()` nie selbst auf):
 
 ```ini
-# ssh3-c-server.socket (Ausschnitt)
+# ssh3-server.socket (Ausschnitt)
 [Socket]
 ListenDatagram=0.0.0.0:443
 FreeBind=yes
 
-# ssh3-c-server.service (Ausschnitt)
+# ssh3-server.service (Ausschnitt)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
 User=root
@@ -129,14 +139,14 @@ Unit-Kommentaren und `man/ssh3-server.8` (`PRIVILEGE MODEL`)
 beschrieben.
 
 ```bash
-sudo systemctl enable --now ssh3-c-server.socket
+sudo systemctl enable --now ssh3-server.socket
 ```
 
 Die Port-Änderung läuft über einen Drop-in, nicht über eine Bearbeitung
 des Units:
 
 ```bash
-sudo systemctl edit ssh3-c-server.socket
+sudo systemctl edit ssh3-server.socket
 # [Socket]
 # ListenDatagram=0.0.0.0:8443
 ```

@@ -19,6 +19,9 @@ Source2:        THIRD-PARTY-NOTICES.md
 Source3:        README.md
 
 Requires:       openssl-libs >= 3.5
+Provides:       ssh3-go
+Conflicts:      ssh3-go
+Replaces:       ssh3-go
 
 %description
 SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),

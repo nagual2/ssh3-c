@@ -32,6 +32,16 @@ Current status: phases **P0–P1** are done (the core + the event/UDP
 layer, the GSO bench); **P2** preparation is underway — adapting the
 nginx QUIC layer (see [docs/PLAN.md](docs/PLAN.md)).
 
+## Launch compatibility (drop-in)
+
+ssh3-c is a drop-in replacement for ssh3-go (the OpenSSH-style fork)
+and a peer of OpenSSH (ssh2): the binaries carry the same names
+(`ssh3`, `ssh3-server`), the launch keys match where the functionality
+is the same; the packages declare `Provides`/`Conflicts`/`Replaces`
+against ssh3-go, so one package replaces another (e.g. when closing a
+vulnerability) without reconfiguring third-party programs that work
+over ssh3.
+
 ## Layout
 
 | № | Directory | Contents |
@@ -90,8 +100,8 @@ cmake --preset linux-release && cmake --build --preset linux-release
 ## systemd (socket activation)
 
 The shipped pair splits the port privilege from the service: the
-root-owned `ssh3-c-server.socket` binds UDP/443 and systemd hands the
-ready datagram fd to `ssh3-c-server.service`.  Since P7.3 the service
+root-owned `ssh3-server.socket` binds UDP/443 and systemd hands the
+ready datagram fd to `ssh3-server.service`.  Since P7.3 the service
 runs as root with the **per-session setuid**: after authentication
 every session with a resolvable CONNECT username drops onto that
 identity (`initgroups`, `setgid`, `setuid`, the home `chdir`) before
@@ -101,12 +111,12 @@ and needs **no** `CAP_NET_BIND_SERVICE` (the daemon takes the passed
 fd, it never calls `bind()`):
 
 ```ini
-# ssh3-c-server.socket (excerpt)
+# ssh3-server.socket (excerpt)
 [Socket]
 ListenDatagram=0.0.0.0:443
 FreeBind=yes
 
-# ssh3-c-server.service (excerpt)
+# ssh3-server.service (excerpt)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
 User=root
@@ -125,13 +135,13 @@ the P7.2 hardening) is documented in the unit comments and
 `man/ssh3-server.8` (`PRIVILEGE MODEL`).
 
 ```bash
-sudo systemctl enable --now ssh3-c-server.socket
+sudo systemctl enable --now ssh3-server.socket
 ```
 
 Port variation goes through a drop-in, not an edit of the unit:
 
 ```bash
-sudo systemctl edit ssh3-c-server.socket
+sudo systemctl edit ssh3-server.socket
 # [Socket]
 # ListenDatagram=0.0.0.0:8443
 ```

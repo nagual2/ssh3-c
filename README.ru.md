@@ -30,6 +30,14 @@ chain-интерфейс всего I/O, zero-copy data path. Целевая п�
 Текущий статус: фазы **P0–P1** готовы (core + event/UDP-слой, GSO-бенч);
 идёт подготовка **P2** — адаптация QUIC-слоя nginx (см. [docs/PLAN.md](docs/PLAN.md)).
 
+## Совместимость запуска (drop-in)
+
+ssh3-c — drop-in замена ssh3-go (форк в стиле OpenSSH) и сосед OpenSSH (ssh2):
+бинарники носят одинаковые имена (`ssh3`, `ssh3-server`), ключи запуска совпадают там,
+где функционал совпадает; пакеты объявляют `Provides`/`Conflicts`/`Replaces` против
+ssh3-go, так что один пакет заменяет другой (например, при закрытии уязвимости)
+без перенастройки сторонних программ, работающих через ssh3.
+
 ## Структура
 
 | № | Каталог | Содержимое |
@@ -88,8 +96,8 @@ cmake --preset linux-release && cmake --build --preset linux-release
 ## systemd (socket-активация)
 
 Пара юнитов делит привилегию порта и сервис: root-овый
-`ssh3-c-server.socket` биндит UDP/443, а systemd передаёт готовый
-datagram-fd в `ssh3-c-server.service`. С P7.3 сервис работает от root
+`ssh3-server.socket` биндит UDP/443, а systemd передаёт готовый
+datagram-fd в `ssh3-server.service`. С P7.3 сервис работает от root
 с **per-session setuid**: после аутентификации каждая сессия с
 резолвящимся именем пользователя CONNECT переходит на его идентичность
 (`initgroups`, `setgid`, `setuid`, `chdir` в home) перед спавном —
@@ -99,12 +107,12 @@ datagram-fd в `ssh3-c-server.service`. С P7.3 сервис работает о
 вызывает):
 
 ```ini
-# ssh3-c-server.socket (фрагмент)
+# ssh3-server.socket (фрагмент)
 [Socket]
 ListenDatagram=0.0.0.0:443
 FreeBind=yes
 
-# ssh3-c-server.service (фрагмент)
+# ssh3-server.service (фрагмент)
 [Service]
 ExecStart=/usr/sbin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/key.pem
 User=root
@@ -123,13 +131,13 @@ PrivateTmp=yes
 `man/ssh3-server.8` (`PRIVILEGE MODEL`).
 
 ```bash
-sudo systemctl enable --now ssh3-c-server.socket
+sudo systemctl enable --now ssh3-server.socket
 ```
 
 Смена порта — через drop-in, без правки самого юнита:
 
 ```bash
-sudo systemctl edit ssh3-c-server.socket
+sudo systemctl edit ssh3-server.socket
 # [Socket]
 # ListenDatagram=0.0.0.0:8443
 ```

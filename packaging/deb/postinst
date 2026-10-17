@@ -22,9 +22,9 @@ case "$1" in
         # deb-systemd-helper keeps the admin enable state across
         # upgrades; the reload only runs on a booted systemd
         if [ -x /usr/bin/deb-systemd-helper ]; then
-            deb-systemd-helper enable ssh3-c-server.socket >/dev/null || true
-            deb-systemd-helper enable ssh3-c-server.service >/dev/null || true
-            deb-systemd-helper was-enabled ssh3-c-server.socket >/dev/null 2>&1 || true
+            deb-systemd-helper enable ssh3-server.socket >/dev/null || true
+            deb-systemd-helper enable ssh3-server.service >/dev/null || true
+            deb-systemd-helper was-enabled ssh3-server.socket >/dev/null 2>&1 || true
         fi
         if [ -d /run/systemd/system ] && [ -x /usr/bin/systemctl ]; then
             systemctl daemon-reload || true

@@ -219,10 +219,10 @@ build_deb() {
         install -m 0644 "$BUNDLE_STAGE/openssl-copyright" \
             "$stage/usr/share/doc/ssh3-server/openssl-copyright"
     fi
-    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-c-server.socket" \
-        "$stage/usr/lib/systemd/system/ssh3-c-server.socket"
-    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-c-server.service" \
-        "$stage/usr/lib/systemd/system/ssh3-c-server.service"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-server.socket" \
+        "$stage/usr/lib/systemd/system/ssh3-server.socket"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-server.service" \
+        "$stage/usr/lib/systemd/system/ssh3-server.service"
     bundle_report
     dpkg-deb --root-owner-group --build "$stage" \
         "$OUT_DIR/ssh3-server_${debver}_amd64.deb"

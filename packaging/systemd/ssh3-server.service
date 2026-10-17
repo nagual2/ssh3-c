@@ -7,7 +7,7 @@ Documentation=man:ssh3-server(8)
 # needs NO CAP_NET_BIND_SERVICE - the port privilege stays inside the
 # root-owned socket unit while the service itself keeps only what the
 # per-session setuid transition needs (the bounding set below).
-Requires=ssh3-c-server.socket
+Requires=ssh3-server.socket
 After=network.target
 
 [Service]
@@ -36,7 +36,7 @@ Environment=SSH3_LOG_LEVEL=info
 #
 # 2. SINGLE-IDENTITY, unprivileged daemon (the P7.2 shape): keep the
 #    three lines below commented out and add from a drop-in:
-#      systemctl edit ssh3-c-server.service
+#      systemctl edit ssh3-server.service
 #      [Service]
 #      User=ssh3
 #      Group=ssh3
@@ -80,5 +80,5 @@ UMask=0022
 
 
 # socket-activated only: enabling the unit is
-#   systemctl enable --now ssh3-c-server.socket
+#   systemctl enable --now ssh3-server.socket
 # and the service comes up on the first packet

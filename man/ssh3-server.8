@@ -332,7 +332,7 @@ mapping is required when that is not acceptable.
 Single-identity unprivileged daemon (the P7.2 shape): run
 .Nm
 as a service account (the packaged unit drop-in, see
-.Pa ssh3-c-server.service )
+.Pa ssh3-server.service )
 with
 .Fl -run-as-user off ;
 every session and the in-process SFTP server then run as that
@@ -442,7 +442,7 @@ target).
 .El
 .Sh SOCKET ACTIVATION
 The packaged
-.Pa ssh3-c-server.socket
+.Pa ssh3-server.socket
 binds UDP/443 as root and systemd passes the ready datagram socket to
 the service:
 .Nm
@@ -469,7 +469,7 @@ service is root with a minimal bounding set (the per-session setuid
 capabilities only), see
 .Sx PRIVILEGE MODEL
 and
-.Pa ssh3-c-server.service .
+.Pa ssh3-server.service .
 An fd of the wrong type or family, or more than two, stops the daemon
 with an error instead of falling back to a second bind.
 The listener address and port are owned by the socket unit

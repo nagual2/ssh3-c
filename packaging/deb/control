@@ -5,6 +5,9 @@ Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: net
 Priority: optional
 Depends: libc6, zlib1g, libzstd1, adduser
+Provides: ssh3-go
+Conflicts: ssh3-go
+Replaces: ssh3-go
 Description: SSH3 server - SSH over QUIC/HTTP3 transport
  SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
  implemented in C in the nginx style on top of the OpenSSL QUIC TLS API.
