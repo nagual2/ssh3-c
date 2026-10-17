@@ -905,6 +905,7 @@ static unsigned  s3_cli_escape_live(void);
 static void      s3_cli_operand_host(const char *src, size_t len);
 static s3_int_t  s3_cli_cfg_pattern_match(const char *pat, const char *host);
 static unsigned  s3_cli_cfg_host_block(const char *patterns, const char *host);
+static s3_int_t  s3_cli_cfg_fwd_join(char *out, size_t cap, const char *val);
 static s3_int_t  s3_cli_cfg_apply(const char *key, const char *val);
 static void      s3_cli_b64std(const u_char *src, size_t len, char *dst);
 static void      s3_cli_b64url(const u_char *src, size_t len, char *dst);
@@ -2452,15 +2453,39 @@ s3_cli_cfg_apply(const char *key, const char *val)
     }
 
     if (s3_cli_streq_ci(key, "localforward") == 0) {
-        return s3_cli_fwd_parse(val);
+
+        char joined[300];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config LocalForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_fwd_parse(joined);
     }
 
     if (s3_cli_streq_ci(key, "remoteforward") == 0) {
-        return s3_cli_rev_parse_spec(val);
+
+        char joined[600];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config RemoteForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_rev_parse_spec(joined);
     }
 
     if (s3_cli_streq_ci(key, "dynamicforward") == 0) {
-        return s3_cli_socks_parse(val);
+
+        char joined[300];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config DynamicForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_socks_parse(joined);
     }
 
     if (s3_cli_streq_ci(key, "proxyjump") == 0) {
@@ -2558,6 +2583,51 @@ s3_cli_cfg_apply(const char *key, const char *val)
 
     /* the unknown key ignores silently (the ssh2 tolerance of the
      * newer keywords in the older clients) */
+
+    return S3_OK;
+}
+
+/* the ssh2 config forward value ([bind:]port host:port, the two
+ * whitespace tokens) joins into the spec shape port:host:port; the
+ * single-token form rides as is */
+
+static s3_int_t
+s3_cli_cfg_fwd_join(char *out, size_t cap, const char *val)
+{
+    const char *sp = val;
+    size_t      a;
+
+    while (*sp != '\0' && *sp != ' ' && *sp != '\t') {
+        sp++;
+    }
+
+    if (*sp == '\0') {
+
+        /* the single-token form: the DynamicForward shape or a bare
+         * spec (the parser rejects what it cannot ride) */
+
+        if (strlen(val) >= cap) {
+            return S3_ERROR;
+        }
+
+        memcpy(out, val, strlen(val) + 1);
+
+        return S3_OK;
+    }
+
+    a = (size_t)(sp - val);
+
+    while (*sp == ' ' || *sp == '\t') {
+        sp++;
+    }
+
+    if (*sp == '\0' || a + 1 + strlen(sp) >= cap) {
+        return S3_ERROR;
+    }
+
+    memcpy(out, val, a);
+    out[a] = ':';
+    memcpy(out + a + 1, sp, strlen(sp) + 1);
 
     return S3_OK;
 }
