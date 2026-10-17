@@ -881,6 +881,15 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
         /* the bare a.b.c.d form: the default port applies (the sshd
          * ListenAddress shape) */
 
+        n = strlen(text);
+
+        if (n == 0 || n >= sizeof(host)) {
+            return S3_ERROR;
+        }
+
+        memcpy(host, text, n);
+        host[n] = '\0';
+
         port = default_port;
 
     } else {

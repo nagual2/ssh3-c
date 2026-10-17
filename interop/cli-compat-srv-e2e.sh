@@ -233,11 +233,13 @@ wait_port() {
     return 1
 }
 
-# the plain exec run of one daemon: rc 0 and the verdict marker
+# the plain exec run of one daemon: rc 0 and the verdict marker (the
+# -e runs verify through the SSH3_AGENT_PROBE_OK marker of the runner)
 
 run_exec() {
-    HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e 'true' \
-        -a "127.0.0.1:$1" -t 20000 > "$WORK/cli.log" 2>&1
+    HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec \
+        -e "printf SSH3_AGENT_PROBE_OK" -a "127.0.0.1:$1" -t 20000 \
+        > "$WORK/cli.log" 2>&1
 }
 
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
@@ -248,8 +250,8 @@ echo "== leg 1: --help on stdout exits 0, the short keys keep the strict shape"
 "$BIN" --help > "$WORK/help.out" 2> "$WORK/help.err"
 RC=$?
 
-if [ "$RC" -eq 0 ] && grep -q "usage: ssh3-server" "$WORK/help.out" &&
-    grep -q -- "-h" "$WORK/help.out" && grep -q -- "-o" "$WORK/help.out" &&
+if [ "$RC" -eq 0 ] && grep -q "usage: .*ssh3-server" "$WORK/help.out" &&
+    grep -q -- "-h  host key file" "$WORK/help.out" && grep -q -- "-o  sshd_config-style" "$WORK/help.out" &&
     [ ! -s "$WORK/help.err" ]; then
     pass "--help printed the usage on stdout and exited 0"
 else
@@ -259,7 +261,7 @@ fi
 "$BIN" -Z -c "$WORK/cert.pem" -h "$WORK/key.pem" > "$WORK/bad.out" 2> "$WORK/bad.err"
 RC=$?
 
-if [ "$RC" -eq 1 ] && grep -q "usage: ssh3-server" "$WORK/bad.err" &&
+if [ "$RC" -eq 1 ] && grep -q "usage: .*ssh3-server" "$WORK/bad.err" &&
     [ ! -s "$WORK/bad.out" ]; then
     pass "the unknown short key draws the usage on stderr with exit 1"
 else
@@ -269,7 +271,7 @@ fi
 "$BIN" -h > "$WORK/badh.out" 2> "$WORK/badh.err"
 RC=$?
 
-if [ "$RC" -eq 1 ] && grep -q "usage: ssh3-server" "$WORK/badh.err"; then
+if [ "$RC" -eq 1 ] && grep -q "usage: .*ssh3-server" "$WORK/badh.err"; then
     pass "the bare -h (no keyfile) refuses: the help moved off the short key"
 else
     fail "the bare -h leg: rc=$RC"
@@ -462,7 +464,7 @@ start_srv -o MaxStartups=0 -l 127.0.0.1:0 ||
 
 wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
-HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e 'true' \
+HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e "printf SSH3_AGENT_PROBE_OK" \
     -a "127.0.0.1:$PORT" -t 20000 > "$WORK/leg12.log" 2>&1
 
 if grep -q "INTEROP-H3-STATUS 503" "$WORK/leg12.log"; then
@@ -509,7 +511,8 @@ start_srv -o AuthorizedKeysFile="$WORK/authorized_keys" -l 127.0.0.1:0 ||
 
 wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
-HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e 'true' \
+HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec \
+    -e "printf SSH3_AGENT_PROBE_OK" \
     -K "$WORK/id_c.pem" -U bob -a "127.0.0.1:$PORT" -t 20000 > "$WORK/leg14.log" 2>&1
 
 if [ $? -eq 0 ] && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/leg14.log"; then
@@ -525,7 +528,7 @@ start_srv -o AuthorizedKeysFile="$WORK/keys-%u" -l 127.0.0.1:0 ||
 
 wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
-HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e 'true' \
+HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e "printf SSH3_AGENT_PROBE_OK" \
     -K "$WORK/id_c.pem" -U bob -a "127.0.0.1:$PORT" -t 20000 > "$WORK/leg14b.log" 2>&1
 
 if [ $? -eq 0 ] && grep -q "INTEROP-EXEC-OK exit=0" "$WORK/leg14b.log"; then
@@ -564,7 +567,7 @@ if [ "$HAVE_SUDO" -eq 1 ]; then
 
     wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
 
-    HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e 'true' \
+    HOME="$WORK" timeout 30 "$BUILD/s3interop_client" -3 -C -S exec -e "printf SSH3_AGENT_PROBE_OK" \
         -K "$WORK/id_c.pem" -U "$AK_USER" -a "127.0.0.1:$PORT" -t 20000 \
         > "$WORK/leg15.log" 2>&1
 
