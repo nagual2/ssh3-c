@@ -278,6 +278,17 @@ start_hold() {
         > "$WORK/hold.log" 2>&1 < /dev/null &
     HOLD_PID=$!
     SRVPIDS="$SRVPIDS $HOLD_PID"
+
+    # the hold liveness of the debug runs (the dead pid tells early)
+
+    sleep 1
+
+    if kill -0 "$HOLD_PID" 2>/dev/null; then
+        echo "HOLD alive $HOLD_PID" >> "${HOLD_DBG:-/dev/null}"
+
+    else
+        echo "HOLD dead $HOLD_PID" >> "${HOLD_DBG:-/dev/null}"
+    fi
 }
 
 stop_hold() {
