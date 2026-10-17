@@ -12239,6 +12239,17 @@ main(int argc, char **argv)
 
             break;
 
+        case 'D':
+
+            /* the dynamic forward (the ssh2 shape): the SOCKS
+             * listener, the request names the target per connection */
+
+            if (s3_cli_socks_parse(optarg) != S3_OK) {
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            break;
+
         case 'R':
 
             /* the reverse forward: the spec parses now, the control

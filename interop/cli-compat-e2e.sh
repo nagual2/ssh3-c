@@ -332,8 +332,8 @@ fi
 
 echo "== leg 3: -p port (the operand without one)"
 
-if HOME="$WORK/home" timeout 20 "$BUILD/ssh3" -i "$WORK/priv.pem" client@127.0.0.1 \
-    -p "$PORT" /ssh3-term "printf S3-P-PORT-OK" > "$WORK/leg-p.out" 2>/dev/null &&
+if HOME="$WORK/home" timeout 20 "$BUILD/ssh3" -i "$WORK/priv.pem" -p "$PORT" \
+    "client@127.0.0.1/ssh3-term" "printf S3-P-PORT-OK" > "$WORK/leg-p.out" 2>/dev/null &&
     grep -q "S3-P-PORT-OK" "$WORK/leg-p.out"; then
     pass "-p re-ported the dial"
 else
