@@ -355,6 +355,11 @@ static unsigned s3_cli_notes_n;
 #define S3_CLI_JUMP_DGRAM_SIZE 1352
 #define S3_CLI_JUMP_DGRAM_MIN  1202
 
+/* the phase 1 deadline (the tunnel bring-up), the wrong jump host
+ * refuses inside it */
+
+#define S3_CLI_JUMP_TIMEOUT 10000
+
 static unsigned s3_cli_jump_on;
 static char     s3_cli_jump_user[128];
 static char     s3_cli_jump_host[256];
@@ -12766,9 +12771,18 @@ main(int argc, char **argv)
         snprintf(s3_cli_target, sizeof(s3_cli_target), "%s", s3_cli_path);
     }
 
-    /* the jump target rides the default path with the jump login */
+    /* the jump target rides the default path with the jump login; a
+     * jump spec without a user@ borrows the main login (the ssh2
+     * shape) */
 
     if (s3_cli_jump_on) {
+
+        if (s3_cli_jump_user[0] == '\0') {
+
+            /* the jump spec without a user@ borrows the main login */
+
+            snprintf(s3_cli_jump_user, sizeof(s3_cli_jump_user), "%s", s3_cli_user);
+        }
 
         if (s3_cli_jump_user[0] != '\0') {
             snprintf(s3_cli_jump_target, sizeof(s3_cli_jump_target), "%s?user=%s", "/ssh3-term",
@@ -12843,8 +12857,10 @@ main(int argc, char **argv)
 
         freeaddrinfo(jres);
 
-        if (s3_cli_jump_dial(&s3_cli_ctx, s3_current_msec, (s3_msec_t)S3_CLI_SETUP_TIMEOUT) !=
-            S3_OK) {
+        /* the jump dial rides its own 10s bound: the wrong jump host
+         * refuses cleanly well inside the session shape */
+
+        if (s3_cli_jump_dial(&s3_cli_ctx, s3_current_msec, S3_CLI_JUMP_TIMEOUT) != S3_OK) {
             s3_cli_net_cleanup();
             return S3_CLI_EXIT_ERROR;
         }
@@ -13084,9 +13100,13 @@ main(int argc, char **argv)
         }
 
         /* the 200 brings the -L listeners up: the forward run carries
-         * no session channel, the bridges live on the event loop */
+         * no session channel, the bridges live on the event loop; the
+         * conversation id of the CONNECT stream names every direct-*
+         * channel the bridges open (the -R run stamps the same) */
 
         if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_fwd_count && !s3_cli_fwd_ready) {
+
+            s3_cli_conv_id = ((s3_quic_stream_t *)s3_cli_ctrl->data)->id;
 
             if (s3_cli_fwd_listeners_start() != S3_OK) {
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
