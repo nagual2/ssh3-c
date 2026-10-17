@@ -55,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -455,10 +456,11 @@ s3_srv_gateway_ports_name(void)
 }
 
 /*
- * the policy parse of the env default and the --gateway-ports flag:
- * S3_OK sets the policy, S3_ERROR leaves the caller to warn (the env
- * keeps the default) or to leave the argv pair for the getopt usage
- * (the flag)
+ * the policy parse of the env default, the --gateway-ports flag and
+ * the -o GatewayPorts option: the sshd_config shape, the words
+ * compare case-insensitively and the y|n single-letter aliases ride
+ * with them; S3_OK sets the policy, S3_ERROR leaves the caller to
+ * warn (the env keeps the default) or to refuse (the flags)
  */
 
 static s3_int_t
@@ -468,17 +470,17 @@ s3_srv_gateway_ports_parse(const char *text)
         return S3_ERROR;
     }
 
-    if (strcmp(text, "no") == 0) {
+    if (strcasecmp(text, "no") == 0 || strcasecmp(text, "n") == 0) {
         s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_NO;
         return S3_OK;
     }
 
-    if (strcmp(text, "clientspecified") == 0) {
+    if (strcasecmp(text, "clientspecified") == 0) {
         s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_CLIENTSPECIFIED;
         return S3_OK;
     }
 
-    if (strcmp(text, "yes") == 0) {
+    if (strcasecmp(text, "yes") == 0 || strcasecmp(text, "y") == 0) {
         s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_YES;
         return S3_OK;
     }
@@ -807,10 +809,14 @@ s3_srv_read_file(const char *path, size_t *len)
  * bracket form of the reference -bind, whose default "[::]:443" is
  * the dual-stack wildcard); the v6 host may itself carry colons, so
  * the port splits at the colon behind the closing bracket; the
- * numeric forms only (inet_pton), the names resolve in the unit
+ * numeric forms only (inet_pton), the names resolve in the unit.
+ * A bare address without the port part ("a.b.c.d", "[v6]") is the
+ * sshd ListenAddress shape: the default_port rides in (the -p port
+ * or the 443 of the reference)
  */
 static s3_int_t
-s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *sslen)
+s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *sslen,
+                  unsigned default_port)
 {
     char        host[64];
     const char *colon, *end_bracket;
@@ -825,7 +831,25 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
 
         end_bracket = strchr(text, ']');
 
-        if (end_bracket == NULL || end_bracket[1] != ':' || end_bracket[2] == '\0') {
+        if (end_bracket == NULL) {
+            return S3_ERROR;
+        }
+
+        if (end_bracket[1] == ':') {
+
+            port = (unsigned)atoi(end_bracket + 2);
+
+        } else if (end_bracket[1] == '\0') {
+
+            /* the bare [v6] form: the default port applies */
+
+            port = default_port;
+
+        } else {
+            return S3_ERROR;
+        }
+
+        if (port > 65535) {
             return S3_ERROR;
         }
 
@@ -838,18 +862,10 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
         memcpy(host, text + 1, n);
         host[n] = '\0';
 
-        colon = end_bracket + 1;
-
-        port = (unsigned)atoi(colon + 1);
-
-        if (port > 65535) {
-            return S3_ERROR;
-        }
-
         s3_memzero(ss, sizeof(*ss));
 
         ((struct sockaddr_in6 *)ss)->sin6_family = AF_INET6;
-        ((struct sockaddr_in6 *)ss)->sin6_port = htons((uint16_t)port);
+        ((struct sockaddr_in6 *)ss)->sin6_port   = htons((uint16_t)port);
 
         if (inet_pton(AF_INET6, host, &((struct sockaddr_in6 *)ss)->sin6_addr) != 1) {
             return S3_ERROR;
@@ -861,18 +877,26 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
     }
 
     if (colon == NULL) {
-        return S3_ERROR;
+
+        /* the bare a.b.c.d form: the default port applies (the sshd
+         * ListenAddress shape) */
+
+        port = default_port;
+
+    } else {
+
+        n = (size_t)(colon - text);
+
+        if (n == 0 || n >= sizeof(host)) {
+            return S3_ERROR;
+        }
+
+        memcpy(host, text, n);
+        host[n] = '\0';
+
+        port = (unsigned)atoi(colon + 1);
     }
 
-    n = (size_t)(colon - text);
-    if (n == 0 || n >= sizeof(host)) {
-        return S3_ERROR;
-    }
-
-    memcpy(host, text, n);
-    host[n] = '\0';
-
-    port = (unsigned)atoi(colon + 1);
     if (port > 65535) {
         return S3_ERROR;
     }
@@ -880,7 +904,7 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
     s3_memzero(ss, sizeof(*ss));
 
     ((struct sockaddr_in *)ss)->sin_family = AF_INET;
-    ((struct sockaddr_in *)ss)->sin_port = htons((uint16_t)port);
+    ((struct sockaddr_in *)ss)->sin_port   = htons((uint16_t)port);
 
     if (inet_pton(AF_INET, host, &((struct sockaddr_in *)ss)->sin_addr) != 1) {
         return S3_ERROR;
@@ -889,6 +913,250 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
     *sslen = sizeof(struct sockaddr_in);
 
     return S3_OK;
+}
+
+/* the reference -bind default port: the bare -l address and the
+ * default listener take it when no -p rides */
+
+#define S3_SRV_DEFAULT_PORT 443
+
+/*
+ * the -p port of the sshd command line: the digits only, 1..65535
+ * (the sshd "bad port" shape; the ephemeral 0 stays a -l addr:0 form)
+ */
+
+static s3_int_t
+s3_srv_parse_port(const char *text, unsigned *port)
+{
+    size_t   n, i;
+    unsigned v = 0;
+
+    n = (text != NULL) ? strlen(text) : 0;
+
+    if (n == 0 || n > 5) {
+        return S3_ERROR;
+    }
+
+    for (i = 0; i < n; i++) {
+
+        if (text[i] < '0' || text[i] > '9') {
+            return S3_ERROR;
+        }
+
+        v = v * 10 + (unsigned)(text[i] - '0');
+    }
+
+    if (v == 0 || v > 65535) {
+        return S3_ERROR;
+    }
+
+    *port = v;
+
+    return S3_OK;
+}
+
+/*
+ * the AuthorizedKeysFile paths of the -o option: the tokens split out
+ * of the single argv string, the copies own their storage (the -K
+ * slots keep their argv pointers, both walk the same table)
+ */
+
+static char s3_srv_ak_paths[S3_SRV_KEYFILES_MAX][512];
+
+/*
+ * the -o option of the sshd command line, the sshd_config subset the
+ * daemon serves: "Key=Value", repeatable, the keys and the boolean
+ * values case-insensitive.  S3_OK applies the value (the spec
+ * pointers ride into the argv-owned strings, the keyfiles append to
+ * the -K table, the guards take the knobs); S3_ERROR refuses the
+ * unknown or malformed entry - the reason is logged here, the caller
+ * stops the daemon (the config-error shape of the url-path check)
+ */
+
+static s3_int_t
+s3_srv_o_option(const char *spec, const char **permit_open_arg, const char **permit_listen_arg,
+                int *dos_unauth, int *chroot_warned)
+{
+    const char *eq, *value;
+    size_t      key_len;
+    int         k;
+
+    eq = strchr(spec, '=');
+
+    if (eq == NULL || eq == spec) {
+
+        /* no key, or an empty key: the malformed entry, the same
+         * refusal path as the unknown option below */
+
+        fprintf(stderr, "ssh3-server: bad -o option \"%s\", the Key=Value form only\n", spec);
+        return S3_ERROR;
+    }
+
+    key_len = (size_t)(eq - spec);
+    value   = eq + 1;
+
+    if (key_len == 10 && strncasecmp(spec, "PermitOpen", key_len) == 0) {
+
+        /* the dial policy: "any" is the unrestricted default (the
+         * empty spec of the parser), "none" refuses everything (the
+         * negated wildcard entry), the rest is the --permit-open
+         * spec verbatim */
+
+        if (strcasecmp(value, "any") == 0) {
+            *permit_open_arg = "";
+
+        } else if (strcasecmp(value, "none") == 0) {
+            *permit_open_arg = "!*:*";
+
+        } else {
+            *permit_open_arg = value;
+        }
+
+        return S3_OK;
+    }
+
+    if (key_len == 12 && strncasecmp(spec, "PermitListen", key_len) == 0) {
+
+        /* the reverse bind policy, the same shapes */
+
+        if (strcasecmp(value, "any") == 0) {
+            *permit_listen_arg = "";
+
+        } else if (strcasecmp(value, "none") == 0) {
+            *permit_listen_arg = "!*:*";
+
+        } else {
+            *permit_listen_arg = value;
+        }
+
+        return S3_OK;
+    }
+
+    if (key_len == 12 && strncasecmp(spec, "GatewayPorts", key_len) == 0) {
+
+        if (s3_srv_gateway_ports_parse(value) != S3_OK) {
+            fprintf(stderr,
+                    "ssh3-server: bad -o GatewayPorts value \"%s\":"
+                    " no|yes|clientspecified\n",
+                    value);
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    if (key_len == 11 && strncasecmp(spec, "MaxStartups", key_len) == 0) {
+
+        /* the flat count of the --max-unauth-conversations validator
+         * (the negative is the config error, 0 the kill-switch); the
+         * start:rate:full form of sshd_config has no analog here */
+
+        if (strchr(value, ':') != NULL) {
+            fprintf(stderr,
+                    "ssh3-server: the -o MaxStartups start:rate:full form \"%s\" is not"
+                    " supported: the flat count only (the"
+                    " --max-unauth-conversations analog)\n",
+                    value);
+            return S3_ERROR;
+        }
+
+        k = atoi(value);
+
+        if (k < 0) {
+            fprintf(stderr, "ssh3-server: bad -o MaxStartups \"%s\"\n", value);
+            return S3_ERROR;
+        }
+
+        *dos_unauth = k;
+
+        return S3_OK;
+    }
+
+    if (key_len == 18 && strncasecmp(spec, "AuthorizedKeysFile", key_len) == 0) {
+
+        /* the paths split on the spaces and the tabs, each one joins
+         * the -K chain in the given order; the %%u / %%h tokens
+         * expand per session at the verdict */
+
+        const char *p     = value;
+        unsigned    added = 0;
+
+        while (*p != '\0') {
+
+            const char *f;
+
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+
+            if (*p == '\0') {
+                break;
+            }
+
+            f = p;
+
+            while (*p != '\0' && *p != ' ' && *p != '\t') {
+                p++;
+            }
+
+            if (s3_srv_keyfiles_n >= S3_SRV_KEYFILES_MAX) {
+                fprintf(stderr, "ssh3-server: too many AuthorizedKeysFile entries"
+                                " (max %d)\n",
+                        S3_SRV_KEYFILES_MAX);
+                return S3_ERROR;
+            }
+
+            if ((size_t)(p - f) >= sizeof(s3_srv_ak_paths[0])) {
+                fprintf(stderr, "ssh3-server: the AuthorizedKeysFile path is too long\n");
+                return S3_ERROR;
+            }
+
+            memcpy(s3_srv_ak_paths[s3_srv_keyfiles_n], f, (size_t)(p - f));
+            s3_srv_ak_paths[s3_srv_keyfiles_n][p - f] = '\0';
+
+            s3_srv_keyfiles[s3_srv_keyfiles_n] = s3_srv_ak_paths[s3_srv_keyfiles_n];
+            s3_srv_keyfiles_n++;
+            added++;
+        }
+
+        if (added == 0) {
+            fprintf(stderr, "ssh3-server: -o AuthorizedKeysFile needs at least one path\n");
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    if (key_len == 15 && strncasecmp(spec, "ChrootDirectory", key_len) == 0) {
+
+        if (*value == '\0') {
+            fprintf(stderr, "ssh3-server: -o ChrootDirectory needs a directory\n");
+            return S3_ERROR;
+        }
+
+        /* the sftp jail root override, the -H alias; the sshd option
+         * is per-user Match-scoped, the daemon serves one global
+         * value - the one-time warn says so */
+
+        snprintf(s3_srv_sftp_home, sizeof(s3_srv_sftp_home), "%s", value);
+
+        if (!*chroot_warned) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "-o ChrootDirectory is simplified: single global value,"
+                         " per-user Match is not supported");
+            *chroot_warned = 1;
+        }
+
+        return S3_OK;
+    }
+
+    fprintf(stderr,
+            "ssh3-server: unsupported -o option \"%.*s\": the supported set is"
+            " PermitOpen, PermitListen, GatewayPorts, MaxStartups,"
+            " AuthorizedKeysFile, ChrootDirectory\n",
+            (int)key_len, spec);
+
+    return S3_ERROR;
 }
 
 static void
@@ -1686,19 +1954,21 @@ s3_srv_h3_basic_verdict(void)
 }
 
 /*
- * the -K path of one user: a %u token is the session username (the
- * sshd AuthorizedKeysFile shape), the unknown directives stay
- * literal; the username passes the plain-name guard - no leading
- * dot, no separator - so the substitution cannot climb out of the
- * directory; S3_ERROR when the expanded path does not fit
+ * the -K path of one user: a %u token is the session username and a
+ * %h token its home directory (the sshd AuthorizedKeysFile shape),
+ * the unknown directives stay literal; the username passes the
+ * plain-name guard - no leading dot, no separator - so the
+ * substitution cannot climb out of the directory; S3_ERROR when the
+ * expanded path does not fit or the session user does not resolve
  */
 
 static s3_int_t
 s3_srv_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, size_t size)
 {
-    const char *p;
-    char       *o = out;
-    size_t      left = size - 1, i;
+    const char    *p;
+    char          *o = out;
+    size_t         left = size - 1, i;
+    struct passwd *pw = NULL;
 
     for (p = pattern; *p != '\0'; p++) {
 
@@ -1740,6 +2010,57 @@ s3_srv_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, s
 
             o += user->len;
             left -= user->len;
+            p++;
+
+            continue;
+        }
+
+        if (p[1] == 'h') {
+
+            /* the home of the session user: the passwd entry decides
+             * (the getpwnam shape of the default identities chain),
+             * the unknown or home-less user fails the path; the same
+             * plain-name guard as %u fences the lookup key */
+
+            char name[256];
+
+            if (user->len == 0 || user->data[0] == '.') {
+                return S3_ERROR;
+            }
+
+            for (i = 0; i < user->len; i++) {
+
+                u_char c = user->data[i];
+
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '.' || c == '_' || c == '-')) {
+                    return S3_ERROR;
+                }
+            }
+
+            if (user->len >= sizeof(name)) {
+                return S3_ERROR;
+            }
+
+            memcpy(name, user->data, user->len);
+            name[user->len] = '\0';
+
+            pw = getpwnam(name);
+
+            if (pw == NULL || pw->pw_dir == NULL || pw->pw_dir[0] == '\0') {
+                return S3_ERROR;
+            }
+
+            i = strlen(pw->pw_dir);
+
+            if (i > left) {
+                return S3_ERROR;
+            }
+
+            memcpy(o, pw->pw_dir, i);
+
+            o += i;
+            left -= i;
             p++;
 
             continue;
@@ -6292,19 +6613,52 @@ s3_srv_listener_add(s3_event_ctx_t *ctx, s3_fd_t fd, const struct sockaddr_stora
 }
 
 static void
-s3_srv_usage(const char *prog)
+s3_srv_usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
-            "usage: %s [-l addr:port] -c cert.pem -k key.pem [-A alpn] [-d dg_size]"
-            " [-i idle_ms] [-L level] [-P pwfile] [-H dir] [-v] [-V]\n"
-            "  -l  UDP listen address: a.b.c.d:port or [v6]:port ([::] serves both"
-            " families, the\n"
-            "      reference -bind default); port 0 picks an ephemeral one; omitted"
-            " under systemd\n"
-            "      socket activation (LISTEN_FDS): the passed fd(s) serve, no bind"
-            " happens\n"
+    fprintf(out,
+            "usage: %s -c cert.pem (-h keyfile|-k keyfile) [-p port] [-o option]"
+            " [-l addr[:port]]\n"
+            "              [the ssh3 options]\n"
+            "\n"
+            "the sshd(8) shapes:\n"
+            "  -h  host key file: the private key PEM (the sshd -h hostkey, the alias\n"
+            "      of -k - the QUIC listener serves the TLS pair)\n"
             "  -c  certificate PEM file\n"
-            "  -k  private key PEM file\n"
+            "  -p  listen port: re-ports the default listener and the bare -l\n"
+            "      addresses ([::]:443 -> [::]:port, -l addr -> addr:port); the\n"
+            "      explicit port of -l addr:port wins; under the systemd socket\n"
+            "      activation (LISTEN_FDS) the passed fd serves and -p is ignored\n"
+            "  -o  sshd_config-style option, repeatable, the keys and the boolean\n"
+            "      values case-insensitive:\n"
+            "        PermitOpen=spec|any|none: the direct-tcp/udp dial policy (the\n"
+            "          --permit-open spec shape, the entries host:port, the\n"
+            "          wildcards, the !negation); any = unrestricted, none = the\n"
+            "          every-dial refusal\n"
+            "        PermitListen=spec|any|none: the reverse (-R) bind policy, the\n"
+            "          same shapes\n"
+            "        GatewayPorts=no|yes|clientspecified: the reverse bind policy\n"
+            "          (the y|n aliases ride)\n"
+            "        MaxStartups=n: the cap of the CONNECTs between the arrival\n"
+            "          and the auth verdict (the --max-unauth-conversations\n"
+            "          analog), 0 is the kill-switch; the start:rate:full form is\n"
+            "          not supported\n"
+            "        AuthorizedKeysFile=path [path...]: the authorized_keys chain,\n"
+            "          the paths split on the spaces, the %%u token is the session\n"
+            "          username, the %%h token its home directory (the files the\n"
+            "          repeatable -K serves)\n"
+            "        ChrootDirectory=dir: the sftp jail root override (the -H\n"
+            "          alias); simplified: single global value, per-user Match is\n"
+            "          not supported\n"
+            "      an unknown option names the supported set and stops the daemon\n"
+            "\n"
+            "the ssh3 options:\n"
+            "  -k  private key PEM file (the alias of -h)\n"
+            "  -l  UDP listen address: a.b.c.d[:port] or [v6][:port]; a bare\n"
+            "      address takes the -p port or the 443 default; the [::] bind\n"
+            "      serves both families (the dual-stack shape of the reference\n"
+            "      -bind default); port 0 picks an ephemeral one; omitted under\n"
+            "      the systemd socket activation (LISTEN_FDS): the passed fd(s)\n"
+            "      serve, no bind happens\n"
             "  -A  ALPN name, default h3 (RFC 9220 extended CONNECT, ssh3)\n"
             "  -d  max_datagram_frame_size transport parameter, default 1200\n"
             "  -i  quic idle timeout, milliseconds, default 60000\n"
@@ -6316,28 +6670,15 @@ s3_srv_usage(const char *prog)
             "      the reference default is off); the file backend answers"
             " before the system\n"
             "      one when both are wired (--password-system)\n"
-            "  --password-system on|off: the system account verifier of the"
-            " Basic method\n"
-            "      (PLAN.md 8.2, the parity of the fork 0.1.34): the unix"
-            " accounts - getpwnam\n"
-            "      for the identity, the shadow entry for the hash, the"
-            " crypt(3) check for the\n"
-            "      verdict; default off, the deployment owner opts in (on"
-            " also opts the\n"
-            "      password login in); the unprivileged daemon cannot read"
-            " the shadow - the\n"
-            "      startup warns and every attempt fails closed; the"
-            " brute-force lockout\n"
-            "      (--max-password-failures) books the system accounts the"
-            " same way\n"
             "  -K  authorized_keys file, repeatable: the CONNECT passes only with a"
             " Bearer JWT\n"
             "      signed by one of their keys; %%u in the path is the session"
-            " username; without\n"
-            "      -K the default chain of the session user serves"
-            " (~/.ssh3/authorized_identities\n"
-            "      then ~/.ssh/authorized_keys, the reference"
-            " DefaultIdentitiesFileNames)\n"
+            " username, %%h its\n"
+            "      home directory; without -K the default chain of the session"
+            " user serves\n"
+            "      (~/.ssh3/authorized_identities then"
+            " ~/.ssh/authorized_keys, the reference\n"
+            "      DefaultIdentitiesFileNames)\n"
             "  --url-path p: the CONNECT route, default /ssh3-term (the reference"
             " -url-path)\n"
             "  -H  the sftp jail directory override, default the user's home\n"
@@ -6419,6 +6760,8 @@ s3_srv_usage(const char *prog)
             " at once (S2-06)\n"
             "  --handshake-timeout-ms ms: the QUIC handshake timeout,"
             " default 30000\n"
+            "  --help  this summary on stdout, exit 0 (the help moved off the\n"
+            "      short -h, the sshd host key owns it now)\n"
             "  -v  verbose logging (debug)\n"
             "  -V  print the version and exit\n"
             "env:  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN (seconds,\n"
@@ -6469,6 +6812,10 @@ main(int argc, char **argv)
     socklen_t               listen_salen[S3_SRV_LISTENERS_MAX];
     unsigned                listeners = 0, li;
     int                     dos_unauth = -1, dos_pw_failures = -1, dos_pw_secs = -1;
+    unsigned                port_arg = 0;        /* the -p port, 0 = not given */
+    unsigned                dport;               /* the effective bare-address port */
+    int                     chroot_warned = 0;   /* the one-time -o warn flag */
+    char                    default_listen[24];  /* the "[::]:port" text of the default */
     s3_event_ctx_t          ctx;
     struct sigaction        act;
 
@@ -6671,7 +7018,16 @@ main(int argc, char **argv)
             drop = 0;
             value = NULL;
 
-            if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
+            if (strcmp(argv[n], "--help") == 0) {
+
+                /* the summary of the sshd -h era moved here: the
+                 * short key serves the host key now, the usage rides
+                 * stdout and the exit is 0 */
+
+                s3_srv_usage(stdout, argv[0]);
+                return 0;
+
+            } else if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
                 s3_srv_oidc_issuer = argv[n + 1];
                 value = argv[n + 1];
 
@@ -6914,7 +7270,7 @@ main(int argc, char **argv)
             dos_pw_secs >= 0 ? (s3_msec_t)dos_pw_secs * 1000 : S3_DOS_PW_LOCKOUT_MSEC_DEFAULT);
     }
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3vVh")) != -1) {
+    while ((opt = (char)getopt(argc, argv, "l:c:k:h:A:d:i:L:P:H:K:3p:o:vV")) != -1) {
 
         switch (opt) {
 
@@ -6927,7 +7283,33 @@ main(int argc, char **argv)
             break;
 
         case 'k':
+        case 'h':
+
+            /* the private key PEM: the -h is the sshd host key shape,
+             * the -k the project name - one key_path serves both */
+
             key_path = optarg;
+            break;
+
+        case 'p':
+
+            /* the sshd -p port: the strict digits (the "bad port"
+             * shape), the listener wiring rides after the getopt */
+
+            if (s3_srv_parse_port(optarg, &port_arg) != S3_OK) {
+                s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad -p port \"%s\"", optarg);
+                return 1;
+            }
+
+            break;
+
+        case 'o':
+
+            if (s3_srv_o_option(optarg, &permit_open_arg, &permit_listen_arg, &dos_unauth,
+                                &chroot_warned) != S3_OK) {
+                return 1;
+            }
+
             break;
 
         case 'A':
@@ -6991,7 +7373,7 @@ main(int argc, char **argv)
             break;
 
         default:
-            s3_srv_usage(argv[0]);
+            s3_srv_usage(stderr, argv[0]);
             return 1;
         }
     }
@@ -7057,7 +7439,7 @@ main(int argc, char **argv)
     }
 
     if (cert_path == NULL || key_path == NULL) {
-        s3_srv_usage(argv[0]);
+        s3_srv_usage(stderr, argv[0]);
         return 1;
     }
 
@@ -7150,11 +7532,16 @@ main(int argc, char **argv)
 
     /*
      * -l stays optional: the socket-activated daemon serves the passed
-     * fd and binds nothing (the check below runs before any use of
-     * listen_text)
+     * fd and binds nothing, and the sshd-canon default listener (the
+     * dual-stack wildcard) serves when neither -l nor -p rode (the
+     * check below runs before any use of listen_text).  A bare -l
+     * address takes the -p port or the 443 of the reference
      */
+
+    dport = port_arg ? port_arg : S3_SRV_DEFAULT_PORT;
+
     if (listen_text != NULL &&
-        s3_srv_parse_addr(listen_text, &listen_sa[0], &listen_salen[0]) != S3_OK) {
+        s3_srv_parse_addr(listen_text, &listen_sa[0], &listen_salen[0], dport) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad listen address %s", listen_text);
         return 1;
     }
@@ -7234,9 +7621,21 @@ main(int argc, char **argv)
 
         if (listen_text == NULL) {
 
-            /* neither the activation markers nor -l: nothing to serve */
-            s3_srv_usage(argv[0]);
-            return 1;
+            /*
+             * the sshd ListenAddress default: the dual-stack wildcard
+             * listener, the -p port or the 443 of the reference - the
+             * sockets open on it exactly like on the -l spec (the
+             * V6ONLY=0 of the bind below serves both families)
+             */
+
+            s3_memzero(&listen_sa[0], sizeof(listen_sa[0]));
+
+            listen_sa[0].ss_family = AF_INET6;
+            ((struct sockaddr_in6 *)&listen_sa[0])->sin6_port = htons((uint16_t)dport);
+            listen_salen[0] = sizeof(struct sockaddr_in6);
+
+            snprintf(default_listen, sizeof(default_listen), "[::]:%u", dport);
+            listen_text = default_listen;
         }
 
         fd = socket(listen_sa[0].ss_family, SOCK_DGRAM, 0);
@@ -7296,14 +7695,25 @@ main(int argc, char **argv)
         listen_fds[0] = fd;
         listeners = 1;
 
-    } else if (listen_text != NULL) {
+    } else {
 
         /*
          * the unit owns the port: the activated socket serves, a -l
          * the operator kept changes nothing (no second bind); the
-         * claim already filled listen_sa[] and verified the family
+         * claim already filled listen_sa[] and verified the family.
+         * The -p port rides the same rule: the fd carries the port,
+         * the flag would only re-port a bind that never happens
          */
-        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0, "socket-activated: -l %s ignored", listen_text);
+
+        if (listen_text != NULL) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0, "socket-activated: -l %s ignored",
+                         listen_text);
+        }
+
+        if (port_arg != 0) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "socket-activated: -p %u ignored, the passed fd(s) serve", port_arg);
+        }
     }
 
     for (li = 0; li < listeners; li++) {
