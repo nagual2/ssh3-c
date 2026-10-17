@@ -100,7 +100,7 @@ start_srv() {
     S_TAG=$1
     shift
     S_LOG="$WORK/srv-$S_TAG.log"
-    S_P=$((47300 + ($$ + S_TAG * 7) % 1500))
+    S_P=$((47300 + ($$ + S_TAG * 17) % 1500))
     S_I=0
 
     while [ "$S_I" -lt 8 ]; do
@@ -292,7 +292,7 @@ stop_hold() {
 
 echo "== run 1: the daemon of the certificate a"
 
-PORT=$(start_srv a) || die "the daemon did not start: $(tail -3 "$WORK/srv-a.log")"
+PORT=$(start_srv 1) || die "the daemon did not start: $(tail -3 "$WORK/srv-1.log")"
 
 [ -n "$PORT" ] || die "no listen port"
 
@@ -572,7 +572,7 @@ stop_hold
 
 echo "== run 2: the dual-stack daemon of the -6 leg"
 
-PORT6=$(start_srv6 six) || die "the dual-stack daemon did not start"
+PORT6=$(start_srv6 3) || die "the dual-stack daemon did not start"
 
 [ -n "$PORT6" ] || die "no -6 listen port"
 
@@ -590,7 +590,7 @@ fi
 
 echo "== run 3: the jump stand (the -d 1352 jump daemon)"
 
-JPORT=$(start_srv j -d 1352) || die "the jump daemon did not start"
+JPORT=$(start_srv 2 -d 1352) || die "the jump daemon did not start"
 
 echo "== leg 16: -J jump (the exec through the tunnel)"
 
