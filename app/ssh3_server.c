@@ -7262,23 +7262,6 @@ main(int argc, char **argv)
         }
     }
 
-    /*
-     * the knobs land on the guards once: the env defaults and the
-     * flags met in the same locals, the last writer of each wins
-     * (the flag overrides the env, the untouched piece keeps the
-     * module default)
-     */
-
-    if (dos_unauth >= 0) {
-        s3_dos_unauth_set_limit((unsigned)dos_unauth);
-    }
-
-    if (dos_pw_failures >= 0 || dos_pw_secs >= 0) {
-        s3_dos_pw_set_limits(
-            dos_pw_failures >= 0 ? (unsigned)dos_pw_failures : S3_DOS_PW_FAILURES_MAX_DEFAULT,
-            dos_pw_secs >= 0 ? (s3_msec_t)dos_pw_secs * 1000 : S3_DOS_PW_LOCKOUT_MSEC_DEFAULT);
-    }
-
     while ((opt = (char)getopt(argc, argv, "l:c:k:h:A:d:i:L:P:H:K:3p:o:vV")) != -1) {
 
         switch (opt) {
@@ -7385,6 +7368,25 @@ main(int argc, char **argv)
             s3_srv_usage(stderr, argv[0]);
             return 1;
         }
+    }
+
+    /*
+     * the knobs land on the guards once: the env defaults, the
+     * pre-scan flags and the -o options met in the same locals, the
+     * last writer of each wins (the flag overrides the env, the
+     * untouched piece keeps the module default); the landing runs
+     * after the getopt loop - the -o MaxStartups writes the same
+     * local the pre-scan wrote
+     */
+
+    if (dos_unauth >= 0) {
+        s3_dos_unauth_set_limit((unsigned)dos_unauth);
+    }
+
+    if (dos_pw_failures >= 0 || dos_pw_secs >= 0) {
+        s3_dos_pw_set_limits(
+            dos_pw_failures >= 0 ? (unsigned)dos_pw_failures : S3_DOS_PW_FAILURES_MAX_DEFAULT,
+            dos_pw_secs >= 0 ? (s3_msec_t)dos_pw_secs * 1000 : S3_DOS_PW_LOCKOUT_MSEC_DEFAULT);
     }
 
     /*
