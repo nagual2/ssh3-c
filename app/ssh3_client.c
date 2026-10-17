@@ -902,6 +902,7 @@ static s3_int_t  s3_cli_socks_parse(const char *arg);
 static int       s3_cli_streq_ci(const char *a, const char *b);
 static void      s3_cli_note(const char *fmt, ...);
 static unsigned  s3_cli_escape_live(void);
+static void      s3_cli_operand_host(const char *src, size_t len);
 static s3_int_t  s3_cli_cfg_pattern_match(const char *pat, const char *host);
 static unsigned  s3_cli_cfg_host_block(const char *patterns, const char *host);
 static s3_int_t  s3_cli_cfg_apply(const char *key, const char *val);
@@ -2962,6 +2963,22 @@ static unsigned
 s3_cli_escape_live(void)
 {
     return (s3_cli_escape_ch >= 0 && s3_cli_console && s3_cli_tty && s3_cli_cmd == NULL);
+}
+
+/* the operand host text: the bracketed ipv6 strips (the dial and the
+ * known_hosts key both ride the bare form) */
+
+static void
+s3_cli_operand_host(const char *src, size_t len)
+{
+    if (len >= 2 && src[0] == '[' && src[len - 1] == ']') {
+        memcpy(s3_cli_host, src + 1, len - 2);
+        s3_cli_host[len - 2] = '\0';
+        return;
+    }
+
+    memcpy(s3_cli_host, src, len);
+    s3_cli_host[len] = '\0';
 }
 
 /* the escape processor state: the escape char is live at the start
@@ -12378,7 +12395,35 @@ main(int argc, char **argv)
         operand = (char *)at + 1;
     }
 
+    /* the bracketed ipv6 operand ([::1]:port): the port colon is the
+     * one outside the brackets, the brackets strip off the host */
+
     slash = strchr(operand, '/');
+
+    {
+
+        const char *lim = (slash != NULL) ? slash : operand + strlen(operand);
+        const char *p = operand;
+        unsigned    in_brackets = 0;
+
+        colon = NULL;
+
+        while (p < lim) {
+
+            if (*p == '[') {
+                in_brackets = 1;
+
+            } else if (*p == ']') {
+                in_brackets = 0;
+
+            } else if (*p == ':' && !in_brackets) {
+                colon = p;
+                break;
+            }
+
+            p++;
+        }
+    }
 
     if (slash != NULL) {
 
@@ -12390,9 +12435,8 @@ main(int argc, char **argv)
         }
 
         snprintf(s3_cli_path, sizeof(s3_cli_path), "%s", slash);
-        colon = strchr(operand, ':');
 
-        if (colon != NULL && colon < slash) {
+        if (colon != NULL) {
 
             oport = (unsigned)atoi(colon + 1);
 
@@ -12408,8 +12452,7 @@ main(int argc, char **argv)
                 s3_cli_port = oport;
             }
 
-            memcpy(s3_cli_host, operand, (size_t)(colon - operand));
-            s3_cli_host[colon - operand] = '\0';
+            s3_cli_operand_host(operand, (size_t)(colon - operand));
 
         } else {
 
@@ -12418,43 +12461,37 @@ main(int argc, char **argv)
                 return S3_CLI_EXIT_ERROR;
             }
 
-            memcpy(s3_cli_host, operand, (size_t)(slash - operand));
-            s3_cli_host[slash - operand] = '\0';
+            s3_cli_operand_host(operand, (size_t)(slash - operand));
         }
+
+    } else if (colon != NULL) {
+
+        unsigned oport = (unsigned)atoi(colon + 1);
+
+        if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
+            fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_port_operand = 1;
+
+        if (!s3_cli_have_port) {
+            s3_cli_port = oport;
+        }
+
+        s3_cli_operand_host(operand, (size_t)(colon - operand));
 
     } else {
 
-        colon = strchr(operand, ':');
-
-        if (colon != NULL) {
-
-            unsigned oport = (unsigned)atoi(colon + 1);
-
-            if (oport == 0 || oport > 65535 ||
-                (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            s3_cli_port_operand = 1;
-
-            if (!s3_cli_have_port) {
-                s3_cli_port = oport;
-            }
-
-            memcpy(s3_cli_host, operand, (size_t)(colon - operand));
-            s3_cli_host[colon - operand] = '\0';
-
-        } else {
-
-            if (strlen(operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: the host is too long\n");
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            snprintf(s3_cli_host, sizeof(s3_cli_host), "%s", operand);
+        if (strlen(operand) >= sizeof(s3_cli_host)) {
+            fprintf(stderr, "ssh3: the host is too long\n");
+            return S3_CLI_EXIT_ERROR;
         }
 
+        s3_cli_operand_host(operand, strlen(operand));
+    }
+
+    if (slash == NULL) {
         snprintf(s3_cli_path, sizeof(s3_cli_path), "/ssh3-term");
     }
 
