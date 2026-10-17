@@ -90,7 +90,13 @@ cleanup() {
         sudo -n userdel -r "$AK_USER" >/dev/null 2>&1
     fi
 
-    rm -rf "$WORK"
+    # the jail content rides the session identity owner, the root
+    # sweep clears what the plain rm cannot (no-op without sudo)
+
+    if [ -n "${WORK:-}" ]; then
+        sudo -n rm -rf "$WORK" >/dev/null 2>&1
+        rm -rf "$WORK"
+    fi
 }
 
 trap cleanup EXIT INT TERM
@@ -645,7 +651,7 @@ if [ "$HAVE_SUDO" -eq 1 ]; then
     # sshd/sshd3 socket unit of the host, the P8 coexistence shape)
     # keeps the legs out - the SKIP is the honest verdict there
 
-    if ss -u -l 2>/dev/null | grep -q ":443 "; then
+    if ss -u -ln 2>/dev/null | grep -q ":443 "; then
         skip "the 443 default legs: the port is already bound on this host"
     else
 
