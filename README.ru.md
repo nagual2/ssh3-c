@@ -2,6 +2,27 @@
 
 [English](README.md) | **Русский** | [Deutsch](README.de.md)
 
+## Документация
+
+Все документы проекта трёхязычны (баннер `> Languages:` в каждом файле
+ссылается на версии). Канонический текст документов `docs/` — русский;
+EN/DE — точные переводы.
+
+| № | Документ | Содержимое | Языки |
+|---|----------|------------|-------|
+| 1 | [docs/PLAN.md](docs/PLAN.md) | план разработки: фазы P0–P9, история приёмок волн, открытый бэклог | RU · [EN](docs/PLAN.en.md) · [DE](docs/PLAN.de.md) |
+| 2 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | слоистая архитектура: core/event/quic/h3/ssh3/app, конвенции zero-copy | RU · [EN](docs/ARCHITECTURE.en.md) · [DE](docs/ARCHITECTURE.de.md) |
+| 3 | [docs/SPEC-wire.md](docs/SPEC-wire.md) | спецификация wire-протокола SSH3 (rev nagual2/1, draft 1) | RU · [EN](docs/SPEC-wire.en.md) · [DE](docs/SPEC-wire.de.md) |
+| 4 | [docs/P4-WIRE.md](docs/P4-WIRE.md) | исторический дистиллят: жизненный цикл каналов и датаграммный роутинг (волна 2) | RU · [EN](docs/P4-WIRE.en.md) · [DE](docs/P4-WIRE.de.md) |
+| 5 | [docs/PORTING-nginx-quic.md](docs/PORTING-nginx-quic.md) | журнал порта: QUIC-слой nginx → ssh3-c | RU · [EN](docs/PORTING-nginx-quic.en.md) · [DE](docs/PORTING-nginx-quic.de.md) |
+| 6 | [docs/DEPS-QUIC.md](docs/DEPS-QUIC.md) | зависимости и лицензии QUIC-стека (OpenSSL ≥3.5 QUIC API) | RU · [EN](docs/DEPS-QUIC.en.md) · [DE](docs/DEPS-QUIC.de.md) |
+| 7 | [docs/BENCH-METRICS.md](docs/BENCH-METRICS.md) | методика и метрики бенчмарков (R3) | RU · [EN](docs/BENCH-METRICS.en.md) · [DE](docs/BENCH-METRICS.de.md) |
+| 8 | [docs/BENCH-P7-2026-10-06.md](docs/BENCH-P7-2026-10-06.md) | отчёт бенчей фазы P7 | RU · [EN](docs/BENCH-P7-2026-10-06.en.md) · [DE](docs/BENCH-P7-2026-10-06.de.md) |
+| 9 | [docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md) | отчёт бенчей релиза v0.2.0 | RU · [EN](docs/BENCH-V0.2.0-2026-10-13.en.md) · [DE](docs/BENCH-V0.2.0-2026-10-13.de.md) |
+| 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | отчёт бенчей релиза v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
+| 11 | [packaging/README.md](packaging/README.md) | сборка дистрибутивных пакетов (deb/rpm/apk/OpenWrt, бандл OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
+| 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | сторонние копирайты и лицензии (юридический текст, без перевода) | EN |
+
 Реализация SSH3 на чистом C17 в стиле nginx: пулы памяти, буферы-вьюхи,
 chain-интерфейс всего I/O, zero-copy data path. Целевая позиция — «OpenSSH
 среди Linux-систем» (см. [docs/PLAN.md](docs/PLAN.md)).

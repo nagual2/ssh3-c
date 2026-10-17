@@ -1,4 +1,5 @@
 # SPEC-wire: спецификация wire-протокола SSH3 — rev nagual2/1 (draft 1)
+> Languages: RU (this file) · [EN](SPEC-wire.en.md) · [DE](SPEC-wire.de.md)
 
 Дата: 2026-10-16. Статус: первая редакция волны P8-0, выверена по живому коду обеих реализаций.
 

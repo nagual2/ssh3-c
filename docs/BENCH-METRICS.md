@@ -1,4 +1,5 @@
 # Метрики контрольного бенча (методика R3) — разбор
+> Languages: RU (this file) · [EN](BENCH-METRICS.en.md) · [DE](BENCH-METRICS.de.md)
 
 Справочник по метрикам `bench/p7-compare.sh`: что именно измеряется, как,
 и как читать цифры. Свежие результаты —

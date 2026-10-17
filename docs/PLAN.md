@@ -1,4 +1,5 @@
 # ssh3-c — план разработки клиента и сервера
+> Languages: RU (this file) · [EN](PLAN.en.md) · [DE](PLAN.de.md)
 
 Создан: 2026-10-01. Источники: [ARCHITECTURE.md](ARCHITECTURE.md) (слои, решения, zero-copy правила), [DEPS-QUIC.md](DEPS-QUIC.md) (зависимости, лицензии). Родительский трек: `project/ssh3/docs/ROADMAP.md`.
 

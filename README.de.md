@@ -2,6 +2,27 @@
 
 [English](README.md) | [Русский](README.ru.md) | **Deutsch**
 
+## Dokumentation
+
+Alle Projektdokumente sind dreisprachig (ein `> Languages:`-Banner in
+jeder Datei verweist auf die Versionen). Der kanonische Text der
+`docs/`-Dokumente ist Russisch; EN/DE sind getreue Übersetzungen.
+
+| № | Dokument | Inhalt | Sprachen |
+|---|----------|--------|----------|
+| 1 | [docs/PLAN.md](docs/PLAN.md) | Entwicklungsplan: Phasen P0–P9, Abnahme-Historie der Wellen, offener Backlog | RU · [EN](docs/PLAN.en.md) · [DE](docs/PLAN.de.md) |
+| 2 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | die Schichtarchitektur: core/event/quic/h3/ssh3/app, Zero-Copy-Konventionen | RU · [EN](docs/ARCHITECTURE.en.md) · [DE](docs/ARCHITECTURE.de.md) |
+| 3 | [docs/SPEC-wire.md](docs/SPEC-wire.md) | die Spezifikation des SSH3-Wire-Protokolls (rev nagual2/1, draft 1) | RU · [EN](docs/SPEC-wire.en.md) · [DE](docs/SPEC-wire.de.md) |
+| 4 | [docs/P4-WIRE.md](docs/P4-WIRE.md) | historisches Destillat: Kanal-Lebenszyklus und Datagram-Routing (Welle 2) | RU · [EN](docs/P4-WIRE.en.md) · [DE](docs/P4-WIRE.de.md) |
+| 5 | [docs/PORTING-nginx-quic.md](docs/PORTING-nginx-quic.md) | Portierungs-Journal: die nginx-QUIC-Schicht → ssh3-c | RU · [EN](docs/PORTING-nginx-quic.en.md) · [DE](docs/PORTING-nginx-quic.de.md) |
+| 6 | [docs/DEPS-QUIC.md](docs/DEPS-QUIC.md) | Abhängigkeiten und Lizenzen des QUIC-Stacks (OpenSSL ≥3.5 QUIC-API) | RU · [EN](docs/DEPS-QUIC.en.md) · [DE](docs/DEPS-QUIC.de.md) |
+| 7 | [docs/BENCH-METRICS.md](docs/BENCH-METRICS.md) | Benchmark-Methodik und -Metriken (R3) | RU · [EN](docs/BENCH-METRICS.en.md) · [DE](docs/BENCH-METRICS.de.md) |
+| 8 | [docs/BENCH-P7-2026-10-06.md](docs/BENCH-P7-2026-10-06.md) | Benchmark-Bericht, Phase P7 | RU · [EN](docs/BENCH-P7-2026-10-06.en.md) · [DE](docs/BENCH-P7-2026-10-06.de.md) |
+| 9 | [docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md) | Benchmark-Bericht, Release v0.2.0 | RU · [EN](docs/BENCH-V0.2.0-2026-10-13.en.md) · [DE](docs/BENCH-V0.2.0-2026-10-13.de.md) |
+| 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | Benchmark-Bericht, Release v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
+| 11 | [packaging/README.md](packaging/README.md) | Bau der Distributionspakete (deb/rpm/apk/OpenWrt, gebündeltes OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
+| 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Copyright- und Lizenzhinweise Dritter (juristischer Text, nicht übersetzt) | EN |
+
 Eine SSH3-Implementierung in reinem C17 im nginx-Stil: Speicherpools,
 Buffer-Sichten, ein Chain-Interface für sämtliche I/O, ein Zero-Copy-
 Datenpfad. Die Zielpositionierung ist „OpenSSH unter den

@@ -1,4 +1,5 @@
 # ssh3-c — архитектура (nginx-style, zero-copy)
+> Languages: RU (this file) · [EN](ARCHITECTURE.en.md) · [DE](ARCHITECTURE.de.md)
 
 Создан: 2026-10-01. Родительский трек: `project/ssh3/docs/ROADMAP.md`, профиль: `project/ssh3/docs/PROFILE-2026-09-29.md`.
 Референс стиля: nginx 1.31.7 (`C:\Git\temp\ssh3-c\refs\nginx\` — read-only).

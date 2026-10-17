@@ -1,4 +1,5 @@
 # Контрольный бенч v0.2.0: ssh3-c vs Go-форк vs OpenSSH (методика R3)
+> Languages: RU (this file) · [EN](BENCH-V0.2.0-2026-10-13.en.md) · [DE](BENCH-V0.2.0-2026-10-13.de.md)
 
 Дата: 2026-10-13. Прогон: `bench/p7-compare.sh` (репо), сырые CSV —
 `/tmp/p7bench/results/` (в репо не заходят). Предшественник:

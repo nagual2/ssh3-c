@@ -1,4 +1,5 @@
 # ssh3-c: карта портирования QUIC-слоя nginx (фаза P2)
+> Languages: RU (this file) · [EN](PORTING-nginx-quic.en.md) · [DE](PORTING-nginx-quic.de.md)
 
 Дата: 2026-10-01. Референс: `C:\Git\temp\ssh3-c\refs\nginx\src\event\quic\` (nginx 1.31.7, read-only).
 База ssh3-c: P0 (`src/core`: `s3_pool_t`/`s3_buf_t`/`s3_chain_t`/`s3_rbtree_t`/`s3_queue_t`/`s3_log_t`/`s3_str_t`) и P1 (`src/event`: `s3_event_ctx_t` + epoll, таймеры-rbtree, posted events, `s3_connection_t` c `recv`/`send_chain`, UDP-псевдо-коннекции `s3_udp_listen_t` + `s3_event_recvmsg`/`s3_udp_shared_recv`; `src/os/unix`: `s3_udp_sendmsg_chain`, `s3_sendmsg`, `s3_udp_recv`) — обе фазы закрыты (см. `docs/PLAN.md` §7).

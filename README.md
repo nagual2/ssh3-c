@@ -2,6 +2,27 @@
 
 **English** | [Русский](README.ru.md) | [Deutsch](README.de.md)
 
+## Documentation
+
+All project documents are trilingual (a `> Languages:` banner links the
+versions in each file). The canonical text of the `docs/` documents is
+Russian; EN/DE are faithful translations.
+
+| № | Document | Contents | Languages |
+|---|----------|----------|-----------|
+| 1 | [docs/PLAN.md](docs/PLAN.md) | development plan: phases P0–P9, wave acceptance history, open backlog | RU · [EN](docs/PLAN.en.md) · [DE](docs/PLAN.de.md) |
+| 2 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the layer architecture: core/event/quic/h3/ssh3/app, zero-copy conventions | RU · [EN](docs/ARCHITECTURE.en.md) · [DE](docs/ARCHITECTURE.de.md) |
+| 3 | [docs/SPEC-wire.md](docs/SPEC-wire.md) | the SSH3 wire protocol specification (rev nagual2/1, draft 1) | RU · [EN](docs/SPEC-wire.en.md) · [DE](docs/SPEC-wire.de.md) |
+| 4 | [docs/P4-WIRE.md](docs/P4-WIRE.md) | historical distillate: channel lifecycle and datagram routing (wave 2) | RU · [EN](docs/P4-WIRE.en.md) · [DE](docs/P4-WIRE.de.md) |
+| 5 | [docs/PORTING-nginx-quic.md](docs/PORTING-nginx-quic.md) | porting journal: the nginx QUIC layer → ssh3-c | RU · [EN](docs/PORTING-nginx-quic.en.md) · [DE](docs/PORTING-nginx-quic.de.md) |
+| 6 | [docs/DEPS-QUIC.md](docs/DEPS-QUIC.md) | QUIC-stack dependencies and licenses (OpenSSL ≥3.5 QUIC API) | RU · [EN](docs/DEPS-QUIC.en.md) · [DE](docs/DEPS-QUIC.de.md) |
+| 7 | [docs/BENCH-METRICS.md](docs/BENCH-METRICS.md) | benchmark methodology and metrics (R3) | RU · [EN](docs/BENCH-METRICS.en.md) · [DE](docs/BENCH-METRICS.de.md) |
+| 8 | [docs/BENCH-P7-2026-10-06.md](docs/BENCH-P7-2026-10-06.md) | benchmark report, phase P7 | RU · [EN](docs/BENCH-P7-2026-10-06.en.md) · [DE](docs/BENCH-P7-2026-10-06.de.md) |
+| 9 | [docs/BENCH-V0.2.0-2026-10-13.md](docs/BENCH-V0.2.0-2026-10-13.md) | benchmark report, release v0.2.0 | RU · [EN](docs/BENCH-V0.2.0-2026-10-13.en.md) · [DE](docs/BENCH-V0.2.0-2026-10-13.de.md) |
+| 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | benchmark report, release v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
+| 11 | [packaging/README.md](packaging/README.md) | building the distribution packages (deb/rpm/apk/OpenWrt, bundled OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
+| 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | third-party copyright and license notices (legal text, not translated) | EN |
+
 A pure-C17 SSH3 implementation in the nginx style: memory pools, buffer
 views, a chain interface for all I/O, a zero-copy data path. The target
 position is "OpenSSH among Linux systems" (see

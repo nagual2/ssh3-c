@@ -1,4 +1,5 @@
 # packaging - distribution packages for ssh3-server
+> Languages: EN (this file) · [RU](README.ru.md) · [DE](README.de.md)
 
 Assembles the distribution packages for the `ssh3-server` daemon from the
 `build/linux-release/ssh3-server` binary (built on demand via the
