@@ -380,7 +380,7 @@ static struct {
     unsigned                  listeners;
     unsigned                  forwarded; /* the live forwarded-* channels */
     s3_srv_reverse_listener_t listener[S3_SRV_REVERSE_LISTENERS_MAX];
-    char                      budget_user[S3_SRV_SFTP_USER_MAX + 1]; /* the cap owner of the live listeners */
+    char budget_user[S3_SRV_SFTP_USER_MAX + 1]; /* the cap owner of the live listeners */
 } s3_srv_reverse;
 
 /*
@@ -865,7 +865,7 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
         s3_memzero(ss, sizeof(*ss));
 
         ((struct sockaddr_in6 *)ss)->sin6_family = AF_INET6;
-        ((struct sockaddr_in6 *)ss)->sin6_port   = htons((uint16_t)port);
+        ((struct sockaddr_in6 *)ss)->sin6_port = htons((uint16_t)port);
 
         if (inet_pton(AF_INET6, host, &((struct sockaddr_in6 *)ss)->sin6_addr) != 1) {
             return S3_ERROR;
@@ -904,7 +904,7 @@ s3_srv_parse_addr(const char *text, struct sockaddr_storage *ss, socklen_t *ssle
     s3_memzero(ss, sizeof(*ss));
 
     ((struct sockaddr_in *)ss)->sin_family = AF_INET;
-    ((struct sockaddr_in *)ss)->sin_port   = htons((uint16_t)port);
+    ((struct sockaddr_in *)ss)->sin_port = htons((uint16_t)port);
 
     if (inet_pton(AF_INET, host, &((struct sockaddr_in *)ss)->sin_addr) != 1) {
         return S3_ERROR;
@@ -993,7 +993,7 @@ s3_srv_o_option(const char *spec, const char **permit_open_arg, const char **per
     }
 
     key_len = (size_t)(eq - spec);
-    value   = eq + 1;
+    value = eq + 1;
 
     if (key_len == 10 && strncasecmp(spec, "PermitOpen", key_len) == 0) {
 
@@ -1078,7 +1078,7 @@ s3_srv_o_option(const char *spec, const char **permit_open_arg, const char **per
          * the -K chain in the given order; the %%u / %%h tokens
          * expand per session at the verdict */
 
-        const char *p     = value;
+        const char *p = value;
         unsigned    added = 0;
 
         while (*p != '\0') {
@@ -1100,8 +1100,9 @@ s3_srv_o_option(const char *spec, const char **permit_open_arg, const char **per
             }
 
             if (s3_srv_keyfiles_n >= S3_SRV_KEYFILES_MAX) {
-                fprintf(stderr, "ssh3-server: too many AuthorizedKeysFile entries"
-                                " (max %d)\n",
+                fprintf(stderr,
+                        "ssh3-server: too many AuthorizedKeysFile entries"
+                        " (max %d)\n",
                         S3_SRV_KEYFILES_MAX);
                 return S3_ERROR;
             }
@@ -6812,10 +6813,10 @@ main(int argc, char **argv)
     socklen_t               listen_salen[S3_SRV_LISTENERS_MAX];
     unsigned                listeners = 0, li;
     int                     dos_unauth = -1, dos_pw_failures = -1, dos_pw_secs = -1;
-    unsigned                port_arg = 0;        /* the -p port, 0 = not given */
-    unsigned                dport;               /* the effective bare-address port */
-    int                     chroot_warned = 0;   /* the one-time -o warn flag */
-    char                    default_listen[24];  /* the "[::]:port" text of the default */
+    unsigned                port_arg = 0;       /* the -p port, 0 = not given */
+    unsigned                dport;              /* the effective bare-address port */
+    int                     chroot_warned = 0;  /* the one-time -o warn flag */
+    char                    default_listen[24]; /* the "[::]:port" text of the default */
     s3_event_ctx_t          ctx;
     struct sigaction        act;
 
@@ -6979,8 +6980,7 @@ main(int argc, char **argv)
     {
         const char *policy = getenv("SSH3_GATEWAY_PORTS");
 
-        if (policy != NULL && *policy != '\0' &&
-            s3_srv_gateway_ports_parse(policy) != S3_OK) {
+        if (policy != NULL && *policy != '\0' && s3_srv_gateway_ports_parse(policy) != S3_OK) {
             s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                          "invalid SSH3_GATEWAY_PORTS \"%s\", keeping the default", policy);
         }
@@ -7102,8 +7102,8 @@ main(int argc, char **argv)
                 int k = atoi(argv[n + 1]);
 
                 if (k < 0) {
-                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
-                                 "bad --max-reverse-forwards \"%s\"", argv[n + 1]);
+                    s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "bad --max-reverse-forwards \"%s\"",
+                                 argv[n + 1]);
                     return 1;
                 }
 
