@@ -396,7 +396,7 @@ start_hold -N -i "$WORK/priv.pem" -L "127.0.0.1:$LPPORT:127.0.0.1:$ECHOPORT" \
     "client@127.0.0.1:$PORT/ssh3-term"
 
 if wait_tcp "$LPPORT" &&
-    printf 'S3CLI-PROBE\n' | timeout 5 nc 127.0.0.1 "$LPPORT" > "$WORK/leg-n.echo" 2>/dev/null &&
+    printf 'S3CLI-PROBE\n' | timeout 5 nc -q 1 127.0.0.1 "$LPPORT" > "$WORK/leg-n.echo" 2>/dev/null &&
     grep -q "S3CLI-PROBE" "$WORK/leg-n.echo"; then
     pass "-N -L bridged the echo"
 else
@@ -523,7 +523,7 @@ start_hold -N -i "$WORK/priv.pem" -o "LocalForward=127.0.0.1:$OLPORT:127.0.0.1:$
     "client@127.0.0.1:$PORT/ssh3-term"
 
 if wait_tcp "$OLPORT" &&
-    printf 'S3CLI-PROBE\n' | timeout 5 nc 127.0.0.1 "$OLPORT" > "$WORK/leg-ol.echo" 2>/dev/null &&
+    printf 'S3CLI-PROBE\n' | timeout 5 nc -q 1 127.0.0.1 "$OLPORT" > "$WORK/leg-ol.echo" 2>/dev/null &&
     grep -q "S3CLI-PROBE" "$WORK/leg-ol.echo"; then
     pass "-o LocalForward= bridged like -L"
 else
@@ -547,7 +547,7 @@ EOF
 start_hold -N -i "$WORK/priv.pem" -F "$WORK/config" cli-alias
 
 if wait_tcp "$CFGPORT" &&
-    printf 'S3CLI-PROBE\n' | timeout 5 nc 127.0.0.1 "$CFGPORT" > "$WORK/leg-f.echo" 2>/dev/null &&
+    printf 'S3CLI-PROBE\n' | timeout 5 nc -q 1 127.0.0.1 "$CFGPORT" > "$WORK/leg-f.echo" 2>/dev/null &&
     grep -q "S3CLI-PROBE" "$WORK/leg-f.echo"; then
     pass "-F HostName/Port/User/LocalForward rode"
 else
