@@ -3344,7 +3344,7 @@ s3_cli_opt_parse(const char *arg)
             return S3_ERROR;
         }
 
-        snprintf(s3_cli_cm_path, sizeof(s3_cli_cm_path), "%s", val);
+        memcpy(s3_cli_cm_path, val, strlen(val) + 1);
         s3_cli_cm_pipe_name_called = 1;
 
         return S3_OK;
