@@ -11994,7 +11994,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "46ACDe:F:i:J:l:L:MnNp:qS:s:tTo:VvxYU:R:O:h")) != -1) {
+    while ((opt = getopt(argc, argv, "46ACDe:F:i:J:l:L:MnNp:qS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
