@@ -86,9 +86,9 @@ mkcert() {
         || die "openssl req failed for $1"
 }
 
-mkcert a
-mkcert j
-mkcert six
+mkcert 1
+mkcert 2
+mkcert 3
 
 # the v4 loopback daemon: the extra args ride between -3 and the
 # cert pair (the -d 1352 of the jump daemon), the listen port scans
@@ -296,7 +296,7 @@ PORT=$(start_srv 1) || die "the daemon did not start: $(tail -3 "$WORK/srv-1.log
 
 [ -n "$PORT" ] || die "no listen port"
 
-pin_home home "127.0.0.1:$PORT/ssh3-term" a
+pin_home home "127.0.0.1:$PORT/ssh3-term" 1
 
 echo "== leg 1: -V and --help"
 
@@ -576,7 +576,7 @@ PORT6=$(start_srv6 3) || die "the dual-stack daemon did not start"
 
 [ -n "$PORT6" ] || die "no -6 listen port"
 
-pin_home home6 "::1:$PORT6/ssh3-term" six
+pin_home home6 "::1:$PORT6/ssh3-term" 3
 
 echo "== leg 15: -6 against the dual-stack listener"
 
