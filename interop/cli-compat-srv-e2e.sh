@@ -555,7 +555,13 @@ if [ "$HAVE_SUDO" -eq 1 ]; then
     sudo -n userdel -r "$AK_USER" >/dev/null 2>&1
     sudo -n useradd -m -s /bin/sh "$AK_USER" || die "useradd $AK_USER failed"
 
+    # the home rides the useradd default (0750 on the current distros):
+    # the unprivileged daemon of the %h leg must traverse it, the 755
+    # pins the sftp-jail-e2e shape
+
     AK_HOME=$(eval echo "~$AK_USER")
+
+    sudo -n chmod 755 "$AK_HOME"
 
     echo "== leg 15: the %h token resolves the home of the session user"
 
@@ -588,6 +594,12 @@ if [ "$HAVE_SUDO" -eq 1 ]; then
     printf 'jail-payload\n' > "$WORK/jail-docs-up.txt"
     cp "$WORK/jail-docs-up.txt" "$WORK/jail/docs/up.txt"
     chmod 755 "$WORK/jail" "$WORK/jail/docs"
+
+    # the put lands as the session identity: the docs dir rides its
+    # owner (the jail root stays 755, the writability gate only
+    # refuses the group/world-writable roots)
+
+    sudo -n chown -R "$AK_USER:$AK_USER" "$WORK/jail/docs"
 
     start_srv_sudo -l 127.0.0.1:0 -P "$WORK/passfile" --enable-password-login \
         -o ChrootDirectory="$WORK/jail" ||
@@ -629,30 +641,40 @@ if [ "$HAVE_SUDO" -eq 1 ]; then
 
     echo "== leg 17: the root defaults - no -l no -p serves 443, the bare -l too"
 
-    start_srv_sudo || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+    # the 443 bind needs the port free: a coexisting listener (the
+    # sshd/sshd3 socket unit of the host, the P8 coexistence shape)
+    # keeps the legs out - the SKIP is the honest verdict there
 
-    wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
-
-    if [ "$PORT" = "443" ]; then
-        pass "the default listener bound [::]:443"
+    if ss -u -l 2>/dev/null | grep -q ":443 "; then
+        skip "the 443 default legs: the port is already bound on this host"
     else
-        fail "the default-listener leg: port=$PORT want 443"
+
+        start_srv_sudo || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+        wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
+
+        if [ "$PORT" = "443" ]; then
+            pass "the default listener bound [::]:443"
+        else
+            fail "the default-listener leg: port=$PORT want 443"
+        fi
+
+        stop_srv
+
+        start_srv_sudo -l 127.0.0.1 ||
+            die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+        wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
+
+        if [ "$PORT" = "443" ]; then
+            pass "the bare -l 127.0.0.1 took the 443 default port"
+        else
+            fail "the bare -l leg: port=$PORT want 443"
+        fi
+
+        stop_srv
+
     fi
-
-    stop_srv
-
-    start_srv_sudo -l 127.0.0.1 ||
-        die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
-
-    wait_port || die "no listen port: $(tail -3 "$WORK/srv.log")"
-
-    if [ "$PORT" = "443" ]; then
-        pass "the bare -l 127.0.0.1 took the 443 default port"
-    else
-        fail "the bare -l leg: port=$PORT want 443"
-    fi
-
-    stop_srv
 
 else
     echo "== legs 15-17 (the %h token, the ChrootDirectory jail, the 443"
