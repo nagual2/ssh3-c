@@ -200,7 +200,7 @@ pin_home() {
 wait_tcp() {
     i=0
 
-    while [ "" -lt 150 ]; do
+    while [ "$i" -lt 150 ]; do
 
         if nc -z 127.0.0.1 "$1" > /dev/null 2>&1; then
             return 0
