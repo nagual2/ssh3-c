@@ -897,7 +897,7 @@ static void      s3_cli_escape_suspend(void);
 static void      s3_cli_escape_drop(void);
 static s3_int_t  s3_cli_cfg_load(const char *host);
 static s3_int_t  s3_cli_fwd_parse(const char *arg);
-static s3_int_t  s3_cli_fwd_bind_parse(const char *host, unsigned port, s3_cli_fwd_spec_t *spec);
+static s3_int_t  s3_cli_fwd_bind_parse(const char *host, size_t len, s3_cli_fwd_spec_t *spec);
 static s3_int_t  s3_cli_socks_parse(const char *arg);
 static int       s3_cli_streq_ci(const char *a, const char *b);
 static void      s3_cli_note(const char *fmt, ...);
@@ -4343,7 +4343,7 @@ s3_cli_sftp_read(s3_event_t *ev)
  */
 
 static s3_int_t
-s3_cli_fwd_bind_parse(const char *host, size_t len, unsigned port, s3_cli_fwd_spec_t *spec)
+s3_cli_fwd_bind_parse(const char *host, size_t len, s3_cli_fwd_spec_t *spec)
 {
     char text[128];
     char colon6[64];
@@ -4482,7 +4482,7 @@ s3_cli_fwd_parse(const char *arg)
             *colon = '\0';
 
             if (colon == authority ||
-                s3_cli_fwd_bind_parse(authority, (size_t)(colon - authority), 0, spec) != S3_OK) {
+                s3_cli_fwd_bind_parse(authority, (size_t)(colon - authority), spec) != S3_OK) {
                 fprintf(stderr, "ssh3: -L bind %s is not an address\n", authority);
                 return S3_ERROR;
             }
@@ -4655,7 +4655,7 @@ s3_cli_fwd_parse(const char *arg)
             spec->bind_family = AF_INET;
             spec->bind_addr = htonl(INADDR_LOOPBACK);
 
-        } else if (s3_cli_fwd_bind_parse(bind_f, bind_len, 0, spec) != S3_OK) {
+        } else if (s3_cli_fwd_bind_parse(bind_f, bind_len, spec) != S3_OK) {
             fprintf(stderr, "ssh3: -L bind is not an address: %.*s\n", (int)bind_len, bind_f);
             return S3_ERROR;
         }
@@ -4750,7 +4750,7 @@ s3_cli_socks_parse(const char *arg)
 
     if (colon != NULL) {
 
-        if (s3_cli_fwd_bind_parse(arg, (size_t)(colon - arg), 0, spec) != S3_OK) {
+        if (s3_cli_fwd_bind_parse(arg, (size_t)(colon - arg), spec) != S3_OK) {
             fprintf(stderr, "ssh3: -D bind is not an address: %.*s\n", (int)(colon - arg), arg);
             return S3_ERROR;
         }
@@ -5824,12 +5824,13 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
             }
 
             {
-                u_short port = (u_short)((fc->socks_buf[2] << 8) | fc->socks_buf[3]);
-                u_long  addr = ((u_long)fc->socks_buf[7] << 24) | ((u_long)fc->socks_buf[6] << 16) |
-                              ((u_long)fc->socks_buf[5] << 8) | (u_long)fc->socks_buf[4];
+                unsigned port = (unsigned)((fc->socks_buf[2] << 8) | fc->socks_buf[3]);
+                unsigned addr = ((unsigned)fc->socks_buf[7] << 24) |
+                                ((unsigned)fc->socks_buf[6] << 16) |
+                                ((unsigned)fc->socks_buf[5] << 8) | (unsigned)fc->socks_buf[4];
                 struct in_addr a;
 
-                a.s_addr = (unsigned)addr;
+                a.s_addr = addr;
 
                 if (addr == 0 || port == 0) {
                     s3_cli_fwd_tcp_drop(fc);
