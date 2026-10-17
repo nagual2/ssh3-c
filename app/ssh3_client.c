@@ -2151,6 +2151,10 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
         return S3_ERROR;
     }
 
+    memcpy(tok, seg, tlen);
+    tok[tlen++] = '.';
+    s3_cli_b64url(sig, siglen, tok + tlen);
+
     if (strlen(tok) + strlen("Bearer ") + 1 > cap) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the bearer buffer overflow");
         return S3_ERROR;
