@@ -462,7 +462,7 @@ s3_test_session_env_admit(void)
         {"SHELL", "/bin/sh"},       {"SSH_AUTH_SOCK", "/tmp/agent.socket"},
         {"LANG", "C.UTF-8"},
     };
-    char  big[65];
+    char  big[66]; /* 65 x's, one past the pty-req TERM bound */
     size_t i;
 
     memset(big, 'x', sizeof(big) - 1);
