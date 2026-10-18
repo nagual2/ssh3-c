@@ -1,4 +1,4 @@
-.Dd October 17, 2026
+.Dd October 18, 2026
 .Dt SSH3-SERVER 8
 .Os ssh3-c
 .Sh NAME
@@ -20,7 +20,7 @@
 .Op Fl H Ar dir
 .Op Fl -sftp-jail Cm chroot | lexical
 .Op Fl -url-path Ar path
-.Op Fl -enable-password-login
+.Op Fl -enable-password-login Op Cm on | off
 .Op Fl -password-system Cm on | off
 .Op Fl -oidc-issuer Ar url
 .Op Fl -oidc-audience Ar id
@@ -54,9 +54,12 @@ authorized_keys keys (the conversation binds through the TLS
 .Ev EXPORTER-SSH3
 exporter), or Basic credentials against
 .Pq Fl P
-the password file and, when opted in
+the password file and, when the system verifier is wired
 .Pq Fl -password-system ,
-the unix accounts, with the password login opted into.
+the unix accounts; the password login rides on by default
+.Pq the PasswordAuthentication yes of the sshd canon ,
+the root account never passes the Basic step
+.Pq the PermitRootLogin prohibit-password analog .
 Without any
 .Fl K
 the Bearer JWTs verify against the default identities chain of the
@@ -215,7 +218,9 @@ ALPN protocol name, default
 .It Fl d Ar dg_size
 The max_datagram_frame_size transport parameter, default 1200.
 .It Fl i Ar idle_ms
-QUIC idle timeout in milliseconds, default 60000.
+QUIC idle timeout in milliseconds, default 86400000 (24 h, the ssh2
+idle canon: a silent session lives, a dead peer is the transport
+error alone).
 .It Fl L Ar level
 Log level: a name
 .Pf ( Ql debug ,
@@ -228,11 +233,8 @@ or a numeric s3 level.  An unknown name keeps the default.
 Password file: lines of
 .Li user:secret ;
 the CONNECT passes only with matching Basic credentials AND the
-password login opted into (the
-.Fl -enable-password-login
-flag or
-.Ev SSH3_ENABLE_PASSWORD_LOGIN ,
-the reference default is off).
+password login on (the default, see
+.Fl -enable-password-login ) .
 When the system verifier is wired too
 .Pq Fl -password-system ,
 this file answers first: a user listed in both places follows the
@@ -258,9 +260,17 @@ The CONNECT route, default
 .Fl -url-path ) .
 Must start with a slash; the query part of the request path carries
 the username and does not affect the route.
-.It Fl -enable-password-login
-Opt into the Basic password method
-.Pq the reference enablePasswordLogin .
+.It Fl -enable-password-login Op Cm on | off
+The Basic password login switch
+.Pq the PasswordAuthentication of the sshd canon .
+The bare flag is the explicit on, the value form carries the verdict
+.Pq the Cm on | off | true | false | 1 | 0
+ParseBool shapes of the reference; the default is
+.Cm on
+(the wave 1e), an explicit
+.Cm off
+closes the Basic step with 401 whatever backend is wired
+.Pq the PasswordAuthentication no shape .
 .It Fl -password-system Cm on | off
 The system account verifier of the Basic method (the parity of the
 reference fork 0.1.34 password login): the CONNECT username resolves
@@ -273,17 +283,16 @@ the verdict is the
 .Xr crypt 3
 check.
 The default is
-.Cm off :
-the deployment owner opts in, turning it on exposes the system
-accounts to the Basic brute-force surface (the
+.Cm on
+.Pq the PasswordAuthentication yes of the sshd canon, the wave 1e :
+the system accounts ride the Basic method out of the box; turning it
+off
+.Pq Cm Fl -password-system No off
+closes them to the Basic brute-force surface (the
 .Fl -max-password-failures
 lockout books them the same way as the file backend, the invented
 usernames book nothing).
 An explicit
-.Cm on
-also opts the password login in (no
-.Fl -enable-password-login
-needed), an explicit
 .Cm off
 kills the
 .Ev SSH3_PASSWORD_SYSTEM
@@ -292,6 +301,11 @@ The chain order is fixed: the
 .Fl P
 file answers first, the system accounts second; a wrong password for
 a user known to either backend counts one failure.
+The root account never reaches the backends: the Basic verdict for
+root refuses before any lookup and books nothing (the
+PermitRootLogin prohibit-password analog, hardcoded - the root
+account authenticates by key only, the key and the JWT verdicts
+serve as usual).
 An unprivileged daemon cannot read the shadow: the startup logs a
 warning and every Basic attempt against the system accounts fails
 closed (the decline before any lookup), the file backend serves as
@@ -419,6 +433,24 @@ An empty
 (the default, or the unset
 .Ev SSH3_PERMIT_OPEN )
 keeps the historical unrestricted dial.
+.It Fl -handshake-timeout-ms Ar ms
+The QUIC handshake timeout in milliseconds, default 120000
+.Pq the LoginGraceTime 120 s of the sshd canon, the fork mirror :
+a connection whose TLS handshake stalls longer is closed.
+Zero or a negative value stops the daemon (the config-error shape of
+the
+.Fl -max-password-failures
+refusal).
+.It Fl -max-reverse-forwards Ar n
+The cap on the live reverse
+.Pq Fl R
+listeners of one user, default 10 (the
+.Cm maxReverseForwardsPerUser
+mirror of the fork): every bound listener holds one slot of its
+user's budget for its lifetime, over the cap the bind refuses with
+the REVERSE-CAP-DENIED report before any socket is opened.
+Zero is the explicit unlimited (the pre-1d shape), the hard
+per-conversation budget of 10 stays on top.
 .El
 .Sh PRIVILEGE MODEL
 Two deployment shapes are supported.
@@ -480,19 +512,28 @@ Graceful-shutdown window in seconds, default 5; 0 closes the
 connections immediately, a negative or unparsable value falls back to
 the default.
 .It Ev SSH3_ENABLE_PASSWORD_LOGIN
-With a truthy value
+The ParseBool default of
+.Fl -enable-password-login
 .Pf ( Li 1 ,
 .Li true ,
-.Li t ) ,
-the Basic password method is opted in without the flag; the flag
-overrides it (the reference env default for systemd
+.Li t
+turn the login on,
+.Li 0 ,
+.Li false ,
+.Li f
+turn it off), the flag overrides it (the env default for systemd
 EnvironmentFile installs).
 .It Ev SSH3_PASSWORD_SYSTEM
-With a truthy value
+The ParseBool default of
+.Fl -password-system
 .Pf ( Li 1 ,
 .Li true ,
-.Li t ) ,
-the system account verifier is wired without the flag; the explicit
+.Li t
+wire the verifier,
+.Li 0 ,
+.Li false ,
+.Li f
+close it), the explicit
 .Fl -password-system Cm on | off
 overrides it (the env default for systemd EnvironmentFile installs).
 .It Ev SSH3_MAX_UNAUTH_CONVERSATIONS
