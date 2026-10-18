@@ -45,6 +45,7 @@ jobs:
           tar -xzf "/tmp/ssh3-c_${V}.orig.tar.gz" -C /build
           cp -r "$GITHUB_WORKSPACE/packaging/debian" "/build/ssh3-c-$V/debian"
           cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
+          ls -la /build/ && ls -la "/build/ssh3-c_${V}.orig.tar.gz"
 
       - name: dpkg-buildpackage (source first, then binary)
         run: |
