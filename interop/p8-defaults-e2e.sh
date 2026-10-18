@@ -326,14 +326,15 @@ ssh-keygen -t ed25519 -N "" -C p8-defaults-idle -f "$WORK/id_good" -q || die "ss
 cp "$WORK/id_good.pub" "$WORK/idle_keys"
 
 # the fifo holder keeps the client stdin open with no data (no EOF,
-# no FIN, nothing flows - the idle window runs); the hold covers the
-# old 60 s default with a margin, the SIGKILL reaps the client after
-# (the shell session rides a pre-existing post-EOF spin, the client
-# handles TERM as a flag the spinning loop never reads - the exit
-# code of the reap carries no verdict)
+# no FIN, nothing flows - the idle window runs); the proof window
+# sits between the old 60 s default and the holder's EOF at 90 s -
+# the EOF at t=90 wakes the pre-existing post-EOF shape (the fin,
+# the shell exit, the conversation close), the check at t=71 must
+# never see it; the SIGKILL reaps the client (it handles TERM as a
+# flag the loop never reads)
 
 mkfifo "$WORK/in" || die "mkfifo"
-sleep 70 > "$WORK/in" &
+sleep 90 > "$WORK/in" &
 HOLDPID=$!
 
 START=$(date +%s)
