@@ -5661,7 +5661,7 @@ s3_cli_fwd_socks_fail(s3_cli_fwd_tcp_conn_t *fc, u_char code)
 
     reply[1] = code;
 
-    (void)send(fc->fd, reply, sizeof(reply), 0);
+    (void)send(fc->fd, (const char *) reply, sizeof(reply), 0);
     fc->dead = 1;
 }
 
@@ -5684,7 +5684,7 @@ s3_cli_fwd_socks_ok(s3_cli_fwd_tcp_conn_t *fc, unsigned v4)
     reply[6] = (u_char)((v4 >> 16) & 0xff);
     reply[7] = (u_char)((v4 >> 24) & 0xff);
 
-    (void)send(fc->fd, reply, 8, 0);
+    (void)send(fc->fd, (const char *) reply, 8, 0);
 }
 
 /* the client-side resolve of the socks target (the wire rides the
@@ -5733,7 +5733,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
 
         ssize_t n;
 
-        n = recv(fc->fd, fc->socks_buf + fc->socks_len, sizeof(fc->socks_buf) - fc->socks_len, 0);
+        n = recv(fc->fd, (char *) fc->socks_buf + fc->socks_len, sizeof(fc->socks_buf) - fc->socks_len, 0);
 
         if (n < 0) {
 
@@ -5780,7 +5780,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
             {
                 u_char reply[2] = {5, 0};
 
-                (void)send(fc->fd, reply, sizeof(reply), 0);
+                (void)send(fc->fd, (const char *) reply, sizeof(reply), 0);
             }
 
             fc->socks_len = 0;
@@ -5880,7 +5880,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
 
             fc->t_port = port;
 
-            (void)send(fc->fd, (u_char *)"\005\000\000\001\000\000\000\000\000\000", 10, 0);
+            (void)send(fc->fd, "\005\000\000\001\000\000\000\000\000\000", 10, 0);
 
             fc->socks_len = 0;
             fc->socks_step = 3; /* the bridged shape, no parse left */
