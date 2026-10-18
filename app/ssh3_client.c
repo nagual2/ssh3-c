@@ -8349,7 +8349,7 @@ s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
         return;
     }
 
-    n = send(s3_cli_bridge_b, payload.data, payload.len, 0);
+    n = send(s3_cli_bridge_b, (const char *) payload.data, payload.len, 0);
 
     (void)n; /* a short send is a loss the inner conn recovers from */
 }
@@ -8375,7 +8375,7 @@ s3_cli_jump_bridge_read(s3_event_t *ev)
 
     for (;;) {
 
-        n = recv(s3_cli_bridge_b, s3_cli_bridge_frame + pre, sizeof(s3_cli_bridge_frame) - pre, 0);
+        n = recv(s3_cli_bridge_b, (char *) s3_cli_bridge_frame + pre, sizeof(s3_cli_bridge_frame) - pre, 0);
 
         if (n < 0) {
 
