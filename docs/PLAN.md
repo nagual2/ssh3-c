@@ -150,7 +150,8 @@
 | F3 | arm64/arm deb+rpm | реальный спрос на arm-хосты (кросс-toolchain + arm64 OpenSSL job) |
 | F4 | darwin клиент | macos-раннер + OpenSSL darwin, при спросе |
 | F5 | windows arm64 exe | ниша |
-| F6 | FreeBSD/OpenBSD порты | kqueue-модуль (один на обе BSD) + vmactions-CI + pkg-OpenSSL + crypt_r fallback — при спросе; разведка VM первой |
+| F6 | FreeBSD порт | kqueue-модуль + vmactions-CI + pkg-OpenSSL 3.5 + crypt_r fallback — при спросе; разведка VM первой |
+| F6a | OpenBSD порт | kqueue-модуль (общий с F6) + crypt_r fallback — **пакета не будет**, пока системная политика TLS не изменится: в base — LibreSSL без QUIC TLS API, QUIC только через ports-OpenSSL 3.5 (линковка против ports не даёт пакетного пути) | при изменении политики TLS OpenBSD / появлении ports-OpenSSL 3.5 в статусе base-совместимости |
 | F7 | go: darwin CM unit-тесты | macos-раннер |
 
 **Календарь:** Mint 23 (base Ubuntu 26.04, OpenSSL 3.5.5) — декабрь 2026: апгрейд минисфорума (не в день релиза; полный бэкап) → RFS-пакеты напрямую, бандл-необходимость отпадает. WSL recreate на Ubuntu 26.04 — опция владельца. До вех хосты живут на bundled-канале 0.4.1-1 (server+client).
