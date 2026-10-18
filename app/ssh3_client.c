@@ -100,6 +100,7 @@ typedef unsigned short u_short;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 
 #include <openssl/bio.h>
@@ -242,9 +243,12 @@ static s3_connection_t   *s3_cli_ctrl; /* the CONNECT stream */
 static s3_connection_t   *s3_cli_chan; /* the session channel */
 static s3_quic_conf_t     s3_cli_conf;
 static uint64_t           s3_cli_conv_id;
-static struct sockaddr_in s3_cli_sa;
-static unsigned           s3_cli_phase;
-static s3_msec_t          s3_cli_deadline;
+/* the dial peer, the family rides -4/-6 (the storage carries the v6
+ * form, the socklen follows the family) */
+static struct sockaddr_storage s3_cli_sa;
+static socklen_t               s3_cli_sa_len;
+static unsigned                s3_cli_phase;
+static s3_msec_t               s3_cli_deadline;
 
 /* the bring-up facts the main loop acts on */
 
@@ -273,7 +277,124 @@ static char        s3_cli_basic[512];
 static char        s3_cli_bearer[2048];
 static const char *s3_cli_auth_value;
 static char       *s3_cli_cmd; /* the joined exec text, NULL = shell */
-static unsigned    s3_cli_verbose;
+
+/*
+ * the ssh(1)-canon option states (P8 wave 1): the "have" flags track
+ * the explicit command-line sets, the -F config applies only to the
+ * unset ones (the CLI wins); the pending note queue carries the
+ * deprecated warnings so -q still silences them when it rides after
+ * the deprecated flag in the argv
+ */
+
+static unsigned s3_cli_have_user;    /* -l, -o User= or the operand user@ */
+static unsigned s3_cli_have_port;    /* -p or -o Port= */
+static unsigned s3_cli_port_operand; /* the operand carried its own port */
+static unsigned s3_cli_have_keyfile; /* -i or -o IdentityFile= */
+static unsigned s3_cli_have_escape;  /* -e or -o EscapeChar= */
+static unsigned s3_cli_have_strict;  /* -o strict-host-key-checking= */
+static unsigned s3_cli_have_master;  /* -M or -o ControlMaster= */
+static unsigned s3_cli_have_agent;   /* -A/-X or -o ForwardAgent= */
+static unsigned s3_cli_have_jump;    /* -J jump or -o ProxyJump= */
+static unsigned s3_cli_vcount;       /* the -v counter (1 info, 2 debug, 3+ all) */
+static unsigned s3_cli_quiet;        /* -q seen */
+static unsigned s3_cli_level_explicit; /* -v or --log-level seen, quiet yields */
+
+static char s3_cli_login[128]; /* the -l user, the operand wins on a conflict */
+
+/* the escape char of the interactive session, -1 disabled ("none") */
+
+static int s3_cli_escape_ch = '~';
+
+/* the address family of the dial, AF_INET default (the v4 shape of
+ * this port, documented), -4 pins it, -6 rides the v6 dial */
+
+static int s3_cli_family = AF_INET;
+
+/* -N holds the forwards without the session channel, -n leaves the
+ * stdin unpumped, the pty policy rides -t/-tt/-T (0 auto keeps the
+ * stage-A behavior exact) */
+
+static unsigned s3_cli_no_session;
+static unsigned s3_cli_no_stdin;
+
+enum {
+    S3_CLI_PTY_AUTO = 0, /* the console pty, the pipe 80x24 force */
+    S3_CLI_PTY_FORCE,    /* -t: a local tty is required */
+    S3_CLI_PTY_FORCE_NOTTY, /* -tt: the pty rides even without a local one */
+    S3_CLI_PTY_NEVER     /* -T: no pty-req at all */
+};
+
+static unsigned s3_cli_pty_mode;
+static unsigned s3_cli_pty_tcount; /* -tt wins over the first -t */
+
+/* the -F config file: NULL = the default path, empty text = disabled
+ * (-F none, -F /dev/null) */
+
+static char s3_cli_cfg_path[1024];
+static unsigned s3_cli_cfg_off;
+static unsigned s3_cli_cfg_explicit; /* the -F file rides, the default one may miss */
+
+/* the subsystem name of -s: only "sftp" is served, the transfer
+ * specifier then rides the first positional word */
+
+static unsigned s3_cli_sftp_spec_mode;
+
+/* the pending notes: the deprecated warnings queue here, the end of
+ * the parse flushes them unless -q silenced the run */
+
+#define S3_CLI_NOTES_MAX 16
+
+static char *s3_cli_notes[S3_CLI_NOTES_MAX];
+static unsigned s3_cli_notes_n;
+
+/* the -J jump spec ([user@]host[:port], one hop) and the tunnel state
+ * (the interop shape: the direct-udp channel of the jump conversation
+ * bridges the inner datagrams through a loopback socket pair) */
+
+#define S3_CLI_JUMP_INNER_MTU  1200
+#define S3_CLI_JUMP_DGRAM_SIZE 1352
+#define S3_CLI_JUMP_DGRAM_MIN  1202
+
+/* the phase 1 deadline (the tunnel bring-up), the wrong jump host
+ * refuses inside it */
+
+#define S3_CLI_JUMP_TIMEOUT 10000
+
+static unsigned s3_cli_jump_on;
+static char     s3_cli_jump_user[128];
+static char     s3_cli_jump_host[256];
+static unsigned s3_cli_jump_port; /* 0 asks the 443 default at the resolve */
+static char     s3_cli_jump_target[384];
+static char     s3_cli_jump_bearer[2048];
+static const char *s3_cli_jump_auth; /* the jump CONNECT auth value */
+
+static struct sockaddr_in s3_cli_jump_sa;
+
+static s3_connection_t *s3_cli_jump_cli;    /* the jump udp connection */
+static s3_quic_conf_t   s3_cli_jump_conf;
+static s3_connection_t *s3_cli_jump_stream; /* the CONNECT stream */
+static s3_connection_t *s3_cli_jump_channel;
+static uint64_t         s3_cli_jump_conv_id;
+static uint64_t         s3_cli_jump_ch_id;
+static unsigned         s3_cli_jump_hs;
+static unsigned         s3_cli_jump_req_sent;
+static unsigned         s3_cli_jump_ch_sent;
+static unsigned         s3_cli_jump_ch_confirmed;
+
+/* the receive accumulator of the jump channel (the 91 confirmation) */
+
+static u_char s3_cli_jump_ch_buf[64];
+static size_t s3_cli_jump_ch_len;
+
+/* the loopback socket pair: a is the inner quic fd, b is the tunnel
+ * side the bridge reads */
+
+static SOCKET            s3_cli_bridge_a = INVALID_SOCKET;
+static SOCKET            s3_cli_bridge_b = INVALID_SOCKET;
+static s3_connection_t  *s3_cli_bridge_bc;
+static struct sockaddr_in s3_cli_bridge_sa;
+static u_char            s3_cli_bridge_frame[2048];
+static size_t            s3_cli_bridge_parked;
 
 /*
  * the -o options (the backlog 7, the fork keys, case-insensitive):
@@ -336,8 +457,9 @@ static unsigned s3_cli_ch_confirmed;
 /* === the -L forwards (the stage B): the local listeners bridge into
  * the direct-tcp/direct-udp channels of the CONNECT conversation === */
 
-#define S3_CLI_FWD_TCP 1
-#define S3_CLI_FWD_UDP 2
+#define S3_CLI_FWD_TCP   1
+#define S3_CLI_FWD_UDP   2
+#define S3_CLI_FWD_SOCKS 3 /* the -D dynamic forward, the SOCKS listener */
 
 /* the spec and the concurrent shapes the client budget allows */
 
@@ -362,12 +484,14 @@ static unsigned s3_cli_ch_confirmed;
 #define S3_CLI_FWD_UDP_DATAGRAM 1200
 
 typedef struct {
-    unsigned kind;      /* S3_CLI_FWD_TCP or S3_CLI_FWD_UDP */
-    unsigned bind_addr; /* the network order ipv4 */
+    unsigned kind;      /* S3_CLI_FWD_TCP, S3_CLI_FWD_UDP or S3_CLI_FWD_SOCKS */
+    unsigned bind_family; /* AF_INET or AF_INET6, the listener socket */
+    unsigned bind_addr; /* the network order ipv4 (AF_INET binds) */
+    u_char   bind_v6[16];
     unsigned bind_port;
     unsigned target_addr; /* the network order ipv4 of the target */
     unsigned target_port;
-    char     text[128]; /* the tcp://bind:port/host:port shape of the logs */
+    char     text[128]; /* the spec shape of the logs */
 } s3_cli_fwd_spec_t;
 
 static s3_cli_fwd_spec_t s3_cli_fwd_specs[S3_CLI_FWD_MAX];
@@ -376,6 +500,13 @@ static unsigned          s3_cli_fwd_ready;
 
 /* one local tcp connection of a tcp forward: the channel opens per
  * accepted socket, both directions park and drain on the tick */
+
+/* the socks handshake states of the -D conn (the bridge arms after
+ * the target request answers) */
+
+#define S3_CLI_SOCKS_STEP_GREET 0
+#define S3_CLI_SOCKS_STEP_REQ   1
+#define S3_CLI_SOCKS_STEP_V4    2
 
 typedef struct {
     unsigned         used;
@@ -403,6 +534,14 @@ typedef struct {
     u_char          *to_local; /* the parked local bytes */
     size_t           to_local_len;
     size_t           to_local_cap;
+    /* the -D socks leg: the per-conn handshake state and the per-conn
+     * target (the request names it, the spec holds the listener) */
+    unsigned socks;
+    unsigned socks_step;
+    unsigned t_addr;
+    unsigned t_port;
+    u_char   socks_buf[320];
+    size_t   socks_len;
 } s3_cli_fwd_tcp_conn_t;
 
 static s3_cli_fwd_tcp_conn_t s3_cli_fwd_conns[S3_CLI_FWD_TCP_CONNS];
@@ -749,7 +888,30 @@ static s3_event_t *s3_cli_tick;
 
 static unsigned s3_cli_rc;
 
-static void      s3_cli_usage(const char *prog);
+static void     s3_cli_usage(const char *prog);
+static unsigned s3_cli_escape_live(void);
+static void      s3_cli_note(const char *fmt, ...);
+static void      s3_cli_notes_flush(void);
+static char     *s3_cli_join_words(char **argv, size_t first, size_t argc);
+static s3_int_t  s3_cli_sftp_spec_parse(const char *rest);
+static s3_int_t  s3_cli_jump_parse(const char *spec);
+static s3_int_t  s3_cli_escape_parse(const char *arg);
+static size_t    s3_cli_escape_feed(const u_char *src, size_t n, u_char *dst);
+static void      s3_cli_escape_list_forwards(void);
+static void      s3_cli_escape_suspend(void);
+static void      s3_cli_escape_drop(void);
+static s3_int_t  s3_cli_cfg_load(const char *host);
+static s3_int_t  s3_cli_fwd_parse(const char *arg);
+static s3_int_t  s3_cli_fwd_bind_parse(const char *host, size_t len, s3_cli_fwd_spec_t *spec);
+static s3_int_t  s3_cli_socks_parse(const char *arg);
+static int       s3_cli_streq_ci(const char *a, const char *b);
+static void      s3_cli_note(const char *fmt, ...);
+static unsigned  s3_cli_escape_live(void);
+static void      s3_cli_operand_host(const char *src, size_t len);
+static s3_int_t  s3_cli_cfg_pattern_match(const char *pat, const char *host);
+static unsigned  s3_cli_cfg_host_block(const char *patterns, const char *host);
+static s3_int_t  s3_cli_cfg_fwd_join(char *out, size_t cap, const char *val);
+static s3_int_t  s3_cli_cfg_apply(const char *key, const char *val);
 static void      s3_cli_b64std(const u_char *src, size_t len, char *dst);
 static void      s3_cli_b64url(const u_char *src, size_t len, char *dst);
 static size_t    s3_cli_b64dec(const char *src, u_char *dst, size_t cap);
@@ -806,6 +968,9 @@ static void     s3_cli_sftp_read(s3_event_t *ev);
 static s3_int_t s3_cli_fwd_parse(const char *arg);
 static s3_int_t s3_cli_fwd_listeners_start(void);
 static void     s3_cli_fwd_tcp_accept(s3_event_t *ev);
+static void     s3_cli_fwd_socks_accept(s3_event_t *ev);
+static void     s3_cli_fwd_socks_local_read(s3_event_t *ev);
+static s3_int_t s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_addr, unsigned t_port);
 static void     s3_cli_fwd_tcp_local_read(s3_event_t *ev);
 static void     s3_cli_fwd_tcp_chan_read(s3_event_t *ev);
 static void     s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc);
@@ -829,6 +994,14 @@ static void     s3_cli_agent_accept(s3_connection_t *c);
 static void     s3_cli_agent_read(s3_event_t *ev);
 static void     s3_cli_agent_teardown(const char *why);
 static void     s3_cli_agent_pump(void);
+static void     s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data);
+static void     s3_cli_jump_bridge_read(s3_event_t *ev);
+static void     s3_cli_jump_bridge_flush(void);
+static s3_int_t s3_cli_jump_bridge_create(s3_event_ctx_t *ctx);
+static void     s3_cli_jump_ch_read(s3_event_t *ev);
+static size_t   s3_cli_jump_h3_section(u_char *p);
+static s3_int_t s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap);
+static s3_int_t s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout);
 #if (S3_WIN32)
 static void s3_cli_cm_acc_push(HANDLE h);
 static unsigned __stdcall s3_cli_cm_accept_thread(void *arg);
@@ -869,60 +1042,93 @@ s3_cli_usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s [options] [user@]host[:port][/path] [command...]\n"
+            "\n the ssh(1) canon:\n"
+            "  -4 | -6     the address family of the dial (the v4 default)\n"
+            "  -A          the agent forwarding: the server-initiated\n"
+            "              agent-connection channels bridge into the local agent\n"
+#if (S3_WIN32)
+            "              pipe (SSH_AUTH_SOCK when it names a pipe, the OpenSSH\n"
+            "              for Windows agent pipe otherwise)\n"
+#else
+            "              socket (the SSH_AUTH_SOCK of the session)\n"
+#endif
+            "  -D [bind:]port  the dynamic (SOCKS5, SOCKS4 fallback) forward:\n"
+            "              the local listener answers the CONNECT requests and\n"
+            "              bridges every target into a direct-tcp channel\n"
+            "              (repeatable, the bind defaults to 127.0.0.1)\n"
+            "  -e char     the escape character of the interactive session\n"
+            "              (the default ~, ^x is the control code, none is off;\n"
+            "              at a line start: . drops, ^Z suspends, # lists the\n"
+            "              forwards, V version, ? help, ~~ rides literal)\n"
+            "  -F file     the ssh_config (the default ~/.ssh/config reads\n"
+            "              when it exists; none or /dev/null disables; the\n"
+            "              keys: HostName, Port, User, IdentityFile,\n"
+            "              ForwardAgent, LocalForward, RemoteForward,\n"
+            "              DynamicForward, ProxyJump, EscapeChar,\n"
+            "              StrictHostKeyChecking, ControlMaster, ControlPath,\n"
+            "              ControlPersist)\n"
             "  -i keyfile  pubkey auth: sign the Bearer JWT with the PEM private\n"
-            "              key (ed25519, P-256 or RSA); the username rides the\n"
-            "              user@ part of the operand\n"
-            "  -U user:pass  Basic auth (RFC 7617), the ?user= of the target\n"
-            "  -J put|get:local:remote  the sftp transfer (get: local first);\n"
-            "              with -r the -r forms recurse over the tree (a colon\n"
-            "              beyond the Windows drive letter ends the paths)\n"
-            "  -r          with -J: the recursive transfer\n"
-            "  -L tcp://[bind:]port/host/port  the local tcp forward: every\n"
-            "              accepted connection rides a direct-tcp channel of the\n"
-            "              same conversation to the ipv4 target; udp:// likewise\n"
-            "              over the datagrams (the bind defaults to 127.0.0.1)\n"
+            "              key (ed25519, P-256 or RSA)\n"
+            "  -J [user@]host[:port]  the proxy jump (one hop, the comma chain\n"
+            "              refuses)\n"
+            "  -l login    the login name (the operand user wins on a conflict)\n"
+            "  -L [bind:]port:host:hostport  the local tcp forward: every\n"
+            "              accepted connection rides a direct-tcp channel of\n"
+            "              the same conversation to the target (repeatable,\n"
+            "              the bind defaults to 127.0.0.1, the bracketed ipv6\n"
+            "              bind rides)\n"
+            "  -M          the control master: the control socket serves the\n"
+            "              slaves and the ops, the sessions ride the same\n"
+            "              connection\n"
+            "  -n          the stdin stays /dev/null (no pump)\n"
+            "  -N          no session, the forwards hold the run\n"
+            "  -O check|stop|exit  the control op against the -S master\n"
+            "  -p port     the port of the target (the default 443)\n"
+            "  -q          quiet: the errors only\n"
             "  -R [bind:]port[/tcp|/udp]:host:port  the reverse forward: the\n"
             "              server binds the port and mirrors every accepted\n"
             "              connection or datagram back into the client-side\n"
             "              target (repeatable, the ephemeral 0 asks the\n"
             "              server-chosen port, the run holds like -L)\n"
-            "  -o Key=Value  the client option (repeatable, case-insensitive):\n"
-            "              insecure yes|no accepts any server certificate (the\n"
-            "              known_hosts pin store is skipped),\n"
-            "              strict-host-key-checking yes|no|accept-new picks the\n"
-            "              unknown-host policy (yes refuses at once, no accepts\n"
-            "              without a pin, accept-new is the default TOFU)\n"
-            "  -X          the agent forwarding: the server-initiated\n"
-            "              agent-connection channels bridge into the local agent\n"
-#if (S3_WIN32)
-            "              pipe (SSH_AUTH_SOCK when it names a pipe, the OpenSSH\n"
-            "              for Windows agent pipe otherwise)\n"
-            "  -M          the control master: the control pipe serves the\n"
-            "              slaves and the ops, the sessions ride the same\n"
-            "              connection (the pipe name derives from %%USERPROFILE%%,\n"
-            "              printed at the start)\n"
-            "  -U value    user:pass for the Basic auth, or a \\\\\\\\pipe\\\\name of\n"
-            "              the control master for the slave and the ops\n"
-#else
-            "              socket (the SSH_AUTH_SOCK of the session)\n"
-            "  -M          the control master: the control socket serves the\n"
-            "              slaves and the ops, the sessions ride the same\n"
-            "              connection (the socket path derives from the home\n"
-            "              directory, printed at the start)\n"
-            "  -U value    user:pass for the Basic auth, or a socket path of\n"
-            "              the control master for the slave and the ops\n"
-#endif
-            "  -e cmd      the slave command: one exec session through the\n"
-            "              control master of -U (no server operand rides)\n"
-            "  -O check|stop|exit  the control op against the -U master\n"
-            "  -v          verbose logging\n"
-            "  -l lvl      the s3 log level 0..9 or all\n"
+            "  -s subsystem  only sftp is served: the put|get:local:remote\n"
+            "              specifier rides the first word after the operand\n"
+            "  -S path     the control master socket (the master, the slave\n"
+            "              and the ops; the slave command rides the positional\n"
+            "              words: %s -S path [words...])\n"
+            "  -t | -tt    force the pty (-tt even without a local tty)\n"
+            "  -T          never request the pty\n"
             "  -V          version\n"
             "  -h          this help\n"
+            "  -v          verbose (repeatable: -vv debug, -vvv everything)\n"
+            "  -o Key=Value  the client option (repeatable, case-insensitive):\n"
+            "              insecure, strict-host-key-checking, forwardagent,\n"
+            "              port, user, identityfile, localforward,\n"
+            "              remoteforward, dynamicforward, proxyjump,\n"
+            "              escapechar, controlmaster, controlpath,\n"
+            "              controlpersist; the unknown key refuses with the\n"
+            "              list (exit 255)\n"
+            "  -x | -Y     accepted, ignored (no X11)\n"
+            "\n the deprecated aliases (the legacy shapes ride):\n"
+            "  -X          the agent forwarding (use -A)\n"
+            "  -J put|get:local:remote  the sftp transfer (use --sftp)\n"
+            "  -U path     the control master socket (use -S)\n"
+            "  -L tcp://[bind:]port/host/port  the legacy local forward\n"
+            "              (use -L port:host:hostport)\n"
+            "\n the project extensions (no ssh2 twin):\n"
+            "  -L udp://[bind:]port/host/port  the local udp forward over the\n"
+            "              datagrams\n"
+            "  -R ...[/tcp|/udp]  the reverse protocol infix (the tcp default)\n"
+            "  -U user:pass  the Basic auth (RFC 7617), the ?user= of the\n"
+            "              target (the HTTP spec keeps its own head)\n"
+            "  -r          with the transfers: the recursive tree\n"
+            "  --log-level 0..9|all  the s3 log level\n"
+            "  --sftp put|get:local:remote  the transfer (get: local first)\n"
+            "  --help      this help\n"
+            "  -C          accepted, ignored (no compression)\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
             " certificate pins into %s\n",
-            prog, S3_CLI_KH_LABEL);
+            prog, prog, S3_CLI_KH_LABEL);
 }
 
 /*
@@ -1781,7 +1987,7 @@ s3_cli_openssh_key(const char *buf)
  */
 
 static s3_int_t
-s3_cli_jwt_build(SSL *ssl)
+s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
 {
     static const char label[] = "EXPORTER-SSH3";
 
@@ -1919,7 +2125,7 @@ s3_cli_jwt_build(SSL *ssl)
     plen = (size_t)snprintf(payload, sizeof(payload),
                             "{\"iss\":\"%s\",\"iat\":%lld,\"exp\":%lld,\"sub\":\"ssh3\","
                             "\"aud\":\"unused\",\"client_id\":\"ssh3-%s\",\"jti\":\"%s\"}",
-                            s3_cli_user, iat, exp, s3_cli_user, jti);
+                            user, iat, exp, user, jti);
 
     if (hlen >= sizeof(header) || plen >= sizeof(payload)) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the claim buffers overflow");
@@ -1955,7 +2161,26 @@ s3_cli_jwt_build(SSL *ssl)
     tok[tlen++] = '.';
     s3_cli_b64url(sig, siglen, tok + tlen);
 
-    snprintf(s3_cli_bearer, sizeof(s3_cli_bearer), "Bearer %s", tok);
+    if (strlen(tok) + strlen("Bearer ") + 1 > cap) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the bearer buffer overflow");
+        return S3_ERROR;
+    }
+
+    snprintf(out, cap, "Bearer %s", tok);
+
+    return S3_OK;
+}
+
+/* the main conversation wrapper: the JWT rides the live TLS exporter
+ * and feeds the session auth value */
+
+static s3_int_t
+s3_cli_jwt_build(SSL *ssl)
+{
+    if (s3_cli_jwt_build_user(ssl, s3_cli_user, s3_cli_bearer, sizeof(s3_cli_bearer)) != S3_OK) {
+        return S3_ERROR;
+    }
+
     s3_cli_auth_value = s3_cli_bearer;
 
     return S3_OK;
@@ -1978,16 +2203,15 @@ s3_cli_h3_field_l(u_char *p, const char *name, const char *value)
  * the extended CONNECT request section: a zero prefix plus the
  * literal field lines, it decodes against any peer QPACK state (the
  * harness shape); the :authority carries the real host:port, the
- * :path the ?user= target
+ * :path the ?user= target; the jump conversation reuses the same
+ * shape with its own authority, target and auth (the bearer of the
+ * jump exporter)
  */
 
 static size_t
-s3_cli_h3_section(u_char *p)
+s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const char *auth)
 {
     u_char *start = p;
-    char    authority[320];
-
-    snprintf(authority, sizeof(authority), "%s:%u", s3_cli_host, s3_cli_port);
 
     if (p == NULL) {
         size_t n = (size_t)s3_h3_encode_field_section_prefix(NULL, 0, 0, 0);
@@ -1996,11 +2220,11 @@ s3_cli_h3_section(u_char *p)
         n += (size_t)s3_cli_h3_field_l(NULL, ":protocol", "ssh3");
         n += (size_t)s3_cli_h3_field_l(NULL, ":scheme", "https");
         n += (size_t)s3_cli_h3_field_l(NULL, ":authority", authority);
-        n += (size_t)s3_cli_h3_field_l(NULL, ":path", s3_cli_target);
+        n += (size_t)s3_cli_h3_field_l(NULL, ":path", target);
         n += (size_t)s3_cli_h3_field_l(NULL, "user-agent", S3_SSH3_VERSION_STRING);
 
-        if (s3_cli_auth_value != NULL) {
-            n += (size_t)s3_cli_h3_field_l(NULL, "authorization", s3_cli_auth_value);
+        if (auth != NULL) {
+            n += (size_t)s3_cli_h3_field_l(NULL, "authorization", auth);
         }
 
         return n;
@@ -2011,24 +2235,542 @@ s3_cli_h3_section(u_char *p)
     p = (u_char *)s3_cli_h3_field_l(p, ":protocol", "ssh3");
     p = (u_char *)s3_cli_h3_field_l(p, ":scheme", "https");
     p = (u_char *)s3_cli_h3_field_l(p, ":authority", authority);
-    p = (u_char *)s3_cli_h3_field_l(p, ":path", s3_cli_target);
+    p = (u_char *)s3_cli_h3_field_l(p, ":path", target);
     p = (u_char *)s3_cli_h3_field_l(p, "user-agent", S3_SSH3_VERSION_STRING);
 
-    if (s3_cli_auth_value != NULL) {
-        p = (u_char *)s3_cli_h3_field_l(p, "authorization", s3_cli_auth_value);
+    if (auth != NULL) {
+        p = (u_char *)s3_cli_h3_field_l(p, "authorization", auth);
     }
 
     return (size_t)(p - start);
 }
 
+static size_t
+s3_cli_h3_section(u_char *p)
+{
+    char authority[320];
+
+    snprintf(authority, sizeof(authority), "%s:%u", s3_cli_host, s3_cli_port);
+
+    return s3_cli_h3_section_ex(p, authority, s3_cli_target, s3_cli_auth_value);
+}
+
+/* the jump CONNECT section: the jump host authority, the jump target
+ * (?user= of the jump login) and the jump auth value */
+
+static size_t
+s3_cli_jump_h3_section(u_char *p)
+{
+    char authority[320];
+
+    snprintf(authority, sizeof(authority), "%s:%u", s3_cli_jump_host, s3_cli_jump_port);
+
+    return s3_cli_h3_section_ex(p, authority, s3_cli_jump_target, s3_cli_jump_auth);
+}
+
 /*
- * the -o option parser (the backlog 7, the fork keys): the key and
- * the value split on the first =, both lowercased for the compare
- * (the case-insensitivity of the fork); an unknown key or a bad
- * value refuses with the supported list (the caller exits 255)
+ * the ssh_config host pattern of the -F loader: the exact name, the
+ * `*` and `?` wildcards, case-insensitive (the bracket classes stay
+ * out, the common shapes cover); S3_OK on a match.  The recursion
+ * rides the NUL-terminated pattern tail (the caller bound the copy)
  */
 
-static const char s3_cli_opt_keys[] = "insecure, strict-host-key-checking";
+static s3_int_t
+s3_cli_cfg_pattern_match(const char *pat, const char *host)
+{
+    size_t i, j = 0;
+
+    for (i = 0; pat[i] != '\0'; i++) {
+
+        char pc = pat[i], hc = host[j];
+
+        if (pc >= 'A' && pc <= 'Z') {
+            pc = (char)(pc - 'A' + 'a');
+        }
+
+        if (hc >= 'A' && hc <= 'Z') {
+            hc = (char)(hc - 'A' + 'a');
+        }
+
+        if (pc == '*') {
+
+            size_t k;
+
+            if (pat[i + 1] == '\0') {
+                return 1; /* the trailing star spans the rest */
+            }
+
+            for (k = j;; k++) {
+
+                if (s3_cli_cfg_pattern_match(pat + i + 1, host + k) == 1) {
+                    return 1;
+                }
+
+                if (host[k] == '\0') {
+                    return 0;
+                }
+            }
+        }
+
+        if (hc == '\0') {
+            return 0;
+        }
+
+        if (pc != '?' && pc != hc) {
+            return 0;
+        }
+
+        j++;
+    }
+
+    return (host[j] == '\0');
+}
+
+/*
+ * the -F config loader (the mini ssh_config): the Host blocks pick
+ * the keys, the first obtained value wins per key (the ssh2 shape),
+ * the command-line sets stay (the CLI wins), the forwards append;
+ * the keys: HostName, Port, User, IdentityFile, ForwardAgent,
+ * LocalForward, RemoteForward, DynamicForward, ProxyJump, EscapeChar,
+ * StrictHostKeyChecking, ControlMaster, ControlPath, ControlPersist;
+ * the unknown keys ignore silently.  The host name rides the operand
+ * (the HostName substitution lands after the match)
+ */
+
+static unsigned
+s3_cli_cfg_host_block(const char *patterns, const char *host)
+{
+    unsigned matched = 0, negated = 0;
+    const char *p = patterns;
+
+    while (*p != '\0') {
+
+        const char *f = p;
+
+        while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') {
+            p++;
+        }
+
+        if (p > f) {
+
+            if (*f == '!') {
+                negated |= (s3_cli_cfg_pattern_match(f + 1, host) == 1) ? 1u : 0u;
+            } else {
+                matched |= (s3_cli_cfg_pattern_match(f, host) == 1) ? 1u : 0u;
+            }
+        }
+
+        while (*p == ',' || *p == ' ' || *p == '\t') {
+            p++;
+        }
+    }
+
+    return (matched && !negated) ? 1u : 0u;
+}
+
+static s3_int_t
+s3_cli_cfg_apply(const char *key, const char *val)
+{
+    if (s3_cli_streq_ci(key, "hostname") == 0) {
+
+        if (strlen(val) >= sizeof(s3_cli_host)) {
+            fprintf(stderr, "ssh3: the config HostName is too long\n");
+            return S3_ERROR;
+        }
+
+        snprintf(s3_cli_host, sizeof(s3_cli_host), "%s", val);
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "port") == 0) {
+
+        unsigned v = (unsigned)atoi(val);
+
+        if (v == 0 || v > 65535) {
+            fprintf(stderr, "ssh3: the config Port wants 1..65535\n");
+            return S3_ERROR;
+        }
+
+        if (!s3_cli_have_port && !s3_cli_port_operand) {
+            s3_cli_port = v;
+        }
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "user") == 0) {
+
+        if (!s3_cli_have_user && strlen(val) < sizeof(s3_cli_user)) {
+            snprintf(s3_cli_user, sizeof(s3_cli_user), "%s", val);
+            s3_cli_have_user = 1;
+        }
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "identityfile") == 0) {
+
+        if (s3_cli_have_keyfile) {
+            return S3_OK; /* the first identity wins */
+        }
+
+        if (strlen(val) >= sizeof(s3_cli_keyfile)) {
+            fprintf(stderr, "ssh3: the config IdentityFile is too long\n");
+            return S3_ERROR;
+        }
+
+        /* the ~/ head expands against the home (the ssh2 shape) */
+
+        if (val[0] == '~' && (val[1] == '/' || val[1] == '\0')) {
+
+#if (S3_WIN32)
+            const char *home = getenv("USERPROFILE");
+#else
+            const char *home = getenv("HOME");
+#endif
+
+            if (home != NULL) {
+                snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s%s", home, val + 1);
+            } else {
+                snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s", val + 1);
+            }
+
+        } else {
+            snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s", val);
+        }
+
+        s3_cli_auth = S3_CLI_AUTH_PUBKEY;
+        s3_cli_have_keyfile = 1;
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "forwardagent") == 0) {
+
+        if (!s3_cli_have_agent &&
+            (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "1") == 0)) {
+            s3_cli_agent_mode = 1;
+            s3_cli_have_agent = 1;
+        }
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "localforward") == 0) {
+
+        char joined[300];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config LocalForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_fwd_parse(joined);
+    }
+
+    if (s3_cli_streq_ci(key, "remoteforward") == 0) {
+
+        char joined[600];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config RemoteForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_rev_parse_spec(joined);
+    }
+
+    if (s3_cli_streq_ci(key, "dynamicforward") == 0) {
+
+        char joined[300];
+
+        if (s3_cli_cfg_fwd_join(joined, sizeof(joined), val) != S3_OK) {
+            fprintf(stderr, "ssh3: the config DynamicForward is too long\n");
+            return S3_ERROR;
+        }
+
+        return s3_cli_socks_parse(joined);
+    }
+
+    if (s3_cli_streq_ci(key, "proxyjump") == 0) {
+
+        if (s3_cli_have_jump) {
+            return S3_OK;
+        }
+
+        if (s3_cli_streq_ci(val, "none") == 0) {
+            s3_cli_jump_on = 0;
+            s3_cli_have_jump = 1;
+            return S3_OK;
+        }
+
+        return s3_cli_jump_parse(val);
+    }
+
+    if (s3_cli_streq_ci(key, "escapechar") == 0) {
+
+        if (!s3_cli_have_escape) {
+            return s3_cli_escape_parse(val);
+        }
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "stricthostkeychecking") == 0) {
+
+        if (s3_cli_have_strict) {
+            return S3_OK;
+        }
+
+        if (s3_cli_streq_ci(val, "yes") == 0) {
+            s3_cli_opt_strict = S3_CLI_SHK_YES;
+
+        } else if (s3_cli_streq_ci(val, "no") == 0) {
+            s3_cli_opt_strict = S3_CLI_SHK_NO;
+
+        } else if (s3_cli_streq_ci(val, "accept-new") == 0) {
+            s3_cli_opt_strict = S3_CLI_SHK_ACCEPT_NEW;
+        }
+
+        s3_cli_have_strict = 1;
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "controlmaster") == 0) {
+
+        if (s3_cli_have_master) {
+            return S3_OK;
+        }
+
+        if (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "auto") == 0 ||
+            strcmp(val, "1") == 0) {
+
+            if (s3_cli_streq_ci(val, "auto") == 0) {
+                s3_cli_note("ssh3: ControlMaster=auto is not implemented yet, acting as yes");
+            }
+
+            s3_cli_cm_master = 1;
+            s3_cli_have_master = 1;
+        }
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "controlpath") == 0) {
+
+        if (s3_cli_cm_path[0] != '\0') {
+            return S3_OK;
+        }
+
+        if (strlen(val) >= sizeof(s3_cli_cm_path)) {
+            fprintf(stderr, "ssh3: the config ControlPath is too long\n");
+            return S3_ERROR;
+        }
+
+        memcpy(s3_cli_cm_path, val, strlen(val) + 1);
+        s3_cli_cm_pipe_name_called = 1;
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "controlpersist") == 0) {
+
+        if (s3_cli_streq_ci(val, "no") == 0 || strcmp(val, "0") == 0) {
+            return S3_OK;
+        }
+
+        s3_cli_note("ssh3: control persist is not implemented yet, master dies with the session");
+
+        return S3_OK;
+    }
+
+    /* the unknown key ignores silently (the ssh2 tolerance of the
+     * newer keywords in the older clients) */
+
+    return S3_OK;
+}
+
+/* the ssh2 config forward value ([bind:]port host:port, the two
+ * whitespace tokens) joins into the spec shape port:host:port; the
+ * single-token form rides as is */
+
+static s3_int_t
+s3_cli_cfg_fwd_join(char *out, size_t cap, const char *val)
+{
+    const char *sp = val;
+    size_t      a;
+
+    while (*sp != '\0' && *sp != ' ' && *sp != '\t') {
+        sp++;
+    }
+
+    if (*sp == '\0') {
+
+        /* the single-token form: the DynamicForward shape or a bare
+         * spec (the parser rejects what it cannot ride) */
+
+        if (strlen(val) >= cap) {
+            return S3_ERROR;
+        }
+
+        memcpy(out, val, strlen(val) + 1);
+
+        return S3_OK;
+    }
+
+    a = (size_t)(sp - val);
+
+    while (*sp == ' ' || *sp == '\t') {
+        sp++;
+    }
+
+    if (*sp == '\0' || a + 1 + strlen(sp) >= cap) {
+        return S3_ERROR;
+    }
+
+    memcpy(out, val, a);
+    out[a] = ':';
+    memcpy(out + a + 1, sp, strlen(sp) + 1);
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_cli_cfg_load(const char *host)
+{
+    FILE   *f;
+    char    line[2048];
+    unsigned active = 0;
+
+    f = fopen(s3_cli_cfg_path, "r");
+
+    if (f == NULL) {
+
+        /* the explicit -F wants the file (the ssh2 refusal), the
+         * default path may not exist at all */
+
+        if (s3_cli_cfg_explicit) {
+            fprintf(stderr, "ssh3: cannot open the config %s\n", s3_cli_cfg_path);
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+
+        char *p = line, *key, *val, *end;
+
+        /* the trailing newline and the comment strip */
+
+        end = line + strlen(line);
+
+        while (end > line && (end[-1] == '\n' || end[-1] == '\r')) {
+            *--end = '\0';
+        }
+
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+
+        if (*p == '#' || *p == '\0' || *p == ';') {
+            continue;
+        }
+
+        /* the inline comment (the space-hash) strips */
+
+        {
+
+            char *h = strchr(p, '#');
+
+            if (h != NULL && h != p && (h[-1] == ' ' || h[-1] == '\t')) {
+                *h = '\0';
+            }
+        }
+
+        key = p;
+
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '=') {
+            p++;
+        }
+
+        if (*p == '=') {
+
+            /* the Key=Value form (the ssh2 accepts both) */
+
+            *p = '\0';
+            p++;
+
+            if (*p == ' ') {
+                p++;
+            }
+
+        } else if (*p != '\0') {
+
+            *p = '\0';
+            p++;
+
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+
+        } else {
+            continue; /* the key without a value */
+        }
+
+        val = p;
+
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+
+        val = p;
+
+        end = val + strlen(val);
+
+        while (end > val && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+
+        if (*val == '"') {
+
+            char *q = strchr(val + 1, '"');
+
+            if (q != NULL) {
+                *q = '\0';
+                val++;
+            }
+        }
+
+        /* the end-of-line backslash continuation stays out (the
+         * common single-line configs cover) */
+
+        if (s3_cli_streq_ci(key, "host") == 0) {
+            active = s3_cli_cfg_host_block(val, host);
+            continue;
+        }
+
+        if (!active) {
+            continue;
+        }
+
+        if (s3_cli_cfg_apply(key, val) != S3_OK) {
+            fclose(f);
+            return S3_ERROR;
+        }
+    }
+
+    fclose(f);
+
+    return S3_OK;
+}
+
+static const char s3_cli_opt_keys[] =
+    "insecure, strict-host-key-checking, forwardagent, port, user, identityfile, localforward,"
+    " remoteforward, dynamicforward, proxyjump, escapechar, controlmaster, controlpath,"
+    " controlpersist";
 
 /* the ASCII case-insensitive compare of the -o texts (the fork
  * accepts any case of the key and the value) */
@@ -2059,10 +2801,410 @@ s3_cli_streq_ci(const char *a, const char *b)
     return (*a != *b);
 }
 
+/*
+ * the pending note of the parse: the deprecated warnings queue here
+ * (a fixed budget, the overflow drops), the end of the parse flushes
+ * them to the stderr unless -q silenced the run
+ */
+
+static void
+s3_cli_note(const char *fmt, ...)
+{
+    va_list ap;
+    char    buf[512];
+
+    if (s3_cli_notes_n >= S3_CLI_NOTES_MAX) {
+        return;
+    }
+
+    va_start(ap, fmt);
+    (void)vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    s3_cli_notes[s3_cli_notes_n++] = strdup(buf);
+}
+
+static void
+s3_cli_notes_flush(void)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_notes_n; i++) {
+        fprintf(stderr, "%s\n", s3_cli_notes[i]);
+        free(s3_cli_notes[i]);
+        s3_cli_notes[i] = NULL;
+    }
+
+    s3_cli_notes_n = 0;
+}
+
+/* the trailing words join into one command text (the ssh shape), the
+ * malloc rides the caller free (the exec text and the slave command
+ * both live one process run) */
+
+static char *
+s3_cli_join_words(char **argv, size_t first, size_t argc)
+{
+    size_t i, cmdlen = 1;
+    char  *cmd;
+
+    for (i = first; i < argc; i++) {
+        cmdlen += strlen(argv[i]) + 1;
+    }
+
+    cmd = malloc(cmdlen);
+
+    if (cmd == NULL) {
+        return NULL;
+    }
+
+    cmd[0] = '\0';
+
+    for (i = first; i < argc; i++) {
+
+        if (i > first) {
+            strncat(cmd, " ", cmdlen - strlen(cmd) - 1);
+        }
+
+        strncat(cmd, argv[i], cmdlen - strlen(cmd) - 1);
+    }
+
+    return cmd;
+}
+
+/*
+ * the transfer specifier put|get:local:remote (the -J legacy shape,
+ * the --sftp and the -s sftp word share it): a colon right behind the
+ * drive letter rides the path, the next one ends the local side (the
+ * remote is the unix path of the server)
+ */
+
+static s3_int_t
+s3_cli_sftp_spec_parse(const char *rest)
+{
+    const char *sep;
+    size_t      len;
+
+    if (strncmp(rest, "put:", 4) == 0) {
+        s3_cli_sftp_mode = S3_CLI_SFTP_PUT;
+        rest += 4;
+
+    } else if (strncmp(rest, "get:", 4) == 0) {
+        s3_cli_sftp_mode = S3_CLI_SFTP_GET;
+        rest += 4;
+
+    } else {
+        fprintf(stderr, "ssh3: the transfer spec wants put|get:local:remote\n");
+        return S3_ERROR;
+    }
+
+    sep = strchr(rest, ':');
+
+    if (sep == rest + 1 &&
+        ((rest[0] >= 'A' && rest[0] <= 'Z') || (rest[0] >= 'a' && rest[0] <= 'z'))) {
+        sep = strchr(sep + 1, ':');
+    }
+
+    if (sep == NULL || sep == rest || sep[1] == '\0') {
+        fprintf(stderr, "ssh3: the transfer spec wants put|get:local:remote\n");
+        return S3_ERROR;
+    }
+
+    len = (size_t)(sep - rest);
+    s3_cli_sftp_local = malloc(len + 1);
+
+    if (s3_cli_sftp_local == NULL) {
+        fprintf(stderr, "ssh3: out of memory\n");
+        return S3_ERROR;
+    }
+
+    memcpy(s3_cli_sftp_local, rest, len);
+    s3_cli_sftp_local[len] = '\0';
+
+    len = strlen(sep + 1);
+    s3_cli_sftp_remote = malloc(len + 1);
+
+    if (s3_cli_sftp_remote == NULL) {
+        fprintf(stderr, "ssh3: out of memory\n");
+        return S3_ERROR;
+    }
+
+    memcpy(s3_cli_sftp_remote, sep + 1, len + 1);
+
+    return S3_OK;
+}
+
+/*
+ * the jump spec [user@]host[:port] (the ssh2 ProxyJump shape): one
+ * hop, the comma chain refuses cleanly, the port defaults to 443 at
+ * the resolve
+ */
+
+static s3_int_t
+s3_cli_jump_parse(const char *spec)
+{
+    const char *s = spec, *at, *colon;
+    size_t      len;
+
+    /* the transfer spec of the legacy -J never lands here (the
+     * caller forked it off), the comma chain is the rejected shape */
+
+    if (strchr(spec, ',') != NULL) {
+        fprintf(stderr, "ssh3: proxy chains are not supported (one jump hop rides)\n");
+        return S3_ERROR;
+    }
+
+    at = strchr(s, '@');
+
+    if (at != NULL) {
+
+        if ((size_t)(at - s) >= sizeof(s3_cli_jump_user)) {
+            fprintf(stderr, "ssh3: the jump user name is too long\n");
+            return S3_ERROR;
+        }
+
+        memcpy(s3_cli_jump_user, s, (size_t)(at - s));
+        s3_cli_jump_user[at - s] = '\0';
+        s = at + 1;
+    }
+
+    colon = strchr(s, ':');
+
+    if (colon != NULL) {
+
+        s3_cli_jump_port = (unsigned)atoi(colon + 1);
+
+        if (s3_cli_jump_port == 0 || s3_cli_jump_port > 65535) {
+            fprintf(stderr, "ssh3: bad jump port in %s\n", spec);
+            return S3_ERROR;
+        }
+
+        len = (size_t)(colon - s);
+
+    } else {
+        len = strlen(s);
+    }
+
+    if (len == 0 || len >= sizeof(s3_cli_jump_host)) {
+        fprintf(stderr, "ssh3: bad jump host in %s\n", spec);
+        return S3_ERROR;
+    }
+
+    memcpy(s3_cli_jump_host, s, len);
+    s3_cli_jump_host[len] = '\0';
+
+    s3_cli_jump_on = 1;
+    s3_cli_have_jump = 1;
+
+    return S3_OK;
+}
+
+/*
+ * the escape character spec (the ssh2 -e shape): one character, the
+ * ^x form is the control code, "none" disables the processor
+ */
+
+static s3_int_t
+s3_cli_escape_parse(const char *arg)
+{
+    s3_cli_have_escape = 1;
+
+    if (strcmp(arg, "none") == 0) {
+        s3_cli_escape_ch = -1;
+        return S3_OK;
+    }
+
+    if (strlen(arg) == 2 && arg[0] == '^') {
+
+        if (arg[1] == '?') {
+            s3_cli_escape_ch = 127;
+            return S3_OK;
+        }
+
+        s3_cli_escape_ch = arg[1] & 0x1f;
+        return S3_OK;
+    }
+
+    if (strlen(arg) != 1 || (u_char)arg[0] < 32 || (u_char)arg[0] > 126) {
+        fprintf(stderr, "ssh3: -e wants one character, ^x or none\n");
+        return S3_ERROR;
+    }
+
+    s3_cli_escape_ch = (u_char)arg[0];
+
+    return S3_OK;
+}
+
+/* the escape processor lives in the interactive console shell only:
+ * no exec, no pipe, no sftp, no master, a live escape char */
+
+static unsigned
+s3_cli_escape_live(void)
+{
+    return (s3_cli_escape_ch >= 0 && s3_cli_console && s3_cli_tty && s3_cli_cmd == NULL);
+}
+
+/* the operand host text: the bracketed ipv6 strips (the dial and the
+ * known_hosts key both ride the bare form) */
+
+static void
+s3_cli_operand_host(const char *src, size_t len)
+{
+    if (len >= 2 && src[0] == '[' && src[len - 1] == ']') {
+        memcpy(s3_cli_host, src + 1, len - 2);
+        s3_cli_host[len - 2] = '\0';
+        return;
+    }
+
+    memcpy(s3_cli_host, src, len);
+    s3_cli_host[len] = '\0';
+}
+
+/* the escape processor state: the escape char is live at the start
+ * of a line only, a hit waits for the command byte */
+
+static unsigned s3_cli_esc_hit;
+static unsigned s3_cli_esc_line_start = 1;
+
+/* the local listeners of the forwards, the ~# listing */
+
+static void
+s3_cli_escape_list_forwards(void)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_fwd_count; i++) {
+        fprintf(stderr, "the forward %u: %s\n", (unsigned)i, s3_cli_fwd_specs[i].text);
+    }
+
+    for (i = 0; i < s3_cli_rspec_count; i++) {
+        fprintf(stderr, "the reverse forward %u: %s -> %s\n", (unsigned)i,
+                s3_cli_rspec[i].bind_host[0] ? s3_cli_rspec[i].bind_host : "*",
+                s3_cli_rtarget_text[i]);
+    }
+}
+
+/* the ~^Z suspend (the unix leg): the cooked terminal back, the
+ * SIGTSTP to the process group, the raw mode on the return */
+
+static void
+s3_cli_escape_suspend(void)
+{
+#if !(S3_WIN32)
+
+    if (s3_cli_raw) {
+        (void)s3_ssh3_session_cli_tty_restore(0, &s3_cli_saved_termios);
+        s3_cli_raw = 0;
+    }
+
+    (void)kill(0, SIGTSTP);
+
+    /* the shell continued us: the raw mode of the session lifetime
+     * rides again */
+
+    if (s3_ssh3_session_cli_tty_raw(0, &s3_cli_saved_termios) == S3_OK) {
+        s3_cli_raw = 1;
+    }
+
+#else
+    fprintf(stderr, "ssh3: the suspend escape is unsupported on this platform\n");
+#endif
+}
+
+/* the ~. drop: the graceful close of the session, the ssh exit code
+ * 255 (the transport shape of the reference) */
+
+static void
+s3_cli_escape_drop(void)
+{
+    s3_cli_verdict = 1;
+    s3_cli_exit_code = S3_CLI_EXIT_ERROR;
+}
+
+/*
+ * the escape processor of the interactive console session: the bytes
+ * filter into dst (the passed-through ones), the commands ride the
+ * stderr and the session verdict; the caller gates the console+pty
+ * shell shape and a live escape char
+ */
+
+static size_t
+s3_cli_escape_feed(const u_char *src, size_t n, u_char *dst)
+{
+    size_t i, o = 0;
+
+    for (i = 0; i < n; i++) {
+
+        u_char b = src[i];
+
+        if (s3_cli_esc_hit) {
+
+            s3_cli_esc_hit = 0;
+
+            if (b == (u_char)'.') {
+                s3_cli_escape_drop();
+                s3_cli_esc_line_start = 0;
+                continue;
+            }
+
+            if (b == (u_char)s3_cli_escape_ch) {
+
+                /* the doubled escape rides as the literal byte */
+
+                s3_cli_esc_line_start = 0;
+                dst[o++] = b;
+                continue;
+            }
+
+            if (b == 0x1a) { /* ^Z */
+                s3_cli_escape_suspend();
+                s3_cli_esc_line_start = 0;
+                continue;
+            }
+
+            if (b == '#') {
+                s3_cli_escape_list_forwards();
+                s3_cli_esc_line_start = 0;
+                continue;
+            }
+
+            if (b == 'V') {
+                fprintf(stderr, "ssh3 version %s\n", S3_SSH3_VERSION_STRING);
+                s3_cli_esc_line_start = 0;
+                continue;
+            }
+
+            /* the unknown and the ? both take the short help, the
+             * bytes stay swallowed (the session keeps the line) */
+
+            fprintf(stderr,
+                    "ssh3 escape commands: %c. drop the session, %c%c suspend (unix),"
+                    " %c# list the forwards, %cV version, %c? help, %c%c the literal"
+                    " escape\n",
+                    s3_cli_escape_ch, s3_cli_escape_ch, '^', s3_cli_escape_ch,
+                    s3_cli_escape_ch, s3_cli_escape_ch, s3_cli_escape_ch,
+                    s3_cli_escape_ch);
+
+            s3_cli_esc_line_start = 0;
+            continue;
+        }
+
+        if (s3_cli_esc_line_start && b == (u_char)s3_cli_escape_ch) {
+            s3_cli_esc_hit = 1;
+            continue;
+        }
+
+        s3_cli_esc_line_start = (b == LF || b == CR);
+        dst[o++] = b;
+    }
+
+    return o;
+}
+
 static s3_int_t
 s3_cli_opt_parse(const char *arg)
 {
-    char        key[64], val[32];
+    char        key[64], val[1024];
     const char *eq;
     size_t      n;
 
@@ -2079,6 +3221,7 @@ s3_cli_opt_parse(const char *arg)
 
         if (s3_cli_streq_ci(arg, "strict-host-key-checking") == 0) {
             s3_cli_opt_strict = S3_CLI_SHK_YES;
+            s3_cli_have_strict = 1;
             return S3_OK;
         }
 
@@ -2092,7 +3235,9 @@ s3_cli_opt_parse(const char *arg)
     }
 
     /* the key: bounded, lowercased in place (the fork accepts any
-     * case of both the key and the value) */
+     * case); the value stays raw (the paths of the identity and the
+     * control socket are case sensitive), the booleans compare
+     * case-insensitively */
 
     n = (size_t)(eq - arg);
 
@@ -2115,8 +3260,6 @@ s3_cli_opt_parse(const char *arg)
         }
     }
 
-    /* the value: the same bound and fold */
-
     n = strlen(eq + 1);
 
     if (n >= sizeof(val)) {
@@ -2126,23 +3269,14 @@ s3_cli_opt_parse(const char *arg)
 
     memcpy(val, eq + 1, n + 1);
 
-    {
-        char *c;
-
-        for (c = val; *c != '\0'; c++) {
-
-            if (*c >= 'A' && *c <= 'Z') {
-                *c = (char)(*c - 'A' + 'a');
-            }
-        }
-    }
-
     if (strcmp(key, "insecure") == 0) {
 
-        if (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+        if (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "true") == 0 ||
+            strcmp(val, "1") == 0) {
             s3_cli_opt_insecure = 1;
 
-        } else if (strcmp(val, "no") == 0 || strcmp(val, "false") == 0 || strcmp(val, "0") == 0) {
+        } else if (s3_cli_streq_ci(val, "no") == 0 || s3_cli_streq_ci(val, "false") == 0 ||
+                   strcmp(val, "0") == 0) {
             s3_cli_opt_insecure = 0;
 
         } else {
@@ -2155,19 +3289,176 @@ s3_cli_opt_parse(const char *arg)
 
     if (strcmp(key, "strict-host-key-checking") == 0) {
 
-        if (strcmp(val, "yes") == 0) {
+        if (s3_cli_streq_ci(val, "yes") == 0) {
             s3_cli_opt_strict = S3_CLI_SHK_YES;
 
-        } else if (strcmp(val, "no") == 0) {
+        } else if (s3_cli_streq_ci(val, "no") == 0) {
             s3_cli_opt_strict = S3_CLI_SHK_NO;
 
-        } else if (strcmp(val, "accept-new") == 0) {
+        } else if (s3_cli_streq_ci(val, "accept-new") == 0) {
             s3_cli_opt_strict = S3_CLI_SHK_ACCEPT_NEW;
 
         } else {
             fprintf(stderr, "ssh3: -o strict-host-key-checking wants yes|no|accept-new\n");
             return S3_ERROR;
         }
+
+        s3_cli_have_strict = 1;
+
+        return S3_OK;
+    }
+
+    /* the ssh2 canon keys (the P8 wave): each maps onto the twin
+     * short flag, the CLI-wins tracking rides along */
+
+    if (strcmp(key, "port") == 0) {
+
+        unsigned v = (unsigned)atoi(val);
+
+        if (v == 0 || v > 65535) {
+            fprintf(stderr, "ssh3: -o Port= wants a port 1..65535\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_port = v;
+        s3_cli_have_port = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "user") == 0) {
+
+        if (strlen(val) >= sizeof(s3_cli_user)) {
+            fprintf(stderr, "ssh3: -o User= is too long\n");
+            return S3_ERROR;
+        }
+
+        memcpy(s3_cli_user, val, strlen(val) + 1);
+        s3_cli_have_user = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "identityfile") == 0) {
+
+        /* the ssh2 repeatable list carries one identity here, the
+         * first wins and the rest note */
+
+        if (s3_cli_have_keyfile) {
+            s3_cli_note("ssh3: the additional IdentityFile rides ignored (one identity: %s)", val);
+            return S3_OK;
+        }
+
+        if (strlen(val) >= sizeof(s3_cli_keyfile)) {
+            fprintf(stderr, "ssh3: -o IdentityFile= is too long\n");
+            return S3_ERROR;
+        }
+
+        snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s", val);
+        s3_cli_auth = S3_CLI_AUTH_PUBKEY;
+        s3_cli_have_keyfile = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "forwardagent") == 0) {
+
+        if (s3_cli_streq_ci(val, "yes") == 0 || strcmp(val, "1") == 0) {
+            s3_cli_agent_mode = 1;
+
+        } else if (s3_cli_streq_ci(val, "no") == 0 || strcmp(val, "0") == 0) {
+            s3_cli_agent_mode = 0;
+
+        } else {
+            fprintf(stderr, "ssh3: -o ForwardAgent= wants yes|no\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_have_agent = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "localforward") == 0) {
+        return s3_cli_fwd_parse(val);
+    }
+
+    if (strcmp(key, "remoteforward") == 0) {
+        return s3_cli_rev_parse_spec(val);
+    }
+
+    if (strcmp(key, "dynamicforward") == 0) {
+        return s3_cli_socks_parse(val);
+    }
+
+    if (strcmp(key, "proxyjump") == 0) {
+
+        if (s3_cli_streq_ci(val, "none") == 0) {
+            s3_cli_jump_on = 0;
+            s3_cli_have_jump = 1;
+            return S3_OK;
+        }
+
+        return s3_cli_jump_parse(val);
+    }
+
+    if (strcmp(key, "escapechar") == 0) {
+        return s3_cli_escape_parse(val);
+    }
+
+    if (strcmp(key, "controlmaster") == 0) {
+
+        if (s3_cli_streq_ci(val, "yes") == 0 || strcmp(val, "1") == 0) {
+            s3_cli_cm_master = 1;
+
+        } else if (s3_cli_streq_ci(val, "auto") == 0) {
+
+            /* the auto dial-probe mode lives in the interop harness
+             * only, the product client rides the master branch with
+             * the documented note */
+
+            s3_cli_cm_master = 1;
+            s3_cli_note("ssh3: ControlMaster=auto is not implemented yet, acting as yes");
+
+        } else if (s3_cli_streq_ci(val, "no") == 0 || strcmp(val, "0") == 0) {
+            s3_cli_cm_master = 0;
+
+        } else {
+            fprintf(stderr, "ssh3: -o ControlMaster= wants yes|no|auto\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_have_master = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "controlpath") == 0) {
+
+        if (strlen(val) >= sizeof(s3_cli_cm_path)) {
+            fprintf(stderr, "ssh3: -o ControlPath= is too long\n");
+            return S3_ERROR;
+        }
+
+        memcpy(s3_cli_cm_path, val, strlen(val) + 1);
+        s3_cli_cm_pipe_name_called = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "controlpersist") == 0) {
+
+        if (s3_cli_streq_ci(val, "no") == 0 || strcmp(val, "0") == 0) {
+
+            /* the default shape: the master dies with the client */
+
+            return S3_OK;
+        }
+
+        /* yes or the seconds form: the detached master of the
+         * harness lives there only, the documented lacuna notes */
+
+        s3_cli_note("ssh3: control persist is not implemented yet, master dies with the session");
 
         return S3_OK;
     }
@@ -3141,97 +4432,443 @@ s3_cli_sftp_read(s3_event_t *ev)
  * carries no names)
  */
 
+/*
+ * the bind side of a forward spec: the v4 literal, the bracketed v6
+ * literal or the "*" wildcard (the listener binds it, the wire never
+ * carries it); the port rides the caller value
+ */
+
+static s3_int_t
+s3_cli_fwd_bind_parse(const char *host, size_t len, s3_cli_fwd_spec_t *spec)
+{
+    char text[128];
+    char colon6[64];
+
+    if (len == 0 || len >= sizeof(text)) {
+        return S3_ERROR;
+    }
+
+    memcpy(text, host, len);
+    text[len] = '\0';
+
+    /* the "*" wildcard rides the any-bind of both families */
+
+    if (strcmp(text, "*") == 0) {
+        spec->bind_family = AF_INET;
+        spec->bind_addr = htonl(INADDR_ANY);
+        return S3_OK;
+    }
+
+    /* the bracketed ipv6: [::1] shape, the brackets strip */
+
+    if (text[0] == '[') {
+
+        size_t n = strlen(text);
+
+        if (n < 2 || text[n - 1] != ']' || n - 2 >= sizeof(colon6)) {
+            return S3_ERROR;
+        }
+
+        memcpy(colon6, text + 1, n - 2);
+        colon6[n - 2] = '\0';
+
+        {
+            u_char v6[16];
+
+            if (inet_pton(AF_INET6, colon6, v6) != 1) {
+                return S3_ERROR;
+            }
+
+            spec->bind_family = AF_INET6;
+            memcpy(spec->bind_v6, v6, 16);
+        }
+
+        return S3_OK;
+    }
+
+    {
+        struct in_addr a;
+
+        if (inet_pton(AF_INET, text, &a) != 1) {
+            return S3_ERROR;
+        }
+
+        spec->bind_family = AF_INET;
+        spec->bind_addr = (unsigned)a.s_addr;
+    }
+
+    return S3_OK;
+}
+
+/*
+ * the -L local forward spec: the ssh2 canon [bind_address:]port:host:
+ * hostport (TCP, repeatable, the bracketed v6 bind), the tcp:// scheme
+ * head is the deprecated legacy alias, the udp:// head stays the
+ * project extension (the datagram forwards); the target host is a v4
+ * literal or a name resolved AF_INET client-side (the direct-tcp
+ * target extension carries the raw ipv4)
+ */
+
 static s3_int_t
 s3_cli_fwd_parse(const char *arg)
 {
     s3_cli_fwd_spec_t *spec;
-    const char        *s = arg, *slash, *slash2;
-    char              *colon;
-    char               authority[128], host[128];
-    unsigned           kind, bind_port, target_port;
-    struct in_addr     bind_addr, target_addr;
+    const char        *s = arg;
+    unsigned           kind = S3_CLI_FWD_TCP;
+    unsigned           port, tport;
 
     if (strncmp(s, "tcp://", 6) == 0) {
-        kind = S3_CLI_FWD_TCP;
+        /* the legacy shape rides the same finalize, deprecated */
+
+        s3_cli_note("ssh3: -L tcp:// is deprecated, use [bind:]port:host:hostport");
         s += 6;
 
     } else if (strncmp(s, "udp://", 6) == 0) {
-        kind = S3_CLI_FWD_UDP;
+
+        /* the project extension keeps its shape */
+
         s += 6;
-
-    } else {
-        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
-        return S3_ERROR;
+        kind = S3_CLI_FWD_UDP;
     }
 
-    slash = strchr(s, '/');
+    if (kind == S3_CLI_FWD_UDP) {
 
-    if (slash == NULL || slash == s || (size_t)(slash - s) >= sizeof(authority)) {
-        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
-        return S3_ERROR;
-    }
+        /* the legacy udp shape: [bind:]port/host/port */
 
-    memcpy(authority, s, (size_t)(slash - s));
-    authority[slash - s] = '\0';
+        const char *slash, *slash2;
+        char        authority[128], host[128];
+        char       *colon;
 
-    s = slash + 1;
-    slash2 = strchr(s, '/');
+        slash = strchr(s, '/');
 
-    if (slash2 == NULL || slash2 == s || (size_t)(slash2 - s) >= sizeof(host) ||
-        strlen(slash2 + 1) == 0 || strlen(slash2 + 1) > 5) {
-        fprintf(stderr, "ssh3: -L wants tcp://[bind:]port/host/port\n");
-        return S3_ERROR;
-    }
-
-    memcpy(host, s, (size_t)(slash2 - s));
-    host[slash2 - s] = '\0';
-
-    /* the authority: [bind:]port, the bind defaults to the loopback */
-
-    colon = strchr(authority, ':');
-
-    if (colon != NULL) {
-        *colon = '\0';
-
-        if (colon == authority || inet_pton(AF_INET, authority, &bind_addr) != 1) {
-            fprintf(stderr, "ssh3: -L bind %s is not an ipv4 address\n", authority);
+        if (slash == NULL || slash == s || (size_t)(slash - s) >= sizeof(authority)) {
+            fprintf(stderr, "ssh3: -L wants udp://[bind:]port/host/port\n");
             return S3_ERROR;
         }
 
-        bind_port = (unsigned)atoi(colon + 1);
+        memcpy(authority, s, (size_t)(slash - s));
+        authority[slash - s] = '\0';
 
-    } else {
-        bind_addr.s_addr = htonl(INADDR_LOOPBACK);
-        bind_port = (unsigned)atoi(authority);
+        s = slash + 1;
+        slash2 = strchr(s, '/');
+
+        if (slash2 == NULL || slash2 == s || (size_t)(slash2 - s) >= sizeof(host) ||
+            strlen(slash2 + 1) == 0 || strlen(slash2 + 1) > 5) {
+            fprintf(stderr, "ssh3: -L wants udp://[bind:]port/host/port\n");
+            return S3_ERROR;
+        }
+
+        memcpy(host, s, (size_t)(slash2 - s));
+        host[slash2 - s] = '\0';
+
+        colon = strchr(authority, ':');
+
+        if (s3_cli_fwd_count >= S3_CLI_FWD_MAX) {
+            fprintf(stderr, "ssh3: too many -L forwards\n");
+            return S3_ERROR;
+        }
+
+        spec = &s3_cli_fwd_specs[s3_cli_fwd_count];
+
+        memset(spec, 0, sizeof(*spec));
+
+        spec->kind = S3_CLI_FWD_UDP;
+
+        if (colon != NULL) {
+            *colon = '\0';
+
+            if (colon == authority ||
+                s3_cli_fwd_bind_parse(authority, (size_t)(colon - authority), spec) != S3_OK) {
+                fprintf(stderr, "ssh3: -L bind %s is not an address\n", authority);
+                return S3_ERROR;
+            }
+
+            port = (unsigned)atoi(colon + 1);
+
+        } else {
+            spec->bind_family = AF_INET;
+            spec->bind_addr = htonl(INADDR_LOOPBACK);
+            port = (unsigned)atoi(authority);
+        }
+
+        if (port == 0 || port > 65535) {
+            fprintf(stderr, "ssh3: -L bad bind port in %s\n", arg);
+            return S3_ERROR;
+        }
+
+        spec->bind_port = port;
+
+        {
+            struct in_addr a;
+
+            if (inet_pton(AF_INET, host, &a) != 1) {
+                fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4 socket\n", host, slash2 + 1);
+                return S3_ERROR;
+            }
+
+            spec->target_addr = (unsigned)a.s_addr;
+        }
+
+        tport = (unsigned)atoi(slash2 + 1);
+
+        if (tport == 0 || tport > 65535) {
+            fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4 socket\n", host, slash2 + 1);
+            return S3_ERROR;
+        }
+
+        spec->target_port = tport;
+        snprintf(spec->text, sizeof(spec->text), "%s", arg);
+
+        s3_cli_fwd_count++;
+
+        return S3_OK;
     }
 
-    if (bind_port == 0 || bind_port > 65535) {
-        fprintf(stderr, "ssh3: -L bad bind port in %s\n", arg);
-        return S3_ERROR;
+    /*
+     * the canon (and the deprecated tcp:// through it): the colons
+     * split outside the brackets, the bind side brackets v6
+     */
+
+    {
+
+        const char *cpos[3];
+        unsigned    ncol = 0;
+        unsigned    in_brackets = 0;
+        const char *p = s;
+        const char *bind_f = NULL, *port_f, *host_f, *tport_f;
+        size_t      bind_len = 0, port_len, host_len, tport_len;
+
+        while (*p != '\0') {
+
+            if (*p == '[') {
+                in_brackets = 1;
+
+            } else if (*p == ']') {
+                in_brackets = 0;
+
+            } else if (*p == ':' && !in_brackets) {
+
+                if (ncol >= 3) {
+                    fprintf(stderr, "ssh3: -L wants [bind:]port:host:hostport\n");
+                    return S3_ERROR;
+                }
+
+                cpos[ncol++] = p;
+            }
+
+            p++;
+        }
+
+        if (ncol == 2) {
+
+            /* port:host:hostport, the loopback bind implied */
+
+            port_f = s;
+            port_len = (size_t)(cpos[0] - s);
+            host_f = cpos[0] + 1;
+            host_len = (size_t)(cpos[1] - cpos[0] - 1);
+            tport_f = cpos[1] + 1;
+            tport_len = strlen(tport_f);
+
+        } else if (ncol == 3) {
+
+            /* bind:port:host:hostport */
+
+            bind_f = s;
+            bind_len = (size_t)(cpos[0] - s);
+            port_f = cpos[0] + 1;
+            port_len = (size_t)(cpos[1] - cpos[0] - 1);
+            host_f = cpos[1] + 1;
+            host_len = (size_t)(cpos[2] - cpos[1] - 1);
+            tport_f = cpos[2] + 1;
+            tport_len = strlen(tport_f);
+
+        } else {
+            fprintf(stderr, "ssh3: -L wants [bind:]port:host:hostport\n");
+            return S3_ERROR;
+        }
+
+        /* the port fields: decimal digits only, the uint16 range */
+
+        port = 0;
+
+        {
+
+            size_t k;
+
+            for (k = 0; k < port_len; k++) {
+
+                if (port_f[k] < '0' || port_f[k] > '9' || port > 6553) {
+                    port = 0;
+                    break;
+                }
+
+                port = port * 10 + (unsigned)(port_f[k] - '0');
+            }
+
+            if (k != port_len || port == 0 || port > 65535) {
+                fprintf(stderr, "ssh3: -L bad bind port in %s\n", arg);
+                return S3_ERROR;
+            }
+        }
+
+        tport = 0;
+
+        {
+
+            size_t k;
+
+            for (k = 0; k < tport_len; k++) {
+
+                if (tport_f[k] < '0' || tport_f[k] > '9' || tport > 6553) {
+                    tport = 0;
+                    break;
+                }
+
+                tport = tport * 10 + (unsigned)(tport_f[k] - '0');
+            }
+
+            if (k != tport_len || tport == 0 || tport > 65535) {
+                fprintf(stderr, "ssh3: -L bad target port in %s\n", arg);
+                return S3_ERROR;
+            }
+        }
+
+        if (s3_cli_fwd_count >= S3_CLI_FWD_MAX) {
+            fprintf(stderr, "ssh3: too many -L forwards\n");
+            return S3_ERROR;
+        }
+
+        spec = &s3_cli_fwd_specs[s3_cli_fwd_count];
+
+        memset(spec, 0, sizeof(*spec));
+
+        spec->kind = S3_CLI_FWD_TCP;
+
+        /* the bind side: absent keeps the loopback */
+
+        if (bind_f == NULL) {
+            spec->bind_family = AF_INET;
+            spec->bind_addr = htonl(INADDR_LOOPBACK);
+
+        } else if (s3_cli_fwd_bind_parse(bind_f, bind_len, spec) != S3_OK) {
+            fprintf(stderr, "ssh3: -L bind is not an address: %.*s\n", (int)bind_len, bind_f);
+            return S3_ERROR;
+        }
+
+        spec->bind_port = port;
+
+        /* the target host: a v4 literal or a name resolved AF_INET */
+
+        {
+
+            struct sockaddr_in sa;
+            struct addrinfo    hints, *res = NULL;
+            char               thtext[128];
+
+            if (host_len == 0 || host_len >= sizeof(thtext)) {
+                fprintf(stderr, "ssh3: -L bad target host in %s\n", arg);
+                return S3_ERROR;
+            }
+
+            memcpy(thtext, host_f, host_len);
+            thtext[host_len] = '\0';
+
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+
+            if (inet_pton(AF_INET, thtext, &sa.sin_addr) == 1) {
+                spec->target_addr = (unsigned)sa.sin_addr.s_addr;
+
+            } else if (getaddrinfo(thtext, NULL, &hints, &res) == 0 && res != NULL) {
+
+                memcpy(&sa, res->ai_addr, sizeof(sa));
+                spec->target_addr = (unsigned)sa.sin_addr.s_addr;
+
+                freeaddrinfo(res);
+
+            } else {
+                fprintf(stderr, "ssh3: the -L target %s resolves nowhere\n", thtext);
+                return S3_ERROR;
+            }
+        }
+
+        spec->target_port = tport;
+        snprintf(spec->text, sizeof(spec->text), "%s", arg);
+
+        s3_cli_fwd_count++;
     }
 
-    target_port = (unsigned)atoi(slash2 + 1);
+    return S3_OK;
+}
 
-    if (target_port == 0 || target_port > 65535 || inet_pton(AF_INET, host, &target_addr) != 1) {
-        fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4 socket\n", host, slash2 + 1);
-        return S3_ERROR;
+/*
+ * the -D dynamic forward spec: [bind:]port, the bind defaults to the
+ * loopback (the ssh2 shape, repeatable); the listener speaks the
+ * SOCKS5 CONNECT (the SOCKS4 fallback) and bridges every request
+ * target into the direct-tcp channels of the same conversation
+ */
+
+static s3_int_t
+s3_cli_socks_parse(const char *arg)
+{
+    s3_cli_fwd_spec_t *spec;
+    const char        *colon = NULL, *p = arg;
+    unsigned           in_brackets = 0, port;
+
+    while (*p != '\0') {
+
+        if (*p == '[') {
+            in_brackets = 1;
+
+        } else if (*p == ']') {
+            in_brackets = 0;
+
+        } else if (*p == ':' && !in_brackets) {
+            colon = p;
+            break;
+        }
+
+        p++;
     }
 
     if (s3_cli_fwd_count >= S3_CLI_FWD_MAX) {
-        fprintf(stderr, "ssh3: too many -L forwards\n");
+        fprintf(stderr, "ssh3: too many -D forwards\n");
         return S3_ERROR;
     }
 
-    spec = &s3_cli_fwd_specs[s3_cli_fwd_count++];
+    spec = &s3_cli_fwd_specs[s3_cli_fwd_count];
 
     memset(spec, 0, sizeof(*spec));
 
-    spec->kind = kind;
-    spec->bind_addr = (unsigned)bind_addr.s_addr;
-    spec->bind_port = bind_port;
-    spec->target_addr = (unsigned)target_addr.s_addr;
-    spec->target_port = target_port;
-    snprintf(spec->text, sizeof(spec->text), "%s", arg);
+    spec->kind = S3_CLI_FWD_SOCKS;
+
+    if (colon != NULL) {
+
+        if (s3_cli_fwd_bind_parse(arg, (size_t)(colon - arg), spec) != S3_OK) {
+            fprintf(stderr, "ssh3: -D bind is not an address: %.*s\n", (int)(colon - arg), arg);
+            return S3_ERROR;
+        }
+
+        port = (unsigned)atoi(colon + 1);
+
+    } else {
+        spec->bind_family = AF_INET;
+        spec->bind_addr = htonl(INADDR_LOOPBACK);
+        port = (unsigned)atoi(arg);
+    }
+
+    if (port == 0 || port > 65535) {
+        fprintf(stderr, "ssh3: -D bad port in %s\n", arg);
+        return S3_ERROR;
+    }
+
+    spec->bind_port = port;
+
+    snprintf(spec->text, sizeof(spec->text), "socks://%s", arg);
+
+    s3_cli_fwd_count++;
 
     return S3_OK;
 }
@@ -3249,18 +4886,12 @@ s3_cli_fwd_listeners_start(void)
     for (i = 0; i < s3_cli_fwd_count; i++) {
 
         s3_cli_fwd_spec_t *spec = &s3_cli_fwd_specs[i];
-        struct sockaddr_in sa;
         SOCKET             fd;
         s3_connection_t   *c;
+        unsigned           is_stream = (spec->kind != S3_CLI_FWD_UDP);
+        int                af = (spec->bind_family == AF_INET6) ? AF_INET6 : AF_INET;
 
-        memset(&sa, 0, sizeof(sa));
-
-        sa.sin_family = AF_INET;
-        sa.sin_addr.s_addr = spec->bind_addr;
-        sa.sin_port = htons((u_short)spec->bind_port);
-
-        fd = (spec->kind == S3_CLI_FWD_TCP) ? socket(AF_INET, SOCK_STREAM, 0)
-                                            : socket(AF_INET, SOCK_DGRAM, 0);
+        fd = (is_stream) ? socket(af, SOCK_STREAM, 0) : socket(af, SOCK_DGRAM, 0);
 
         if (fd == INVALID_SOCKET) {
             s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "socket() failed for %s",
@@ -3268,14 +4899,42 @@ s3_cli_fwd_listeners_start(void)
             return S3_ERROR;
         }
 
-        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "bind() failed for %s",
-                         spec->text);
-            closesocket(fd);
-            return S3_ERROR;
+        if (af == AF_INET6) {
+
+            struct sockaddr_in6 sa6;
+
+            memset(&sa6, 0, sizeof(sa6));
+
+            sa6.sin6_family = AF_INET6;
+            sa6.sin6_port = htons((u_short)spec->bind_port);
+            memcpy(&sa6.sin6_addr, spec->bind_v6, 16);
+
+            if (bind(fd, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "bind() failed for %s",
+                             spec->text);
+                closesocket(fd);
+                return S3_ERROR;
+            }
+
+        } else {
+
+            struct sockaddr_in sa;
+
+            memset(&sa, 0, sizeof(sa));
+
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = spec->bind_addr;
+            sa.sin_port = htons((u_short)spec->bind_port);
+
+            if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "bind() failed for %s",
+                             spec->text);
+                closesocket(fd);
+                return S3_ERROR;
+            }
         }
 
-        if (spec->kind == S3_CLI_FWD_TCP && listen(fd, 8) != 0) {
+        if (is_stream && listen(fd, 8) != 0) {
             s3_log_error(S3_LOG_ERR, &s3_cli_log, s3_socket_errno, "listen() failed for %s",
                          spec->text);
             closesocket(fd);
@@ -3294,8 +4953,9 @@ s3_cli_fwd_listeners_start(void)
             return S3_ERROR;
         }
 
-        c->read->handler =
-            (spec->kind == S3_CLI_FWD_TCP) ? s3_cli_fwd_tcp_accept : s3_cli_fwd_udp_local_read;
+        c->read->handler = (spec->kind == S3_CLI_FWD_UDP)      ? s3_cli_fwd_udp_local_read
+                           : (spec->kind == S3_CLI_FWD_SOCKS) ? s3_cli_fwd_socks_accept
+                                                              : s3_cli_fwd_tcp_accept;
         c->read->data = c; /* the select module contract: data is the conn */
 
         /* the spec index rides the free data of the raw connection */
@@ -3309,7 +4969,7 @@ s3_cli_fwd_listeners_start(void)
             return S3_ERROR;
         }
 
-        if (spec->kind == S3_CLI_FWD_TCP) {
+        if (is_stream) {
             s3_cli_fwd_listen[i] = fd;
 
         } else {
@@ -3762,6 +5422,67 @@ s3_cli_fwd_tcp_local_read(s3_event_t *ev)
  * direct-tcp header with the target extension rides at once
  */
 
+/*
+ * the direct-tcp channel open of one bridge conn: the header and the
+ * target extension build once, the send parks on the write readiness
+ * (the per-conn target: the -L spec names it, the -D socks request
+ * does)
+ */
+
+static s3_int_t
+s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_addr, unsigned t_port)
+{
+    s3_ssh3_channel_t        h;
+    s3_ssh3_forward_target_t t;
+    u_char                  *p;
+    ssize_t                  m;
+
+    fc->chan = s3_quic_open_stream(s3_cli_conn, 1);
+
+    if (fc->chan == NULL) {
+        return S3_ERROR;
+    }
+
+    fc->frame = malloc(S3_CLI_FWD_FRAME);
+
+    if (fc->frame == NULL) {
+        return S3_ERROR;
+    }
+
+    memset(&h, 0, sizeof(h));
+
+    h.conversation_stream_id = s3_cli_conv_id;
+    h.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+    h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
+    h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
+
+    t.family = 4;
+    t.ip_len = 4;
+    memcpy(t.ip, &t_addr, 4);
+    t.port = (uint16_t)t_port;
+
+    p = fc->hdr;
+    p = (u_char *)s3_ssh3_channel_build_header(p, &h);
+    p = s3_ssh3_forward_build_target(p, &t);
+
+    fc->hdr_len = (size_t)(p - fc->hdr);
+
+    m = s3_quic_stream_send(fc->chan, fc->hdr, fc->hdr_len);
+
+    if (m == (ssize_t)S3_AGAIN) {
+
+        /* the tiny header parks, the flush retries */
+
+    } else if (m <= 0) {
+        return S3_ERROR;
+
+    } else {
+        fc->hdr_sent = 1;
+    }
+
+    return S3_OK;
+}
+
 static void
 s3_cli_fwd_tcp_accept(s3_event_t *ev)
 {
@@ -3820,58 +5541,11 @@ s3_cli_fwd_tcp_accept(s3_event_t *ev)
         fc->spec = spec;
         fc->fd = fd;
         fc->evc = c;
-        fc->chan = s3_quic_open_stream(s3_cli_conn, 1);
 
-        if (fc->chan == NULL) {
+        if (s3_cli_fwd_conn_open(fc, s3_cli_fwd_specs[spec].target_addr,
+                                 s3_cli_fwd_specs[spec].target_port) != S3_OK) {
             s3_cli_fwd_tcp_drop(fc);
             continue;
-        }
-
-        fc->frame = malloc(S3_CLI_FWD_FRAME);
-
-        if (fc->frame == NULL) {
-            s3_cli_fwd_tcp_drop(fc);
-            continue;
-        }
-
-        {
-            s3_cli_fwd_spec_t       *sp = &s3_cli_fwd_specs[spec];
-            s3_ssh3_channel_t        h;
-            s3_ssh3_forward_target_t t;
-            u_char                  *p;
-            ssize_t                  m;
-
-            memset(&h, 0, sizeof(h));
-
-            h.conversation_stream_id = s3_cli_conv_id;
-            h.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
-            h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
-            h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
-
-            t.family = 4;
-            t.ip_len = 4;
-            memcpy(t.ip, &sp->target_addr, 4);
-            t.port = (uint16_t)sp->target_port;
-
-            p = fc->hdr;
-            p = (u_char *)s3_ssh3_channel_build_header(p, &h);
-            p = s3_ssh3_forward_build_target(p, &t);
-
-            fc->hdr_len = (size_t)(p - fc->hdr);
-
-            m = s3_quic_stream_send(fc->chan, fc->hdr, fc->hdr_len);
-
-            if (m == (ssize_t)S3_AGAIN) {
-
-                /* the tiny header parks, the flush retries */
-
-            } else if (m <= 0) {
-                s3_cli_fwd_tcp_drop(fc);
-                continue;
-
-            } else {
-                fc->hdr_sent = 1;
-            }
         }
 
         fc->chan->read->handler = s3_cli_fwd_tcp_chan_read;
@@ -3886,6 +5560,413 @@ s3_cli_fwd_tcp_accept(s3_event_t *ev)
         if (s3_event_actions.add_event(c->read, S3_READ_EVENT, 0) != S3_OK) {
             s3_cli_fwd_tcp_drop(fc);
             continue;
+        }
+    }
+}
+
+/*
+ * the -D socks accept: the same conn budget and local setup as the
+ * -L accept, the channel opens only after the SOCKS handshake names
+ * the target (RFC 1928, the CONNECT command; the SOCKS4 request is
+ * the fallback shape)
+ */
+
+static void
+s3_cli_fwd_socks_accept(s3_event_t *ev)
+{
+    s3_connection_t       *lc = ev->data;
+    unsigned               spec = (unsigned)(uintptr_t)lc->data;
+    s3_cli_fwd_tcp_conn_t *fc = NULL;
+    unsigned               k;
+
+    for (;;) {
+
+        SOCKET             fd;
+        struct sockaddr_in peer;
+        socklen_t          plen = sizeof(peer);
+        s3_connection_t   *c;
+
+        fd = accept(s3_cli_fwd_listen[spec], (struct sockaddr *)&peer, &plen);
+
+        if (fd == INVALID_SOCKET) {
+            return;
+        }
+
+        for (k = 0; k < S3_CLI_FWD_TCP_CONNS; k++) {
+
+            if (!s3_cli_fwd_conns[k].used) {
+                fc = &s3_cli_fwd_conns[k];
+                break;
+            }
+        }
+
+        if (fc == NULL) {
+            closesocket(fd);
+            continue;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            closesocket(fd);
+            continue;
+        }
+
+        c = s3_get_connection(&s3_cli_ctx, fd);
+
+        if (c == NULL) {
+            closesocket(fd);
+            continue;
+        }
+
+        memset(fc, 0, sizeof(*fc));
+
+        fc->used = 1;
+        fc->spec = spec;
+        fc->fd = fd;
+        fc->evc = c;
+        fc->socks = 1;
+        fc->socks_step = S3_CLI_SOCKS_STEP_GREET;
+
+        c->read->handler = s3_cli_fwd_socks_local_read;
+        c->read->data = c;
+        c->data = fc;
+        c->read->active = 1;
+
+        if (s3_event_actions.add_event(c->read, S3_READ_EVENT, 0) != S3_OK) {
+            s3_cli_fwd_tcp_drop(fc);
+            continue;
+        }
+    }
+}
+
+/* the socks failure reply of the v5 shape (the code rides the
+ * RFC 1928 table), the conn drops after it */
+
+static void
+s3_cli_fwd_socks_fail(s3_cli_fwd_tcp_conn_t *fc, u_char code)
+{
+    u_char reply[8] = {5, 0, 0, 1, 0, 0, 0, 0};
+
+    reply[1] = code;
+
+    (void)send(fc->fd, reply, sizeof(reply), 0);
+    fc->dead = 1;
+}
+
+/* the socks success reply: the v5 form rides a zero bind addr, the
+ * v4 form the granted port and the target ip */
+
+static void
+s3_cli_fwd_socks_ok(s3_cli_fwd_tcp_conn_t *fc, unsigned v4)
+{
+    u_char reply[10];
+
+    memset(reply, 0, sizeof(reply));
+
+    reply[0] = 0;
+    reply[1] = 0x5a;
+    reply[2] = (u_char)((fc->t_port >> 8) & 0xff);
+    reply[3] = (u_char)(fc->t_port & 0xff);
+    reply[4] = (u_char)(v4 & 0xff);
+    reply[5] = (u_char)((v4 >> 8) & 0xff);
+    reply[6] = (u_char)((v4 >> 16) & 0xff);
+    reply[7] = (u_char)((v4 >> 24) & 0xff);
+
+    (void)send(fc->fd, reply, 8, 0);
+}
+
+/* the client-side resolve of the socks target (the wire rides the
+ * raw ipv4, the names never cross the channel) */
+
+static s3_int_t
+s3_cli_fwd_socks_resolve(s3_cli_fwd_tcp_conn_t *fc, const char *host)
+{
+    struct addrinfo    hints, *res = NULL;
+    struct sockaddr_in sa;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    if (inet_pton(AF_INET, host, &sa.sin_addr) == 1) {
+        fc->t_addr = (unsigned)sa.sin_addr.s_addr;
+        return S3_OK;
+    }
+
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+        return S3_ERROR;
+    }
+
+    memcpy(&sa, res->ai_addr, sizeof(sa));
+    fc->t_addr = (unsigned)sa.sin_addr.s_addr;
+
+    freeaddrinfo(res);
+
+    return S3_OK;
+}
+
+/*
+ * the socks handshake pump: the greeting and the request parse out
+ * of the accumulated bytes, the bridge arms once the target names
+ * (the direct-tcp channel rides the same conn_open the -L shapes)
+ */
+
+static void
+s3_cli_fwd_socks_local_read(s3_event_t *ev)
+{
+    s3_connection_t *c = ev->data;
+    s3_cli_fwd_tcp_conn_t *fc = c->data;
+
+    for (;;) {
+
+        ssize_t n;
+
+        n = recv(fc->fd, fc->socks_buf + fc->socks_len,
+                 sizeof(fc->socks_buf) - fc->socks_len, 0);
+
+        if (n < 0) {
+
+            if (s3_socket_errno == S3_EAGAIN) {
+                return;
+            }
+
+            s3_cli_fwd_tcp_drop(fc);
+            return;
+        }
+
+        if (n == 0) {
+            s3_cli_fwd_tcp_drop(fc);
+            return;
+        }
+
+        fc->socks_len += (size_t)n;
+
+        if (fc->socks_step == S3_CLI_SOCKS_STEP_GREET) {
+
+            /* the v5 greeting: VER NMETHODS METHODS, the no-auth
+             * method answers; the v4 request (VER 4) skips straight
+             * to the fallback parse */
+
+            if (fc->socks_len < 2) {
+                return;
+            }
+
+            if (fc->socks_buf[0] == 4) {
+                fc->socks_step = S3_CLI_SOCKS_STEP_V4;
+                continue;
+            }
+
+            if (fc->socks_buf[0] != 5) {
+                s3_cli_fwd_socks_fail(fc, 1);
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            if (fc->socks_len < (size_t)(2 + fc->socks_buf[1])) {
+                return;
+            }
+
+            {
+                u_char reply[2] = {5, 0};
+
+                (void)send(fc->fd, reply, sizeof(reply), 0);
+            }
+
+            fc->socks_len = 0;
+            fc->socks_step = S3_CLI_SOCKS_STEP_REQ;
+            return;
+
+        } else if (fc->socks_step == S3_CLI_SOCKS_STEP_REQ) {
+
+            /* the v5 request: VER CMD RSV ATYP ADDR PORT, the
+             * CONNECT only; the ipv4, the domain and the ipv6 atyp
+             * parse (the ipv6 target refuses, the wire rides v4) */
+
+            u_char  atyp;
+            size_t  need;
+            char    host[64];
+            u_short port;
+
+            if (fc->socks_len < 4) {
+                return;
+            }
+
+            if (fc->socks_buf[0] != 5) {
+                s3_cli_fwd_socks_fail(fc, 1);
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            if (fc->socks_buf[1] != 1) {
+                s3_cli_fwd_socks_fail(fc, 7); /* the command not supported */
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            atyp = fc->socks_buf[3];
+
+            if (atyp == 1) {
+                need = 4 + 4 + 2;
+
+                if (fc->socks_len < need) {
+                    return;
+                }
+
+                snprintf(host, sizeof(host), "%u.%u.%u.%u", (unsigned)fc->socks_buf[4],
+                         (unsigned)fc->socks_buf[5], (unsigned)fc->socks_buf[6],
+                         (unsigned)fc->socks_buf[7]);
+
+            } else if (atyp == 3) {
+
+                u_char dlen = fc->socks_buf[4];
+
+                need = 4 + 1 + (size_t)dlen + 2;
+
+                if (fc->socks_len < need) {
+                    return;
+                }
+
+                if (dlen == 0 || dlen >= sizeof(host)) {
+                    s3_cli_fwd_socks_fail(fc, 1);
+                    s3_cli_fwd_tcp_drop(fc);
+                    return;
+                }
+
+                memcpy(host, fc->socks_buf + 5, dlen);
+                host[dlen] = '\0';
+
+            } else if (atyp == 4) {
+
+                /* the v6 target: the resolve stays v4 in this wave */
+
+                s3_cli_fwd_socks_fail(fc, 8); /* the address not supported */
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+
+            } else {
+                s3_cli_fwd_socks_fail(fc, 1);
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            {
+                size_t tail = need;
+
+                port = (u_short)((fc->socks_buf[tail - 2] << 8) | fc->socks_buf[tail - 1]);
+            }
+
+            if (port == 0) {
+                s3_cli_fwd_socks_fail(fc, 1);
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            if (s3_cli_fwd_socks_resolve(fc, host) != S3_OK) {
+                s3_cli_fwd_socks_fail(fc, 4); /* the host unreachable */
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            fc->t_port = port;
+
+            (void)send(fc->fd, (u_char *)"\005\000\000\001\000\000\000\000\000\000", 10, 0);
+
+            fc->socks_len = 0;
+            fc->socks_step = 3; /* the bridged shape, no parse left */
+
+            if (s3_cli_fwd_conn_open(fc, fc->t_addr, fc->t_port) != S3_OK) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            fc->chan->read->handler = s3_cli_fwd_tcp_chan_read;
+            fc->chan->read->data = fc;
+            fc->chan->read->active = 1;
+
+            /* the local read hands over to the bridge pump */
+
+            c->read->handler = s3_cli_fwd_tcp_local_read;
+            c->read->active = 1;
+
+            return;
+
+        } else if (fc->socks_step == S3_CLI_SOCKS_STEP_V4) {
+
+            /* the socks4 request: VER CMD PORT(2) ADDR(4) USERID NUL,
+             * the CONNECT only, the 0.0.0.x remote-id form stays
+             * out (the plain v4 fallback) */
+
+            size_t i;
+
+            if (fc->socks_len < 8) {
+                return;
+            }
+
+            if (fc->socks_buf[1] != 1) {
+                s3_cli_fwd_tcp_drop(fc);
+                return;
+            }
+
+            /* the userid rides to the NUL (the len bound guards) */
+
+            for (i = 4; i < fc->socks_len && i < sizeof(fc->socks_buf); i++) {
+
+                if (fc->socks_buf[i] == 0) {
+                    break;
+                }
+            }
+
+            if (i >= fc->socks_len) {
+                return; /* the NUL waits in the next read */
+            }
+
+            {
+                unsigned port = (unsigned)((fc->socks_buf[2] << 8) | fc->socks_buf[3]);
+                unsigned addr = ((unsigned)fc->socks_buf[7] << 24) |
+                                ((unsigned)fc->socks_buf[6] << 16) |
+                                ((unsigned)fc->socks_buf[5] << 8) | (unsigned)fc->socks_buf[4];
+                struct in_addr a;
+
+                a.s_addr = addr;
+
+                if (addr == 0 || port == 0) {
+                    s3_cli_fwd_tcp_drop(fc);
+                    return;
+                }
+
+                fc->t_addr = (unsigned)a.s_addr;
+                fc->t_port = port;
+
+                s3_cli_fwd_socks_ok(fc, a.s_addr);
+
+                fc->socks_len = 0;
+                fc->socks_step = 3;
+
+                if (s3_cli_fwd_conn_open(fc, fc->t_addr, fc->t_port) != S3_OK) {
+                    s3_cli_fwd_tcp_drop(fc);
+                    return;
+                }
+
+                fc->chan->read->handler = s3_cli_fwd_tcp_chan_read;
+                fc->chan->read->data = fc;
+                fc->chan->read->active = 1;
+
+                c->read->handler = s3_cli_fwd_tcp_local_read;
+                c->read->active = 1;
+
+                return;
+            }
+
+        } else {
+
+            /* the bridged conn landed here late: the bytes ride the
+             * bridge pump once */
+
+            c->read->handler = s3_cli_fwd_tcp_local_read;
+            c->read->active = 1;
+
+            s3_cli_fwd_tcp_local_read(ev);
+
+            return;
         }
     }
 }
@@ -4290,6 +6371,15 @@ s3_cli_rev_parse_spec(const char *arg)
 {
     s3_ssh3_reverse_spec_t *spec;
     char                    text[64];
+
+    /* the bare port (no target colons) is the stdio forward request,
+     * the ssh2 shape this client does not serve -- the clean refusal
+     * beats the generic parse error */
+
+    if (strchr(arg, ':') == NULL) {
+        fprintf(stderr, "ssh3: stdio forward is not supported\n");
+        return S3_ERROR;
+    }
 
     if (s3_cli_rspec_count >= S3_CLI_REV_MAX) {
         fprintf(stderr, "ssh3: too many -R forwards (the bound is %u)\n", S3_CLI_REV_MAX);
@@ -6186,6 +8276,587 @@ s3_cli_agent_pump(void)
         }
 
         s3_cli_agent_frame_sent += (size_t)m;
+    }
+}
+
+/* === the proxy jump (-J [user@]host[:port], the tunnel and the
+ * loopback bridge, the interop shape): phase 1 dials the jump host
+ * byte-for-byte like the normal run, the direct-udp channel to the
+ * inner server address tunnels the inner connection, the loopback
+ * socket pair feeds it; the inner conn then dials against the tunnel
+ * side with the path mtu pinned to the 1200 floor === */
+
+/*
+ * the datagram handler of the jump conversation: the tunnel frames
+ * carry the prefix of the direct-udp channel, the payloads are the
+ * raw quic packets of the inner connection, one send() into the
+ * bridge socket b delivers them; a dropped datagram stays a loss the
+ * inner connection recovers from (RFC 768, RFC 9002)
+ */
+
+static void
+s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
+{
+    u_char        flat[S3_CLI_JUMP_INNER_MTU + 16];
+    u_char       *p;
+    size_t        len = 0;
+    s3_chain_t   *cl;
+    const u_char *pos, *end;
+    uint64_t      csid, chid;
+    s3_str_t      payload;
+    ssize_t       n;
+
+    (void)c;
+
+    if (s3_cli_bridge_b == INVALID_SOCKET) {
+        return;
+    }
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        len += s3_buf_size(cl->buf);
+    }
+
+    if (len > sizeof(flat)) {
+        return;
+    }
+
+    p = flat;
+
+    for (cl = data; cl != NULL; cl = cl->next) {
+        p = s3_cpymem(p, cl->buf->pos, s3_buf_size(cl->buf));
+    }
+
+    pos = flat;
+    end = flat + len;
+
+    if (s3_ssh3_dgram_parse(&pos, end, &csid, &chid, &payload) != S3_OK) {
+        return;
+    }
+
+    if (csid != s3_cli_jump_conv_id || chid != s3_cli_jump_ch_id) {
+        return;
+    }
+
+    n = send(s3_cli_bridge_b, payload.data, payload.len, 0);
+
+    (void)n; /* a short send is a loss the inner conn recovers from */
+}
+
+/*
+ * the tunnel side of the bridge: the quic packets of the inner
+ * connection recv straight behind the prefix (the payload bytes never
+ * move), one datagram per send; the congested channel parks the
+ * frame and puts the read event to sleep until the flush drains it
+ */
+
+static void
+s3_cli_jump_bridge_read(s3_event_t *ev)
+{
+    size_t  pre;
+    ssize_t n;
+
+    if (s3_cli_bridge_parked > 0) {
+        return;
+    }
+
+    pre = s3_ssh3_dgram_prefix_size(s3_cli_jump_conv_id, s3_cli_jump_ch_id);
+
+    for (;;) {
+
+        n = recv(s3_cli_bridge_b, s3_cli_bridge_frame + pre, sizeof(s3_cli_bridge_frame) - pre, 0);
+
+        if (n < 0) {
+
+            if (s3_socket_errno == S3_EAGAIN) {
+                return;
+            }
+
+            /* the bridge socket died: the inner conn has no transport
+             * left, the verdict ends the run */
+
+            s3_cli_verdict = 1;
+            s3_cli_exit_code = S3_CLI_EXIT_ERROR;
+
+            return;
+        }
+
+        if (n == 0) {
+            /* a zero-length datagram carries nothing */
+            continue;
+        }
+
+        if ((size_t)n > S3_CLI_JUMP_INNER_MTU) {
+            /* the inner packets are pinned to the cap, the rest drops */
+            continue;
+        }
+
+        {
+            u_char *p = s3_cli_bridge_frame;
+            size_t  len;
+
+            p = (u_char *)s3_ssh3_encode_varint(p, s3_cli_jump_conv_id);
+            p = (u_char *)s3_ssh3_encode_varint(p, s3_cli_jump_ch_id);
+
+            len = (size_t)(p - s3_cli_bridge_frame) + (size_t)n;
+
+            if (s3_quic_send_datagram(s3_cli_jump_cli, s3_cli_bridge_frame, len) != S3_OK) {
+
+                /* the channel is full: park the frame, the read
+                 * event sleeps until the flush drains the queue */
+
+                s3_cli_bridge_parked = len;
+
+                (void)s3_event_actions.del_event(ev, S3_READ_EVENT, 0);
+
+                return;
+            }
+        }
+    }
+}
+
+/* the parked frame retries each pass, the read event wakes on success */
+
+static void
+s3_cli_jump_bridge_flush(void)
+{
+    if (s3_cli_bridge_parked == 0) {
+        return;
+    }
+
+    if (s3_quic_send_datagram(s3_cli_jump_cli, s3_cli_bridge_frame, s3_cli_bridge_parked) != S3_OK) {
+        /* still congested, the next pass retries */
+        return;
+    }
+
+    s3_cli_bridge_parked = 0;
+
+    (void)s3_event_actions.add_event(s3_cli_bridge_bc->read, S3_READ_EVENT, 0);
+}
+
+/*
+ * the loopback socket pair: two udp sockets bound to 127.0.0.1:0 and
+ * connected to each other, a becomes the fd of the inner quic
+ * connection, b is the tunnel side the bridge reads
+ */
+
+static s3_int_t
+s3_cli_jump_bridge_create(s3_event_ctx_t *ctx)
+{
+    struct sockaddr_in a, b;
+    socklen_t          len;
+
+    s3_memzero(&a, sizeof(a));
+    s3_memzero(&b, sizeof(b));
+
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    s3_cli_bridge_a = socket(AF_INET, SOCK_DGRAM, 0);
+    s3_cli_bridge_b = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (s3_cli_bridge_a == INVALID_SOCKET || s3_cli_bridge_b == INVALID_SOCKET) {
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking((s3_fd_t)s3_cli_bridge_a) != S3_OK ||
+        s3_nonblocking((s3_fd_t)s3_cli_bridge_b) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (bind(s3_cli_bridge_a, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        return S3_ERROR;
+    }
+
+    len = sizeof(a);
+
+    if (getsockname(s3_cli_bridge_a, (struct sockaddr *)&a, &len) != 0) {
+        return S3_ERROR;
+    }
+
+    b = a;
+    b.sin_port = 0;
+
+    if (bind(s3_cli_bridge_b, (struct sockaddr *)&b, sizeof(b)) != 0) {
+        return S3_ERROR;
+    }
+
+    len = sizeof(b);
+
+    if (getsockname(s3_cli_bridge_b, (struct sockaddr *)&b, &len) != 0) {
+        return S3_ERROR;
+    }
+
+    s3_cli_bridge_sa = b;
+
+    if (connect(s3_cli_bridge_a, (struct sockaddr *)&b, sizeof(b)) != 0 ||
+        connect(s3_cli_bridge_b, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        return S3_ERROR;
+    }
+
+    s3_cli_bridge_bc = s3_get_connection(ctx, (s3_fd_t)s3_cli_bridge_b);
+
+    if (s3_cli_bridge_bc == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_cli_bridge_bc->read->handler = s3_cli_jump_bridge_read;
+
+    return s3_event_actions.add_event(s3_cli_bridge_bc->read, S3_READ_EVENT, 0);
+}
+
+/*
+ * the jump channel reader: the direct-udp channel carries no stream
+ * data, the tunnel lives once the 91 confirmation came back
+ */
+
+static void
+s3_cli_jump_ch_read(s3_event_t *ev)
+{
+    s3_connection_t *sc;
+    const u_char    *pos, *end;
+    ssize_t          n;
+
+    if (s3_cli_jump_ch_confirmed) {
+        return;
+    }
+
+    sc = ev->data;
+
+    n = sc->recv(sc, s3_cli_jump_ch_buf + s3_cli_jump_ch_len,
+                 sizeof(s3_cli_jump_ch_buf) - s3_cli_jump_ch_len);
+
+    if (n == (ssize_t)S3_AGAIN) {
+        return;
+    }
+
+    if (n <= 0) {
+        fprintf(stderr, "ssh3: the jump channel closed before the confirmation\n");
+        s3_cli_verdict = 1;
+        s3_cli_exit_code = S3_CLI_EXIT_ERROR;
+        return;
+    }
+
+    s3_cli_jump_ch_len += (size_t)n;
+
+    pos = s3_cli_jump_ch_buf;
+    end = s3_cli_jump_ch_buf + s3_cli_jump_ch_len;
+
+    while (pos < end) {
+
+        const u_char *msg = pos;
+        uint64_t      type;
+
+        if (s3_ssh3_parse_varint(&pos, end, &type) != S3_OK) {
+            /* a partial type varint, the next recv completes it */
+            pos = msg;
+            break;
+        }
+
+        if (type == S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
+
+            s3_ssh3_msg_open_confirmation_t conf;
+
+            if (s3_ssh3_msg_parse_open_confirmation(&pos, end, &conf) != S3_OK) {
+                pos = msg;
+                break;
+            }
+
+            s3_cli_jump_ch_confirmed = 1;
+            continue;
+        }
+
+        fprintf(stderr, "ssh3: unexpected jump channel message %llu\n", (unsigned long long)type);
+        s3_cli_verdict = 1;
+        s3_cli_exit_code = S3_CLI_EXIT_ERROR;
+        return;
+    }
+
+    /* the consumed bytes compact to the front of the accumulator */
+
+    s3_cli_jump_ch_len = (size_t)(end - pos);
+    s3_memmove(s3_cli_jump_ch_buf, pos, s3_cli_jump_ch_len);
+}
+
+/*
+ * phase 1 of the proxy jump: the connection to the jump host runs the
+ * normal h3 bring-up, the CONNECT answers 200 and the direct-udp
+ * channel to the inner server address confirms; the jump connection
+ * stays open for the whole run, its events ride the same loop the
+ * inner connection uses below.  The -i mode builds the JWT of the
+ * jump exporter (the bearer binds the live TLS session), the -U mode
+ * rides the Basic string unchanged
+ */
+
+static s3_int_t
+s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
+{
+    u_char                alpn_wire[8];
+    s3_str_t              alpn;
+    s3_quic_conf_t       *conf = &s3_cli_jump_conf;
+    s3_fd_t               fd;
+    s3_quic_connection_t *qc;
+    s3_uint_t             i;
+
+    fd = (s3_fd_t)socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd == (s3_fd_t)INVALID_SOCKET) {
+        fprintf(stderr, "ssh3: the jump socket failed\n");
+        return S3_ERROR;
+    }
+
+    if (s3_nonblocking(fd) != S3_OK) {
+        fprintf(stderr, "ssh3: the jump nonblocking mode failed\n");
+        return S3_ERROR;
+    }
+
+    s3_cli_jump_cli = s3_get_connection(ctx, fd);
+
+    if (s3_cli_jump_cli == NULL) {
+        fprintf(stderr, "ssh3: the jump connection alloc failed\n");
+        return S3_ERROR;
+    }
+
+    s3_cli_jump_cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+
+    if (s3_cli_jump_cli->pool == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_cli_jump_cli->sockaddr =
+        (struct sockaddr *)s3_palloc(s3_cli_jump_cli->pool, sizeof(s3_cli_jump_sa));
+
+    if (s3_cli_jump_cli->sockaddr == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memcpy(s3_cli_jump_cli->sockaddr, &s3_cli_jump_sa, sizeof(s3_cli_jump_sa));
+    s3_cli_jump_cli->socklen = sizeof(s3_cli_jump_sa);
+
+    alpn_wire[0] = (u_char)2;
+    alpn_wire[1] = 'h';
+    alpn_wire[2] = '3';
+
+    alpn.data = alpn_wire;
+    alpn.len = 3;
+
+    s3_memzero(conf, sizeof(s3_quic_conf_t));
+
+    conf->ssl = s3_ssl_client_create(&s3_cli_log, &alpn);
+
+    if (conf->ssl == NULL) {
+        fprintf(stderr, "ssh3: the jump ssl init failed\n");
+        return S3_ERROR;
+    }
+
+    conf->ctx = ctx;
+    conf->handshake_timeout = timeout;
+    conf->idle_timeout = 60000;
+    conf->stream_buffer_size = 1 << 20;
+    conf->max_concurrent_streams_bidi = 16;
+    conf->max_concurrent_streams_uni = 16;
+    conf->active_connection_id_limit = 8;
+
+    /*
+     * the tunnel frames carry the 1200-byte inner packets with the
+     * prefix on top, the advertised acceptance must cover them
+     */
+
+    conf->max_datagram_frame_size = S3_CLI_JUMP_DGRAM_SIZE;
+    conf->datagram_handler = s3_cli_jump_datagram;
+
+    /* the server's uni streams go to the session port, like at home */
+
+    conf->stream_handler = s3_cli_client_stream;
+
+    for (i = 0; i < S3_QUIC_AV_KEY_LEN; i++) {
+        conf->av_token_key[i] = (u_char)(0xa0 + i);
+        conf->sr_token_key[i] = (u_char)(0xb0 + i);
+    }
+
+    if (s3_event_actions.add_event(s3_cli_jump_cli->read, S3_READ_EVENT, 0) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (s3_quic_connect(s3_cli_jump_cli, conf) != S3_OK) {
+        fprintf(stderr, "ssh3: the jump connect failed\n");
+        return S3_ERROR;
+    }
+
+    for (;;) {
+
+        s3_event_process_posted(ctx, &ctx->posted_events);
+
+        s3_process_events_and_timers(ctx);
+
+        qc = s3_quic_get_connection(s3_cli_jump_cli);
+
+        if (qc == NULL) {
+            fprintf(stderr, "ssh3: the jump connection is gone\n");
+            return S3_ERROR;
+        }
+
+        if (!s3_cli_jump_hs && s3_cli_jump_cli->ssl != NULL && s3_cli_jump_cli->ssl->handshaked) {
+
+            s3_cli_jump_hs = 1;
+
+            /* the h3 session first, the same the main run does */
+
+            if (s3_h3_get_session(s3_cli_jump_cli) == NULL &&
+                s3_h3_init_session(s3_cli_jump_cli) != S3_OK) {
+                fprintf(stderr, "ssh3: the jump h3 session init failed\n");
+                return S3_ERROR;
+            }
+
+            s3_cli_jump_stream = s3_quic_open_stream(s3_cli_jump_cli, 1);
+
+            if (s3_cli_jump_stream == NULL) {
+                fprintf(stderr, "ssh3: the jump stream open failed\n");
+                return S3_ERROR;
+            }
+
+            s3_cli_jump_conv_id = ((s3_quic_stream_t *)s3_cli_jump_stream->data)->id;
+
+            s3_cli_jump_stream->read->handler = s3_cli_ctrl_read;
+            s3_cli_jump_stream->read->data = s3_cli_jump_stream;
+            s3_cli_jump_stream->read->active = 1;
+
+            /*
+             * the transport parameters are final at the handshake: a
+             * jump peer that cannot take the 1202-byte tunnel frames
+             * is a configuration error, fail at once
+             */
+
+            if (qc->ctp.max_datagram_frame_size < S3_CLI_JUMP_DGRAM_MIN) {
+                fprintf(stderr,
+                        "ssh3: the jump peer max_datagram_frame_size %u is below the tunnel "
+                        "need %u (the jump server wants -d 1352)\n",
+                        (unsigned)qc->ctp.max_datagram_frame_size, (unsigned)S3_CLI_JUMP_DGRAM_MIN);
+                return S3_ERROR;
+            }
+
+            /* the jump auth rides the same scheme: the JWT of the
+             * jump exporter for the -i mode, the Basic string for
+             * the -U mode */
+
+            if (s3_cli_auth == S3_CLI_AUTH_PUBKEY) {
+
+                if (s3_cli_jwt_build_user(s3_cli_jump_cli->ssl->connection, s3_cli_jump_user,
+                                          s3_cli_jump_bearer, sizeof(s3_cli_jump_bearer)) != S3_OK) {
+                    return S3_ERROR;
+                }
+
+                s3_cli_jump_auth = s3_cli_jump_bearer;
+
+            } else if (s3_cli_auth == S3_CLI_AUTH_BASIC) {
+                s3_cli_jump_auth = s3_cli_basic;
+            }
+        }
+
+        if (s3_cli_jump_hs && !s3_cli_jump_req_sent) {
+
+            u_char  frame[1024];
+            u_char *p;
+            size_t  sec_len, total;
+            ssize_t m;
+
+            sec_len = s3_cli_jump_h3_section(NULL);
+
+            p = frame;
+            p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
+            p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
+            sec_len = s3_cli_jump_h3_section(p);
+            total = (size_t)(p - frame) + sec_len;
+
+            m = s3_quic_stream_send(s3_cli_jump_stream, frame, total);
+
+            if (m == (ssize_t)S3_AGAIN) {
+                /* the window opens on the write event, retried next pass */
+            } else if (m != (ssize_t)total) {
+                fprintf(stderr, "ssh3: the jump request send failed\n");
+                return S3_ERROR;
+
+            } else {
+                s3_cli_jump_req_sent = 1;
+            }
+        }
+
+        if (s3_cli_status_seen && s3_cli_jump_channel == NULL) {
+
+            /* the direct-udp channel comes up right after the 200:
+             * the target extension carries the inner server address,
+             * the 91 confirmation completes the tunnel */
+
+            s3_cli_jump_channel = s3_quic_open_stream(s3_cli_jump_cli, 1);
+
+            if (s3_cli_jump_channel == NULL) {
+                fprintf(stderr, "ssh3: the jump channel open failed\n");
+                return S3_ERROR;
+            }
+
+            s3_cli_jump_ch_id = ((s3_quic_stream_t *)s3_cli_jump_channel->data)->id;
+
+            s3_cli_jump_channel->read->handler = s3_cli_jump_ch_read;
+            s3_cli_jump_channel->read->data = s3_cli_jump_channel;
+            s3_cli_jump_channel->read->active = 1;
+        }
+
+        if (s3_cli_status_seen && !s3_cli_jump_ch_sent) {
+
+            u_char                   frame[1024];
+            u_char                  *p;
+            s3_ssh3_channel_t        hdr;
+            s3_ssh3_forward_target_t target;
+            size_t                   total;
+            ssize_t                  m;
+
+            s3_memzero(&hdr, sizeof(hdr));
+
+            hdr.conversation_stream_id = s3_cli_jump_conv_id;
+            hdr.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
+            hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
+            hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
+
+            p = frame;
+            p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
+
+            target.family = 4;
+            target.ip_len = 4;
+
+            {
+                struct sockaddr_in in;
+
+                memcpy(&in, &s3_cli_sa, sizeof(in));
+                memcpy(target.ip, &in.sin_addr, 4);
+                target.port = ntohs(in.sin_port);
+            }
+
+            p = s3_ssh3_forward_build_target(p, &target);
+
+            total = (size_t)(p - frame);
+
+            m = s3_quic_stream_send(s3_cli_jump_channel, frame, total);
+
+            if (m == (ssize_t)S3_AGAIN) {
+                /* the window opens on the write event, retried next pass */
+            } else if (m != (ssize_t)total) {
+                fprintf(stderr, "ssh3: the jump channel send failed\n");
+                return S3_ERROR;
+
+            } else {
+                s3_cli_jump_ch_sent = 1;
+            }
+        }
+
+        if (s3_cli_jump_ch_confirmed) {
+            return S3_OK;
+        }
+
+        if (s3_current_msec - start > timeout) {
+            fprintf(stderr,
+                    "ssh3: the jump tunnel timed out (hs=%u req=%u status=%u ch=%u)\n",
+                    s3_cli_jump_hs, s3_cli_jump_req_sent, s3_cli_status_seen, s3_cli_jump_ch_sent);
+            return S3_ERROR;
+        }
     }
 }
 
@@ -8737,6 +11408,14 @@ s3_cli_console_init(void)
 
     InitializeCriticalSection(&s3_cli_ring_cs);
 
+    /* the -n run: the stdin stays unpumped (the EOF semantics of
+     * /dev/null), no reader thread rides */
+
+    if (s3_cli_no_stdin) {
+        DeleteCriticalSection(&s3_cli_ring_cs);
+        return S3_OK;
+    }
+
     s3_cli_thread = _beginthreadex(NULL, 0, s3_cli_reader, NULL, 0, NULL);
 
     if (s3_cli_thread == 0) {
@@ -8762,6 +11441,10 @@ s3_cli_console_init(void)
     /* the stdin rides the event loop: the handler chunks the bytes
      * into the channel frames directly (the ring of the win build
      * exists because the console read is not selectable there) */
+
+    if (s3_cli_no_stdin) {
+        return S3_OK;
+    }
 
     if (s3_nonblocking((s3_fd_t)0) != S3_OK) {
         return S3_ERROR;
@@ -8871,16 +11554,35 @@ static unsigned __stdcall s3_cli_reader(void *arg)
 
             for (i = 0; i < n; i++) {
 
-                size_t next = (s3_cli_ring_head + 1) & S3_CLI_RING_MASK;
+                u_char b = buf[i];
+                u_char filtered[8];
+                size_t flen;
 
-                if (next == s3_cli_ring_tail) {
-                    /* the ring full drops the byte: the echo runs
-                     * ahead of the window, the user keeps typing */
-                    continue;
+                /* the escape processor of the interactive console
+                 * shell filters the bytes before the ring */
+
+                if (s3_cli_escape_live()) {
+
+                    flen = s3_cli_escape_feed(&b, 1, filtered);
+
+                } else {
+                    flen = 1;
+                    filtered[0] = b;
                 }
 
-                s3_cli_ring[s3_cli_ring_head] = buf[i];
-                s3_cli_ring_head = next;
+                for (size_t k = 0; k < flen; k++) {
+
+                    size_t next = (s3_cli_ring_head + 1) & S3_CLI_RING_MASK;
+
+                    if (next == s3_cli_ring_tail) {
+                        /* the ring full drops the byte: the echo runs
+                         * ahead of the window, the user keeps typing */
+                        continue;
+                    }
+
+                    s3_cli_ring[s3_cli_ring_head] = filtered[k];
+                    s3_cli_ring_head = next;
+                }
             }
         }
 
@@ -8913,8 +11615,10 @@ s3_cli_stdin_read(s3_event_t *ev)
 
         ssize_t n;
         u_char  frame[sizeof(chunk) + 8];
+        u_char  filtered[sizeof(chunk)];
+        u_char *src = chunk;
+        size_t  len, overhead;
         u_char *p;
-        size_t  overhead;
 
         if (s3_cli_fin_sent) {
 
@@ -8933,12 +11637,26 @@ s3_cli_stdin_read(s3_event_t *ev)
 
         if (n > 0) {
 
+            len = (size_t)n;
+
+            /* the escape processor of the interactive console shell
+             * filters the bytes before they ride the channel */
+
+            if (s3_cli_escape_live()) {
+                len = s3_cli_escape_feed(chunk, len, filtered);
+                src = filtered;
+            }
+
+            if (len == 0) {
+                continue;
+            }
+
             p = frame;
             p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-            p = (u_char *)s3_ssh3_encode_varint(p, (uint64_t)n);
-            memcpy(p, chunk, (size_t)n);
+            p = (u_char *)s3_ssh3_encode_varint(p, (uint64_t)len);
+            memcpy(p, src, len);
 
-            overhead = (size_t)(p - frame) + (size_t)n;
+            overhead = (size_t)(p - frame) + len;
 
             s3_cli_chan_park(frame, overhead);
 
@@ -9135,39 +11853,43 @@ s3_cli_tick_handler(s3_event_t *ev)
 
     /* the stdin ring into the data frames, one frame per tick keeps
      * the outbox bounded by the ring size (the unix build parks the
-     * frames straight in the stdin read event) */
+     * frames straight in the stdin read event); the -n run pumps no
+     * stdin at all */
 
-    for (;;) {
+    if (!s3_cli_no_stdin) {
 
-        u_char  chunk[S3_CLI_RING_SIZE];
-        size_t  len = 0, overhead;
-        u_char *p;
+        for (;;) {
 
-        EnterCriticalSection(&s3_cli_ring_cs);
+            u_char  chunk[S3_CLI_RING_SIZE];
+            size_t  len = 0, overhead;
+            u_char *p;
 
-        while (s3_cli_ring_tail != s3_cli_ring_head && len < sizeof(chunk)) {
-            chunk[len++] = s3_cli_ring[s3_cli_ring_tail];
-            s3_cli_ring_tail = (s3_cli_ring_tail + 1) & S3_CLI_RING_MASK;
-        }
+            EnterCriticalSection(&s3_cli_ring_cs);
 
-        LeaveCriticalSection(&s3_cli_ring_cs);
+            while (s3_cli_ring_tail != s3_cli_ring_head && len < sizeof(chunk)) {
+                chunk[len++] = s3_cli_ring[s3_cli_ring_tail];
+                s3_cli_ring_tail = (s3_cli_ring_tail + 1) & S3_CLI_RING_MASK;
+            }
 
-        if (len == 0) {
-            break;
-        }
+            LeaveCriticalSection(&s3_cli_ring_cs);
 
-        p = frame;
-        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-        p = (u_char *)s3_ssh3_encode_varint(p, len);
-        memcpy(p, chunk, len);
+            if (len == 0) {
+                break;
+            }
 
-        overhead = (size_t)(p - frame) + len;
+            p = frame;
+            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
+            p = (u_char *)s3_ssh3_encode_varint(p, len);
+            memcpy(p, chunk, len);
 
-        s3_cli_chan_park(frame, overhead);
+            overhead = (size_t)(p - frame) + len;
 
-        if (s3_cli_outbox_len > 0) {
-            /* the window is tight, the rest waits for the next tick */
-            break;
+            s3_cli_chan_park(frame, overhead);
+
+            if (s3_cli_outbox_len > 0) {
+                /* the window is tight, the rest waits for the next tick */
+                break;
+            }
         }
     }
 
@@ -9236,7 +11958,7 @@ main(int argc, char **argv)
     int                   opt;
     char                 *operand = NULL;
     const char           *at, *colon, *slash;
-    size_t                i, cmdlen;
+    size_t                i;
     s3_str_t              alpn;
     u_char                alpn_wire[8];
     s3_fd_t               fd;
@@ -9275,20 +11997,102 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "i:U:J:L:R:o:rMl:e:O:vXVh")) != -1) {
+    /*
+     * the long forms ride the pre-scan before the short getopt (the
+     * server shape): --log-level carries the s3 log level the -l
+     * login key vacated, --help spells the usage, --sftp carries the
+     * transfer spec the -J key gave back
+     */
+
+    {
+
+        int n, m, keep, drop;
+        char *value;
+
+        for (n = 1; n < argc;) {
+
+            keep = 1;
+            drop = 0;
+            value = NULL;
+
+            if (strcmp(argv[n], "--log-level") == 0 && n + 1 < argc) {
+
+                if (strcmp(argv[n + 1], "all") == 0) {
+                    s3_cli_log.log_level = S3_LOG_DEBUG_ALL;
+                    s3_cli_level_explicit = 1;
+                    value = argv[n + 1];
+
+                } else {
+
+                    long lvl = atol(argv[n + 1]);
+                    const char *t = argv[n + 1];
+
+                    if (*t == '\0' || (lvl == 0 && strcmp(t, "0") != 0) || lvl < 0 || lvl > 9) {
+                        fprintf(stderr, "ssh3: --log-level wants 0..9 or all\n");
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    s3_cli_log.log_level = (s3_uint_t)lvl;
+                    s3_cli_level_explicit = 1;
+                    value = argv[n + 1];
+                }
+
+            } else if (strcmp(argv[n], "--help") == 0) {
+                s3_cli_usage(argv[0]);
+                s3_cli_net_cleanup();
+                return 0;
+
+            } else if (strcmp(argv[n], "--sftp") == 0 && n + 1 < argc) {
+
+                if (s3_cli_sftp_spec_parse(argv[n + 1]) != S3_OK) {
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                value = argv[n + 1];
+            }
+
+            if (value != NULL) {
+                drop = 2;
+            }
+
+            if (drop > 0) {
+
+                for (m = n; m + drop < argc; m++) {
+                    argv[m] = argv[m + drop];
+                }
+
+                argc -= drop;
+                keep = 0;
+            }
+
+            if (keep) {
+                n++;
+            }
+        }
+    }
+
+    while ((opt = getopt(argc, argv, "46AC:D:e:F:i:J:l:L:MnNp:qS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
         case 'i':
-            snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s", optarg);
-            s3_cli_auth = S3_CLI_AUTH_PUBKEY;
+
+            if (!s3_cli_have_keyfile) {
+                s3_cli_have_keyfile = 1;
+                snprintf(s3_cli_keyfile, sizeof(s3_cli_keyfile), "%s", optarg);
+                s3_cli_auth = S3_CLI_AUTH_PUBKEY;
+            }
+
             break;
 
         case 'U': {
 
             /* the value shape decides: the control endpoint head
-             * names the control master (the -U of the slave and of
-             * the -O ops), anything else is the Basic user:pass */
+             * names the control master (the -S shape now, the -U
+             * spelling deprecated), anything else is the Basic
+             * user:pass (the HTTP spec carries no ssh2 twin) */
 
 #if (S3_WIN32)
             if (optarg[0] == '\\' && optarg[1] == '\\') {
@@ -9296,8 +12100,10 @@ main(int argc, char **argv)
             if (optarg[0] == '/') {
 #endif
 
+                s3_cli_note("ssh3: -U with a control path is deprecated, use -S");
+
                 if (strlen(optarg) >= sizeof(s3_cli_cm_path)) {
-                    fprintf(stderr, "ssh3: -U control path is too long\n");
+                    fprintf(stderr, "ssh3: -S control path is too long\n");
                     return S3_CLI_EXIT_ERROR;
                 }
 
@@ -9337,87 +12143,93 @@ main(int argc, char **argv)
             break;
         }
 
+        case 'S':
+
+            /* the control master path (the ssh2 ControlPath shape):
+             * the master, the slave and the -O ops all ride it */
+
+            if (strlen(optarg) >= sizeof(s3_cli_cm_path)) {
+                fprintf(stderr, "ssh3: -S control path is too long\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            snprintf(s3_cli_cm_path, sizeof(s3_cli_cm_path), "%s", optarg);
+            s3_cli_cm_pipe_name_called = 1;
+
+            break;
+
         case 'M':
             s3_cli_cm_master = 1;
+            s3_cli_have_master = 1;
             break;
 
         case 'e':
 
-            if (strlen(optarg) >= 1024) {
-                fprintf(stderr, "ssh3: -e command is too long\n");
+            /* the escape character of the interactive session (the
+             * ssh2 shape); the slave command moved to the positional
+             * words of the -S run */
+
+            if (s3_cli_escape_parse(optarg) != S3_OK) {
                 return S3_CLI_EXIT_ERROR;
             }
 
-            free(s3_cli_cm_exec);
-            s3_cli_cm_exec = strdup(optarg);
             break;
 
         case 'O':
             s3_cli_cm_op = optarg;
             break;
 
-        case 'X':
+        case 'A':
             s3_cli_agent_mode = 1;
+            s3_cli_have_agent = 1;
+            break;
+
+        case 'X':
+            s3_cli_note("ssh3: -X is deprecated, use -A");
+            s3_cli_agent_mode = 1;
+            s3_cli_have_agent = 1;
+            break;
+
+        case 'x':
+        case 'Y':
+            s3_cli_note("ssh3: X11 forwarding is not supported by ssh3, ignoring");
             break;
 
         case 'J': {
 
-            const char *rest = optarg;
-            const char *sep;
-            size_t      len;
+            /* the fork decision: the put|get head stays the legacy
+             * transfer (deprecated), everything else is the ssh2
+             * proxy jump spec */
 
-            if (strncmp(rest, "put:", 4) == 0) {
-                s3_cli_sftp_mode = S3_CLI_SFTP_PUT;
-                rest += 4;
+            if (strncmp(optarg, "put:", 4) == 0 || strncmp(optarg, "get:", 4) == 0) {
+                s3_cli_note("ssh3: -J transfer is deprecated, use --sftp");
 
-            } else if (strncmp(rest, "get:", 4) == 0) {
-                s3_cli_sftp_mode = S3_CLI_SFTP_GET;
-                rest += 4;
+                if (s3_cli_sftp_spec_parse(optarg) != S3_OK) {
+                    return S3_CLI_EXIT_ERROR;
+                }
 
-            } else {
-                fprintf(stderr, "ssh3: -J wants put|get:local:remote\n");
+                break;
+            }
+
+            if (s3_cli_jump_parse(optarg) != S3_OK) {
                 return S3_CLI_EXIT_ERROR;
             }
-
-            /* the local:remote split: a colon right behind the drive
-             * letter rides the path, the next one ends the local
-             * side (the remote is the unix path of the server) */
-
-            sep = strchr(rest, ':');
-
-            if (sep == rest + 1 &&
-                ((rest[0] >= 'A' && rest[0] <= 'Z') || (rest[0] >= 'a' && rest[0] <= 'z'))) {
-                sep = strchr(sep + 1, ':');
-            }
-
-            if (sep == NULL || sep == rest || sep[1] == '\0') {
-                fprintf(stderr, "ssh3: -J wants put|get:local:remote\n");
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            len = (size_t)(sep - rest);
-            s3_cli_sftp_local = malloc(len + 1);
-
-            if (s3_cli_sftp_local == NULL) {
-                fprintf(stderr, "ssh3: out of memory\n");
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            memcpy(s3_cli_sftp_local, rest, len);
-            s3_cli_sftp_local[len] = '\0';
-
-            len = strlen(sep + 1);
-            s3_cli_sftp_remote = malloc(len + 1);
-
-            if (s3_cli_sftp_remote == NULL) {
-                fprintf(stderr, "ssh3: out of memory\n");
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            memcpy(s3_cli_sftp_remote, sep + 1, len + 1);
 
             break;
         }
+
+        case 's':
+
+            /* the subsystem name: only the sftp driver is served,
+             * the transfer spec rides the first positional word */
+
+            if (strcmp(optarg, "sftp") != 0) {
+                fprintf(stderr, "ssh3: only the sftp subsystem is supported\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            s3_cli_sftp_spec_mode = 1;
+            break;
 
         case 'L':
 
@@ -9427,10 +12239,21 @@ main(int argc, char **argv)
 
             break;
 
+        case 'D':
+
+            /* the dynamic forward (the ssh2 shape): the SOCKS
+             * listener, the request names the target per connection */
+
+            if (s3_cli_socks_parse(optarg) != S3_OK) {
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            break;
+
         case 'R':
 
-            /* the reverse forward (the backlog 3 tail): the spec
-             * parses now, the control channel opens after the 200 */
+            /* the reverse forward: the spec parses now, the control
+             * channel opens after the 200 */
 
             if (s3_cli_rev_parse_spec(optarg) != S3_OK) {
                 return S3_CLI_EXIT_ERROR;
@@ -9444,8 +12267,8 @@ main(int argc, char **argv)
 
         case 'o':
 
-            /* the client option (the backlog 7): the unknown key or
-             * the bad value exits 255 with the supported list */
+            /* the client option: the unknown key or the bad value
+             * exits 255 with the supported list */
 
             if (s3_cli_opt_parse(optarg) != S3_OK) {
                 return S3_CLI_EXIT_ERROR;
@@ -9454,13 +12277,114 @@ main(int argc, char **argv)
             break;
 
         case 'v':
-            s3_cli_verbose = 1;
-            s3_cli_log.log_level = S3_LOG_DEBUG_ALL;
+            s3_cli_vcount++;
+            s3_cli_level_explicit = 1;
             break;
 
         case 'l':
-            s3_cli_log.log_level =
-                (strcmp(optarg, "all") == 0) ? S3_LOG_DEBUG_ALL : (s3_uint_t)atol(optarg);
+
+            /* the login name (the ssh2 shape); the numeric level of
+             * the legacy -l refuses with the long form hint */
+
+            {
+                const char *t = optarg;
+                unsigned    digits = (*t != '\0');
+
+                for (; *t != '\0'; t++) {
+
+                    if (*t < '0' || *t > '9') {
+                        digits = 0;
+                        break;
+                    }
+                }
+
+                if (digits) {
+                    fprintf(stderr, "ssh3: -l takes a login name now, use --log-level for "
+                                    "the s3 log level\n");
+                    return S3_CLI_EXIT_ERROR;
+                }
+            }
+
+            if (strlen(optarg) >= sizeof(s3_cli_login)) {
+                fprintf(stderr, "ssh3: the login name is too long\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            snprintf(s3_cli_login, sizeof(s3_cli_login), "%s", optarg);
+            s3_cli_have_user = 1;
+            break;
+
+        case 'p':
+
+            /* the port of the target (the ssh2 shape), the operand
+             * port yields */
+
+            {
+                unsigned v = (unsigned)atoi(optarg);
+
+                if (v == 0 || v > 65535) {
+                    fprintf(stderr, "ssh3: -p wants a port 1..65535\n");
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                s3_cli_port = v;
+                s3_cli_have_port = 1;
+            }
+
+            break;
+
+        case '4':
+            s3_cli_family = AF_INET;
+            break;
+
+        case '6':
+            s3_cli_family = AF_INET6;
+            break;
+
+        case 'N':
+            s3_cli_no_session = 1;
+            break;
+
+        case 'n':
+            s3_cli_no_stdin = 1;
+            break;
+
+        case 't':
+            s3_cli_pty_mode = (++s3_cli_pty_tcount >= 2) ? S3_CLI_PTY_FORCE_NOTTY : S3_CLI_PTY_FORCE;
+            break;
+
+        case 'T':
+            s3_cli_pty_mode = S3_CLI_PTY_NEVER;
+            s3_cli_pty_tcount = 0;
+            break;
+
+        case 'q':
+            s3_cli_quiet = 1;
+            break;
+
+        case 'F':
+
+            /* the config file: "none" and /dev/null disable the
+             * whole config incl. the default read */
+
+            if (strcmp(optarg, "none") == 0 || strcmp(optarg, "/dev/null") == 0) {
+                s3_cli_cfg_off = 1;
+                s3_cli_cfg_path[0] = '\0';
+
+                break;
+            }
+
+            if (strlen(optarg) >= sizeof(s3_cli_cfg_path)) {
+                fprintf(stderr, "ssh3: -F path is too long\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            snprintf(s3_cli_cfg_path, sizeof(s3_cli_cfg_path), "%s", optarg);
+            s3_cli_cfg_explicit = 1;
+            break;
+
+        case 'C':
+            s3_cli_note("ssh3: compression is not supported by ssh3, ignoring");
             break;
 
         case 'V':
@@ -9486,7 +12410,7 @@ main(int argc, char **argv)
     if (s3_cli_cm_op != NULL) {
 
         if (!s3_cli_cm_pipe_name_called) {
-            fprintf(stderr, "ssh3: -O wants -U "
+            fprintf(stderr, "ssh3: -O wants -S "
 #if (S3_WIN32)
                             "\\\\pipe-name"
 #else
@@ -9497,10 +12421,33 @@ main(int argc, char **argv)
             return S3_CLI_EXIT_ERROR;
         }
 
+        s3_cli_notes_flush();
         return s3_cli_cm_control_op();
     }
 
-    if (s3_cli_cm_exec != NULL && s3_cli_cm_pipe_name_called && !s3_cli_cm_master) {
+    /*
+     * the slave of the control master (the ssh mux shape): a set
+     * control path with no -M and no -O means the positional words
+     * are the exec command of one session through the master
+     */
+
+    if (s3_cli_cm_path[0] != '\0' && !s3_cli_cm_master) {
+
+        if (optind >= argc) {
+            fprintf(stderr, "ssh3: the slave wants a command\n");
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_cm_exec = s3_cli_join_words(argv, (size_t)optind, (size_t)argc);
+
+        if (s3_cli_cm_exec == NULL) {
+            fprintf(stderr, "ssh3: out of memory\n");
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_notes_flush();
 
         return s3_cli_cm_slave_run();
     }
@@ -9514,7 +12461,9 @@ main(int argc, char **argv)
     operand = argv[optind++];
 
     /* the operand: [user@]host[:port][/path], the defaults are the
-     * 443 port and the /ssh3-term path (the Go fork parity) */
+     * 443 port and the /ssh3-term path (the Go fork parity); the
+     * -p/-o Port= wins over the operand port, the operand user wins
+     * over the -l login (the ssh2 conflict shape) */
 
     at = strchr(operand, '@');
 
@@ -9525,15 +12474,50 @@ main(int argc, char **argv)
             return S3_CLI_EXIT_ERROR;
         }
 
+        if (s3_cli_have_user) {
+            s3_cli_note("ssh3: the operand user overrides the -l login");
+        }
+
         memcpy(s3_cli_user, operand, (size_t)(at - operand));
         s3_cli_user[at - operand] = '\0';
+        s3_cli_have_user = 1;
 
         operand = (char *)at + 1;
     }
 
+    /* the bracketed ipv6 operand ([::1]:port): the port colon is the
+     * one outside the brackets, the brackets strip off the host */
+
     slash = strchr(operand, '/');
 
+    {
+
+        const char *lim = (slash != NULL) ? slash : operand + strlen(operand);
+        const char *p = operand;
+        unsigned    in_brackets = 0;
+
+        colon = NULL;
+
+        while (p < lim) {
+
+            if (*p == '[') {
+                in_brackets = 1;
+
+            } else if (*p == ']') {
+                in_brackets = 0;
+
+            } else if (*p == ':' && !in_brackets) {
+                colon = p;
+                break;
+            }
+
+            p++;
+        }
+    }
+
     if (slash != NULL) {
+
+        unsigned oport;
 
         if (strlen(slash) >= sizeof(s3_cli_path)) {
             fprintf(stderr, "ssh3: the path is too long\n");
@@ -9541,66 +12525,231 @@ main(int argc, char **argv)
         }
 
         snprintf(s3_cli_path, sizeof(s3_cli_path), "%s", slash);
-        colon = strchr(operand, ':');
 
-        if (colon != NULL && colon < slash) {
-            s3_cli_port = (unsigned)atoi(colon + 1);
+        if (colon != NULL) {
 
-            if (s3_cli_port == 0 || s3_cli_port > 65535 ||
+            oport = (unsigned)atoi(colon + 1);
+
+            if (oport == 0 || oport > 65535 ||
                 (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
                 fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
                 return S3_CLI_EXIT_ERROR;
             }
 
-            memcpy(s3_cli_host, operand, (size_t)(colon - operand));
-            s3_cli_host[colon - operand] = '\0';
+            s3_cli_port_operand = 1;
+
+            if (!s3_cli_have_port) {
+                s3_cli_port = oport;
+            }
+
+            s3_cli_operand_host(operand, (size_t)(colon - operand));
 
         } else {
-            s3_cli_port = 443;
 
             if ((size_t)(slash - operand) >= sizeof(s3_cli_host)) {
                 fprintf(stderr, "ssh3: the host is too long\n");
                 return S3_CLI_EXIT_ERROR;
             }
 
-            memcpy(s3_cli_host, operand, (size_t)(slash - operand));
-            s3_cli_host[slash - operand] = '\0';
+            s3_cli_operand_host(operand, (size_t)(slash - operand));
         }
+
+    } else if (colon != NULL) {
+
+        unsigned oport = (unsigned)atoi(colon + 1);
+
+        if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
+            fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_port_operand = 1;
+
+        if (!s3_cli_have_port) {
+            s3_cli_port = oport;
+        }
+
+        s3_cli_operand_host(operand, (size_t)(colon - operand));
 
     } else {
 
-        colon = strchr(operand, ':');
-
-        if (colon != NULL) {
-            s3_cli_port = (unsigned)atoi(colon + 1);
-
-            if (s3_cli_port == 0 || s3_cli_port > 65535 ||
-                (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            memcpy(s3_cli_host, operand, (size_t)(colon - operand));
-            s3_cli_host[colon - operand] = '\0';
-
-        } else {
-
-            s3_cli_port = 443;
-
-            if (strlen(operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: the host is too long\n");
-                return S3_CLI_EXIT_ERROR;
-            }
-
-            snprintf(s3_cli_host, sizeof(s3_cli_host), "%s", operand);
+        if (strlen(operand) >= sizeof(s3_cli_host)) {
+            fprintf(stderr, "ssh3: the host is too long\n");
+            return S3_CLI_EXIT_ERROR;
         }
 
+        s3_cli_operand_host(operand, strlen(operand));
+    }
+
+    if (slash == NULL) {
         snprintf(s3_cli_path, sizeof(s3_cli_path), "/ssh3-term");
     }
 
     if (s3_cli_host[0] == '\0') {
         s3_cli_usage(argv[0]);
         return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the transfer spec of -s sftp rides the first positional word
+     * after the operand, the rest refuses */
+
+    if (s3_cli_sftp_spec_mode) {
+
+        if (optind >= argc) {
+            fprintf(stderr, "ssh3: -s sftp wants a put|get:local:remote specifier\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        if (s3_cli_sftp_spec_parse(argv[optind++]) != S3_OK) {
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
+
+    /* the console detection rides the -t check, the config question
+     * and the session */
+
+    s3_cli_console = _isatty(0) ? 1u : 0u;
+
+    /* the -t force without a local tty is the ssh2 refusal */
+
+    if (s3_cli_pty_mode == S3_CLI_PTY_FORCE && !s3_cli_console) {
+        fprintf(stderr, "ssh3: no tty present, the -t force cannot ride\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the config file: the -F path wins, the default one reads when
+     * it exists; the values land only on the options the command
+     * line left unset, the forwards append */
+
+    if (!s3_cli_cfg_off) {
+
+        if (s3_cli_cfg_path[0] == '\0') {
+
+#if (S3_WIN32)
+            {
+                const char *home = getenv("USERPROFILE");
+
+                if (home != NULL) {
+                    snprintf(s3_cli_cfg_path, sizeof(s3_cli_cfg_path), "%s\\.ssh\\config", home);
+                }
+            }
+#else
+            {
+                const char *home = getenv("HOME");
+
+                if (home != NULL) {
+                    snprintf(s3_cli_cfg_path, sizeof(s3_cli_cfg_path), "%s/.ssh/config", home);
+                }
+            }
+#endif
+        }
+
+        if (s3_cli_cfg_path[0] != '\0' && s3_cli_cfg_load(s3_cli_host) != S3_OK) {
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
+
+    /* the port settles after the config: the -p and the operand port
+     * both beat it, the 443 default stays the last resort */
+
+    if (s3_cli_port == 0) {
+        s3_cli_port = 443;
+    }
+
+    /* the -l login lands when neither the operand nor the -U Basic
+     * head named a user (the -o User= and the config User write the
+     * user buffer directly) */
+
+    if (s3_cli_have_user && s3_cli_user[0] == '\0') {
+        snprintf(s3_cli_user, sizeof(s3_cli_user), "%s", s3_cli_login);
+    }
+
+    /* the level of the run: the explicit -v/--log-level wins over
+     * the -q, the quiet alone rides the errors */
+
+    if (!s3_cli_level_explicit && s3_cli_quiet) {
+        s3_cli_log.log_level = S3_LOG_ERR;
+
+    } else if (s3_cli_level_explicit && !s3_cli_vcount) {
+
+        /* the explicit --log-level keeps its value, an explicit -v
+         * count overrides it below */
+    }
+
+    if (s3_cli_vcount >= 3) {
+        s3_cli_log.log_level = S3_LOG_DEBUG_ALL;
+
+    } else if (s3_cli_vcount == 2) {
+        s3_cli_log.log_level = S3_LOG_DEBUG;
+
+    } else if (s3_cli_vcount == 1) {
+        s3_cli_log.log_level = S3_LOG_INFO;
+    }
+
+    s3_cli_notes_flush();
+
+    /* the jump rides the v4 inner target of this wave: the direct-udp
+     * extension carries the ipv4 form, the -6 dial refuses cleanly */
+
+    if (s3_cli_jump_on && s3_cli_family != AF_INET) {
+        fprintf(stderr, "ssh3: the proxy jump rides ipv4 in this wave, drop -6\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the mode interlocks of the stage B shapes */
+
+    if (s3_cli_cm_master &&
+        (s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_rspec_count || s3_cli_jump_on)) {
+        fprintf(stderr, "ssh3: -M rides no -J, -L, -R, --sftp or a command\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    if (s3_cli_cm_op != NULL &&
+        (s3_cli_cm_master || s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_rspec_count ||
+         s3_cli_jump_on)) {
+        fprintf(stderr, "ssh3: -O rides no -M, -J, -L or -R\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the -N holds the forwards only: a command and the sftp driver
+     * both refuse (the ssh2 shape) */
+
+    if (s3_cli_no_session) {
+
+        if (optind < argc) {
+            fprintf(stderr, "ssh3: Cannot execute command with -N\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        if (s3_cli_sftp_mode || s3_cli_cm_master) {
+            fprintf(stderr, "ssh3: -N rides no --sftp and no -M\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
+
+    /* the sftp transfer and the forwards carry no exec words */
+
+    if ((s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_cm_master || s3_cli_rspec_count) &&
+        optind < argc) {
+        fprintf(stderr, "ssh3: the transfers and the forwards take no command\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    if (s3_cli_sftp_mode && (s3_cli_fwd_count || s3_cli_rspec_count)) {
+        fprintf(stderr, "ssh3: the sftp transfer and the forwards do not ride one session\n");
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the trailing words join into the exec command (the ssh shape) */
+
+    if (optind < argc) {
+
+        s3_cli_cmd = s3_cli_join_words(argv, (size_t)optind, (size_t)argc);
+
+        if (s3_cli_cmd == NULL) {
+            fprintf(stderr, "ssh3: out of memory\n");
+            return S3_CLI_EXIT_ERROR;
+        }
     }
 
     /* the auth consistency: the pubkey wants the bare username, the
@@ -9633,84 +12782,36 @@ main(int argc, char **argv)
         snprintf(s3_cli_target, sizeof(s3_cli_target), "%s", s3_cli_path);
     }
 
+    /* the jump target rides the default path with the jump login; a
+     * jump spec without a user@ borrows the main login (the ssh2
+     * shape) */
+
+    if (s3_cli_jump_on) {
+
+        if (s3_cli_jump_user[0] == '\0') {
+
+            /* the jump spec without a user@ borrows the main login */
+
+            snprintf(s3_cli_jump_user, sizeof(s3_cli_jump_user), "%s", s3_cli_user);
+        }
+
+        if (s3_cli_jump_user[0] != '\0') {
+            snprintf(s3_cli_jump_target, sizeof(s3_cli_jump_target), "%s?user=%s", "/ssh3-term",
+                     s3_cli_jump_user);
+
+        } else {
+            snprintf(s3_cli_jump_target, sizeof(s3_cli_jump_target), "%s", "/ssh3-term");
+        }
+    }
+
     (void)s3_cli_tofu_prepare();
 
-    /* the mode interlocks of the stage B shapes */
-
-    if (s3_cli_cm_master &&
-        (s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_rspec_count || s3_cli_cm_exec != NULL)) {
-        fprintf(stderr, "ssh3: -M rides no -J, -L, -R or -e\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
-    if (s3_cli_cm_exec != NULL && (!s3_cli_cm_pipe_name_called || s3_cli_cm_master)) {
-        fprintf(stderr, "ssh3: -e wants -U "
-#if (S3_WIN32)
-                        "\\\\pipe-name"
-#else
-                        "socket-path"
-#endif
-                        " of a control master\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
-    if (s3_cli_cm_op != NULL &&
-        (s3_cli_cm_master || s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_rspec_count)) {
-        fprintf(stderr, "ssh3: -O rides no -M, -J, -L or -R\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
-    /* the sftp transfer and the forwards carry no exec words */
-
-    if ((s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_cm_master || s3_cli_rspec_count) &&
-        optind < argc) {
-        fprintf(stderr, "ssh3: -J, -L, -R and -M take no command\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
-    if (s3_cli_sftp_mode && (s3_cli_fwd_count || s3_cli_rspec_count)) {
-        fprintf(stderr, "ssh3: -J and -L/-R do not ride one session\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
-    /* the trailing words join into the exec command (the ssh shape) */
-
-    if (optind < argc) {
-
-        cmdlen = 1;
-
-        for (i = optind; i < (size_t)argc; i++) {
-            cmdlen += strlen(argv[i]) + 1;
-        }
-
-        s3_cli_cmd = malloc(cmdlen);
-
-        if (s3_cli_cmd == NULL) {
-            fprintf(stderr, "ssh3: out of memory\n");
-            return S3_CLI_EXIT_ERROR;
-        }
-
-        s3_cli_cmd[0] = '\0';
-
-        for (i = optind; i < (size_t)argc; i++) {
-
-            if (i > (size_t)optind) {
-                strncat(s3_cli_cmd, " ", cmdlen - strlen(s3_cli_cmd) - 1);
-            }
-
-            strncat(s3_cli_cmd, argv[i], cmdlen - strlen(s3_cli_cmd) - 1);
-        }
-    }
-
-    /* the console detection rides the TOFU prompt and the session */
-
-    s3_cli_console = _isatty(0) ? 1u : 0u;
-
-    /* the resolution first: the literal or the name, AF_INET (the
-     * QUIC listener of the server is a v4 socket in this port) */
+    /* the resolution first: the literal or the name; the family is
+     * the v4 default of this port, -6 rides the v6 dial; the jump
+     * run resolves the inner host v4 (the tunnel target extension) */
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = s3_cli_jump_on ? AF_INET : s3_cli_family;
     hints.ai_socktype = SOCK_DGRAM;
 
     if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
@@ -9719,9 +12820,15 @@ main(int argc, char **argv)
         return S3_CLI_EXIT_ERROR;
     }
 
-    memcpy(&s3_cli_sa, res->ai_addr, sizeof(struct sockaddr_in));
-    s3_cli_sa.sin_family = AF_INET;
-    s3_cli_sa.sin_port = htons((u_short)s3_cli_port);
+    s3_cli_sa_len = res->ai_addrlen;
+    memcpy(&s3_cli_sa, res->ai_addr, s3_cli_sa_len);
+
+    if (s3_cli_sa.ss_family == AF_INET6) {
+        ((struct sockaddr_in6 *)&s3_cli_sa)->sin6_port = htons((u_short)s3_cli_port);
+
+    } else {
+        ((struct sockaddr_in *)&s3_cli_sa)->sin_port = htons((u_short)s3_cli_port);
+    }
 
     freeaddrinfo(res);
 
@@ -9731,19 +12838,87 @@ main(int argc, char **argv)
         return S3_CLI_EXIT_ERROR;
     }
 
-    fd = (s3_fd_t)socket(AF_INET, SOCK_DGRAM, 0);
+    /*
+     * the jump phase: the tunnel to the inner server comes up first
+     * (the jump dial runs its own loop on the same event context),
+     * the inner conn then rides the bridge socket a
+     */
 
-    if (fd == (s3_fd_t)INVALID_SOCKET) {
-        fprintf(stderr, "ssh3: socket() failed\n");
-        s3_cli_net_cleanup();
-        return S3_CLI_EXIT_ERROR;
+    if (s3_cli_jump_on) {
+
+        struct addrinfo jhints, *jres = NULL;
+
+        if (s3_cli_jump_port == 0) {
+            s3_cli_jump_port = 443;
+        }
+
+        memset(&jhints, 0, sizeof(jhints));
+        jhints.ai_family = AF_INET;
+        jhints.ai_socktype = SOCK_DGRAM;
+
+        if (getaddrinfo(s3_cli_jump_host, NULL, &jhints, &jres) != 0 || jres == NULL) {
+            fprintf(stderr, "ssh3: cannot resolve the jump host %s\n", s3_cli_jump_host);
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        memcpy(&s3_cli_jump_sa, jres->ai_addr, sizeof(struct sockaddr_in));
+        s3_cli_jump_sa.sin_family = AF_INET;
+        s3_cli_jump_sa.sin_port = htons((u_short)s3_cli_jump_port);
+
+        freeaddrinfo(jres);
+
+        /* the jump dial rides its own 10s bound: the wrong jump host
+         * refuses cleanly well inside the session shape */
+
+        if (s3_cli_jump_dial(&s3_cli_ctx, s3_current_msec, S3_CLI_JUMP_TIMEOUT) != S3_OK) {
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        /* the loopback bridge, a becomes the inner quic fd below; the
+         * h3 globals the tunnel run touched reset for the inner phase
+         * (the CONNECT and the :status replay clean) */
+
+        if (s3_cli_jump_bridge_create(&s3_cli_ctx) != S3_OK) {
+            fprintf(stderr, "ssh3: the jump bridge create failed\n");
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_hs_done = 0;
+        s3_cli_req_sent = 0;
+        s3_cli_status_seen = 0;
+        s3_cli_status = 0;
+        s3_cli_resp_len = 0;
+        s3_memzero(&s3_cli_h3parse, sizeof(s3_cli_h3parse));
     }
 
-    if (s3_nonblocking(fd) != S3_OK) {
-        fprintf(stderr, "ssh3: the nonblocking mode failed\n");
-        closesocket((SOCKET)fd);
-        s3_cli_net_cleanup();
-        return S3_CLI_EXIT_ERROR;
+    if (s3_cli_jump_on) {
+
+        /* the inner quic rides the bridge socket a, its peer is the
+         * tunnel side b: the packets loop through the kernel and the
+         * bridge wraps them into the jump channel datagrams */
+
+        fd = (s3_fd_t)s3_cli_bridge_a;
+        s3_cli_bridge_a = INVALID_SOCKET;
+
+    } else {
+
+        fd = (s3_fd_t)socket(s3_cli_family, SOCK_DGRAM, 0);
+
+        if (fd == (s3_fd_t)INVALID_SOCKET) {
+            fprintf(stderr, "ssh3: socket() failed\n");
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        if (s3_nonblocking(fd) != S3_OK) {
+            fprintf(stderr, "ssh3: the nonblocking mode failed\n");
+            closesocket((SOCKET)fd);
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
     }
 
     cli = s3_get_connection(&s3_cli_ctx, fd);
@@ -9771,8 +12946,14 @@ main(int argc, char **argv)
         return S3_CLI_EXIT_ERROR;
     }
 
-    memcpy(cli->sockaddr, &s3_cli_sa, sizeof(s3_cli_sa));
-    cli->socklen = sizeof(s3_cli_sa);
+    if (s3_cli_jump_on) {
+        memcpy(cli->sockaddr, &s3_cli_bridge_sa, sizeof(s3_cli_bridge_sa));
+        cli->socklen = sizeof(s3_cli_bridge_sa);
+
+    } else {
+        memcpy(cli->sockaddr, &s3_cli_sa, s3_cli_sa_len);
+        cli->socklen = s3_cli_sa_len;
+    }
 
     alpn_wire[0] = (u_char)2;
     alpn_wire[1] = 'h';
@@ -9828,12 +13009,35 @@ main(int argc, char **argv)
 
         s3_process_events_and_timers(&s3_cli_ctx);
 
+        /* the jump tunnel: the parked frame retries, a dead jump
+         * conversation strands the inner conn, the run ends */
+
+        if (s3_cli_jump_on) {
+
+            if (s3_quic_get_connection(s3_cli_jump_cli) == NULL) {
+                fprintf(stderr, "ssh3: the jump connection is gone\n");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+
+            s3_cli_jump_bridge_flush();
+        }
+
         qc = s3_quic_get_connection(cli);
 
         if (qc == NULL) {
             fprintf(stderr, "ssh3: the connection is gone\n");
             s3_cli_rc = S3_CLI_EXIT_ERROR;
             break;
+        }
+
+        /* the inner connection lives inside the jump tunnel: the path
+         * mtu discovery pins at the 1200 floor, the escalating probes
+         * would not fit the tunnel datagrams (the reference turns the
+         * discovery off for its --proxy-jump the same way) */
+
+        if (s3_cli_jump_on && qc->path != NULL && qc->path->max_mtu > S3_CLI_JUMP_INNER_MTU) {
+            qc->path->max_mtu = S3_CLI_JUMP_INNER_MTU;
         }
 
         /* the handshake: the cert pins, the JWT signs, the h3
@@ -9907,9 +13111,13 @@ main(int argc, char **argv)
         }
 
         /* the 200 brings the -L listeners up: the forward run carries
-         * no session channel, the bridges live on the event loop */
+         * no session channel, the bridges live on the event loop; the
+         * conversation id of the CONNECT stream names every direct-*
+         * channel the bridges open (the -R run stamps the same) */
 
         if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_fwd_count && !s3_cli_fwd_ready) {
+
+            s3_cli_conv_id = ((s3_quic_stream_t *)s3_cli_ctrl->data)->id;
 
             if (s3_cli_fwd_listeners_start() != S3_OK) {
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
@@ -9976,10 +13184,11 @@ main(int argc, char **argv)
         }
 
         /* the 200 opens the session channel (the forwards, the
-         * reverse and the master carry no session of their own) */
+         * reverse and the master carry no session of their own, the
+         * -N holds the run without one) */
 
         if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
-            s3_cli_rspec_count == 0 && s3_cli_chan == NULL) {
+            s3_cli_rspec_count == 0 && !s3_cli_no_session && s3_cli_chan == NULL) {
 
             s3_cli_chan = s3_quic_open_stream(cli, 1);
 
@@ -10016,7 +13225,7 @@ main(int argc, char **argv)
         /* the header plus the session requests ride one send */
 
         if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
-            s3_cli_rspec_count == 0 && !s3_cli_ch_sent) {
+            s3_cli_rspec_count == 0 && !s3_cli_no_session && !s3_cli_ch_sent) {
 
             u_char            frame[2048];
             u_char           *p;
@@ -10050,15 +13259,26 @@ main(int argc, char **argv)
                 /* the sftp channel: the header alone rides, the
                  * driver start follows the send */
 
-            } else if (s3_cli_cmd != NULL) {
+            } else {
 
-                /* the exec: the command with the reply wanted, the
-                 * fin rides right behind it; the -X mode announces
-                 * the agent trigger on the LARVAL session first */
+                /*
+                 * the pty policy (the ssh2 shape): the shell wants
+                 * the pty by default (the console with the real
+                 * geometry, the pipe with the 80x24 force), -T drops
+                 * it entirely; the exec rides without a pty unless
+                 * -t/-tt force one.  The -X/-A mode announces the
+                 * agent trigger on the LARVAL session first
+                 */
 
-                s3_ssh3_request_t exec;
+                unsigned want_pty = 0;
 
-                memset(&exec, 0, sizeof(exec));
+                if (s3_cli_cmd != NULL) {
+                    want_pty = (s3_cli_pty_mode == S3_CLI_PTY_FORCE ||
+                                s3_cli_pty_mode == S3_CLI_PTY_FORCE_NOTTY);
+
+                } else {
+                    want_pty = (s3_cli_pty_mode != S3_CLI_PTY_NEVER);
+                }
 
                 if (s3_cli_agent_mode) {
 
@@ -10075,81 +13295,63 @@ main(int argc, char **argv)
                     p = (u_char *)s3_ssh3_msg_encode_data(p, &marker);
                 }
 
-                exec.kind = S3_SSH3_REQ_EXEC;
-                exec.u.exec.command.data = (u_char *)s3_cli_cmd;
-                exec.u.exec.command.len = strlen(s3_cli_cmd);
+                if (want_pty) {
 
-                p = s3_cli_session_request(p, S3_SSH3_REQ_EXEC, 1, &exec);
+                    s3_ssh3_request_t pty;
 
-            } else if (s3_cli_console) {
+                    memset(&pty, 0, sizeof(pty));
 
-                /* the interactive shell: the pty with the real
-                 * geometry, then the shell request */
+                    pty.kind = S3_SSH3_REQ_PTY;
+                    pty.u.pty.term.data = (u_char *)"xterm-256color";
+                    pty.u.pty.term.len = strlen("xterm-256color");
 
-                s3_ssh3_request_t pty, shell;
+                    if (s3_cli_console &&
+                        s3_cli_console_winsize(&s3_cli_win_w, &s3_cli_win_h) == S3_OK &&
+                        s3_cli_win_w != 0 && s3_cli_win_h != 0) {
+                        /* the real geometry of the console */
+                    } else {
+                        s3_cli_win_w = 80;
+                        s3_cli_win_h = 24;
+                    }
 
-                memset(&pty, 0, sizeof(pty));
+                    pty.u.pty.width = s3_cli_win_w;
+                    pty.u.pty.height = s3_cli_win_h;
+                    pty.u.pty.pixel_width = 0;
+                    pty.u.pty.pixel_height = 0;
+                    pty.u.pty.modes.data = NULL;
+                    pty.u.pty.modes.len = 0;
 
-                pty.kind = S3_SSH3_REQ_PTY;
-                pty.u.pty.term.data = (u_char *)"xterm-256color";
-                pty.u.pty.term.len = strlen("xterm-256color");
+                    p = s3_cli_session_request(p, S3_SSH3_REQ_PTY, 1, &pty);
 
-                if (s3_cli_console_winsize(&s3_cli_win_w, &s3_cli_win_h) != S3_OK ||
-                    s3_cli_win_w == 0 || s3_cli_win_h == 0) {
-                    s3_cli_win_w = 80;
-                    s3_cli_win_h = 24;
+                    s3_cli_tty = 1;
                 }
 
-                pty.u.pty.width = s3_cli_win_w;
-                pty.u.pty.height = s3_cli_win_h;
-                pty.u.pty.pixel_width = 0;
-                pty.u.pty.pixel_height = 0;
-                pty.u.pty.modes.data = NULL;
-                pty.u.pty.modes.len = 0;
+                if (s3_cli_cmd != NULL) {
 
-                p = s3_cli_session_request(p, S3_SSH3_REQ_PTY, 1, &pty);
+                    /* the exec: the command with the reply wanted, the
+                     * fin rides right behind it */
 
-                memset(&shell, 0, sizeof(shell));
-                shell.kind = S3_SSH3_REQ_SHELL;
+                    s3_ssh3_request_t exec;
 
-                p = s3_cli_session_request(p, S3_SSH3_REQ_SHELL, 1, &shell);
+                    memset(&exec, 0, sizeof(exec));
 
-                s3_cli_tty = 1;
+                    exec.kind = S3_SSH3_REQ_EXEC;
+                    exec.u.exec.command.data = (u_char *)s3_cli_cmd;
+                    exec.u.exec.command.len = strlen(s3_cli_cmd);
 
-            } else {
+                    p = s3_cli_session_request(p, S3_SSH3_REQ_EXEC, 1, &exec);
 
-                /*
-                 * the pipe shell: the pty-req with the default
-                 * geometry announces the session intent anyway (the
-                 * C server keeps a bare shell in the harness echo
-                 * mode), the stdin pumps through the remote line
-                 * discipline (the RequestTTY=force shape)
-                 */
+                } else {
 
-                s3_ssh3_request_t pty, shell;
+                    /* the shell request closes the header */
 
-                memset(&pty, 0, sizeof(pty));
+                    s3_ssh3_request_t shell;
 
-                pty.kind = S3_SSH3_REQ_PTY;
-                pty.u.pty.term.data = (u_char *)"xterm-256color";
-                pty.u.pty.term.len = strlen("xterm-256color");
-                pty.u.pty.width = 80;
-                pty.u.pty.height = 24;
-                pty.u.pty.pixel_width = 0;
-                pty.u.pty.pixel_height = 0;
-                pty.u.pty.modes.data = NULL;
-                pty.u.pty.modes.len = 0;
+                    memset(&shell, 0, sizeof(shell));
+                    shell.kind = S3_SSH3_REQ_SHELL;
 
-                p = s3_cli_session_request(p, S3_SSH3_REQ_PTY, 1, &pty);
-
-                memset(&shell, 0, sizeof(shell));
-                shell.kind = S3_SSH3_REQ_SHELL;
-
-                p = s3_cli_session_request(p, S3_SSH3_REQ_SHELL, 1, &shell);
-
-                s3_cli_win_w = 80;
-                s3_cli_win_h = 24;
-                s3_cli_tty = 1;
+                    p = s3_cli_session_request(p, S3_SSH3_REQ_SHELL, 1, &shell);
+                }
             }
 
             total = (size_t)(p - frame);
@@ -10217,6 +13419,23 @@ main(int argc, char **argv)
 
                     s3_cli_phase = S3_CLI_PH_SESSION;
                 }
+            }
+        }
+
+        /* the -N hold: the session channel never comes, the event
+         * pump keeps the conn alive until it dies (the verdict then
+         * rides the gone-conn check at the loop head) */
+
+        if (s3_cli_status_seen && s3_cli_status == 200 && s3_cli_no_session &&
+            s3_cli_phase != S3_CLI_PH_SESSION) {
+
+            s3_cli_phase = S3_CLI_PH_SESSION;
+
+            s3_cli_tick_arm();
+
+            if (s3_cli_tick == NULL) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
             }
         }
 
@@ -10408,6 +13627,30 @@ s3_cli_teardown(void)
     if (s3_cli_conn != NULL) {
         closesocket((SOCKET)s3_cli_conn->fd);
         s3_cli_conn = NULL;
+    }
+
+    /* the jump tunnel: the jump conn and the bridge sockets close
+     * with the wire (the pools ride the conn close) */
+
+    if (s3_cli_jump_cli != NULL) {
+
+        if (s3_cli_jump_conf.ssl != NULL) {
+            s3_ssl_free(s3_cli_jump_conf.ssl);
+            s3_cli_jump_conf.ssl = NULL;
+        }
+
+        closesocket((SOCKET)s3_cli_jump_cli->fd);
+        s3_cli_jump_cli = NULL;
+    }
+
+    if (s3_cli_bridge_a != INVALID_SOCKET) {
+        closesocket(s3_cli_bridge_a);
+        s3_cli_bridge_a = INVALID_SOCKET;
+    }
+
+    if (s3_cli_bridge_b != INVALID_SOCKET) {
+        closesocket(s3_cli_bridge_b);
+        s3_cli_bridge_b = INVALID_SOCKET;
     }
 
     s3_event_ctx_shutdown(&s3_cli_ctx);

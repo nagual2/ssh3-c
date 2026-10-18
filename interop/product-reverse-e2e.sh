@@ -233,7 +233,7 @@ start_cli() {
     S3CLILOG="${S3CLILOG:-$WORK/cli.log}"
 
     if [ "${S3CLI_V:-0}" = "1" ]; then
-        set -- -v "$@"
+        set -- -vv "$@"
     fi
 
     setsid nohup env HOME="$WORK/home" "$BUILD/ssh3" "$@" \
@@ -344,7 +344,7 @@ if timeout 10 "$BUILD/ssh3" -R garbage bob@127.0.0.1:1/ssh3-term \
 else
     RC=$?
 
-    if [ "$RC" -eq 255 ] && grep -q "bad -R spec" "$WORK/leg1.err"; then
+    if [ "$RC" -eq 255 ] && grep -qE "bad -R spec|stdio forward is not supported" "$WORK/leg1.err"; then
         pass "the bad spec refused at the parse (rc $RC)"
     else
         fail "the bad spec leg: rc=$RC $(tail -1 "$WORK/leg1.err")"
