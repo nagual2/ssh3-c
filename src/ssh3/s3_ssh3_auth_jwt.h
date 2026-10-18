@@ -29,6 +29,14 @@
 s3_int_t s3_ssh3_auth_jwt_bearer(const s3_str_t *header);
 
 /*
+ * the jti replay cache reset (P2-3): the ring empties; the test suite
+ * calls it between the fixture cases (they ride one prepared token),
+ * the daemon restart resets it by construction
+ */
+
+void s3_ssh3_jwt_replay_reset(void);
+
+/*
  * the full verdict: the token of the authorization header verifies
  * against the keys of the authorized_keys file for the requested
  * session username; convid is the TLS exporter material the harness

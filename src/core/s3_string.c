@@ -380,3 +380,67 @@ s3_sprintf_str(u_char *buf, u_char *last, u_char *src, size_t len, s3_uint_t hex
 
     return buf;
 }
+
+s3_int_t
+s3_json_escape(const u_char *src, size_t len, u_char *dst, size_t cap)
+{
+    size_t              i, n = 0;
+    static const u_char hex[] = "0123456789abcdef";
+
+    if (cap == 0) {
+        return -1;
+    }
+
+    for (i = 0; i < len; i++) {
+
+        u_char c = src[i];
+
+        if (c == '"' || c == '\\') {
+
+            if (n + 3 > cap) {
+                return -1;
+            }
+
+            dst[n++] = '\\';
+            dst[n++] = c;
+
+        } else if (c < 0x20 || c == 0x7f) {
+
+            if (n + 7 > cap) {
+                return -1;
+            }
+
+            dst[n++] = '\\';
+            dst[n++] = 'u';
+            dst[n++] = '0';
+            dst[n++] = '0';
+            dst[n++] = hex[(c >> 4) & 0xf];
+            dst[n++] = hex[c & 0xf];
+
+        } else {
+
+            if (n + 2 > cap) {
+                return -1;
+            }
+
+            dst[n++] = c;
+        }
+    }
+
+    dst[n] = '\0';
+
+    return (s3_int_t) n;
+}
+
+s3_int_t
+s3_memcmp_ct(const u_char *a, const u_char *b, size_t n)
+{
+    volatile u_char d = 0;
+    size_t          i;
+
+    for (i = 0; i < n; i++) {
+        d |= a[i] ^ b[i];
+    }
+
+    return (s3_int_t) d;
+}

@@ -255,6 +255,13 @@ static s3_event_ctx_t   s3_cli_ctx;
 static s3_connection_t *s3_cli_conn; /* the udp connection */
 static s3_connection_t *s3_cli_ctrl; /* the CONNECT stream */
 static s3_connection_t *s3_cli_chan; /* the session channel */
+
+/*
+ * the peer-advertised maxPacketSize of the session channel (P2-1): the
+ * confirmation parse keeps it, the send path chunks by it instead of
+ * the local constant - the reference WriteData() honors the peer bound
+ */
+static uint64_t s3_cli_ch_peer_mps = S3_CLI_CHANNEL_MAX_PACKET;
 static s3_quic_conf_t   s3_cli_conf;
 static uint64_t         s3_cli_conv_id;
 /* the dial peer, the family rides -4/-6 (the storage carries the v6
@@ -529,6 +536,7 @@ typedef struct {
     SOCKET           fd;
     s3_connection_t *evc;      /* the event connection of the fd */
     s3_connection_t *chan;     /* the quic stream, NULL until opened */
+    uint64_t         peer_mps; /* the peer-advertised maxPacketSize (P2-1) */
     unsigned         hdr_sent; /* the direct-tcp header parks until sent */
     unsigned         confirmed;
     unsigned         chan_fin;      /* the channel fin: the local write closes */
@@ -633,6 +641,7 @@ typedef struct {
     unsigned         spec;
     s3_connection_t *sc;
     uint64_t         ch_id;
+    uint64_t         peer_mps; /* the peer-advertised maxPacketSize (P2-1) */
     SOCKET           fd;
     unsigned         confirmed;
     unsigned         chan_fin;      /* the channel saw the fin */
@@ -717,6 +726,7 @@ static int s3_cli_agent_fd = -1;
 static s3_pool_t       *s3_cli_agent_pool; /* the dial state of the agent module */
 static unsigned         s3_cli_agent_bridged;
 static s3_connection_t *s3_cli_agent_sc; /* the agent-connection channel */
+static uint64_t s3_cli_agent_peer_mps = S3_CLI_CHANNEL_MAX_PACKET; /* P2-1 */
 static u_char           s3_cli_agent_hdr[64];
 static size_t           s3_cli_agent_hdr_len;
 static u_char          *s3_cli_agent_in; /* the channel bytes to the pipe */
@@ -774,6 +784,7 @@ struct s3_cli_cm_run_s {
     unsigned          finalized : 1;
     unsigned          exit_queued : 1;
     uint64_t          exit_code;
+    uint64_t          peer_mps; /* the peer-advertised maxPacketSize (P2-1) */
     s3_connection_t  *chan;   /* the ssh3 session channel */
     u_char           *ch_buf; /* the channel parse accumulator */
     size_t            ch_len;
@@ -1106,6 +1117,7 @@ s3_cli_usage(const char *prog)
             "              server-chosen port, the run holds like -L)\n"
             "  -s subsystem  only sftp is served: the put|get:local:remote\n"
             "              specifier rides the first word after the operand\n"
+            "  -r          the recursive sftp put|get (the directory walk)\n"
             "  -S path     the control master socket (the master, the slave\n"
             "              and the ops; the slave command rides the positional\n"
             "              words: %s -S path [words...])\n"
@@ -2006,6 +2018,7 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
     static const char label[] = "EXPORTER-SSH3";
 
     char        header[64], payload[512], seg[1024], jti[64], tok[1200];
+    char        user_esc[512];
     u_char      conv[32], sig[1024];
     BIO        *bio;
     EVP_PKEY   *key = NULL;
@@ -2016,6 +2029,7 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
     unsigned    ok;
     const char *alg;
     long long   iat, exp;
+    s3_int_t    elen;
     size_t      hlen, plen, tlen, siglen;
 
     /* the file loads once: the OpenSSH container takes its parser,
@@ -2135,11 +2149,24 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
     iat = (long long)time(NULL);
     exp = iat + S3_CLI_JWT_EXP_FRESH;
 
+    /* the login rides the JSON escape (P2-4): a quote or a backslash
+     * in the username would otherwise split or duplicate the claims,
+     * and the audit asks for the escape regardless of the server's
+     * exact-match refusal */
+
+    elen = s3_json_escape((const u_char *) user, strlen(user), (u_char *) user_esc, sizeof(user_esc));
+
+    if (elen < 0) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the login does not escape into the claims");
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
     hlen = (size_t)snprintf(header, sizeof(header), "{\"alg\":\"%s\",\"typ\":\"JWT\"}", alg);
     plen = (size_t)snprintf(payload, sizeof(payload),
                             "{\"iss\":\"%s\",\"iat\":%lld,\"exp\":%lld,\"sub\":\"ssh3\","
                             "\"aud\":\"unused\",\"client_id\":\"ssh3-%s\",\"jti\":\"%s\"}",
-                            user, iat, exp, user, jti);
+                            user_esc, iat, exp, user_esc, jti);
 
     if (hlen >= sizeof(header) || plen >= sizeof(payload)) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the claim buffers overflow");
@@ -4163,7 +4190,7 @@ s3_cli_sftp_pump(void)
 
             u_char *p;
 
-            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+            chunk = s3_ssh3_channel_chunk_size(s3_cli_ch_peer_mps, 0);
 
             if (chunk > s3_cli_sftp_out_len) {
                 chunk = s3_cli_sftp_out_len;
@@ -4380,6 +4407,7 @@ s3_cli_sftp_read(s3_event_t *ev)
                     break;
                 }
 
+                s3_cli_ch_peer_mps = conf.max_packet_size;
                 s3_cli_ch_confirmed = 1;
 
                 /* the channel is confirmed: the parked INIT rides */
@@ -5113,7 +5141,8 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
         if (fc->frame_sent == fc->frame_total) {
 
             u_char *p;
-            size_t  chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+            size_t  chunk =
+                s3_ssh3_channel_chunk_size(fc->peer_mps ? fc->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
             if (chunk > fc->to_chan_len) {
                 chunk = fc->to_chan_len;
@@ -5277,6 +5306,7 @@ s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
                         break;
                     }
 
+                    fc->peer_mps = conf.max_packet_size;
                     fc->confirmed = 1;
 
                     /* the confirmation opens the pump: the parked
@@ -7051,6 +7081,7 @@ s3_cli_rev_stream_read(s3_event_t *ev)
                         break;
                     }
 
+                    b->peer_mps = conf.max_packet_size;
                     b->confirmed = 1;
                     continue;
                 }
@@ -7283,7 +7314,7 @@ s3_cli_rev_pump(void)
                 u_char *p;
                 size_t  chunk;
 
-                chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+                chunk = s3_ssh3_channel_chunk_size(b->peer_mps ? b->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
                 if (chunk > b->to_chan_len) {
                     chunk = b->to_chan_len;
@@ -8170,6 +8201,7 @@ s3_cli_agent_pump(void)
                         break;
                     }
 
+                    s3_cli_agent_peer_mps = conf.max_packet_size;
                     continue;
                 }
 
@@ -8257,7 +8289,7 @@ s3_cli_agent_pump(void)
              * frame is the wire shape, the wait would strand the
              * short answers of the agent */
 
-            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+            chunk = s3_ssh3_channel_chunk_size(s3_cli_agent_peer_mps, 0);
 
             if (chunk > s3_cli_agent_acc_len) {
                 chunk = s3_cli_agent_acc_len;
@@ -9327,6 +9359,7 @@ s3_cli_cm_run_alloc(void)
         if (!s3_cli_cm_runs[i].used) {
             memset(&s3_cli_cm_runs[i], 0, sizeof(s3_cli_cm_runs[i]));
             s3_cli_cm_runs[i].used = 1;
+            s3_cli_cm_runs[i].peer_mps = S3_CLI_CHANNEL_MAX_PACKET;
 
             return &s3_cli_cm_runs[i];
         }
@@ -9655,7 +9688,7 @@ s3_cli_cm_run_stdin_pump(s3_cli_cm_run_t *run)
 
         if (run->frame_sent == run->frame_total) {
 
-            chunk = s3_ssh3_channel_chunk_size(S3_CLI_CHANNEL_MAX_PACKET, 0);
+            chunk = s3_ssh3_channel_chunk_size(run->peer_mps ? run->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
             if (chunk > run->stdin_len) {
                 chunk = run->stdin_len;
@@ -9940,6 +9973,7 @@ s3_cli_cm_run_read(s3_event_t *ev)
                     break;
                 }
 
+                run->peer_mps = conf.max_packet_size;
                 run->ch_confirmed = 1;
 
                 continue;
@@ -12089,7 +12123,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "46AC:D:e:F:i:J:l:L:MnNp:qS:s:tTo:VvxXYU:R:O:h")) != -1) {
+    while ((opt = getopt(argc, argv, "46AC:D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
