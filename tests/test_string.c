@@ -143,6 +143,34 @@ s3_test_string(void)
     len = s3_test_format(buf, sizeof(buf), "");
     S3_ASSERT(len == 0);
 
+    /* the JSON escape (P2-4): quotes and backslashes double-escape,
+     * the control characters ride the \u00xx form, the plain text
+     * passes through, the overflow refuses with -1 */
+
+    len = (size_t) s3_json_escape((u_char *) "plain", 5, buf, sizeof(buf));
+    s3_test_expect(buf, len, "plain");
+
+    len = (size_t) s3_json_escape((u_char *) "a\"b\\c", 5, buf, sizeof(buf));
+    s3_test_expect(buf, len, "a\\\"b\\\\c");
+
+    len = (size_t) s3_json_escape((u_char *) "a\tb\x01c", 5, buf, sizeof(buf));
+    s3_test_expect(buf, len, "a\\u0009b\\u0001c");
+
+    len = (size_t) s3_json_escape((u_char *) "", 0, buf, sizeof(buf));
+    S3_ASSERT(len == 0);
+    S3_ASSERT(buf[0] == '\0');
+
+    S3_ASSERT(s3_json_escape((u_char *) "abcd", 4, buf, 8) == 4);
+    S3_ASSERT(s3_json_escape((u_char *) "ab\"d", 4, buf, 5) < 0); /* the escaped form needs 6 */
+
+    /* the constant-time compare (P2-2): equal folds to zero, the
+     * difference verdicts on every byte position */
+
+    S3_ASSERT(s3_memcmp_ct((u_char *) "secret", (u_char *) "secret", 6) == 0);
+    S3_ASSERT(s3_memcmp_ct((u_char *) "secret", (u_char *) "secreT", 6) != 0);
+    S3_ASSERT(s3_memcmp_ct((u_char *) "secret", (u_char *) "Xecret", 6) != 0);
+    S3_ASSERT(s3_memcmp_ct((u_char *) "abc", (u_char *) "abcd", 3) == 0); /* the len is the caller's contract */
+
     return s3_test_failures;
 }
 

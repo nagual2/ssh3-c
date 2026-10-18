@@ -1198,6 +1198,60 @@ s3_ssh3_auth_jwt_bearer(const s3_str_t *header)
     return S3_OK;
 }
 
+/*
+ * the jti replay cache (P2-3): a valid token spends its jti, the
+ * second presentation inside the exp window declines.  The ring is a
+ * fixed bound, the oldest entry leaves on the wrap, so the memory
+ * does not grow with the token count; an expired entry answers "not
+ * seen" even while it still occupies its slot.
+ */
+
+#define S3_JWT_REPLAY_RING 4096
+
+typedef struct {
+    uint64_t  hash;
+    long long exp;
+} s3_jwt_replay_ent_t;
+
+static s3_jwt_replay_ent_t s3_jwt_replay_ring[S3_JWT_REPLAY_RING];
+static size_t              s3_jwt_replay_next;
+
+static uint64_t
+s3_jwt_replay_hash(const u_char *data, size_t len)
+{
+    uint64_t h = 1469598103934665603ULL; /* the FNV-1a 64 offset */
+    size_t   i;
+
+    for (i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 1099511628211ULL; /* the FNV-1a 64 prime */
+    }
+
+    return h;
+}
+
+static unsigned
+s3_jwt_replay_seen(uint64_t hash, long long now)
+{
+    size_t i;
+
+    for (i = 0; i < S3_JWT_REPLAY_RING; i++) {
+        if (s3_jwt_replay_ring[i].hash == hash && s3_jwt_replay_ring[i].exp > now) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void
+s3_jwt_replay_add(uint64_t hash, long long exp)
+{
+    s3_jwt_replay_ring[s3_jwt_replay_next].hash = hash;
+    s3_jwt_replay_ring[s3_jwt_replay_next].exp = exp;
+    s3_jwt_replay_next = (s3_jwt_replay_next + 1) % S3_JWT_REPLAY_RING;
+}
+
 s3_int_t
 s3_ssh3_auth_jwt_verify(const s3_str_t *header, const s3_str_t *user, const char *keys_path,
                         const u_char *convid, size_t convid_len)
@@ -1206,6 +1260,7 @@ s3_ssh3_auth_jwt_verify(const s3_str_t *header, const s3_str_t *user, const char
 
     s3_ssh3_jwt_claims_t cl, hdr_cl;
     s3_str_t             alg = s3_string(""), dead_alg = s3_string("");
+    s3_int_t             rc;
     const u_char        *token, *dot1, *dot2, *token_end;
     size_t               token_len, hlen, plen, slen, dlen, mlen;
     u_char               hdr[S3_SSH3_JWT_HDR_MAX];
@@ -1341,7 +1396,10 @@ s3_ssh3_auth_jwt_verify(const s3_str_t *header, const s3_str_t *user, const char
 
         dlen = s3_ssh3_jwt_b64_std_encode(convid, convid_len, jti);
 
-        if (cl.jti.len != dlen || s3_memcmp(cl.jti.data, jti, dlen) != 0) {
+        /* the exporter bytes are secret-derived: the compare rides the
+         * constant-time helper (P2-2), s3_memcmp short-circuits */
+
+        if (cl.jti.len != dlen || s3_memcmp_ct(cl.jti.data, jti, dlen) != 0) {
             return S3_DECLINED;
         }
     }
@@ -1349,5 +1407,21 @@ s3_ssh3_auth_jwt_verify(const s3_str_t *header, const s3_str_t *user, const char
     /* the signature over the signing input against the keys file, the
      * claim checks ran first so a garbage token never loads a file */
 
-    return s3_ssh3_jwt_keys_file(keys_path, &alg, token, (size_t)(dot2 - token), sig, slen);
+    rc = s3_ssh3_jwt_keys_file(keys_path, &alg, token, (size_t)(dot2 - token), sig, slen);
+
+    if (rc != S3_OK) {
+        return rc;
+    }
+
+    /* the replay gate (P2-3) rides after every other check: only a
+     * fully verified token spends its jti, and the second
+     * presentation inside the exp window declines */
+
+    if (s3_jwt_replay_seen(s3_jwt_replay_hash(cl.jti.data, cl.jti.len), now)) {
+        return S3_DECLINED;
+    }
+
+    s3_jwt_replay_add(s3_jwt_replay_hash(cl.jti.data, cl.jti.len), cl.exp);
+
+    return S3_OK;
 }

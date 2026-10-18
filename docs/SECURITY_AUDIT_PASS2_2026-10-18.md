@@ -381,5 +381,23 @@ reader count), it is marked as not re-verified in the text rather than restated 
 
 ---
 
-Prepared as a report-only audit. No repository code was modified; the branch carries this document
-and nothing else.
+## 10. Findings closure (the pass-2 closure wave)
+
+The closure landed on the `fix/pass2-findings` branch; the `file:line` anchors are its HEAD.
+
+| ID | Verdict | Fix and evidence |
+|----|---------|------------------|
+| P2-1 | **FIXED** | the peer bound rides the channel on both sides.  The client keeps it per context: the session channel keeps `s3_cli_ch_peer_mps` from the confirmation parse (`app/ssh3_client.c:4410`), the sftp pump chunks by it (`:4193`); the forward conns keep `fc->peer_mps` (`:5309`, chunk `:5145`); the reverse bridges keep `b->peer_mps` (`:7084`, chunk `:7317`); the agent keeps `s3_cli_agent_peer_mps` (`:8204`, chunk `:8292`); the CM runs keep `run->peer_mps` (`:9976`, chunk `:9691`).  The server stores it at the client-open parse (`app/ssh3_server.c:5582`) and at the client 91 of the server-initiated channels (`:6262`), and `s3_srv_fwd_flush` chunks by it (`:3412`, the local constant covers the window before the bound is known).  The helper self-clamps, so the §4.2 floor invariants hold at every new call site.  The interop runners stay on the local constant (not shipped). |
+| P2-2 | **FIXED** | `s3_memcmp_ct` in `src/core/s3_string.c:436` (no early exit, the folded xor; pinned in `tests/test_string.c`); the exporter-derived jti compare rides it (`src/ssh3/s3_ssh3_auth_jwt.c:1402`). |
+| P2-3 | **FIXED** | the jti replay ring in `src/ssh3/s3_ssh3_auth_jwt.c` (4096 entries, FNV-1a 64, the expired slots answer not-seen): only a fully verified token spends its jti, and the second presentation inside the exp window declines (`:1420`). |
+| P2-4 | **FIXED** | `s3_json_escape` in `src/core/s3_string.c:385` (quotes, backslashes, the controls over the `\u00xx` form, the cap refusal; pinned in `tests/test_string.c`); the login escapes before the claim interpolation (`app/ssh3_client.c:2157`). |
+| P2-5 | **FIXED** | `s3_srv_reverse_bind_rewrite` (`app/ssh3_server.c:4623`) copies the view into a local NUL-terminated buffer bounded by `S3_SSH3_REVERSE_HOST_MAX`; an oversize bind folds to the loopback (fail closed). |
+| P2-6 | **DONE** | the systematic string/table check: every optstring letter has a case and vice versa, every argument letter carries its `:` (the missing-argument form lands on `?` and the usage).  One defect of the wave's class found and fixed: the sftp `-r` (the recursive put|get) kept its case, its flag variable and both `put_r`/`get_r` implementations, but had lost the letter from the optstring — the recursive transfers were unreachable from the CLI; `-r` returned to the optstring and the usage text. |
+
+The carried-forward list (§9) is unchanged by this wave; the highest-value items stay the h3
+field-value pointer lifetime and the lexical SFTP drop ordering.
+
+---
+
+The report body (§1–§9) is the auditors' report-only deliverable; the findings closure (§10) landed
+as the `fix/pass2-findings` branch code on top of it.

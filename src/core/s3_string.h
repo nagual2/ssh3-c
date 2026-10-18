@@ -39,4 +39,18 @@ u_char *s3_slprintf(u_char *buf, u_char *last, const char *fmt, ...);
 
 #define s3_vsnprintf(buf, max, fmt, args) s3_vslprintf(buf, buf + (max), fmt, args)
 
+/*
+ * the JSON string escape (P2-4): quotes, backslashes and the control
+ * characters go over their \", \\ or \u00xx forms; returns the escaped
+ * length, or -1 when cap (the NUL included) does not hold it
+ */
+s3_int_t s3_json_escape(const u_char *src, size_t len, u_char *dst, size_t cap);
+
+/*
+ * the constant-time comparison (P2-2): no early exit, the verdict is
+ * the folded xor (0 = equal); the call site handling secret-derived
+ * bytes prefers this over s3_memcmp, which short-circuits
+ */
+s3_int_t s3_memcmp_ct(const u_char *a, const u_char *b, size_t n);
+
 #endif /* _S3_STRING_H_INCLUDED_ */

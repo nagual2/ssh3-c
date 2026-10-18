@@ -1384,6 +1384,14 @@ struct s3_srv_h3_channel_s {
      */
     s3_connection_t *pc;
 
+    /*
+     * the peer-advertised maxPacketSize (P2-1): the channel header
+     * parse clamps it into [4096 .. 16 MiB], the send path chunks by
+     * it instead of the local constant - the reference WriteData()
+     * honors the peer bound
+     */
+    uint64_t peer_max_packet;
+
     u_char  *buf;
     size_t   cap;
     size_t   len;
@@ -3396,9 +3404,12 @@ s3_srv_fwd_flush(s3_srv_h3_channel_t *ch)
             }
 
             /* a new frame: the payload copy rides the static buffer,
-             * the pending bytes drop at once */
+             * the pending bytes drop at once; the chunk rides the peer
+             * bound (P2-1), the local constant covers the window
+             * before the peer bound is known */
 
-            chunk = s3_ssh3_channel_chunk_size(S3_SRV_CHANNEL_MAX_PACKET, 0);
+            chunk = s3_ssh3_channel_chunk_size(
+                ch->peer_max_packet ? ch->peer_max_packet : S3_SRV_CHANNEL_MAX_PACKET, 0);
 
             if (chunk > ch->fwd_out_len) {
                 chunk = ch->fwd_out_len;
@@ -4614,8 +4625,28 @@ s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len
 {
     struct in_addr  a4;
     struct in6_addr a6;
+    char            text[S3_SSH3_REVERSE_HOST_MAX + 1];
 
     *rewritten = 0;
+
+    /* the local NUL-terminated copy bounds every string use below
+     * (P2-5): the s3_str_t parameter carries the length, the address
+     * parsers and the snprintf spellings need the terminator - a
+     * future caller may hand a view into a larger buffer */
+
+    if (requested->len > S3_SSH3_REVERSE_HOST_MAX) {
+
+        /* an oversize bind is not a loopback address: the no policy
+         * folds it back to the loopback and flags the rewrite, the
+         * family gate below answers whatever survives */
+
+        snprintf(out, out_len, "127.0.0.1");
+        *rewritten = 1;
+        return;
+    }
+
+    s3_memcpy(text, requested->data, requested->len);
+    text[requested->len] = '\0';
 
     if (s3_srv_gateway_ports == S3_SRV_GATEWAY_PORTS_YES) {
 
@@ -4635,14 +4666,13 @@ s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len
         return;
     }
 
-    if (inet_pton(AF_INET, (const char *)requested->data, &a4) == 1 &&
-        (ntohl(a4.s_addr) >> 24) == 127) {
-        snprintf(out, out_len, "%s", (const char *)requested->data);
+    if (inet_pton(AF_INET, text, &a4) == 1 && (ntohl(a4.s_addr) >> 24) == 127) {
+        snprintf(out, out_len, "%s", text);
         return;
     }
 
-    if (inet_pton(AF_INET6, (const char *)requested->data, &a6) == 1 && IN6_IS_ADDR_LOOPBACK(&a6)) {
-        snprintf(out, out_len, "%s", (const char *)requested->data);
+    if (inet_pton(AF_INET6, text, &a6) == 1 && IN6_IS_ADDR_LOOPBACK(&a6)) {
+        snprintf(out, out_len, "%s", text);
         return;
     }
 
@@ -4654,7 +4684,7 @@ s3_srv_reverse_bind_rewrite(const s3_str_t *requested, char *out, size_t out_len
          * may be a name the client resolved locally, the rewrite
          * passes it through */
 
-        snprintf(out, out_len, "%s", (const char *)requested->data);
+        snprintf(out, out_len, "%s", text);
         return;
     }
 
@@ -5546,6 +5576,11 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
         return S3_ERROR;
     }
 
+    /* the peer bound rides the channel (P2-1): the parse clamped it
+     * into [4096 .. 16 MiB], the send path chunks by it */
+
+    ch->peer_max_packet = hdr.max_packet_size;
+
     /* the receiver must verify the conversation of the channel */
 
     if (hdr.conversation_stream_id != s3_srv_h3_conv_id) {
@@ -6220,6 +6255,11 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     pos = msg;
                     break;
                 }
+
+                /* the client bound arrives here on the server-initiated
+                 * channels (P2-1): the send path chunks by it */
+
+                ch->peer_max_packet = conf.max_packet_size;
 
                 continue;
             }
