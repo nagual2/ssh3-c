@@ -115,3 +115,42 @@
 | 10 | S3_ASSERT-подсчёт в тестовом фреймворке | Макрос инкрементит глобальный `s3_test_failures`, а `main()` каждого теста возвращает локальный счётчик — тест может печатать FAIL и выйти 0, ctest покажет зелёный при фактическом падении. Смоук по ~40 тестовым main; закрыть ДО больших прогонов suite (предсуществующее, вскрыто IOCP-волной) | **ЗАКРЫТО** 2026-10-16 (c55dfe3): честный FAILURE-счёт во всех тестовых main (smoke ~40) |
 | 11 | SIGTERM-обработчик interop-харнес-сервера | Продуктовый демон чист (двухфазный drain P6.5), а `s3interop_server` после тестов оставляет огрызки процессов/сокетов, valgrind-прогоны шумят; обработчик по образцу демона (drain → flush-grace → force-close) | **ЗАКРЫТО** 2026-10-16 (b56993b): SIGTERM/SIGINT → drain → force-close по образцу демона |
 | 12 | Память sftp-сервера | Входящий файл буферизовался целиком (RSS ≈ размер payload вместо ожидаемых ~32 МиБ окна pipeline) — находка бенча 2026-10-13 (BENCH-V0.2.0 §4). Серверный read-буфер рос с файлом; READ-буферы переведены в пул, per-file pipeline put_r/get_r | **ЗАКРЫТО** 2026-10-14 (995f0f0 + 23fcb74) |
+
+## 9. Дорожная карта после v0.4.1 (внесено 2026-10-18 после закрытия P8 и pass-2 аудита)
+
+Источник: pass-2 аудит (`SECURITY_AUDIT_PASS2_2026-10-18.md` §9 carry-forward + находки P2-1..P2-6 закрыты), релиз v0.4.1, решение о пакетном расщеплении (ssh3-client/ssh3-server/ssh3c — RFS и bundled-каналы). Приоритет — целевая позиция §1: сначала безопасность shipped-поверхности, затем дистрибутивная зрелость, затем платформы.
+
+**Волна A — лёгкое, исполнимо сразу:**
+
+| № | Пункт | Суть | Приёмка |
+|---|-------|------|---------|
+| A1 | Pass-3: lexical SFTP drop ordering | Порядок chroot/setuid в child (`app/ssh3_server.c:3943+`), symlink-атака против недропнутого child, identity lexical-режима — highest consequence аудитора | фиксы + тесты, ctest 42/42 release+asan |
+| A2 | Pass-3: password/OIDC секретные сравнения | `s3_ssh3_oidc*.c`/auth_srv — `s3_memcmp_ct` (готов с P2-2) на все секретные сравнения | grep-ревизия + пины |
+| A3 | Fuzz harness `s3_h3_parse.c` | libFuzzer-обёртка (API buffer+state, allocation-free), ASan+UBSan, corpus pass-1 | ~160k+ инпутов без репортов |
+| A4 | checksums.txt + linux-клиент в release-ассеты | `build-release.yml`: `sha256sum dist/*`, `cp build/linux-release/ssh3 dist/ssh3_linux_amd64` | ассеты v0.4.2 |
+| A5 | mentors-подготовка | source-only changes, ITP-письмо, dupload-команды (загрузка — Debian-аккаунты владельца) | пакет готов к спонсорской загрузке |
+
+**Волна B — среднее:**
+
+| № | Пункт | Суть | Приёмка |
+|---|-------|------|---------|
+| B1 | Pass-3: h3 field-value pointer lifetime | `s3_str_t` → receive buffer через event-handler границу (pre-auth CONNECT) | трассировка, при риске — копирование в pool; тест |
+| B2 | DoS guard | `s3_srv_dos_*` счётчики/early-drop корректность | тесты переполнения |
+| B3 | Клиентский -R validation + UDP leg + --run-as-user | остаток §5.6 | интероп-леги |
+| B4 | Client rpm/apk | вторые пакеты в rpm-спеке и apk-контроле | сборка + установка |
+| B5 | go-форк: linux integration | разбор логов build-linux job (обвязка против нового CLI) | job зелёный |
+| B6 | apt-репозиторий | reprepro на минисфоруме (хостинг — решение владельца), `Scripts/`-публикатор | чистая Mint VM: apt install |
+
+**Заморожено (не планируем; условия разморозки):**
+
+| № | Пункт | Условие разморозки |
+|---|-------|--------------------|
+| F1 | QUIC-стек `src/event/quic/*` (~11.7k LOC) | отдельная полноценная сессия-аудит, не подфаза |
+| F2 | Huffman/QPACK encoder/eviction, `s3_h3_uni/encode` | после B1 |
+| F3 | arm64/arm deb+rpm | реальный спрос на arm-хосты (кросс-toolchain + arm64 OpenSSL job) |
+| F4 | darwin клиент | macos-раннер + OpenSSL darwin, при спросе |
+| F5 | windows arm64 exe | ниша |
+| F6 | FreeBSD/OpenBSD порты | kqueue-модуль (один на обе BSD) + vmactions-CI + pkg-OpenSSL + crypt_r fallback — при спросе; разведка VM первой |
+| F7 | go: darwin CM unit-тесты | macos-раннер |
+
+**Календарь:** Mint 23 (base Ubuntu 26.04, OpenSSL 3.5.5) — декабрь 2026: апгрейд минисфорума (не в день релиза; полный бэкап) → RFS-пакеты напрямую, бандл-необходимость отпадает. WSL recreate на Ubuntu 26.04 — опция владельца. До вех хосты живут на bundled-канале 0.4.1-1 (server+client).
