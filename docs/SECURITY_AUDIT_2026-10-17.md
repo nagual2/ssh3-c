@@ -287,5 +287,18 @@ nonce construction + `s3_quic_tokens.c` address-token validation; (3) `s3_ssh3_a
   (with the floor from F-1) or drop them; dead protocol invariants are indistinguishable from missing ones at review
   time.
 
+## 8. Findings closure (2026-10-18)
+
+Closed on `main` by the `fix/security-audit-1` wave (commits `d2787f7`…`0ad93b2`, merge `e4b45e7`), TDD (red first — 21 falling assertions — then green):
+
+| ID | Disposition |
+|----|-------------|
+| F-1 | **Closed (hardened).** `S3_SSH3_CHANNEL_MIN_PACKET_SIZE 4096` now sits next to the 16 MiB ceiling (`s3_ssh3_channel.h`), the parity of the Go `minPeerMaxPacketSize` (`channel.go:168`). `s3_ssh3_channel_parse_header()` clamps a below-floor advertisement up to the floor (a clamp, not a refusal — the fork semantics; the ceiling refusal is unchanged), and `s3_ssh3_channel_chunk_size()` clamps its input into `[4096 … 16 MiB]` internally, so the guarantee cannot be lost by a future caller. Tests: seven below-floor advertisements (4095…0) parse to 4096, `chunk_size(4)` yields 4093/4092 (plain/extended), the ceiling case stays green (`tests/test_ssh3_channel.c`). The send/receive data-path enforcement stays deliberately unwired — exactly as this report defers it; the value remains data-inert, so the latent one-byte-chunk DoS class is closed at the source. Readers audit at closure time: no consumer of the peer-advertised value exists in `src/` (the header build paths only), and the OPEN_CONFIRMATION field has zero readers — dead by design until the send-path wiring lands (see §7). |
+| I-1 | **Closed (documented + pinned).** The length-exact contract is now written at `s3_cm_op_is` (`s3_ssh3_cm.c`): the comparison must stay length-exact, a dispatcher must not evolve into a prefix switch, a growing op-set takes a (length, `s3_strncmp`) table. The pin test feeds the prefix-neighbour op `checkx` and asserts the ERROR verdict with no status dispatch (`tests/test_ssh3_cm.c`). |
+| I-2 | **Closed (centralised).** `s3_ssh3_env_admit(name, value)` is the single allow-list decision point (`s3_ssh3_session_srv.{c,h}`); every environment build rides it — the `s3_ssh3_session_srv_env` quota path (the run-as block, the pty-req TERM, the SSH_AUTH_SOCK injection) and the LANG fallback envp. There is no second env builder in the tree: the sftp child inherits via fork without exec. The unit corpus refuses LD_PRELOAD/LD_LIBRARY_PATH/LD_AUDIT/BASH_ENV/ENV/PYTHONSTARTUP/PERL5OPT/GLIBC_TUNABLES/GCONV_PATH/IFS and their neighbours (including value-injection and case-shift shapes) and pins the TERM bound (1..64). LC_* intentionally ride the wholesale environ (documented at the gate). |
+| I-3 | **Verified, no code change.** The per-user sftp budget is taken before the child fork: `s3_srv_sftp_budget_take` is the first check of `s3_srv_sftp_start` (`app/ssh3_server.c`), the refusal carries `SFTP-SRV-CAP-DENIED`, and the fork lives deeper in `s3_srv_sftp_chroot_start`; the knob is `--max-sftp-sessions-per-user` (S2-02). The e2e leg (`interop/security-pass2-e2e.sh`) drives two parallel 128 MiB puts under the cap of 1 and greps the marker. A per-transfer byte budget has no sshd analog — parity not required (PLAN). |
+
+Closure evidence: ctest 42/42 on `linux-release` and `linux-asan`; `fuzz_wire` 5.6M runs and `fuzz_message` 2.2M runs on `linux-fuzz` — zero findings; e2e `s3cm` / `cli-compat` / `security-pass2` green. The §6 coverage gaps (HTTP/3 + QPACK, the QUIC transport/protection layer, the JWT/OIDC internals) remain the R2 scope on frozen code.
+
 ---
 Prepared as a report-only audit. No repository code was modified.
