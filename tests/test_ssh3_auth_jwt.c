@@ -843,7 +843,7 @@ s3_test_ssh3_auth_jwt(void)
 
     {
         s3_str_t header, u;
-        char     hdr[2200];
+        char     hdr[sizeof(token) + 16];
         s3_int_t rrc;
 
         s3_ssh3_jwt_replay_reset();
