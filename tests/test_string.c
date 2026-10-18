@@ -153,8 +153,15 @@ s3_test_string(void)
     len = (size_t) s3_json_escape((u_char *) "a\"b\\c", 5, buf, sizeof(buf));
     s3_test_expect(buf, len, "a\\\"b\\\\c");
 
-    len = (size_t) s3_json_escape((u_char *) "a\tb\x01c", 5, buf, sizeof(buf));
-    s3_test_expect(buf, len, "a\\u0009b\\u0001c");
+    /* the controls: the explicit byte array (a string literal would
+     * feed the \x01 into the greedy hex escape) */
+
+    {
+        u_char ctrl[] = {'a', 0x09, 'b', 0x01, 'c'};
+
+        len = (size_t) s3_json_escape(ctrl, sizeof(ctrl), buf, sizeof(buf));
+        s3_test_expect(buf, len, "a\\u0009b\\u0001c");
+    }
 
     len = (size_t) s3_json_escape((u_char *) "", 0, buf, sizeof(buf));
     S3_ASSERT(len == 0);

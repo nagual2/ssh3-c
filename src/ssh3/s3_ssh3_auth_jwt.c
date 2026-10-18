@@ -1252,6 +1252,13 @@ s3_jwt_replay_add(uint64_t hash, long long exp)
     s3_jwt_replay_next = (s3_jwt_replay_next + 1) % S3_JWT_REPLAY_RING;
 }
 
+void
+s3_ssh3_jwt_replay_reset(void)
+{
+    s3_memzero(s3_jwt_replay_ring, sizeof(s3_jwt_replay_ring));
+    s3_jwt_replay_next = 0;
+}
+
 s3_int_t
 s3_ssh3_auth_jwt_verify(const s3_str_t *header, const s3_str_t *user, const char *keys_path,
                         const u_char *convid, size_t convid_len)

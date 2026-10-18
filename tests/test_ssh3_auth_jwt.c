@@ -488,6 +488,12 @@ s3_tj_case(const char *name, const char *token, const char *user, const char *ke
     u.data = (u_char *)user;
     u.len = strlen(user);
 
+    /* the cases ride one prepared token: the replay cache would spend
+     * its jti on the first success, so every case starts clean - the
+     * replay behavior itself pins in the dedicated case below */
+
+    s3_ssh3_jwt_replay_reset();
+
     rc = s3_ssh3_auth_jwt_verify(&header, &u, keysfile, convid, convid_len);
 
     if (rc != expect) {
@@ -830,6 +836,32 @@ s3_test_ssh3_auth_jwt(void)
     s3_tj_token(token, sizeof(token), "EdDSA", claims, ed, 0);
     s3_tj_case("missing keys file", token, "bob", "/tmp/s3jwt-missing-file", s3_tj_conv,
                sizeof(s3_tj_conv), S3_ERROR);
+
+    /* the replay pin (P2-3): the direct verify twice, no reset
+     * between - the second presentation of the verified token
+     * declines inside its exp window */
+
+    {
+        s3_str_t header, u;
+        char     hdr[2200];
+        s3_int_t rrc;
+
+        s3_ssh3_jwt_replay_reset();
+
+        snprintf(hdr, sizeof(hdr), "Bearer %s", token);
+
+        header.data = (u_char *)hdr;
+        header.len = strlen(hdr);
+
+        u.data = (u_char *)"bob";
+        u.len = 3;
+
+        rrc = s3_ssh3_auth_jwt_verify(&header, &u, path_a, s3_tj_conv, sizeof(s3_tj_conv));
+        S3_ASSERT(rrc == S3_OK);
+
+        rrc = s3_ssh3_auth_jwt_verify(&header, &u, path_a, s3_tj_conv, sizeof(s3_tj_conv));
+        S3_ASSERT(rrc == S3_DECLINED);
+    }
 
     /* the fixtures leave no trace (ASan clean) */
 
