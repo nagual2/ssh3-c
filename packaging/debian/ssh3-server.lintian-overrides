@@ -1,0 +1,9 @@
+# The ITP bug number does not exist yet: the Closes: line lands in
+# debian/changelog together with the mentors.debian.net upload.
+ssh3-server: initial-upload-closes-no-bugs
+
+# groff bug #290: the mdoc source nests .Cm as the first argument of
+# .Op/.It (the SYNOPSIS and the option tables); the rendered page is
+# correct, the warning is a formatter artifact - the upstream man page
+# (man/ssh3-server.8) stays verbatim.
+ssh3-server: groff-message

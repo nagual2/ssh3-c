@@ -1,0 +1,27 @@
+#!/bin/sh
+# postinst for ssh3-server: create the unprivileged service account and
+# its state directory.  The systemd enable/restart dance is left to the
+# dh_installsystemd snippet at the debhelper marker below: the socket
+# unit carries the [Install] and gets enabled, the service unit stays
+# static (socket-activated) - no direct systemctl calls anywhere.
+set -e
+
+case "$1" in
+    configure)
+        # the unprivileged service account running the daemon
+        if ! getent passwd ssh3 >/dev/null; then
+            adduser --system --group --home /var/lib/ssh3 --quiet ssh3
+        fi
+        if [ ! -d /var/lib/ssh3 ]; then
+            mkdir -p /var/lib/ssh3
+        fi
+        if getent passwd ssh3 >/dev/null; then
+            chown ssh3:ssh3 /var/lib/ssh3
+        fi
+        chmod 0750 /var/lib/ssh3
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

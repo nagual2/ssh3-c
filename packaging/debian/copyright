@@ -1,0 +1,54 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ssh3-c
+Upstream-Contact: Max <nahual15@gmail.com>
+Source: https://github.com/nagual2/ssh3-c
+
+Files: *
+Copyright: 2026 the ssh3-c authors
+License: BSD-2-clause
+
+Files: src/core/s3_buf.c
+ src/core/s3_buf.h
+ src/core/s3_log.c
+ src/core/s3_log.h
+ src/core/s3_palloc.c
+ src/core/s3_palloc.h
+ src/core/s3_queue.h
+ src/core/s3_rbtree.c
+ src/core/s3_rbtree.h
+ src/core/s3_string.c
+ src/core/s3_string.h
+ src/os/unix/s3_errno.c
+ src/os/unix/s3_errno.h
+Copyright: 2002-2021 Igor Sysoev
+           2011-2026 Nginx, Inc.
+           2026 the ssh3-c authors
+License: BSD-2-clause
+Comment: adaptations of the nginx src/core and src/os/unix sources
+ (ngx_ renamed to s3_, simplifications noted in code); the files
+ retain the original nginx copyright headers.  The complete list and
+ the SSH3 protocol reference (Apache-2.0, no source transplanted) are
+ in THIRD-PARTY-NOTICES.md.
+
+License: BSD-2-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in
+    the documentation and/or other materials provided with the
+    distribution.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ SUCH DAMAGE.

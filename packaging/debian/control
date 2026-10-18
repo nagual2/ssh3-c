@@ -1,0 +1,48 @@
+Source: ssh3-c
+Section: net
+Priority: optional
+Maintainer: Max <nahual15@gmail.com>
+Standards-Version: 4.7.2
+Homepage: https://github.com/nagual2/ssh3-c
+Vcs-Browser: https://github.com/nagual2/ssh3-c
+Vcs-Git: https://github.com/nagual2/ssh3-c.git
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake,
+ ninja-build,
+ gcc (>= 4:12),
+ libssl-dev (>= 3.5),
+ pkgconf
+Rules-Requires-Root: no
+
+Package: ssh3-server
+Architecture: amd64
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ libssl3t64 (>= 3.5),
+ adduser
+Provides: ssh3-go
+Conflicts: ssh3-go
+Replaces: ssh3-go
+Description: SSH3 server - SSH over QUIC/HTTP3 transport
+ SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
+ implemented in C17 in the nginx style on top of the OpenSSL QUIC TLS
+ API (the system libssl3t64, 3.5+).
+ .
+ The UDP/443 QUIC listener is socket-activated: systemd binds the
+ datagram socket as root and hands the ready fd to the service
+ (sd_listen_fds), so the service needs no CAP_NET_BIND_SERVICE and
+ comes up on the first packet.
+ .
+ System accounts authenticate out of the box: the password login
+ rides on by default (the sshd PasswordAuthentication canon) and the
+ root account never passes the Basic step.  Bearer JWT public keys,
+ OIDC id_tokens, sessions, port forwarding and the in-process sftp
+ with a chroot jail are also supported.
+ .
+ The daemon is configured through command-line flags (ssh3-server
+ --help) and environment variables read from the conffile
+ /etc/ssh3/ssh3-server.env (SSH3_LOG_LEVEL, SSH3_LOG_FILE,
+ SSH3_SHUTDOWN_DRAIN, SSH3_ENABLE_PASSWORD_LOGIN).  See
+ ssh3-server(8).

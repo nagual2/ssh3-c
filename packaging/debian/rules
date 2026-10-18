@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+# debian/rules - debhelper 13 build of ssh3-server from the orig tree:
+# cmake+ninja, one binary (the daemon; the client, the bench and the
+# interop runners stay upstream tools), the full hardening ladder.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+# Ninja instead of the default generator: matches the upstream presets
+# and keeps the single-target build below quiet
+override_dh_auto_configure:
+	dh_auto_configure -- -G Ninja
+
+# the package ships the daemon only; building one target skips the
+# client, the bench and the interop runners of the default ALL
+override_dh_auto_build:
+	dh_auto_build -- ssh3-server
+
+# the upstream unit suite is exercised by the linux-release CI preset,
+# not wired into this packaging build (see packaging/README.md)
+override_dh_auto_test:
+	:
+
+# no install() rules in the upstream CMakeLists (ninja install fails),
+# the .install lines pick the artifacts straight from the build tree
+override_dh_auto_install:
+	:

@@ -1,0 +1,87 @@
+[Unit]
+Description=SSH3 server (sessions and forwards over HTTP/3, RFC 9220)
+Documentation=man:ssh3-server(8)
+# The socket unit owns UDP/443: systemd binds it as root and hands the
+# ready fd to the service (the sd_listen_fds(3) protocol, the daemon
+# logs "socket-activated").  The service therefore never binds and
+# needs NO CAP_NET_BIND_SERVICE - the port privilege stays inside the
+# root-owned socket unit while the service itself keeps only what the
+# per-session setuid transition needs (the bounding set below).
+Requires=ssh3-server.socket
+After=network.target
+
+[Service]
+# exec: the failure of the binary itself (bad key paths, the
+# socket-activation guard) must fail the unit, not hang "simple"
+Type=exec
+# no -l: under LISTEN_FDS the daemon serves the passed fd and binds
+# nothing; the flags, the env table and the drop-in recipes live in
+# ssh3-server(8)
+ExecStart=/usr/bin/ssh3-server -c /etc/ssh3/cert.pem -k /etc/ssh3/priv.key
+# the debian conffile (/usr/bin/ssh3-server here, the build.sh deb
+# keeps /usr/sbin); the "-" tolerates a missing file after a purge
+EnvironmentFile=-/etc/ssh3/ssh3-server.env
+Environment=SSH3_LOG_LEVEL=info
+#
+# PRIVILEGE MODELS (P7.3) - pick exactly one:
+#
+# 1. SHIPPED, root daemon + per-session setuid (the OpenSSH/Go
+#    shape): the service runs as root, after the CONNECT
+#    authentication every session with a resolvable username drops
+#    onto it (initgroups, setgid, setuid, the home chdir) before any
+#    spawn; a user without a passwd entry answers 401 at the CONNECT.
+#    The socket activation keeps the passwordless 443, the bounding
+#    set keeps the root year minimal.  The hardening that conflicts
+#    with the identity switch is OFF and marked below: a root
+#    process must be allowed to setuid()/setgroups(), so
+#    NoNewPrivileges and RestrictSUIDSGID stay disabled, and the
+#    session children touch the real /home (ProtectHome=no).
+#
+# 2. SINGLE-IDENTITY, unprivileged daemon (the P7.2 shape): keep the
+#    three lines below commented out and add from a drop-in:
+#      systemctl edit ssh3-server.service
+#      [Service]
+#      User=ssh3
+#      Group=ssh3
+#      NoNewPrivileges=yes
+#      RestrictSUIDSGID=yes
+#      CapabilityBoundingSet=
+#      ExecStart=
+#      ExecStart=/usr/sbin/ssh3-server --run-as-user off -c /etc/ssh3/cert.pem -k /etc/ssh3/priv.key
+#    ...and restore ProtectHome=yes below.  Every session (and the
+#    in-process sftp) then runs as the ssh3 account; per-user
+#    identities and /home access are not available in this model.
+#
+User=root
+Group=root
+NoNewPrivileges=no
+
+# the writable state (sftp jail via the -H override, session
+# artifacts) lives here, not under /home
+StateDirectory=ssh3
+RuntimeDirectory=ssh3
+# the daemon drains the active conversations on SIGTERM (default 5s,
+# SSH3_SHUTDOWN_DRAIN), 30s leaves it one drain plus the close grace
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=3s
+# the session umask of the reference (the login default, 022): the
+# sessions are full-identity shells, a daemon-private 0077 would leak
+# into every file they create
+UMask=0022
+
+# NO sandboxing in model 1 (the sshd shape): the session children are
+# full-identity shells, and every Namespacing/capability directive
+# here becomes their inherited ceiling - the live deployment caught
+# the ladder one rung at a time: CapabilityBoundingSet without
+# CAP_SYSLOG broke root dmesg, ProtectSystem=strict would break
+# apt (read-only /usr), ProtectProc=invisible hides the system
+# processes from root ps/htop, PrivateTmp hides the host /tmp.
+# sshd carries none of these for its root sessions and neither do
+# we; a hardened deployment wants model 2 (the unprivileged ssh3
+# account) instead - its drop-in recipes stay in ssh3-server(8).
+
+
+# socket-activated only: enabling the unit is
+#   systemctl enable --now ssh3-server.socket
+# and the service comes up on the first packet

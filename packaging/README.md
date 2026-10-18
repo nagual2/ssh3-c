@@ -98,6 +98,59 @@ Backlog: porting the same scheme (private dir + RUNPATH) to the rpm and
 apk payloads is tracked separately; both still strip the build RUNPATH
 and expect the system OpenSSL 3.5.
 
+## Debian source package (RFS, `debian/`)
+
+`packaging/debian/` holds the Debian packaging for the Debian 13
+(trixie) source package: format `3.0 (quilt)`, `ssh3-c (0.3.0-1)`
+unstable, binary package `ssh3-server` (amd64).  It targets the Debian
+archive (mentors.debian.net upload) and **builds from source** against
+the **system** `libssl3t64 (>= 3.5)` - trixie ships 3.5.x with the QUIC
+TLS API, so no bundle is needed here.
+
+### Coexistence with the build.sh deb
+
+The two deb variants stay side by side, each with its own niche:
+
+| № | Difference | build.sh deb (`packaging/deb/`) | debian/ source package |
+|---|------------|--------------------------------|------------------------|
+| 1 | OpenSSL | bundles the Debian 13 libssl3t64 pair in the private `/usr/lib/ssh3-c/lib` (RUNPATH-pinned) | system `libssl3t64 (>= 3.5)` (`Depends`) |
+| 2 | Payload | prebuilt binary staged by `build.sh` | compiled from the orig tree (cmake+ninja, `hardening=+all`) |
+| 3 | Binary path | `/usr/sbin/ssh3-server` | `/usr/bin/ssh3-server` |
+| 4 | Env config | none (env/CLI only) | conffile `/etc/ssh3/ssh3-server.env` (template `debian/ssh3-server.env`, read via `EnvironmentFile` in the service unit) |
+| 5 | Unit enable | hand-rolled postinst block | `dh_installsystemd`: the socket carries `[Install]` and gets enabled, the service stays static (socket-activated, no direct `systemctl` calls) |
+| 6 | Target | arbitrary hosts incl. OpenSSL 3.0.x (mint 22.x, ubuntu 24.04) | Debian 13 archive (RFS upload) |
+
+`build.sh` and `packaging/deb/` are untouched by the debian/ variant;
+the `packaging/systemd/` units stay the canonical source - the
+`packaging/debian/ssh3-server.{socket,service}` copies differ only in
+the binary path (`/usr/bin`), the `EnvironmentFile` line and nothing
+else (the service has no `[Install]` section, so it remains static and
+`dh_installsystemd` enables the socket only).
+
+### Build (docker debian:trixie)
+
+The local WSL is ubuntu 24.04 (OpenSSL 3.0), so the build runs in a
+`debian:trixie` container with the WSL clone mounted:
+
+```
+git archive --format=tar --prefix=ssh3-c-0.3.0/ pkg/debian-rfs | tar -x -C /tmp/deb
+rm -rf /tmp/deb/ssh3-c-0.3.0/packaging/debian   # the orig carries no debian/ sub-tree
+tar -C /tmp/deb -czf ssh3-c_0.3.0.orig.tar.gz ssh3-c-0.3.0
+cp -r packaging/debian /tmp/deb/ssh3-c-0.3.0/debian
+cd /tmp/deb/ssh3-c-0.3.0
+dpkg-buildpackage -us -uc -S                    # source (.dsc + orig + debian.tar)
+dpkg-buildpackage -us -uc -b                    # binary (.deb + .changes)
+```
+
+Artifacts land in `packaging/_debian/` (gitignored, like `_build/`).
+Notes: the rules build the single `ssh3-server` ninja target (the
+client, the bench and the interop runners of the default ALL stay out);
+the upstream unit test suite is not wired into this packaging build
+(it is exercised by the linux-release CI preset); `dh_auto_install` is
+a no-op (no `install()` rules in the upstream CMakeLists) - the
+`ssh3-server.install` lines pick the daemon, the man page and the env
+template straight from the source/build tree.
+
 ## Known limitations
 
 1. The build-tree binary links the developer OpenSSL 3.5
