@@ -1,3 +1,16 @@
+ssh3-c (0.4.1-1) unstable; urgency=medium
+
+  * New upstream release 0.4.1: the pass-2 security audit closure -
+    the peer-advertised maxPacketSize rides the send path on both
+    sides (P2-1), the constant-time compare for the exporter-derived
+    bytes (P2-2), the jti replay cache of the verified tokens
+    (P2-3), the login escapes into the JWT claims (P2-4), the
+    reverse bind rewrite consumes a bounded local copy (P2-5), and
+    the sftp -r (the recursive put|get) is reachable from the CLI
+    again (P2-6).  See docs/SECURITY_AUDIT_PASS2_2026-10-18.md §10.
+
+ -- Max <nahual15@gmail.com>  Sun, 18 Oct 2026 19:30:00 +0000
+
 ssh3-c (0.4.0-2) unstable; urgency=medium
 
   * The openssh(8)-canon package split: the source now builds three
