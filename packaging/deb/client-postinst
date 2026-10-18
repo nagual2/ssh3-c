@@ -1,0 +1,13 @@
+#!/bin/sh
+# the compatibility link /usr/local/bin/ssh3 -> /usr/bin/ssh3: the
+# old-system scripts and habits keep working.  the admin's own real
+# file wins and stays untouched - the link is created only when the
+# target path is free or already a link of ours
+set -e
+
+if [ ! -e /usr/local/bin/ssh3 ] || [ -L /usr/local/bin/ssh3 ]; then
+    mkdir -p /usr/local/bin
+    ln -sf /usr/bin/ssh3 /usr/local/bin/ssh3
+fi
+
+exit 0

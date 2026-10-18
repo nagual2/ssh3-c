@@ -1,0 +1,22 @@
+Package: ssh3-client
+Version: @VERSION@
+Architecture: amd64
+Maintainer: ssh3-c maintainers <maintainers@example.com>
+Section: net
+Priority: optional
+Depends: libc6, ssh3c-libssl3 | ssh3-server (>= 0.4.0-1)
+Conflicts: ssh3-go-client
+Replaces: ssh3-go-client
+Description: SSH3 client - SSH over QUIC/HTTP3 transport
+ The SSH3 client: sessions, the ssh(1)-canon forwards (-L/-R/-D with
+ the udp:// extension), -J proxy jumps, the control master (-M/-S/-O),
+ the agent forwarding (-A), file transfers (put|get, -r recursive) and
+ the in-process sftp subsystem, all over one HTTP/3 (QUIC) extended
+ CONNECT per target.
+ .
+ The CLI follows the ssh(1) canon: -4/-6, -e escape, -F ssh_config,
+ -o keyword overrides, -t/-T pty control, -V.  The first connection
+ pins the server certificate TOFU-style in ~/.ssh3/known_hosts.
+ The OpenSSL 3.5 QUIC TLS API rides the bundled private libraries of
+ ssh3c-libssl3 (the RUNPATH pins /usr/lib/ssh3-c/lib), so any system
+ libssl is fine.  See ssh3(1).

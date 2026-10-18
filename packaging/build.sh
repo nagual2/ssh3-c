@@ -201,15 +201,10 @@ build_deb() {
         || die "deb/control Version ($debver) does not match the binary ($VERSION)"
     fetch_bundle
     mkdir -p "$stage/DEBIAN" "$stage/usr/sbin" "$stage/usr/share/doc/ssh3-server"
-    mkdir -p "$stage/usr/lib/ssh3-c/lib" "$stage/usr/lib/systemd/system"
-    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN" \
-        "$stage/usr/lib/ssh3-c" "$stage/usr/lib/ssh3-c/lib"
+    mkdir -p "$stage/usr/lib/systemd/system"
+    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN"
     install -m 0755 "$BIN" "$stage/usr/sbin/ssh3-server"
     set_runpath "$stage/usr/sbin/ssh3-server"
-    install -m 0644 "$BUNDLE_STAGE/libssl.so.3" \
-        "$stage/usr/lib/ssh3-c/lib/libssl.so.3"
-    install -m 0644 "$BUNDLE_STAGE/libcrypto.so.3" \
-        "$stage/usr/lib/ssh3-c/lib/libcrypto.so.3"
     install -m 0644 "$SCRIPT_DIR/deb/control" "$stage/DEBIAN/control"
     install -m 0755 "$SCRIPT_DIR/deb/postinst" "$stage/DEBIAN/postinst"
     install -m 0644 "$SCRIPT_DIR/deb/copyright" "$stage/usr/share/doc/ssh3-server/copyright"
@@ -226,6 +221,56 @@ build_deb() {
     bundle_report
     dpkg-deb --root-owner-group --build "$stage" \
         "$OUT_DIR/ssh3-server_${debver}_amd64.deb"
+}
+
+# the bundled OpenSSL 3.5 of the deb channel is a package of its own
+# (ssh3c-libssl3): the server and the client debs depend on it, the
+# path stays /usr/lib/ssh3-c/lib - the client of a serverless host
+# rides the same bundle
+build_deb_libs() {
+    log "building the bundled-libs deb package"
+    local stage="$STAGE_ROOT/deb/libs"
+    local debver
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
+    [ "${debver%%-*}" = "$VERSION" ] \
+        || die "deb/control Version ($debver) does not match the binary ($VERSION)"
+    fetch_bundle
+    mkdir -p "$stage/DEBIAN" "$stage/usr/lib/ssh3-c/lib"
+    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN" \
+        "$stage/usr/lib/ssh3-c" "$stage/usr/lib/ssh3-c/lib"
+    install -m 0644 "$BUNDLE_STAGE/libssl.so.3" \
+        "$stage/usr/lib/ssh3-c/lib/libssl.so.3"
+    install -m 0644 "$BUNDLE_STAGE/libcrypto.so.3" \
+        "$stage/usr/lib/ssh3-c/lib/libcrypto.so.3"
+    sed "s/@VERSION@/$debver/" "$SCRIPT_DIR/deb/libssl3-control" \
+        > "$stage/DEBIAN/control"
+    dpkg-deb --root-owner-group --build "$stage" \
+        "$OUT_DIR/ssh3c-libssl3_${debver}_amd64.deb"
+}
+
+# the client deb: /usr/bin/ssh3 with the RUNPATH into the private
+# bundle directory, the man page, and the postinst compatibility link
+# /usr/local/bin/ssh3 -> /usr/bin/ssh3 (the admin's own file wins)
+build_deb_client() {
+    log "building the client deb package"
+    local stage="$STAGE_ROOT/deb/client"
+    local client="$BIN_DIR/ssh3"
+    [ -x "$client" ] || die "no client binary at '$client' (cmake --build --preset linux-release)"
+    local debver
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
+    [ "${debver%%-*}" = "$VERSION" ] \
+        || die "deb/control Version ($debver) does not match the binary ($VERSION)"
+    mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/man/man1"
+    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN" \
+        "$stage/usr/bin"
+    install -m 0755 "$client" "$stage/usr/bin/ssh3"
+    set_runpath "$stage/usr/bin/ssh3"
+    gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
+    install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
+    sed "s/@VERSION@/$debver/" "$SCRIPT_DIR/deb/client-control" \
+        > "$stage/DEBIAN/control"
+    dpkg-deb --root-owner-group --build "$stage" \
+        "$OUT_DIR/ssh3-client_${debver}_amd64.deb"
 }
 
 build_rpm() {
@@ -267,9 +312,11 @@ build_apk() {
 FMT="${1:-all}"
 case "$FMT" in
     deb) ensure_bin; build_deb ;;
+    deb-libs) ensure_bin; fetch_bundle; build_deb_libs ;;
+    deb-client) ensure_bin; build_deb_client ;;
     rpm) ensure_bin; build_rpm ;;
     apk) ensure_bin; build_apk ;;
-    all) ensure_bin; build_deb; build_rpm; build_apk ;;
+    all) ensure_bin; build_deb; build_deb_libs; build_deb_client; build_rpm; build_apk ;;
     *) die "usage: bash packaging/build.sh [deb|rpm|apk|all]" ;;
 esac
 

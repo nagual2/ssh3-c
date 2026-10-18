@@ -1,0 +1,15 @@
+Package: ssh3c-libssl3
+Version: @VERSION@
+Architecture: amd64
+Maintainer: ssh3-c maintainers <maintainers@example.com>
+Section: libs
+Priority: optional
+Depends: libc6
+Breaks: ssh3-server (<= 0.4.1)
+Replaces: ssh3-server (<= 0.4.1)
+Description: the bundled OpenSSL 3.5 shared libraries of ssh3-c
+ The unmodified Debian 13 libssl3t64 shared libraries (3.5.x, the
+ QUIC TLS API) installed in the private /usr/lib/ssh3-c/lib/: the
+ ssh3 binaries pin this directory with their RUNPATH, so the system
+ libssl (any version, e.g. the 3.0.x of mint 22.x / ubuntu 24.04) is
+ neither required nor touched.
