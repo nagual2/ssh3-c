@@ -55,7 +55,7 @@ jobs:
           # follows; the orig is restored for the artifact set
           cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
           cd "/build/ssh3-c-$V"
-          dpkg-buildpackage -us -uc -S
+          dpkg-buildpackage -us -uc -S -nc
           dpkg-buildpackage -us -uc -b
           cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
           ls -la /build/*.deb /build/*.dsc /build/*.changes /build/*.orig.tar.gz
