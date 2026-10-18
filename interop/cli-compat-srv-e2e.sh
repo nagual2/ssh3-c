@@ -165,7 +165,11 @@ wait_echo "$WORK/echo2.log" || die "the relay echo did not start"
 # the daemon leg: the fresh log, the flags after the fixed ones
 
 start_srv() {
+    # the 1e password default rides off here: the legs exercise the
+    # sshd-CLI shapes on the open harness shape, not the auth
+
     env SSH3C_PROTO=1 "$BIN" -3 -c "$WORK/cert.pem" -h "$WORK/key.pem" \
+        --password-system off \
         "$@" > "$WORK/srv.log" 2>&1 < /dev/null &
     SRVPID=$!
 
@@ -188,6 +192,7 @@ start_srv() {
 
 start_srv_sudo() {
     sudo -n env SSH3C_PROTO=1 "$BIN" -3 -c "$WORK/cert.pem" -h "$WORK/key.pem" \
+        --password-system off \
         "$@" > "$WORK/srv.log" 2>&1 < /dev/null &
     SUDO_PID=$!
     SRVPID=$SUDO_PID

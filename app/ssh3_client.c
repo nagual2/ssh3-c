@@ -172,10 +172,24 @@ typedef int s3_cli_cm_h_t;
 /* the CONNECT response accumulator, the status section only */
 #define S3_CLI_RESP_MAX 16384
 
-/* the setup deadline after the dial: the handshake, the CONNECT and
- * the channel bring-up must complete inside it, the session itself
- * runs without a deadline (the long exec is legitimate) */
-#define S3_CLI_SETUP_TIMEOUT 30000
+/*
+ * the setup deadline after the dial: 0 = not armed (the wave 1d, the
+ * ConnectTimeout unset of the ssh(1) canon - the bring-up runs until
+ * the transport or the server ends it); a non-zero value arms the
+ * deadline of the handshake, the CONNECT and the channel bring-up
+ * (the session itself runs without a deadline, the long exec is
+ * legitimate)
+ */
+#define S3_CLI_SETUP_TIMEOUT 0
+
+/*
+ * the quic conf guard of the same wave: the engine timer reads a 0
+ * as "fire at once" (s3_event_add_timer keys on now+timer), so the
+ * no-deadline canon is a day-sized value, not a zero - the server
+ * LoginGraceTime (120 s) and the negotiated idle close end a stalled
+ * handshake for real
+ */
+#define S3_CLI_HS_CONF_TIMEOUT (24 * 60 * 60 * 1000)
 
 /* the ssh exit code of the transport failures, the OpenSSH parity */
 #define S3_CLI_EXIT_ERROR 255
@@ -8649,7 +8663,10 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
 
     conf->ctx = ctx;
     conf->handshake_timeout = timeout;
-    conf->idle_timeout = 60000;
+    /* the 24 h idle of the ssh2 canon (the wave 1d, the same window
+     * the home conf rides): the jump conversation stays alive while
+     * the inner conn parks */
+    conf->idle_timeout = (24 * 60 * 60 * 1000);
     conf->stream_buffer_size = 1 << 20;
     conf->max_concurrent_streams_bidi = 16;
     conf->max_concurrent_streams_uni = 16;
@@ -12971,8 +12988,11 @@ main(int argc, char **argv)
     }
 
     s3_cli_conf.ctx = &s3_cli_ctx;
-    s3_cli_conf.handshake_timeout = S3_CLI_SETUP_TIMEOUT;
-    s3_cli_conf.idle_timeout = 60000;
+    s3_cli_conf.handshake_timeout = S3_CLI_HS_CONF_TIMEOUT;
+    /* the 24 h idle of the ssh2 canon (the wave 1d, the fork mirror
+     * of both sides): a silent session lives, the negotiated minimum
+     * keeps the peer's window in charge */
+    s3_cli_conf.idle_timeout = (24 * 60 * 60 * 1000);
     s3_cli_conf.stream_buffer_size = 1 << 20;
     s3_cli_conf.max_concurrent_streams_bidi = 16;
     s3_cli_conf.max_concurrent_streams_uni = 16;
@@ -12997,7 +13017,10 @@ main(int argc, char **argv)
         return S3_CLI_EXIT_ERROR;
     }
 
-    s3_cli_deadline = s3_current_msec + S3_CLI_SETUP_TIMEOUT;
+    /* the setup deadline rides 0 (not armed) unless the
+     * S3_CLI_SETUP_TIMEOUT above carries a real window */
+
+    s3_cli_deadline = (S3_CLI_SETUP_TIMEOUT != 0) ? s3_current_msec + S3_CLI_SETUP_TIMEOUT : 0;
     s3_cli_rc = 0;
     s3_cli_phase = S3_CLI_PH_DIAL;
 
@@ -13442,9 +13465,11 @@ main(int argc, char **argv)
         }
 
         /* the setup deadline guards the bring-up only; the session
-         * runs without one (the long exec is legitimate) */
+         * runs without one (the long exec is legitimate); 0 = the
+         * deadline is not armed (the ConnectTimeout unset canon) */
 
-        if (s3_cli_phase != S3_CLI_PH_SESSION && s3_current_msec > s3_cli_deadline) {
+        if (s3_cli_phase != S3_CLI_PH_SESSION && s3_cli_deadline != 0 &&
+            s3_current_msec > s3_cli_deadline) {
             fprintf(stderr, "ssh3: the setup timed out (hs=%u req=%u status=%u ch=%u)\n",
                     s3_cli_hs_done, s3_cli_req_sent, s3_cli_status_seen, s3_cli_ch_sent);
             s3_cli_rc = S3_CLI_EXIT_ERROR;

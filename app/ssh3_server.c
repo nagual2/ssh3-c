@@ -169,28 +169,30 @@ static unsigned s3_srv_proto_mode;
 
 /*
  * the password file (-P): the CONNECT passes only with the correct
- * Basic credentials against its user:secret lines; the method itself
- * stays off until the password login is opted into
- * (--enable-password-login or SSH3_ENABLE_PASSWORD_LOGIN=1, the
- * reference enablePasswordLogin default)
+ * Basic credentials against its user:secret lines; the password login
+ * rides on by default (the PasswordAuthentication yes of the sshd
+ * canon, the wave 1e; the enablePasswordLogin true of the fork), the
+ * explicit off rides --enable-password-login off or
+ * SSH3_ENABLE_PASSWORD_LOGIN=0
  */
 static const char *s3_srv_passfile;
-static unsigned    s3_srv_password_enabled;
+static unsigned    s3_srv_password_enabled = 1;
 
 /*
  * the system account verifier (--password-system on|off, PLAN.md
  * 8.2, the parity of the fork 0.1.34 password login): the Basic
  * credentials verify against the unix accounts - getpwnam(3) for the
  * identity, the shadow entry for the hash, the crypt(3) check for
- * the verdict.  The default is off, the deployment owner opts in:
- * turning it on exposes the system accounts to the Basic brute-force
- * surface (the lockout books the same way as for the file backend);
- * the verifier opts the password login in on its own, the chain
- * order is the -P file first, the system accounts second; the
- * unprivileged daemon cannot read the shadow - the flag warns at the
- * startup and every attempt fails closed
+ * the verdict.  The default is on (the PasswordAuthentication yes of
+ * the sshd canon, the wave 1e), the operator turns it off with the
+ * explicit flag or SSH3_PASSWORD_SYSTEM=0: turning it off closes the
+ * system accounts to the Basic brute-force surface (the lockout books
+ * the same way as for the file backend); the chain order is the -P
+ * file first, the system accounts second; the unprivileged daemon
+ * cannot read the shadow - the flag warns at the startup and every
+ * attempt fails closed
  */
-static unsigned s3_srv_password_system;
+static unsigned s3_srv_password_system = 1;
 
 /*
  * the authorized_keys files (-K, repeatable): the CONNECT passes only
@@ -307,9 +309,13 @@ static unsigned s3_srv_sftp_budget_none;
  */
 static int s3_srv_max_conns = 0;
 
-/* the handshake timeout in ms (S2-06, --handshake-timeout-ms) */
+/*
+ * the handshake timeout in ms (S2-06, --handshake-timeout-ms): the
+ * LoginGraceTime 120 s of the sshd canon, the ssh2HandshakeTimeout
+ * 120 s mirror of the fork (cmd/ssh3.go)
+ */
 
-static int s3_srv_hs_ms = 30000;
+static int s3_srv_hs_ms = 120000;
 
 /*
  * the reverse forward (-R) DoS guards (S2-04, the pass-2 audit
@@ -329,8 +335,9 @@ static int s3_srv_hs_ms = 30000;
  * the reference carries both knobs behind flags/env (-max-reverse-
  * forwards, SSH3_MAX_REVERSE_FORWARDS); the C shape keeps the
  * per-conversation constant pinned and wires the per-user knob as
- * --max-reverse-forwards / SSH3_MAX_REVERSE_FORWARDS (0, the default,
- * stays unbounded, the conversation constant stays on top)
+ * --max-reverse-forwards / SSH3_MAX_REVERSE_FORWARDS, the default 10
+ * mirrors the fork (the wave 1d of the ssh2 canon), the explicit 0
+ * stays unbounded, the conversation constant stays on top
  */
 
 #define S3_SRV_REVERSE_LISTENERS_MAX 10
@@ -388,11 +395,12 @@ static struct {
  * reference maxReverseForwardsPerUser, --max-reverse-forwards /
  * SSH3_MAX_REVERSE_FORWARDS): every bound listener holds one slot of
  * its user's budget for its lifetime, over the cap the bind refuses
- * with the REVERSE-CAP-DENIED report before any socket().  0 (the
- * default) keeps the unbounded shape, the hard per-conversation
- * budget of S3_SRV_REVERSE_LISTENERS_MAX stays on top.  The table
- * mirrors the sftp budget: the daemon serves one conversation at a
- * time, the extra entries exist for the shape only
+ * with the REVERSE-CAP-DENIED report before any socket().  The
+ * default 10 mirrors the fork maxReverseForwardsPerUser, the explicit
+ * 0 keeps the unbounded shape, the hard per-conversation budget of
+ * S3_SRV_REVERSE_LISTENERS_MAX stays on top.  The table mirrors the
+ * sftp budget: the daemon serves one conversation at a time, the
+ * extra entries exist for the shape only
  */
 
 #define S3_SRV_REVERSE_BUDGET_USERS 16
@@ -410,7 +418,13 @@ static s3_srv_reverse_budget_t s3_srv_reverse_budgets[S3_SRV_REVERSE_BUDGET_USER
 
 static unsigned s3_srv_reverse_budget_none;
 
-static unsigned s3_srv_reverse_cap = 0; /* 0 = the unlimited default */
+/*
+ * the default mirrors the fork maxReverseForwardsPerUser = 10 (the
+ * ssh2 wave 1d); the explicit 0 (--max-reverse-forwards 0 /
+ * SSH3_MAX_REVERSE_FORWARDS=0) keeps the unlimited shape
+ */
+
+static unsigned s3_srv_reverse_cap = 10;
 
 /*
  * the listen-side policy (--permit-listen / SSH3_PERMIT_LISTEN, the
@@ -482,6 +496,36 @@ s3_srv_gateway_ports_parse(const char *text)
 
     if (strcasecmp(text, "yes") == 0 || strcasecmp(text, "y") == 0) {
         s3_srv_gateway_ports = S3_SRV_GATEWAY_PORTS_YES;
+        return S3_OK;
+    }
+
+    return S3_ERROR;
+}
+
+/*
+ * the ParseBool of the reference (strconv.ParseBool, the wave 1e
+ * shapes) plus the operator words of the daemon flags: 1/t/T/true/
+ * TRUE/True/on set 1, 0/f/F/false/FALSE/False/off set 0, anything
+ * else declines - the caller keeps the default (the env) or leaves
+ * the tokens to the getopt rejection (the flag)
+ */
+
+static s3_int_t
+s3_srv_parse_bool(const char *text, unsigned *out)
+{
+    if (text == NULL || out == NULL) {
+        return S3_ERROR;
+    }
+
+    if (strcmp(text, "1") == 0 || strcasecmp(text, "t") == 0 || strcasecmp(text, "true") == 0 ||
+        strcasecmp(text, "on") == 0) {
+        *out = 1;
+        return S3_OK;
+    }
+
+    if (strcmp(text, "0") == 0 || strcasecmp(text, "f") == 0 || strcasecmp(text, "false") == 0 ||
+        strcasecmp(text, "off") == 0) {
+        *out = 0;
         return S3_OK;
     }
 
@@ -1859,7 +1903,10 @@ s3_srv_passfile_has_user(const char *path, const s3_str_t *user)
  * the authorization header, the username comes from the CONNECT
  * target (?user=), the -P file answers first and the system accounts
  * (--password-system, the shadow step of PLAN.md 8.2) second - both
- * serve when both are wired, the first S3_OK wins; the brute-force
+ * serve when both are wired, the first S3_OK wins; the root account
+ * never passes the Basic step (the PermitRootLogin prohibit-password
+ * analog of the sshd canon, the wave 1e - the refusal rides before
+ * the backends and before any lockout booking); the brute-force
  * lockout of the reference CheckBasicAuth sits in front of the
  * backends (429 without touching them), the failures of the known
  * users book (the passfile line or the passwd entry) and the success
@@ -1892,6 +1939,22 @@ s3_srv_h3_basic_verdict(void)
 
     if (rc != S3_OK) {
         fprintf(stderr, "ssh3-server: basic auth: no user in the path\n");
+        return 401;
+    }
+
+    /*
+     * the root gate (the PermitRootLogin prohibit-password analog,
+     * the wave 1e): the session username compares exactly, the
+     * refusal rides before the lockout check, the backends and any
+     * booking; the key and the JWT verdicts never pass here, the
+     * root by key stays legitimate
+     */
+
+    if (user.len == 4 && memcmp(user.data, "root", 4) == 0) {
+        s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                     "password auth for root refused: the root account authenticates"
+                     " by key only (PermitRootLogin prohibit-password)");
+
         return 401;
     }
 
@@ -2427,9 +2490,11 @@ s3_srv_h3_respond(s3_connection_t *pc)
             } else if (s3_srv_passfile != NULL || s3_srv_password_system) {
 
                 /* the Basic step: the password backends decide (the
-                 * -P file, then the system accounts), but the method
-                 * itself stays off until the login is opted into
-                 * (the reference enablePasswordLogin default) */
+                 * -P file, then the system accounts); the login is
+                 * on by default (the PasswordAuthentication yes of
+                 * the sshd canon, the wave 1e), the explicit off
+                 * (--enable-password-login off) closes the step with
+                 * 401 - the sshd PasswordAuthentication no shape */
 
                 code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict() : 401;
 
@@ -5048,20 +5113,14 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         goto refuse;
     }
 
-    /* the listener budget of the conversation (S2-04) */
-
-    if (s3_srv_reverse.listeners >= S3_SRV_REVERSE_LISTENERS_MAX) {
-        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
-                 S3_SRV_REVERSE_LISTENERS_MAX);
-        goto refuse;
-    }
-
     /* the operator cap on the live reverse listeners of the user
-     * (the reference maxReverseForwardsPerUser): the refusal rides
-     * before any socket(), the slot books here and gives back on the
-     * refuse paths below.  The user text stages into a fixed buffer:
-     * the empty name (a CONNECT under the daemon identity) prints as
-     * the "-" placeholder */
+     * (the reference maxReverseForwardsPerUser): the gate rides
+     * first - the refusal of a full budget answers before any
+     * conversation bookkeeping, so the listeners of the conversation
+     * that filled the budget stay alive, and the fresh conversation
+     * of a user under the cap takes over cleanly below.  The user
+     * text stages into a fixed buffer: the empty name (a CONNECT
+     * under the daemon identity) prints as the "-" placeholder */
 
     {
         char ruser[S3_SRV_SFTP_USER_MAX + 2];
@@ -5092,9 +5151,6 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         s3_srv_reverse.budget_user[sizeof(s3_srv_reverse.budget_user) - 1] = '\0';
     }
 
-    /* the bind text is a literal (the rewrite produced one), the
-     * family follows it */
-
     s3_memzero(&sa, sizeof(sa));
 
     if (strcmp(bind_host, "::") == 0 || strchr(bind_host, ':') != NULL) {
@@ -5122,8 +5178,10 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
      * told the conversations apart and left the stale listeners of a
      * dead conversation riding under the fresh one (their live check
      * then tore the fresh listeners down with them).  The re-anchor
-     * also covers the refused binds of a new conversation: they leave
-     * listeners == 0 with the pc of the dead conversation riding */
+     * rides after the user gate but before the per-conversation
+     * check: the fresh conversation that paid its budget slot counts
+     * from zero, the hard constant of the previous conversation
+     * never judges it */
 
     if (s3_srv_reverse.listeners > 0 && s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse_teardown();
@@ -5132,6 +5190,15 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     if (s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse.conv_id = s3_srv_h3_conv_id;
         s3_srv_reverse.pc = ch->pc;
+    }
+
+    /* the listener budget of the conversation (S2-04): the hard
+     * constant stays on top of the user cap */
+
+    if (s3_srv_reverse.listeners >= S3_SRV_REVERSE_LISTENERS_MAX) {
+        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
+                 S3_SRV_REVERSE_LISTENERS_MAX);
+        goto refuse;
     }
 
     for (i = 0; i < S3_SRV_REVERSE_LISTENERS_MAX; i++) {
@@ -6671,15 +6738,19 @@ s3_srv_usage(FILE *out, const char *prog)
             "      serve, no bind happens\n"
             "  -A  ALPN name, default h3 (RFC 9220 extended CONNECT, ssh3)\n"
             "  -d  max_datagram_frame_size transport parameter, default 1200\n"
-            "  -i  quic idle timeout, milliseconds, default 60000\n"
+            "  -i  quic idle timeout, milliseconds, default 86400000 (24 h, the\n"
+            "      ssh2 idle canon: a silent session lives, the zombies die on the\n"
+            "      transport error alone)\n"
             "  -L  log level: a name (debug|info|warn|error) or an s3 numeric\n"
             "  -P  password file: the CONNECT passes only with the Basic"
             " user:secret AND the\n"
-            "      password login opted into (--enable-password-login or"
-            " SSH3_ENABLE_PASSWORD_LOGIN=1,\n"
-            "      the reference default is off); the file backend answers"
-            " before the system\n"
-            "      one when both are wired (--password-system)\n"
+            "      password login on (the default, the sshd"
+            " PasswordAuthentication canon;\n"
+            "      disable with --enable-password-login off or"
+            " SSH3_ENABLE_PASSWORD_LOGIN=0);\n"
+            "      the file backend answers before the system one when both are"
+            " wired\n"
+            "      (--password-system)\n"
             "  -K  authorized_keys file, repeatable: the CONNECT passes only with a"
             " Bearer JWT\n"
             "      signed by one of their keys; %%u in the path is the session"
@@ -6756,11 +6827,13 @@ s3_srv_usage(FILE *out, const char *prog)
             "      wildcard address regardless of the request\n"
             "  --max-reverse-forwards n: the live reverse (-R) listeners"
             " of one user,\n"
-            "      default 0 (no cap, the per-conversation budget of 10"
-            " stays), over\n"
-            "      the cap the bind refuses with the REVERSE-CAP-DENIED"
-            " marker before\n"
-            "      any socket\n"
+            "      default 10 (the maxReverseForwardsPerUser mirror of the"
+            " fork), 0 is the\n"
+            "      explicit unlimited, the per-conversation budget of 10"
+            " stays; over the\n"
+            "      cap the bind refuses with the REVERSE-CAP-DENIED marker"
+            " before any\n"
+            "      socket\n"
             "  --max-sftp-sessions-per-user n: the concurrent sftp"
             " channels of one\n"
             "      user, default 16, 0 disables the budget (S2-02)\n"
@@ -6768,8 +6841,9 @@ s3_srv_usage(FILE *out, const char *prog)
             " default 0 (no\n"
             "      limit), over the cap the new connection is closed"
             " at once (S2-06)\n"
-            "  --handshake-timeout-ms ms: the QUIC handshake timeout,"
-            " default 30000\n"
+            "  --handshake-timeout-ms ms: the QUIC handshake timeout, the"
+            " LoginGraceTime\n"
+            "      canon, default 120000\n"
             "  --help  this summary on stdout, exit 0 (the help moved off the\n"
             "      short -h, the sshd host key owns it now)\n"
             "  -v  verbose logging (debug)\n"
@@ -6786,6 +6860,10 @@ s3_srv_usage(FILE *out, const char *prog)
             "      SSH3_HANDSHAKE_TIMEOUT_MS (the S2-02/S2-06 knobs"
             " of the flags\n"
             "      above),\n"
+            "      SSH3_ENABLE_PASSWORD_LOGIN=on|off (the"
+            " --enable-password-login\n"
+            "      default, the ParseBool forms 1/true/t and"
+            " 0/false/f ride),\n"
             "      SSH3_PERMIT_OPEN (the --permit-open default),\n"
             "      SSH3_PERMIT_LISTEN (the --permit-listen default),\n"
             "      SSH3_GATEWAY_PORTS=no|yes|clientspecified (the"
@@ -6793,7 +6871,7 @@ s3_srv_usage(FILE *out, const char *prog)
             "      SSH3_MAX_REVERSE_FORWARDS (the"
             " --max-reverse-forwards default),\n"
             "      SSH3_SFTP_JAIL=chroot|lexical (the --sftp-jail flag overrides),\n"
-            "      SSH3_PASSWORD_SYSTEM=1 (the --password-system default),\n"
+            "      SSH3_PASSWORD_SYSTEM=on|off (the --password-system default),\n"
             "      SSH3C_PROTO=1 adds the runner protocol markers to stdout;\n"
             "      LISTEN_PID/LISTEN_FDS switch to systemd socket activation,"
             " the passed UDP\n"
@@ -6806,12 +6884,16 @@ s3_srv_usage(FILE *out, const char *prog)
 int
 main(int argc, char **argv)
 {
-    char                    opt;
-    const char             *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
-    const char             *alpn_name = "h3";
-    const char             *url_path_arg = NULL, *permit_open_arg = NULL;
-    const char             *permit_listen_arg = NULL;
-    unsigned                dg_size = 1200, idle_ms = 60000;
+    char        opt;
+    const char *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
+    const char *alpn_name = "h3";
+    const char *url_path_arg = NULL, *permit_open_arg = NULL;
+    const char *permit_listen_arg = NULL;
+    unsigned    dg_size = 1200;
+    /* the 24 h idle of the ssh2 canon (ClientAliveInterval=0, the
+     * ssh2IdleTimeout mirror of the fork cmd/ssh3.go), the -i flag
+     * and the env overrides stay */
+    unsigned                idle_ms = 86400000;
     u_char                 *cert, *key, alpn_wire[256];
     size_t                  cert_len = 0, key_len = 0;
     s3_str_t                alpn;
@@ -7001,13 +7083,36 @@ main(int argc, char **argv)
      * pre-scan - so the explicit --password-system on|off overrides
      * it either way (the pattern of the DoS guard knobs)
      */
+    /*
+     * the password defaults of the sshd canon (the wave 1e): both
+     * env knobs parse before the pre-scan, the ParseBool forms of
+     * the reference ride, an unparsable value warns and keeps the
+     * on default; the explicit flags of the pre-scan below override
+     * either way (the pattern of the DoS guard knobs)
+     */
+    {
+        const char *env = getenv("SSH3_ENABLE_PASSWORD_LOGIN");
+        unsigned    v;
+
+        if (env != NULL && s3_srv_parse_bool(env, &v) == S3_OK) {
+            s3_srv_password_enabled = v;
+
+        } else if (env != NULL) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_ENABLE_PASSWORD_LOGIN \"%s\", keeping the default", env);
+        }
+    }
+
     {
         const char *env = getenv("SSH3_PASSWORD_SYSTEM");
+        unsigned    v;
 
-        if (env != NULL &&
-            (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0 ||
-             strcmp(env, "True") == 0 || strcmp(env, "t") == 0 || strcmp(env, "T") == 0)) {
-            s3_srv_password_system = 1;
+        if (env != NULL && s3_srv_parse_bool(env, &v) == S3_OK) {
+            s3_srv_password_system = v;
+
+        } else if (env != NULL) {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_PASSWORD_SYSTEM \"%s\", keeping the default", env);
         }
     }
 
@@ -7054,11 +7159,30 @@ main(int argc, char **argv)
 
             } else if (strcmp(argv[n], "--enable-password-login") == 0) {
 
-                /* the flag form carries no value: it overrides the
-                 * env default parsed below and drops alone */
+                /*
+                 * the PasswordAuthentication shape of the sshd canon
+                 * (the wave 1e, the -enable-password-login mirror of
+                 * the fork): the bare flag is the explicit on, the
+                 * value form on|off|true|false|1|0 carries the
+                 * verdict (the env default parsed above overrides
+                 * either way); an unparsable value stays in the argv
+                 * for the getopt loop to reject with the usage
+                 */
 
-                s3_srv_password_enabled = 1;
-                drop = 1;
+                unsigned v;
+
+                if (n + 1 >= argc || argv[n + 1][0] == '-') {
+
+                    /* the bare form (no value, or the next token is
+                     * another flag): the login rides on */
+
+                    s3_srv_password_enabled = 1;
+                    drop = 1;
+
+                } else if (s3_srv_parse_bool(argv[n + 1], &v) == S3_OK) {
+                    s3_srv_password_enabled = v;
+                    value = argv[n + 1];
+                }
 
             } else if (strcmp(argv[n], "--password-system") == 0 && n + 1 < argc) {
 
@@ -7449,6 +7573,17 @@ main(int argc, char **argv)
         s3_log_error(S3_LOG_INFO, &s3_srv_log, 0, "system password auth enabled");
     }
 
+    /*
+     * the PermitRootLogin prohibit-password analog of the sshd canon
+     * (the wave 1e, the fork root gate of server_auth/root_gate.go):
+     * hardcoded, no flag - root never authenticates by password, the
+     * key and the JWT verdicts serve as usual
+     */
+
+    s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
+                 "PermitRootLogin prohibit-password: the root account authenticates"
+                 " by key only");
+
     if (cert_path == NULL || key_path == NULL) {
         s3_srv_usage(stderr, argv[0]);
         return 1;
@@ -7507,37 +7642,17 @@ main(int argc, char **argv)
     }
 
     /*
-     * the password login: the env default parsed first (the
-     * ParseBool of the reference accepts the 1/true forms, the rest
-     * reads as off), the flag above has overridden it already
+     * the password login of the sshd canon (the wave 1e): the env
+     * default parsed before the pre-scan, the flag has overridden it
+     * already; the explicit off (the PasswordAuthentication no
+     * shape) closes both backends at once - the system verifier no
+     * longer opts the login in on its own, one verdict switch serves
      */
-
-    if (!s3_srv_password_enabled) {
-
-        const char *env = getenv("SSH3_ENABLE_PASSWORD_LOGIN");
-
-        if (env != NULL &&
-            (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0 ||
-             strcmp(env, "True") == 0 || strcmp(env, "t") == 0 || strcmp(env, "T") == 0)) {
-            s3_srv_password_enabled = 1;
-        }
-    }
-
-    /*
-     * the system verifier opts the password login in on its own: one
-     * opt-in covers both backends (the file and the system), an
-     * operator wiring --password-system on never needs the second
-     * flag to hear the Basic verdicts
-     */
-
-    if (s3_srv_password_system) {
-        s3_srv_password_enabled = 1;
-    }
 
     if (s3_srv_passfile != NULL && !s3_srv_password_enabled) {
         s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                      "the password file serves nothing: the password login is off,"
-                     " opt in with --enable-password-login or"
+                     " re-enable with --enable-password-login on or"
                      " SSH3_ENABLE_PASSWORD_LOGIN=1");
     }
 
