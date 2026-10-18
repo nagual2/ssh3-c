@@ -15,16 +15,39 @@ Build-Depends:
  pkgconf
 Rules-Requires-Root: no
 
+Package: ssh3-client
+Architecture: amd64
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ libssl3t64 (>= 3.5)
+Conflicts: ssh3-go-client
+Replaces: ssh3-go-client
+Description: SSH3 client - SSH over QUIC/HTTP3 transport
+ SSH3 client: sessions, the ssh(1)-canon forwards (-L/-R/-D with the
+ udp:// extension), -J proxy jumps, the control master (-M/-S/-O),
+ the agent forwarding (-A), file transfers (put|get) and the
+ in-process sftp subsystem, all over one HTTP/3 (QUIC) extended
+ CONNECT per target.
+ .
+ The CLI follows the ssh(1) canon: -4/-6, -e escape, -F ssh_config
+ (HostName, Port, User, IdentityFile, ForwardAgent, the forwards,
+ ProxyJump, StrictHostKeyChecking, ControlMaster/Path/Persist), -o
+ keyword overrides, -t/-T pty control, -V.
+ The first connection pins the server certificate TOFU-style in
+ ~/.ssh3/known_hosts (the same store the go implementation reads).
+ See ssh3(1).
+
 Package: ssh3-server
 Architecture: amd64
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
  libssl3t64 (>= 3.5),
- adduser
-Provides: ssh3-go
-Conflicts: ssh3-go
-Replaces: ssh3-go
+ adduser,
+ ssh3-client (= ${binary:Version})
+Conflicts: ssh3-go-server
+Replaces: ssh3-go-server
 Description: SSH3 server - SSH over QUIC/HTTP3 transport
  SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
  implemented in C17 in the nginx style on top of the OpenSSL QUIC TLS
@@ -46,3 +69,20 @@ Description: SSH3 server - SSH over QUIC/HTTP3 transport
  /etc/ssh3/ssh3-server.env (SSH3_LOG_LEVEL, SSH3_LOG_FILE,
  SSH3_SHUTDOWN_DRAIN, SSH3_ENABLE_PASSWORD_LOGIN).  See
  ssh3-server(8).
+ .
+ The server depends on the matching ssh3-client (the openssh(8)
+ canon: one release wave ships both halves together).
+
+Package: ssh3c
+Architecture: all
+Section: net
+Priority: optional
+Depends:
+ ${misc:Depends},
+ ssh3-client (= ${source:Version}),
+ ssh3-server (= ${source:Version})
+Description: SSH3 - SSH over QUIC/HTTP3 (client and server metapackage)
+ The openssh(8) `ssh' metapackage analog of this source package:
+ installs the ssh3-client and ssh3-server packages at matching
+ versions, so one install brings up the full SSH3 pair - the client
+ CLI and the socket-activated server daemon.

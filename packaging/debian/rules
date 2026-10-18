@@ -1,7 +1,8 @@
 #!/usr/bin/make -f
-# debian/rules - debhelper 13 build of ssh3-server from the orig tree:
-# cmake+ninja, one binary (the daemon; the client, the bench and the
-# interop runners stay upstream tools), the full hardening ladder.
+# debian/rules - debhelper 13 build of the ssh3 pair from the orig
+# tree: cmake+ninja, the two product targets (the daemon and the
+# client; the bench and the interop runners stay upstream tools),
+# the full hardening ladder.
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
@@ -9,14 +10,14 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 	dh $@
 
 # Ninja instead of the default generator: matches the upstream presets
-# and keeps the single-target build below quiet
+# and keeps the two-target build below quiet
 override_dh_auto_configure:
 	dh_auto_configure -- -G Ninja
 
-# the package ships the daemon only; building one target skips the
-# client, the bench and the interop runners of the default ALL
+# the product pair only; building two named targets skips the bench
+# and the interop runners of the default ALL
 override_dh_auto_build:
-	dh_auto_build -- ssh3-server
+	dh_auto_build -- ssh3-server ssh3
 
 # the upstream unit suite is exercised by the linux-release CI preset,
 # not wired into this packaging build (see packaging/README.md)
@@ -27,3 +28,9 @@ override_dh_auto_test:
 # the .install lines pick the artifacts straight from the build tree
 override_dh_auto_install:
 	:
+
+# the man pages split by their package: the client page written for
+# this packaging, the server page from the upstream man tree
+override_dh_installman:
+	dh_installman -pssh3-client debian/ssh3.1
+	dh_installman -pssh3-server man/ssh3-server.8

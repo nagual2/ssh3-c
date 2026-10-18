@@ -1,3 +1,18 @@
+ssh3-c (0.4.0-2) unstable; urgency=medium
+
+  * The openssh(8)-canon package split: the source now builds three
+    binary packages - ssh3-client (the /usr/bin/ssh3 CLI with its
+    fresh ssh3(1) man page), ssh3-server (the socket-activated
+    daemon, Depends on the matching ssh3-client) and the ssh3c
+    metapackage pulling the pair at matching versions (the `ssh'
+    metapackage analog).
+  * The drop-in conflict dance follows the split: ssh3-client
+    Conflicts/Replaces ssh3-go-client, ssh3-server does the same
+    against ssh3-go-server; the bundled deb/rpm/apk of build.sh
+    declare the same against the split go packages.
+
+ -- Max <nahual15@gmail.com>  Sun, 18 Oct 2026 19:00:00 +0000
+
 ssh3-c (0.4.0-1) unstable; urgency=medium
 
   * New upstream release 0.4.0: the client -o options and the -R of

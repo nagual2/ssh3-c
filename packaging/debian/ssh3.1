@@ -1,0 +1,113 @@
+.Dd October 18, 2026
+.Dt SSH3 1
+.Os ssh3-c
+.Sh NAME
+.Nm ssh3
+.Nd SSH3 client: sessions, forwards and transfers over HTTP/3 (QUIC)
+.Sh SYNOPSIS
+.Nm
+.Op Fl 46AqNTtVv
+.Op Fl i Ar keyfile
+.Op Fl l Ar login
+.Op Fl p Ar port
+.Op Fl L Ar [bind:]port:host:hostport
+.Op Fl R Ar [bind:]port Ns Op /tcp|/udp Ns :host:port
+.Op Fl D Ar [bind:]port
+.Op Fl J Ar [user@]host[:port]
+.Op Fl e Ar char
+.Op Fl F Ar file
+.Op Fl o Ar Key=Value
+.Op Fl M | Fl S Ar path | Fl O Ar op
+.Op Fl s Cm sftp
+.Ar [user@]host[:port][/path]
+.Op Ar command ...
+.Sh DESCRIPTION
+.Nm
+speaks the SSH3 transport of RFC 9220: one QUIC (UDP) connection
+carries an HTTP/3 extended CONNECT to the server route
+.Pq default Li /ssh3-term ,
+and every subsequent bidirectional stream is an SSH3 channel.
+Shell and exec sessions, direct-tcp and direct-udp forwards, the
+in-process sftp and the agent bridge ride those channels.
+The CLI follows the
+.Xr ssh 1
+canon; the server counterpart is
+.Xr ssh3-server 8 .
+.Pp
+Authentication: public keys — the Bearer JWT signed with the
+.Fl i
+PEM private key
+.Pq ed25519, P-256 or RSA ,
+OIDC id_tokens when the server is wired for them, or the Basic
+step against the server's password backend.
+The first connection pins the server certificate TOFU-style in
+.Pa ~/.ssh3/known_hosts
+(the same store the go implementation reads).
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl 4 | Fl 6
+The address family of the dial (the v4 default).
+.It Fl A
+Agent forwarding: the server-initiated agent-connection channels
+bridge into the local agent socket.
+.It Fl L Ar [bind:]port:host:hostport
+Local tcp forward, repeatable; every accepted connection rides a
+direct-tcp channel of the same conversation (the bind defaults to
+127.0.0.1, the bracketed ipv6 bind rides).
+.It Fl R Ar [bind:]port Ns Op /tcp|/udp Ns :host:port
+Reverse forward, repeatable: the server binds the port and mirrors
+every accepted connection or datagram back into the client-side
+target (the ephemeral 0 asks the server-chosen port).
+.It Fl D Ar [bind:]port
+Dynamic forward, repeatable: the local listener answers SOCKS5
+(SOCKS4 fallback) and bridges every target into a direct-tcp
+channel.
+.It Fl J Ar [user@]host[:port]
+The proxy jump (one hop; the comma chain refuses — chain them by
+hand or via
+.Fl F ) .
+.It Fl i Ar keyfile
+Pubkey auth: sign the Bearer JWT with the PEM private key.
+.It Fl l Ar login , Fl p Ar port
+The login name (the operand user wins) and the target port (the
+default 443).
+.It Fl e Ar char
+The escape character of the interactive session (the default ~;
+at a line start: . drops, ^Z suspends, # lists the forwards, V
+version, ? help, ~~ rides literal).
+.It Fl F Ar file
+The
+.Xr ssh_config 5
+file (the default ~/.ssh/config when it exists; none or
+/dev/null disables): HostName, Port, User, IdentityFile,
+ForwardAgent, LocalForward, RemoteForward, DynamicForward,
+ProxyJump, EscapeChar, StrictHostKeyChecking, ControlMaster,
+ControlPath, ControlPersist.
+.It Fl o Ar Key=Value
+A client option override, repeatable, case-insensitive.
+.It Fl M , Fl S Ar path , Fl O Ar op
+The control master, its socket path and the control ops (check,
+stop, exit) against a running master.
+.It Fl s Cm sftp
+Serve only sftp; the put|get:local:remote specifier rides the
+first word after the operand.
+.It Fl n , Fl N , Fl t , Fl tt , Fl T
+The stdin stays /dev/null; no session (the forwards hold the
+run); force the pty (even without a local tty); never request the
+pty.
+.It Fl q , Fl v , Fl V
+Quiet (the errors only); verbose (repeatable: -vv debug, -vvv
+everything); print the version.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.ssh3/known_hosts
+The TOFU pin store of the server certificates.
+.It Pa ~/.ssh/config
+The OpenSSH configuration, consulted per
+.Fl F .
+.El
+.Sh SEE ALSO
+.Xr ssh3-server 8 ,
+.Xr ssh 1 ,
+.Xr ssh_config 5

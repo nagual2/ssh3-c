@@ -1,3 +1,2 @@
 obj-x86_64-linux-gnu/ssh3-server usr/bin/
-man/ssh3-server.8 usr/share/man/man8/
 debian/ssh3-server.env etc/ssh3/

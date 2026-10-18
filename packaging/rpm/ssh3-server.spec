@@ -19,10 +19,11 @@ Source2:        THIRD-PARTY-NOTICES.md
 Source3:        README.md
 
 Requires:       openssl-libs >= 3.5
-Provides:       ssh3-go
-Conflicts:      ssh3-go
-# the rpm spelling of the deb Replaces: the files move under this name
-Obsoletes:      ssh3-go
+Conflicts:      ssh3-go-client
+Conflicts:      ssh3-go-server
+# the rpm spelling of the deb Replaces: the files move under these names
+Obsoletes:      ssh3-go-client
+Obsoletes:      ssh3-go-server
 
 %description
 SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
