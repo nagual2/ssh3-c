@@ -18,6 +18,6 @@ Description: SSH3 server - SSH over QUIC/HTTP3 transport
  system libssl (any version) is neither required nor touched.
  .
  The daemon is configured through environment variables (SSH3_LOG_LEVEL,
- SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN) and command-line flags (ssh3-server -h);
+ SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN) and command-line flags (ssh3-server --help);
  it drops privileges to the system user "ssh3" and keeps its state under
  /var/lib/ssh3.

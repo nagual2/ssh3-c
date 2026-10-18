@@ -30,7 +30,7 @@ case "$1" in
             systemctl daemon-reload || true
         fi
 
-        printf 'ssh3-server: configured via env/CLI (see ssh3-server -h);\n'
+        printf 'ssh3-server: configured via env/CLI (see ssh3-server --help);\n'
         printf '  SSH3_LOG_LEVEL, SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN.\n'
         ;;
 esac
