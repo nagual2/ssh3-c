@@ -25,6 +25,25 @@
 
 #define S3_SSH3_SESSION_ENVP_MAX 128
 
+/*
+ * the env allow-list gate of the session children (I-2): the only
+ * names the server quotes into a child environment are the fixed ones
+ * of the list below - the peer never names an entry (no env request
+ * exists on the wire), the gate keeps that property explicit so a
+ * second consumer of the quoting path cannot bypass it; the TERM of
+ * the pty-req, the identity fields of the run-as transition (USER,
+ * LOGNAME, HOME, SHELL), the SSH_AUTH_SOCK of the agent forwarding
+ * and the LANG of the envp locale fallback; LC_* and the rest of the
+ * daemon locale never ride the quoting path, they reach the child
+ * through the wholesale inherited environ only
+ *
+ * S3_OK when the pair may be quoted; S3_DECLINED for a name outside
+ * the list, a broken argument and a TERM value outside the 1..64
+ * pty-req bound
+ */
+
+s3_int_t s3_ssh3_env_admit(const char *name, const char *value);
+
 /* the pump entry of the caller, the watch handler runs it on any readiness */
 
 typedef void (*s3_ssh3_session_pump_pt)(void *ctx);

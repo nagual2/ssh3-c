@@ -75,6 +75,17 @@ s3_ssh3_channel_parse_header(const u_char **pos, const u_char *end, s3_ssh3_chan
         return S3_ERROR;
     }
 
+    /* the floor (F-1, the minPeerMaxPacketSize of the reference): a
+     * peer advertising below the empty-frame length would hand the
+     * sender 1-byte chunks once a send path chunks to the advertised
+     * size, the parse clamps up like the reference
+     * clampPeerMaxPacketSize instead of refusing; the enforcement on
+     * the data path itself stays with the send wiring */
+
+    if (max_packet_size < S3_SSH3_CHANNEL_MIN_PACKET_SIZE) {
+        max_packet_size = S3_SSH3_CHANNEL_MIN_PACKET_SIZE;
+    }
+
     *pos = p;
 
     /* the channel_id is not on the wire: it is the StreamID of the
@@ -91,6 +102,18 @@ size_t
 s3_ssh3_channel_chunk_size(uint64_t max_packet_size, unsigned extended)
 {
     uint64_t overhead;
+
+    /* the input clamps into the parsed bound first (F-1): the
+     * invariant travels with the helper, a future caller cannot lose
+     * the floor or the ceiling by handing a raw advertisement in */
+
+    if (max_packet_size < S3_SSH3_CHANNEL_MIN_PACKET_SIZE) {
+        max_packet_size = S3_SSH3_CHANNEL_MIN_PACKET_SIZE;
+    }
+
+    if (max_packet_size > S3_SSH3_CHANNEL_MAX_PACKET_LIMIT) {
+        max_packet_size = S3_SSH3_CHANNEL_MAX_PACKET_LIMIT;
+    }
 
     /* the reference WriteData() subtracts the emptyMsgLen: the length
      * of the frame with an empty string. varint(94) and varint(95)

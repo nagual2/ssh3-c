@@ -431,6 +431,86 @@ s3_test_session_pty_master_above_stdio(void)
     return s3_test_failures;
 }
 
+/*
+ * the env allow-list gate (I-2): the fixed set of names a child may
+ * receive through the quoting path; the hostile corpus of the audit
+ * (the LD_* family, BASH_ENV, ENV, the python/perl startup hooks, the
+ * glibc tunables) is refused by the name, whatever the value carries;
+ * the allowed corpus is exactly the list the server quotes today (the
+ * TERM of the pty-req, USER/LOGNAME/HOME/SHELL of the run-as
+ * identity, SSH_AUTH_SOCK of the agent forwarding, LANG of the envp
+ * fallback); LC_* rides the wholesale inherited environ (the trusted
+ * side), the quoting gate never carries it
+ */
+
+static int
+s3_test_session_env_admit(void)
+{
+    static const char *const hostile[] = {
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",   "LD_HINTS",   "BASH_ENV",
+        "ENV",        "PYTHONSTARTUP",   "PYTHONPATH", "PYTHONHOME", "PERL5OPT",
+        "PERL5LIB",   "GLIBC_TUNABLES",  "GCONV_PATH", "LOCPATH",    "MALLOC_PERTURB_",
+        "IFS",        "CD_PATH",         "ENV4",       "TERMX",
+    };
+    static const struct {
+        const char *name;
+        const char *value;
+    } allowed[] = {
+        {"TERM", "xterm-256color"}, {"USER", "s3user"},   {"LOGNAME", "s3user"},
+        {"HOME", "/home/s3user"},   {"SHELL", "/bin/sh"}, {"SSH_AUTH_SOCK", "/tmp/agent.socket"},
+        {"LANG", "C.UTF-8"},
+    };
+    char   big[66]; /* 65 x's, one past the pty-req TERM bound */
+    size_t i;
+
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+
+    /* the hostile corpus: the gate decides by the exact name, the
+       value is never a mitigation */
+
+    for (i = 0; i < sizeof(hostile) / sizeof(hostile[0]); i++) {
+        S3_ASSERT(s3_ssh3_env_admit(hostile[i], "1") == S3_DECLINED);
+    }
+
+    /* the allowed corpus: the fixed list rides verbatim */
+
+    for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        S3_ASSERT(s3_ssh3_env_admit(allowed[i].name, allowed[i].value) == S3_OK);
+    }
+
+    /* the empty value of the identity fields is the passwd quirk (an
+       account with an empty pw_dir keeps its "HOME=" quote), not a
+       gate decision */
+
+    S3_ASSERT(s3_ssh3_env_admit("HOME", "") == S3_OK);
+    S3_ASSERT(s3_ssh3_env_admit("SHELL", "") == S3_OK);
+    S3_ASSERT(s3_ssh3_env_admit("USER", "") == S3_OK);
+
+    /* the TERM value rule of the pty-req: the 1..64 wire bound, the
+       empty and the oversized are declined */
+
+    S3_ASSERT(s3_ssh3_env_admit("TERM", "") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("TERM", big) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("TERM", big + 1) == S3_OK);
+
+    /* the broken arguments and the name-injection shapes */
+
+    S3_ASSERT(s3_ssh3_env_admit(NULL, "x") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("TERM", NULL) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("", "x") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("LD_PRELOAD=/tmp/evil.so", "x") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("TERM=/bin/sh", "x") == S3_DECLINED);
+
+    /* the case shift and the shared prefix are not the list */
+
+    S3_ASSERT(s3_ssh3_env_admit("term", "xterm") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("Term", "xterm") == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_env_admit("LC_ALL", "C.UTF-8") == S3_DECLINED);
+
+    return s3_test_failures;
+}
+
 /* the pty session carries the requested TERM and the LANG fallback
  * into the child env (the reference: TERM=<pty-req term> for the pty
  * sessions, the unit LANG=C.UTF-8 for the shells); the inherited
@@ -1155,6 +1235,7 @@ static int
 s3_test_ssh3_session_srv(void)
 {
     (void)s3_test_session_larval();
+    (void)s3_test_session_env_admit();
     (void)s3_test_session_exec_pipe();
     (void)s3_test_session_exit_code();
     (void)s3_test_session_signal_term();

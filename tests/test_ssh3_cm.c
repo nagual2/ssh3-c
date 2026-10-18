@@ -1027,6 +1027,29 @@ s3_test_srv(void)
     S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 0);
     S3_ASSERT(s3_ssh3_cm_srv_shutdown(&srv3) == 0);
 
+    /*
+     * the I-1 pin: the op match is length-exact, an op sharing the
+     * "check" prefix with a longer body ("checkx") must not land on
+     * the check dispatch - the control-op decoder tolerates the
+     * trailing bytes of a newer client, the comparison must stay the
+     * one refusing them
+     */
+
+    S3_ASSERT(ctx.status_called == 1);
+
+    S3_ASSERT(s3_ssh3_cm_srv_init(&srv3, pool, &sessions, &cbs, &ctx) == S3_OK);
+    s3_test_srv_feed(&srv3, s3_test_hello, sizeof(s3_test_hello), out, &out_len);
+
+    (void)s3_ssh3_cm_encode_control_op(req_payload, S3_TEST_STR("checkx", 6));
+    s3_ssh3_cm_encode_frame(req_frame, S3_SSH3_CM_MSG_CONTROL_OP, S3_TEST_STR(req_payload, 10));
+
+    s3_test_srv_feed(&srv3, req_frame, S3_SSH3_CM_HEADER_LEN + 10, out, &out_len);
+
+    S3_ASSERT(ctx.status_called == 1);
+    S3_ASSERT(out[5] == S3_SSH3_CM_MSG_ERROR);
+    S3_ASSERT(s3_ssh3_cm_srv_done(&srv3) == 0);
+    S3_ASSERT(s3_ssh3_cm_srv_shutdown(&srv3) == 0);
+
     /* the refused open session keeps the connection too */
 
     ctx.open_rc = S3_ERROR;

@@ -122,7 +122,9 @@ s3_test_channel_parse_roundtrip(void)
     S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
     S3_ASSERT(pos == end);
     S3_ASSERT(ch.conversation_stream_id == 16383);
-    S3_ASSERT(ch.max_packet_size == 64);
+    /* the sub-floor advertisement of 64 rides the F-1 floor: the
+     * parse clamps it up to 4096, the value is not refused */
+    S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
     S3_ASSERT(ch.type.len == 4);
     S3_ASSERT(s3_memcmp(ch.type.data, "sftp", 4) == 0);
     S3_ASSERT(ch.type.data >= buf && ch.type.data < end);
@@ -202,14 +204,27 @@ s3_test_channel_chunk_size(void)
          * form (94 > 63), so the plain overhead is 2 + 1 = 3 and the
          * extended one is 2 + 1 + 1 = 4 (stderr = 1); only the
          * written frame numbers count, the max_packet_size form
-         * does not matter */
+         * does not matter. everything outside [4096, 16 MiB] clamps
+         * into the bound first (F-1): the helper may not lose the
+         * floor to a future caller */
 
-        {30000, 0, 29997}, {30000, 1, 29996}, {16384, 0, 16381}, /* a 4-byte max packet size changes
-                                                                    nothing */
-        {16384, 1, 16380}, {64, 0, 61},       {64, 1, 60},       {4, 0, 1},
-        {4, 1, 0},         {3, 0, 0}, /* exactly the overhead: nothing fits */
-        {3, 1, 0},         {2, 0, 0},         {1, 0, 0},         {1, 1, 0},
-        {0, 0, 0},         {0, 1, 0},
+        {30000, 0, 29997},
+        {30000, 1, 29996},
+        {16384, 0, 16381},
+        {16384, 1, 16380},
+        {64, 0, 4093},
+        {64, 1, 4092},
+        {4, 0, 4093},
+        {4, 1, 4092},
+        {3, 0, 4093},
+        {3, 1, 4092},
+        {2, 0, 4093},
+        {1, 0, 4093},
+        {1, 1, 4092},
+        {0, 0, 4093},
+        {0, 1, 4092},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 0, S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 3},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 1, S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 4},
     };
 
     size_t i;
@@ -218,6 +233,55 @@ s3_test_channel_chunk_size(void)
         S3_ASSERT(s3_ssh3_channel_chunk_size(vec[i].max_packet_size, vec[i].extended) ==
                   vec[i].chunk);
     }
+
+    return s3_test_failures;
+}
+
+static int
+s3_test_channel_min_packet_floor(void)
+{
+    /* the F-1 floor (the minPeerMaxPacketSize of the reference): a
+     * peer advertising below 4096 must not leave a 1-byte chunk size
+     * behind, the parse clamps the value up instead of refusing it -
+     * the mirror of the upper clamp, the refusal stays for the
+     * ceiling only */
+
+    static const uint64_t ads[] = {4095, 2048, 4, 3, 2, 1, 0};
+
+    s3_ssh3_channel_t ch;
+    u_char            buf[64];
+    const u_char     *pos, *end;
+    size_t            i;
+
+    for (i = 0; i < sizeof(ads) / sizeof(ads[0]); i++) {
+
+        /* the build side writes the advertisement verbatim, the
+         * floor is a property of the parse (and of the chunk helper) */
+
+        s3_channel_init(&ch, "session", 0, ads[i]);
+        end = s3_ssh3_channel_build_header(buf, &ch);
+
+        s3_channel_init(&ch, "sentinel", 0xaaaa, 0xbbbb);
+
+        pos = buf;
+
+        S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
+        S3_ASSERT(pos == end);
+        S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
+    }
+
+    /* the floor itself rides verbatim */
+
+    s3_channel_init(&ch, "session", 0, 4096);
+    end = s3_ssh3_channel_build_header(buf, &ch);
+
+    s3_channel_init(&ch, "sentinel", 0xaaaa, 0xbbbb);
+
+    pos = buf;
+
+    S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
+    S3_ASSERT(pos == end);
+    S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
 
     return s3_test_failures;
 }
@@ -290,6 +354,7 @@ s3_test_ssh3_channel(void)
     (void)s3_test_channel_parse_roundtrip();
     (void)s3_test_channel_parse_errors();
     (void)s3_test_channel_chunk_size();
+    (void)s3_test_channel_min_packet_floor();
     (void)s3_test_channel_max_packet_bound();
 
     return s3_test_failures;
