@@ -327,26 +327,27 @@ cp "$WORK/id_good.pub" "$WORK/idle_keys"
 
 # the fifo holder keeps the client stdin open with no data (no EOF,
 # no FIN, nothing flows - the idle window runs); the proof window
-# sits between the old 60 s default and the holder's EOF at 90 s -
-# the EOF at t=90 wakes the pre-existing post-EOF shape (the fin,
-# the shell exit, the conversation close), the check at t=71 must
-# never see it; the SIGKILL reaps the client (it handles TERM as a
-# flag the loop never reads)
+# sits between the old 60 s default and the holder's EOF at 150 s -
+# the EOF at t=150 wakes the pre-existing post-EOF shape (the fin,
+# the shell exit, the conversation close), the check at t=66 must
+# never see it (the wide margin absorbs the wall-clock drift of a
+# loaded host - the 90/71 pair flaked on exactly that); the SIGKILL
+# reaps the client (it handles TERM as a flag the loop never reads)
 
 mkfifo "$WORK/in" || die "mkfifo"
-sleep 90 > "$WORK/in" &
+sleep 150 > "$WORK/in" &
 HOLDPID=$!
 
 START=$(date +%s)
 
-HOME="$WORK" timeout -k 2 90 "$PROD" -i "$WORK/id_good" "bob@127.0.0.1:$SRVPORT/ssh3-term" \
+HOME="$WORK" timeout -k 2 150 "$PROD" -i "$WORK/id_good" "bob@127.0.0.1:$SRVPORT/ssh3-term" \
     < "$WORK/in" > "$WORK/cli-idle.log" 2>&1 &
 CLIPID=$!
 
-# the proof window: at t=70s the old defaults (60 s both sides)
+# the proof window: at t=66s the old defaults (60 s both sides)
 # would have torn the silent session down already
 
-sleep 71
+sleep 66
 
 ALIVE=0
 
