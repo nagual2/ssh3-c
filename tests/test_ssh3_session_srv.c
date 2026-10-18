@@ -447,22 +447,20 @@ static int
 s3_test_session_env_admit(void)
 {
     static const char *const hostile[] = {
-        "LD_PRELOAD",     "LD_LIBRARY_PATH", "LD_AUDIT",      "LD_HINTS",
-        "BASH_ENV",       "ENV",             "PYTHONSTARTUP", "PYTHONPATH",
-        "PYTHONHOME",     "PERL5OPT",        "PERL5LIB",      "GLIBC_TUNABLES",
-        "GCONV_PATH",     "LOCPATH",         "MALLOC_PERTURB_", "IFS",
-        "CD_PATH",        "ENV4",            "TERMX",
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",   "LD_HINTS",   "BASH_ENV",
+        "ENV",        "PYTHONSTARTUP",   "PYTHONPATH", "PYTHONHOME", "PERL5OPT",
+        "PERL5LIB",   "GLIBC_TUNABLES",  "GCONV_PATH", "LOCPATH",    "MALLOC_PERTURB_",
+        "IFS",        "CD_PATH",         "ENV4",       "TERMX",
     };
     static const struct {
         const char *name;
         const char *value;
     } allowed[] = {
-        {"TERM", "xterm-256color"}, {"USER", "s3user"},
-        {"LOGNAME", "s3user"},      {"HOME", "/home/s3user"},
-        {"SHELL", "/bin/sh"},       {"SSH_AUTH_SOCK", "/tmp/agent.socket"},
+        {"TERM", "xterm-256color"}, {"USER", "s3user"},   {"LOGNAME", "s3user"},
+        {"HOME", "/home/s3user"},   {"SHELL", "/bin/sh"}, {"SSH_AUTH_SOCK", "/tmp/agent.socket"},
         {"LANG", "C.UTF-8"},
     };
-    char  big[66]; /* 65 x's, one past the pty-req TERM bound */
+    char   big[66]; /* 65 x's, one past the pty-req TERM bound */
     size_t i;
 
     memset(big, 'x', sizeof(big) - 1);

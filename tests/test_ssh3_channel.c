@@ -208,15 +208,23 @@ s3_test_channel_chunk_size(void)
          * into the bound first (F-1): the helper may not lose the
          * floor to a future caller */
 
-        {30000, 0, 29997},        {30000, 1, 29996},        {16384, 0, 16381},
-        {16384, 1, 16380},        {64, 0, 4093},            {64, 1, 4092},
-        {4, 0, 4093},             {4, 1, 4092},             {3, 0, 4093},
-        {3, 1, 4092},             {2, 0, 4093},             {1, 0, 4093},
-        {1, 1, 4092},             {0, 0, 4093},             {0, 1, 4092},
-        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 0,
-         S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 3},
-        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 1,
-         S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 4},
+        {30000, 0, 29997},
+        {30000, 1, 29996},
+        {16384, 0, 16381},
+        {16384, 1, 16380},
+        {64, 0, 4093},
+        {64, 1, 4092},
+        {4, 0, 4093},
+        {4, 1, 4092},
+        {3, 0, 4093},
+        {3, 1, 4092},
+        {2, 0, 4093},
+        {1, 0, 4093},
+        {1, 1, 4092},
+        {0, 0, 4093},
+        {0, 1, 4092},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 0, S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 3},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 1, S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 4},
     };
 
     size_t i;
