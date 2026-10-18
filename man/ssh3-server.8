@@ -1,4 +1,4 @@
-.Dd October 6, 2026
+.Dd October 17, 2026
 .Dt SSH3-SERVER 8
 .Os ssh3-c
 .Sh NAME
@@ -6,9 +6,11 @@
 .Nd SSH3 server: user sessions and forwards over HTTP/3 (QUIC)
 .Sh SYNOPSIS
 .Nm
-.Op Fl l Ar addr:port
-.Op Fl c Ar cert.pem
-.Op Fl k Ar key.pem
+.Fl c Ar cert.pem
+.Fl h | k Ar keyfile
+.Op Fl p Ar port
+.Op Fl o Ar option
+.Op Fl l Ar addr Ns Op Cm \&: Ns Ar port
 .Op Fl A Ar alpn
 .Op Fl d Ar dg_size
 .Op Fl i Ar idle_ms
@@ -28,9 +30,11 @@
 .Op Fl -max-password-failures Ar n
 .Op Fl -password-lockout-seconds Ar s
 .Op Fl -permit-open Ar spec
+.Op Fl -permit-listen Ar spec
+.Op Fl -gateway-ports Cm no | yes | clientspecified
+.Op Fl -help
 .Op Fl v
 .Op Fl V
-.Op Fl h
 .Sh DESCRIPTION
 .Nm
 speaks the SSH3 transport of RFC 9220: one QUIC (UDP) listener carries
@@ -68,17 +72,131 @@ is skipped when the process runs under systemd
 .Pq Ev INVOCATION_ID .
 .Pp
 With no
-.Fl l ,
+.Fl l
+and no
+.Fl p ,
 .Nm
-serves a systemd socket-activated listener; see
+serves the default dual-stack listener
+.Pq Li [::]:443 ;
+under a systemd socket-activated unit the passed fds serve instead,
+see
 .Sx SOCKET ACTIVATION .
+The command-line shapes of
+.Xr sshd 8
+.Po
+.Fl h ,
+.Fl c ,
+.Fl p ,
+.Fl o
+.Pc
+are served where the functionality matches, the ssh3-specific options
+follow them.
 .Sh OPTIONS
 .Bl -tag -width "-enable-password-login"
-.It Fl l Ar addr:port
+.It Fl c Ar cert.pem
+TLS certificate, PEM (required).
+.It Fl h Ar keyfile
+The host key: the TLS private key, PEM (required).
+The
+.Xr sshd 8
+.Fl h
+hostkey shape, the alias of
+.Fl k
+(the QUIC listener serves the TLS pair, the private key is its
+closest host-key sense).
+.It Fl k Ar key.pem
+TLS private key, PEM (required); the alias of
+.Fl h .
+.It Fl p Ar port
+Listen port, the digits only, 1 to 65535 (the ephemeral 0 stays a
+.Fl l
+addr:0 form).
+Re-ports the default listener
+.Pq Li [::]:443 -> Li [::]:port
+and every bare
+.Fl l
+address
+.Pq Fl l Ar addr -> Fl l Ar addr Ns Cm \&: Ns Ar port ;
+the explicit port of
+.Fl l Ar addr Ns Cm \&: Ns Ar port
+wins.
+Under socket activation
+.Pq Ev LISTEN_FDS
+the passed fd carries its own port and
+.Fl p
+is ignored (a warning is logged).
+.It Fl o Ar option
+An
+.Xr sshd_config 5 Ns -style
+option
+.Li Key=Value ,
+repeatable; the keys and the boolean values compare
+case-insensitively.
+The supported set:
+.Bl -tag -width "AuthorizedKeysFile"
+.It Cm PermitOpen Ns = Ns Ar spec | any | none
+The forward dial policy, the
+.Fl -permit-open
+spec shape.
+The special value
+.Cm any
+keeps the dial unrestricted, the special value
+.Cm none
+refuses every dial; an
+.Fl o
+value overrides the
+.Ev SSH3_PERMIT_OPEN
+default.
+.It Cm PermitListen Ns = Ns Ar spec | any | none
+The reverse bind policy, the same shapes, the
+.Fl -permit-listen
+analog.
+.It Cm GatewayPorts Ns = Ns Cm no | yes | clientspecified
+The reverse bind policy (the
+.Cm y | n
+aliases ride), the
+.Fl -gateway-ports
+analog.
+.It Cm MaxStartups Ns = Ns Ar n
+The cap of the CONNECTs sitting between the arrival and the auth
+verdict, the
+.Fl -max-unauth-conversations
+analog; 0 is the kill-switch.
+The
+.Li start:rate:full
+form of
+.Xr sshd_config 5
+is not supported: the daemon names it and stops.
+.It Cm AuthorizedKeysFile Ns = Ns Ar path Ns Oo Ar path ... Oc
+The authorized_keys chain, the paths split on the spaces, the files
+walk in the given order (the repeatable
+.Fl K
+table).
+The
+.Cm %u
+token in a path substitutes the session username, the
+.Cm %h
+token its home directory (the passwd entry); a path without tokens
+is one file for every user.
+.It Cm ChrootDirectory Ns = Ns Ar dir
+The SFTP jail root override (the
+.Fl H
+alias).
+Simplified: one global value, the per-user
+.Cm Match
+is not supported (a one-time warning says so at the startup).
+.El
+An unknown option names the supported set and stops the daemon.
+.It Fl l Ar addr Ns Oo Cm \&: Ns Ar port Oc
 UDP listen address:
-.Li a.b.c.d:port
+.Li a.b.c.d Ns Oo Cm \&: Ns Ar port Oc
 or the bracketed IPv6 form
-.Li [v6]:port .
+.Li [v6] Ns Oo Cm \&: Ns Ar port Oc .
+A bare address without the port takes the
+.Fl p
+port or the 443 default (the
+.Xr sshd 8
+ListenAddress shape).
 The
 .Li [::]
 bind serves both address families (IPV6_V6ONLY=0, the dual-stack
@@ -86,13 +204,11 @@ shape of the reference
 .Fl -bind
 default); a kernel that refuses the dual mode stops the daemon.
 Port 0 picks an ephemeral one.  Optional under socket activation:
-when LISTEN_FDS is in effect the passed sockets serve and an
+when LISTEN_FDS is in effect the passed sockets serve and the
 .Fl l
-argument is ignored (a warning is logged, nothing is bound).
-.It Fl c Ar cert.pem
-TLS certificate, PEM (required).
-.It Fl k Ar key.pem
-TLS private key, PEM (required).
+and
+.Fl p
+arguments are ignored (a warning is logged, nothing is bound).
 .It Fl A Ar alpn
 ALPN protocol name, default
 .Ql h3 .
@@ -126,10 +242,12 @@ Authorized_keys file, repeatable: the CONNECT passes only with a
 Bearer JWT signed by one of the keys of any listed file, the files
 walk in the given order.  A
 .Cm %u
-token in the path substitutes the session username (the
+token in the path substitutes the session username and a
+.Cm %h
+token its home directory (the
 .Xr sshd 8
-AuthorizedKeysFile shape); a path without it is one file for every
-user.
+AuthorizedKeysFile shape); a path without tokens is one file for
+every user.
 Without any
 .Fl K
 the default chain of the session user serves.
@@ -214,8 +332,12 @@ request path.
 Verbose logging (debug).
 .It Fl V
 Print the version and exit.
-.It Fl h
-Print the usage summary.
+.It Fl -help
+Print the usage summary on stdout and exit 0 (the summary moved off
+the short
+.Fl h :
+the sshd host key owns it now; an unknown short flag prints the
+usage on stderr and exits 1).
 .It Fl 3
 Accepted for compatibility with the interop harness; the SSH3 route
 is the only mode of the daemon, the flag does nothing.
@@ -390,9 +512,42 @@ the flag overrides it; an unparsable or negative value falls back
 to the default.
 .It Ev SSH3_PERMIT_OPEN
 The default of
-.Fl -permit-open ;
+.Fl -permit-open
+(and of the
+.Fl o Cm PermitOpen
+option);
 the flag overrides it, an unset or empty value keeps the
 unrestricted dial.
+.It Ev SSH3_PERMIT_LISTEN
+The default of
+.Fl -permit-listen
+(and of the
+.Fl o Cm PermitListen
+option); the flag overrides it.
+.It Ev SSH3_GATEWAY_PORTS
+The default of
+.Fl -gateway-ports
+(and of the
+.Fl o Cm GatewayPorts
+option),
+.Cm no | yes | clientspecified ;
+the flag overrides it, an unknown value keeps the default.
+.It Ev SSH3_MAX_SFTP_SESSIONS_PER_USER
+The env default of
+.Fl -max-sftp-sessions-per-user ,
+the flag overrides it.
+.It Ev SSH3_MAX_CONNECTIONS
+The env default of
+.Fl -max-connections ,
+the flag overrides it.
+.It Ev SSH3_HANDSHAKE_TIMEOUT_MS
+The env default of
+.Fl -handshake-timeout-ms ,
+the flag overrides it.
+.It Ev SSH3_MAX_REVERSE_FORWARDS
+The env default of
+.Fl -max-reverse-forwards ,
+the flag overrides it.
 .It Ev SSH3_SFTP_JAIL
 The SFTP isolation mode,
 .Cm chroot
