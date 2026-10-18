@@ -368,7 +368,7 @@ if [ "$ALIVE" -eq 1 ] && ! grep -q "connection is gone" "$WORK/cli-idle.log" &&
     ! grep -q "the setup timed out" "$WORK/cli-idle.log"; then
     pass "the silent session lived past the old 60 s window (${TOOK}s, no idle close)"
 else
-    fail "the session died under the silence (alive=$ALIVE, ${TOOK}s), logs kept: $WORK"
+    fail "the session died under the silence (alive=$ALIVE, ${TOOK}s), the logs ride below"
     cat "$WORK/cli-idle.log"
     tail -6 "$WORK/srv4.log"
     exit 1
