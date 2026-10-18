@@ -29,7 +29,7 @@ jobs:
       - name: install the build and lintian toolchain
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends debhelper cmake ninja-build gcc libssl-dev pkg-config fakeroot lintian git ca-certificates dpkg-dev
+          apt-get install -y --no-install-recommends build-essential debhelper cmake ninja-build libssl-dev pkg-config fakeroot lintian git ca-certificates dpkg-dev
 
       - uses: actions/checkout@v4
         with:
