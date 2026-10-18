@@ -2,7 +2,7 @@
 
 > Languages: [RU](SPEC-wire.md) · EN (this file) · [DE](SPEC-wire.de.md)
 
-Date: 2026-10-16. Status: first revision of the P8-0 wave, verified against the live code of both implementations.
+Date: 2026-10-16. Status: first revision of the P8-0 wave, verified against the live code of both implementations; proofread 2026-10-18 (the P8-0 remainder).
 
 ## Sources and document status
 
@@ -200,7 +200,7 @@ non-blocking: overflow = drop (QUIC DATAGRAM is unreliable and unordered anyway)
 | Mechanism | Meaning |
 |----------|-------|
 | QUIC FIN on the stream | half-close of the channel (the canonical path) |
-| STOP_SENDING code 42 | reset of channel reading |
+| STOP_SENDING code 42 | reset of channel reading (sent by the fork only — `channelImpl.CancelRead(42)`; ssh3-c never sends STOP_SENDING, its path is FIN) |
 | control stream closure / conversation FIN | conversation teardown; the implementation waits for the channels to close (drain grace ~3 s) |
 
 Reference timings: PTY-exit grace 1 s (the client sends FIN after exit-status and waits);
@@ -255,7 +255,7 @@ completion are rejected with 425 (anti-replay).
 
 | Scheme | Format | Verification |
 |-------|--------|----------|
-| `Basic` (RFC 7617) | `Authorization: Basic base64(user:password)` | fork: system accounts, amd64 by default (opt-out `SSH3_ENABLE_PASSWORD_LOGIN=0`); ssh3-c: a password file `-P` or system accounts (`--password-system on`, fail-closed when euid≠0), password-login is off until opted in with `--enable-password-login` |
+| `Basic` (RFC 7617) | `Authorization: Basic base64(user:password)` | fork: system accounts, amd64 by default (opt-out `SSH3_ENABLE_PASSWORD_LOGIN=0` / `-enable-password-login=false`); ssh3-c: a password file `-P` or system accounts (`--password-system off` disables them; fail-closed when euid≠0), password-login is on by default (opt-out `--enable-password-login off` / `SSH3_ENABLE_PASSWORD_LOGIN=0`). Both implementations: root via password is always refused — PermitRootLogin prohibit-password (§13) |
 | `Bearer` (pubkey) | `Authorization: Bearer <JWT>` — both implementations travel as Bearer: the fork plugin `pubkey_authentication` (pubkey_auth.go:137) and ssh3-c `-i` (PEM key: EdDSA/ES256/RS256) | signature verified against authorized_keys/authorized_identities; claims: `iss = username`, `sub = "ssh3"`, `aud = "unused"`, `client_id = "ssh3-<username>"`, `jti` = base64 of the TLS exporter (32 bytes of `EXPORTER-SSH3`), `exp` is mandatory and short, `iat`/`nbf` are sanity-checked |
 | `Bearer` (OIDC) | `Authorization: Bearer <token>` from an OIDC provider | RS256/ES256, discovery, a JWKS cache with kid rotation, nonce = TLS exporter |
 
@@ -286,6 +286,7 @@ mux. The full matrix is in the P2–P9 phase reports (`docs/PLAN.md` §7); the n
 ## 13. Security considerations
 
 - The TLS exporter binds the conversation to the identity; 0-RTT is rejected (425) — anti-replay.
+- The root gate: password authentication of root is always refused (PermitRootLogin prohibit-password) — the fork `server_auth/root_gate.go`, ssh3-c — a refusal inside the Basic verdict; root via a key/JWT is allowed.
 - DoS guards: the reverse limits (§9), the channel limit per conversation, the connection budget,
   the username lockout; server FAIL paths on unknown types are a channel error, not a crash.
 - Non-loopback binds only with explicit opt-in (`gateway-ports`); permit-listen gates before the bind.

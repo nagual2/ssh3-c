@@ -1,7 +1,7 @@
 # SPEC-wire: спецификация wire-протокола SSH3 — rev nagual2/1 (draft 1)
 > Languages: RU (this file) · [EN](SPEC-wire.en.md) · [DE](SPEC-wire.de.md)
 
-Дата: 2026-10-16. Статус: первая редакция волны P8-0, выверена по живому коду обеих реализаций.
+Дата: 2026-10-16. Статус: первая редакция волны P8-0, выверена по живому коду обеих реализаций; вычитка 2026-10-18 (остаток этапа P8-0).
 
 ## Источники и статус документа
 
@@ -89,7 +89,7 @@ SSH <major>.<minor>[_<spec>] <impl-name> <sw-major>.<sw-minor>.<sw-patch>[ exper
 
 **Conversation** = пара (control stream, QUIC-коннекция). Идентификатор conversation —
 32 байта из TLS-экспортера с label `EXPORTER-SSH3`; на wire не передаётся, используется
-для auth-привязки (JWT nonce/анти-replay) и логов. Одна QUIC-коннection — одна conversation.
+для auth-привязки (JWT nonce/анти-replay) и логов. Одна QUIC-коннекция — одна conversation.
 
 **Канал** = один bidi-стрим QUIC. **ChannelID == QUIC StreamID канала** — отдельного
 нумератора нет. Первый блок стрима — заголовок канала:
@@ -199,7 +199,7 @@ Datagram Payload {
 | Механизм | Смысл |
 |----------|-------|
 | QUIC FIN на стриме | полузакрытие канала (канонический путь) |
-| STOP_SENDING код 42 | сброс чтения канала |
+| STOP_SENDING код 42 | сброс чтения канала (шлёт только fork — `channelImpl.CancelRead(42)`; ssh3-c STOP_SENDING не использует вовсе, его путь — FIN) |
 | закрытие control stream / FIN conversation | разбор conversation; реализация дожидается закрытия каналов (drain grace ~3 с) |
 
 Тайминги эталона: PTY-exit grace 1 с (клиент шлёт FIN после exit-status и ждёт);
@@ -254,7 +254,7 @@ handshake отклоняются 425 (анти-replay).
 
 | Схема | Формат | Проверка |
 |-------|--------|----------|
-| `Basic` (RFC 7617) | `Authorization: Basic base64(user:password)` | fork: системные аккаунты, amd64 по умолчанию (opt-out `SSH3_ENABLE_PASSWORD_LOGIN=0`); ssh3-c: файл паролей `-P` или системные (`--password-system on`, fail-closed при euid≠0), password-login выключен до opt-in `--enable-password-login` |
+| `Basic` (RFC 7617) | `Authorization: Basic base64(user:password)` | fork: системные аккаунты, amd64 по умолчанию (opt-out `SSH3_ENABLE_PASSWORD_LOGIN=0` / `-enable-password-login=false`); ssh3-c: файл паролей `-P` или системные аккаунты (`--password-system off` выключает; fail-closed при euid≠0), password-login включён по умолчанию (opt-out `--enable-password-login off` / `SSH3_ENABLE_PASSWORD_LOGIN=0`). Обе реализации: root по паролю отклоняется всегда — PermitRootLogin prohibit-password (§13) |
 | `Bearer` (pubkey) | `Authorization: Bearer <JWT>` — обе реализации едут Bearer'ом: fork-плагин `pubkey_authentication` (pubkey_auth.go:137) и ssh3-c `-i` (PEM-ключ: EdDSA/ES256/RS256) | подпись по authorized_keys/authorized_identities; клеймы: `iss = username`, `sub = "ssh3"`, `aud = "unused"`, `client_id = "ssh3-<username>"`, `jti` = base64 TLS-экспортера (32 байта `EXPORTER-SSH3`), `exp` обязателен и короток, `iat`/`nbf` — sanity |
 | `Bearer` (OIDC) | `Authorization: Bearer <token>` от OIDC-провайдера | RS256/ES256, discovery, JWKS-кэш с ротацией kid, nonce = TLS-exporter |
 
@@ -285,6 +285,7 @@ mux. Полная матрица — в отчётах фаз P2–P9 (`docs/PLA
 ## 13. Соображения безопасности
 
 - TLS-exporter привязывает conversation к личности; 0-RTT отклоняется (425) — анти-replay.
+- Root-гейт: парольная аутентификация root запрещена всегда (PermitRootLogin prohibit-password) — fork `server_auth/root_gate.go`, ssh3-c — отказ внутри Basic-вердикта; root по ключу/JWT разрешён.
 - DoS-гварды: reverse-лимиты (§9), лимит каналов на conversation, budget соединений,
   username-букаут; серверные FAIL-пути на неизвестных типах — ошибка канала, не краш.
 - Non-loopback бинды — только с явным opt-in (`gateway-ports`); permit-listen гейтит до bind.
