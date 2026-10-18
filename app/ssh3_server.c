@@ -6738,19 +6738,19 @@ s3_srv_usage(FILE *out, const char *prog)
             "      serve, no bind happens\n"
             "  -A  ALPN name, default h3 (RFC 9220 extended CONNECT, ssh3)\n"
             "  -d  max_datagram_frame_size transport parameter, default 1200\n"
-    "  -i  quic idle timeout, milliseconds, default 86400000 (24 h, the\n"
-    "      ssh2 idle canon: a silent session lives, the zombies die on the\n"
-    "      transport error alone)\n"
-    "  -L  log level: a name (debug|info|warn|error) or an s3 numeric\n"
-    "  -P  password file: the CONNECT passes only with the Basic"
-    " user:secret AND the\n"
-    "      password login on (the default, the sshd"
-    " PasswordAuthentication canon;\n"
-    "      disable with --enable-password-login off or"
-    " SSH3_ENABLE_PASSWORD_LOGIN=0);\n"
-    "      the file backend answers before the system one when both are"
-    " wired\n"
-    "      (--password-system)\n"
+            "  -i  quic idle timeout, milliseconds, default 86400000 (24 h, the\n"
+            "      ssh2 idle canon: a silent session lives, the zombies die on the\n"
+            "      transport error alone)\n"
+            "  -L  log level: a name (debug|info|warn|error) or an s3 numeric\n"
+            "  -P  password file: the CONNECT passes only with the Basic"
+            " user:secret AND the\n"
+            "      password login on (the default, the sshd"
+            " PasswordAuthentication canon;\n"
+            "      disable with --enable-password-login off or"
+            " SSH3_ENABLE_PASSWORD_LOGIN=0);\n"
+            "      the file backend answers before the system one when both are"
+            " wired\n"
+            "      (--password-system)\n"
             "  -K  authorized_keys file, repeatable: the CONNECT passes only with a"
             " Bearer JWT\n"
             "      signed by one of their keys; %%u in the path is the session"
@@ -6825,15 +6825,15 @@ s3_srv_usage(FILE *out, const char *prog)
             "      honors the bind address the client asked for,"
             " \"yes\" binds the\n"
             "      wildcard address regardless of the request\n"
-    "  --max-reverse-forwards n: the live reverse (-R) listeners"
-    " of one user,\n"
-    "      default 10 (the maxReverseForwardsPerUser mirror of the"
-    " fork), 0 is the\n"
-    "      explicit unlimited, the per-conversation budget of 10"
-    " stays; over the\n"
-    "      cap the bind refuses with the REVERSE-CAP-DENIED marker"
-    " before any\n"
-    "      socket\n"
+            "  --max-reverse-forwards n: the live reverse (-R) listeners"
+            " of one user,\n"
+            "      default 10 (the maxReverseForwardsPerUser mirror of the"
+            " fork), 0 is the\n"
+            "      explicit unlimited, the per-conversation budget of 10"
+            " stays; over the\n"
+            "      cap the bind refuses with the REVERSE-CAP-DENIED marker"
+            " before any\n"
+            "      socket\n"
             "  --max-sftp-sessions-per-user n: the concurrent sftp"
             " channels of one\n"
             "      user, default 16, 0 disables the budget (S2-02)\n"
@@ -6841,9 +6841,9 @@ s3_srv_usage(FILE *out, const char *prog)
             " default 0 (no\n"
             "      limit), over the cap the new connection is closed"
             " at once (S2-06)\n"
-    "  --handshake-timeout-ms ms: the QUIC handshake timeout, the"
-    " LoginGraceTime\n"
-    "      canon, default 120000\n"
+            "  --handshake-timeout-ms ms: the QUIC handshake timeout, the"
+            " LoginGraceTime\n"
+            "      canon, default 120000\n"
             "  --help  this summary on stdout, exit 0 (the help moved off the\n"
             "      short -h, the sshd host key owns it now)\n"
             "  -v  verbose logging (debug)\n"
@@ -6884,12 +6884,12 @@ s3_srv_usage(FILE *out, const char *prog)
 int
 main(int argc, char **argv)
 {
-    char                    opt;
-    const char             *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
-    const char             *alpn_name = "h3";
-    const char             *url_path_arg = NULL, *permit_open_arg = NULL;
-    const char             *permit_listen_arg = NULL;
-    unsigned                dg_size = 1200;
+    char        opt;
+    const char *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
+    const char *alpn_name = "h3";
+    const char *url_path_arg = NULL, *permit_open_arg = NULL;
+    const char *permit_listen_arg = NULL;
+    unsigned    dg_size = 1200;
     /* the 24 h idle of the ssh2 canon (ClientAliveInterval=0, the
      * ssh2IdleTimeout mirror of the fork cmd/ssh3.go), the -i flag
      * and the env overrides stay */
