@@ -46,12 +46,19 @@ jobs:
           cp -r "$GITHUB_WORKSPACE/packaging/debian" "/build/ssh3-c-$V/debian"
           cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
 
-      - name: dpkg-buildpackage (binary and source)
+      - name: dpkg-buildpackage (source first, then binary)
         run: |
           V="$PKGVER"
+          # the debhelper clean wipes ../ssh3-c_${V}.orig.tar.gz (the
+          # parent-artifact sweep of dh_clean), so the source build
+          # goes first with the orig in place and the binary build
+          # follows; the orig is restored for the artifact set
+          cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
           cd "/build/ssh3-c-$V"
-          dpkg-buildpackage -us -uc -b
           dpkg-buildpackage -us -uc -S
+          dpkg-buildpackage -us -uc -b
+          cp "/tmp/ssh3-c_${V}.orig.tar.gz" "/build/ssh3-c_${V}.orig.tar.gz"
+          ls -la /build/*.deb /build/*.dsc /build/*.changes /build/*.orig.tar.gz
 
       - name: lintian (errors are fatal)
         run: |
