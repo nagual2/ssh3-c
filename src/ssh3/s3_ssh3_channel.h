@@ -30,6 +30,21 @@
  */
 #define S3_SSH3_CHANNEL_MAX_PACKET_LIMIT (16u << 20)
 
+/*
+ * the floor of the peer-advertised maxPacketSize (F-1, the
+ * minPeerMaxPacketSize of the reference channel.go): the frame
+ * overhead eats 3-4 bytes of every data message, so an advertisement
+ * below 4096 hands the sender 1-byte chunks (a 0-byte one for the
+ * extended data) - the floor protects the sender from the peer-picked
+ * chunk size; the header parse clamps a smaller advertisement up (the
+ * clamp of the reference, not a refusal), the chunk helper clamps its
+ * input into [MIN_PACKET_SIZE .. MAX_PACKET_LIMIT] so the invariant
+ * holds for any future caller; the enforcement on the send/receive
+ * data path itself stays with the send wiring
+ */
+
+#define S3_SSH3_CHANNEL_MIN_PACKET_SIZE 4096u
+
 #define S3_SSH3_CHANNEL_TYPE_SESSION    "session"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_TCP "direct-tcp"
 #define S3_SSH3_CHANNEL_TYPE_DIRECT_UDP "direct-udp"
@@ -85,15 +100,19 @@ u_char *s3_ssh3_channel_build_header(u_char *p, const s3_ssh3_channel_t *ch);
  * receive buffer and the conversation_stream_id and max_packet_size
  * fields are filled (the channel_id is the stream id, the transport
  * knows it, the header does not carry it); a wrong frame type or a
- * truncated buffer leaves *pos untouched and returns S3_ERROR
+ * truncated buffer leaves *pos untouched and returns S3_ERROR; a
+ * max_packet_size above the limit is refused, one below the floor is
+ * clamped up to it (F-1, the clamp of the reference, not a refusal)
  */
 s3_int_t s3_ssh3_channel_parse_header(const u_char **pos, const u_char *end, s3_ssh3_channel_t *ch);
 
 /*
  * the payload bytes one 94/95 frame may carry under the channel
- * maxPacketSize: the frame overhead (the type varint plus the length
- * varint, one more varint for the extended data type) is subtracted
- * first, like the reference WriteData()
+ * maxPacketSize: the input clamps into
+ * [MIN_PACKET_SIZE .. MAX_PACKET_LIMIT] first (F-1), the frame
+ * overhead (the type varint plus the length varint, one more varint
+ * for the extended data type) is subtracted after, like the reference
+ * WriteData()
  */
 size_t s3_ssh3_channel_chunk_size(uint64_t max_packet_size, unsigned extended);
 

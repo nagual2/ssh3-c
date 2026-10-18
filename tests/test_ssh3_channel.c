@@ -124,7 +124,7 @@ s3_test_channel_parse_roundtrip(void)
     S3_ASSERT(ch.conversation_stream_id == 16383);
     /* the sub-floor advertisement of 64 rides the F-1 floor: the
      * parse clamps it up to 4096, the value is not refused */
-    S3_ASSERT(ch.max_packet_size == 4096u);
+    S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
     S3_ASSERT(ch.type.len == 4);
     S3_ASSERT(s3_memcmp(ch.type.data, "sftp", 4) == 0);
     S3_ASSERT(ch.type.data >= buf && ch.type.data < end);
@@ -213,8 +213,10 @@ s3_test_channel_chunk_size(void)
         {4, 0, 4093},             {4, 1, 4092},             {3, 0, 4093},
         {3, 1, 4092},             {2, 0, 4093},             {1, 0, 4093},
         {1, 1, 4092},             {0, 0, 4093},             {0, 1, 4092},
-        {(1ULL << 24) + 1, 0, (1ULL << 24) - 3},
-        {(1ULL << 24) + 1, 1, (1ULL << 24) - 4},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 0,
+         S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 3},
+        {S3_SSH3_CHANNEL_MAX_PACKET_LIMIT + 1, 1,
+         S3_SSH3_CHANNEL_MAX_PACKET_LIMIT - 4},
     };
 
     size_t i;
@@ -257,7 +259,7 @@ s3_test_channel_min_packet_floor(void)
 
         S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
         S3_ASSERT(pos == end);
-        S3_ASSERT(ch.max_packet_size == 4096u);
+        S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
     }
 
     /* the floor itself rides verbatim */
@@ -271,7 +273,7 @@ s3_test_channel_min_packet_floor(void)
 
     S3_ASSERT(s3_ssh3_channel_parse_header(&pos, end, &ch) == S3_OK);
     S3_ASSERT(pos == end);
-    S3_ASSERT(ch.max_packet_size == 4096u);
+    S3_ASSERT(ch.max_packet_size == S3_SSH3_CHANNEL_MIN_PACKET_SIZE);
 
     return s3_test_failures;
 }
