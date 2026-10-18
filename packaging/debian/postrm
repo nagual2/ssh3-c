@@ -1,0 +1,21 @@
+#!/bin/sh
+# debian/postrm - the purge undoes the postinst account: the system
+# user and its state directory go away, the operator's cert/key pair
+# under /etc/ssh3 stays (the dpkg conffile set only covers the env
+# template).  The debhelper marker carries the dh_installsystemd
+# purge snippets (the socket enablement state).
+
+set -e
+
+case "$1" in
+    purge)
+        if getent passwd ssh3 >/dev/null; then
+            userdel --remove ssh3 2>/dev/null || true
+        fi
+        rm -rf /var/lib/ssh3
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
