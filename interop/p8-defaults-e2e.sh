@@ -327,8 +327,9 @@ cp "$WORK/id_good.pub" "$WORK/idle_keys"
 
 # the fifo holder keeps the client stdin open with no data (no EOF,
 # no FIN, nothing flows - the idle window runs); the hold covers the
-# old 60 s default with a margin, the timeout reaps the client after
-# (the shell session rides a pre-existing post-EOF spin, the exit
+# old 60 s default with a margin, the SIGKILL reaps the client after
+# (the shell session rides a pre-existing post-EOF spin, the client
+# handles TERM as a flag the spinning loop never reads - the exit
 # code of the reap carries no verdict)
 
 mkfifo "$WORK/in" || die "mkfifo"
@@ -337,7 +338,7 @@ HOLDPID=$!
 
 START=$(date +%s)
 
-HOME="$WORK" timeout 90 "$PROD" -i "$WORK/id_good" "bob@127.0.0.1:$SRVPORT/ssh3-term" \
+HOME="$WORK" timeout -k 2 90 "$PROD" -i "$WORK/id_good" "bob@127.0.0.1:$SRVPORT/ssh3-term" \
     < "$WORK/in" > "$WORK/cli-idle.log" 2>&1 &
 CLIPID=$!
 
@@ -352,7 +353,7 @@ if kill -0 "$CLIPID" 2>/dev/null; then
     ALIVE=1
 fi
 
-kill "$CLIPID" 2>/dev/null
+kill -9 "$CLIPID" 2>/dev/null
 wait "$CLIPID" 2>/dev/null
 
 TOOK=$(( $(date +%s) - START ))
