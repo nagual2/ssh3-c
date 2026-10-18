@@ -829,6 +829,13 @@ s3_srv_error_done(s3_ssh3_cm_srv_t *t, const char *msg)
     return s3_srv_error(t, msg);
 }
 
+/*
+ * the op match is length-exact on purpose (I-1): the control-op
+ * decoder tolerates the trailing bytes of a newer client, this
+ * comparison is the one refusing them - a prefix test or a first-byte
+ * switch here would accept "check" + garbage; when the op set grows,
+ * keep the (length, s3_strncmp) shape per op, never a prefix dispatch
+ */
 static unsigned
 s3_cm_op_is(const s3_str_t *op, const char *name)
 {
