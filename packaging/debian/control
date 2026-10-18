@@ -79,8 +79,8 @@ Section: net
 Priority: optional
 Depends:
  ${misc:Depends},
- ssh3-client (= ${source:Version}),
- ssh3-server (= ${source:Version})
+ ssh3-client,
+ ssh3-server
 Description: SSH3 - SSH over QUIC/HTTP3 (client and server metapackage)
  The openssh(8) `ssh' metapackage analog of this source package:
  installs the ssh3-client and ssh3-server packages at matching
