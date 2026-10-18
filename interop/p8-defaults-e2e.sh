@@ -250,7 +250,10 @@ ACLIPID=""
 
 stop_server
 
-# the explicit 20: the same shape, the 11th bind of the user takes
+# the explicit 20: the 10 binds of client C hold the budget, the
+# fresh conversation of client D takes the 11th bind of the same
+# identity (the re-anchor claims the conversation slot after the
+# per-user gate passed)
 
 start_server "$WORK/srv3.log" --password-system off --max-reverse-forwards 20
 
@@ -269,16 +272,16 @@ while [ "$i" -lt 100 ]; do
     i=$((i + 1))
 done
 
-kill "$ACLIPID" 2>/dev/null
-wait "$ACLIPID" 2>/dev/null
-ACLIPID=""
-
 HOME="$WORK" timeout 20 "$CLI" -3 -a "127.0.0.1:$SRVPORT" \
     -R "0:127.0.0.1:19931" -t 5000 > "$WORK/cli-d.log" 2>&1 < /dev/null &
 BCLIPID=$!
 
 wait "$BCLIPID" 2>/dev/null
 BCLIPID=""
+
+kill "$ACLIPID" 2>/dev/null
+wait "$ACLIPID" 2>/dev/null
+ACLIPID=""
 
 if grep -q "INTEROP-RFWD-OK" "$WORK/cli-d.log"; then
     pass "the explicit 20 takes the 11th bind of the user"

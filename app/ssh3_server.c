@@ -5110,20 +5110,14 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         goto refuse;
     }
 
-    /* the listener budget of the conversation (S2-04) */
-
-    if (s3_srv_reverse.listeners >= S3_SRV_REVERSE_LISTENERS_MAX) {
-        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
-                 S3_SRV_REVERSE_LISTENERS_MAX);
-        goto refuse;
-    }
-
     /* the operator cap on the live reverse listeners of the user
-     * (the reference maxReverseForwardsPerUser): the refusal rides
-     * before any socket(), the slot books here and gives back on the
-     * refuse paths below.  The user text stages into a fixed buffer:
-     * the empty name (a CONNECT under the daemon identity) prints as
-     * the "-" placeholder */
+     * (the reference maxReverseForwardsPerUser): the gate rides
+     * first - the refusal of a full budget answers before any
+     * conversation bookkeeping, so the listeners of the conversation
+     * that filled the budget stay alive, and the fresh conversation
+     * of a user under the cap takes over cleanly below.  The user
+     * text stages into a fixed buffer: the empty name (a CONNECT
+     * under the daemon identity) prints as the "-" placeholder */
 
     {
         char ruser[S3_SRV_SFTP_USER_MAX + 2];
@@ -5154,9 +5148,6 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         s3_srv_reverse.budget_user[sizeof(s3_srv_reverse.budget_user) - 1] = '\0';
     }
 
-    /* the bind text is a literal (the rewrite produced one), the
-     * family follows it */
-
     s3_memzero(&sa, sizeof(sa));
 
     if (strcmp(bind_host, "::") == 0 || strchr(bind_host, ':') != NULL) {
@@ -5184,8 +5175,10 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
      * told the conversations apart and left the stale listeners of a
      * dead conversation riding under the fresh one (their live check
      * then tore the fresh listeners down with them).  The re-anchor
-     * also covers the refused binds of a new conversation: they leave
-     * listeners == 0 with the pc of the dead conversation riding */
+     * rides after the user gate but before the per-conversation
+     * check: the fresh conversation that paid its budget slot counts
+     * from zero, the hard constant of the previous conversation
+     * never judges it */
 
     if (s3_srv_reverse.listeners > 0 && s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse_teardown();
@@ -5194,6 +5187,15 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     if (s3_srv_reverse.pc != ch->pc) {
         s3_srv_reverse.conv_id = s3_srv_h3_conv_id;
         s3_srv_reverse.pc = ch->pc;
+    }
+
+    /* the listener budget of the conversation (S2-04): the hard
+     * constant stays on top of the user cap */
+
+    if (s3_srv_reverse.listeners >= S3_SRV_REVERSE_LISTENERS_MAX) {
+        snprintf(reason, sizeof(reason), "too many reverse forwards (limit %d)",
+                 S3_SRV_REVERSE_LISTENERS_MAX);
+        goto refuse;
     }
 
     for (i = 0; i < S3_SRV_REVERSE_LISTENERS_MAX; i++) {
