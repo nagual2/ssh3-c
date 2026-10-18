@@ -157,6 +157,64 @@ s3_ssh3_session_nonblock(int fd)
     return S3_OK;
 }
 
+/*
+ * the env allow-list (I-2): the fixed set of names the server quotes
+ * into a child environment; every quoting site (the run-as identity
+ * block, the pty-req TERM, the agent socket of the app, the LANG
+ * fallback of the envp builder) rides it through
+ * s3_ssh3_session_srv_env(), a future call site cannot bypass the
+ * gate
+ */
+
+static const char *const s3_ssh3_env_allow[] = {
+    "TERM", "USER", "LOGNAME", "HOME", "SHELL", "SSH_AUTH_SOCK", "LANG",
+};
+
+s3_int_t
+s3_ssh3_env_admit(const char *name, const char *value)
+{
+    size_t n, i;
+
+    if (name == NULL || value == NULL) {
+        return S3_DECLINED;
+    }
+
+    n = s3_strlen(name);
+
+    if (n == 0) {
+        return S3_DECLINED;
+    }
+
+    for (i = 0; i < sizeof(s3_ssh3_env_allow) / sizeof(s3_ssh3_env_allow[0]); i++) {
+
+        if (s3_strcmp(name, s3_ssh3_env_allow[i]) == 0) {
+            break;
+        }
+    }
+
+    if (i == sizeof(s3_ssh3_env_allow) / sizeof(s3_ssh3_env_allow[0])) {
+        return S3_DECLINED;
+    }
+
+    /* the value rules of the current quoting sites, unchanged: the
+     * TERM of the pty-req rides the 1..64 wire bound (the empty and
+     * the oversized are refused before the quote), the identity
+     * fields keep whatever the passwd database says (an account with
+     * an empty pw_dir still quotes its "HOME="), the agent socket and
+     * the LANG fallback are non-empty at their sites */
+
+    if (s3_strcmp(name, "TERM") == 0) {
+
+        size_t vn = s3_strlen(value);
+
+        if (vn == 0 || vn > 64) {
+            return S3_DECLINED;
+        }
+    }
+
+    return S3_OK;
+}
+
 s3_int_t
 s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *value)
 {
@@ -164,6 +222,13 @@ s3_ssh3_session_srv_env(s3_ssh3_session_srv_t *s, const char *name, const char *
     char  *entry, **grown;
 
     if (s == NULL || s->pid != 0 || name == NULL || value == NULL) {
+        return S3_DECLINED;
+    }
+
+    /* the central gate (I-2): every quoted entry rides the
+     * allow-list */
+
+    if (s3_ssh3_env_admit(name, value) != S3_OK) {
         return S3_DECLINED;
     }
 
@@ -385,20 +450,27 @@ s3_ssh3_session_envp(s3_ssh3_session_srv_t *s, char **envp, size_t cap)
             l = "C.UTF-8";
         }
 
-        if (n == cap - 1) {
-            return NULL;
+        /* the same gate as every quoted entry (I-2): the refusal (a
+         * future list edit) drops the fallback, the child rides the
+         * inherited locale then */
+
+        if (s3_ssh3_env_admit("LANG", l) == S3_OK) {
+
+            if (n == cap - 1) {
+                return NULL;
+            }
+
+            ln = s3_strlen(l);
+            envp[n] = s3_palloc(s->pool, 5 + ln + 1);
+
+            if (envp[n] == NULL) {
+                return NULL;
+            }
+
+            s3_memcpy(envp[n], "LANG=", 5);
+            s3_memcpy(envp[n] + 5, l, ln + 1);
+            n++;
         }
-
-        ln = s3_strlen(l);
-        envp[n] = s3_palloc(s->pool, 5 + ln + 1);
-
-        if (envp[n] == NULL) {
-            return NULL;
-        }
-
-        s3_memcpy(envp[n], "LANG=", 5);
-        s3_memcpy(envp[n] + 5, l, ln + 1);
-        n++;
     }
 
     envp[n] = NULL;
