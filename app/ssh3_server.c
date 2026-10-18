@@ -504,9 +504,10 @@ s3_srv_gateway_ports_parse(const char *text)
 
 /*
  * the ParseBool of the reference (strconv.ParseBool, the wave 1e
- * shapes): 1/t/T/true/TRUE/True set 1, 0/f/F/false/FALSE/False set 0,
- * anything else declines - the caller keeps the default (the env) or
- * leaves the tokens to the getopt rejection (the flag)
+ * shapes) plus the operator words of the daemon flags: 1/t/T/true/
+ * TRUE/True/on set 1, 0/f/F/false/FALSE/False/off set 0, anything
+ * else declines - the caller keeps the default (the env) or leaves
+ * the tokens to the getopt rejection (the flag)
  */
 
 static s3_int_t
@@ -516,12 +517,14 @@ s3_srv_parse_bool(const char *text, unsigned *out)
         return S3_ERROR;
     }
 
-    if (strcmp(text, "1") == 0 || strcasecmp(text, "t") == 0 || strcasecmp(text, "true") == 0) {
+    if (strcmp(text, "1") == 0 || strcasecmp(text, "t") == 0 || strcasecmp(text, "true") == 0 ||
+        strcasecmp(text, "on") == 0) {
         *out = 1;
         return S3_OK;
     }
 
-    if (strcmp(text, "0") == 0 || strcasecmp(text, "f") == 0 || strcasecmp(text, "false") == 0) {
+    if (strcmp(text, "0") == 0 || strcasecmp(text, "f") == 0 || strcasecmp(text, "false") == 0 ||
+        strcasecmp(text, "off") == 0) {
         *out = 0;
         return S3_OK;
     }
