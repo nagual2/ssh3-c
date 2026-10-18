@@ -140,6 +140,7 @@
 | B4 | Client rpm/apk | вторые пакеты в rpm-спеке и apk-контроле | сборка + установка |
 | B5 | go-форк: linux integration | разбор логов build-linux job (обвязка против нового CLI) | job зелёный |
 | B6 | apt-репозиторий | reprepro на минисфоруме (хостинг — решение владельца), `Scripts/`-публикатор | чистая Mint VM: apt install |
+| B7 | **arm64/arm deb+rpm (клиент+сервер)** — решение Пилота 2026-10-18: приоритет сейчас, хостинги массово внедряют arm (Graviton/Ampere) | кросс-тулчейн `gcc-aarch64-linux-gnu` + сборка arm64 OpenSSL 3.5 (build.sh fetch_bundle расширяется на arm64-дебы Debian), `patchelf`, deb/rpm клиента и сервера; linux-release arm64 ctest-лег | сборка зелёная, deb ставится на arm64-хост (Graviton/Ampere VM) |
 
 **Заморожено (не планируем; условия разморозки):**
 
@@ -147,9 +148,9 @@
 |---|-------|--------------------|
 | F1 | QUIC-стек `src/event/quic/*` (~11.7k LOC) | отдельная полноценная сессия-аудит, не подфаза |
 | F2 | Huffman/QPACK encoder/eviction, `s3_h3_uni/encode` | после B1 |
-| F3 | arm64/arm deb+rpm | реальный спрос на arm-хосты (кросс-toolchain + arm64 OpenSSL job) |
+| F3 | ~~arm64/arm deb+rpm~~ | **РАЗМОРОЖЕНО 2026-10-18** — переехало в волну B7 (хостинги внедряют arm) |
 | F4 | darwin клиент | macos-раннер + OpenSSL darwin, при спросе |
-| F5 | windows arm64 exe | ниша |
+| F5 | windows arm64 exe | **заморожено окончательно (2026-10-18)**: windows-ноутбуки на arm — редкость; revisit только при явном запросе пользователя |
 | F6 | FreeBSD порт | kqueue-модуль + vmactions-CI + pkg-OpenSSL 3.5 + crypt_r fallback — при спросе; разведка VM первой |
 | F6a | OpenBSD порт | kqueue-модуль (общий с F6) + crypt_r fallback — **пакета не будет**, пока системная политика TLS не изменится: в base — LibreSSL без QUIC TLS API, QUIC только через ports-OpenSSL 3.5 (линковка против ports не даёт пакетного пути) | при изменении политики TLS OpenBSD / появлении ports-OpenSSL 3.5 в статусе base-совместимости |
 | F7 | go: darwin CM unit-тесты | macos-раннер |
