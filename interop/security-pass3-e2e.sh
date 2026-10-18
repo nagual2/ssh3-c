@@ -86,7 +86,8 @@ stop_server() {
 
 echo "== 1: the allow-list refuses the unknown channel type"
 
-start_server "$WORK/srv1.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem"
+start_server "$WORK/srv1.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
+    --password-system off
 
 S3INTEROP_BAD_CHANNEL=raw:evil-type timeout 30 "$BUILD/s3interop_client" -3 -C \
     -a "127.0.0.1:$PORT" -t 20000 > "$WORK/cli-raw.log" 2>&1
@@ -111,7 +112,8 @@ stop_server
 
 echo "== 2: the sanity leg (the session channel is still served)"
 
-start_server "$WORK/srv2.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem"
+start_server "$WORK/srv2.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
+    --password-system off
 
 timeout 30 "$BUILD/s3interop_client" -3 -C \
     -a "127.0.0.1:$PORT" -t 20000 > "$WORK/cli-ok.log" 2>&1

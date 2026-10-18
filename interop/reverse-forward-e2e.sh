@@ -158,7 +158,11 @@ wait_echo() {
 # the daemon leg: the fresh log, the flags after the fixed ones
 
 start_srv() {
+    # the 1e password default rides off here: the legs exercise the
+    # -R machinery on the open harness shape, not the auth
+
     env SSH3C_PROTO=1 "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
+        --password-system off \
         "$@" > "$WORK/srv.log" 2>&1 < /dev/null &
     SRVPID=$!
 

@@ -63,6 +63,7 @@ port_of() {
 echo "== case 1: the exec session finishes inside the drain (8s window)"
 
 SSH3C_PROTO=1 SSH3_SHUTDOWN_DRAIN=8 "$BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    --password-system off \
     > "$WORK/g-srv.log" 2>&1 < /dev/null &
 SRV=$!
 
@@ -130,6 +131,7 @@ fi
 echo "== case 2: the drain timeout force-closes the wedged session (2s window)"
 
 SSH3C_PROTO=1 SSH3_SHUTDOWN_DRAIN=2 "$BIN" -3 -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    --password-system off \
     > "$WORK/t-srv.log" 2>&1 < /dev/null &
 SRV=$!
 

@@ -90,7 +90,8 @@ stop_server() {
 
 echo "== 1: the role table refuses the server-to-client channel types"
 
-start_server "$WORK/srv1.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem"
+start_server "$WORK/srv1.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
+    --password-system off
 
 for t in forwarded-tcp forwarded-udp; do
 
@@ -114,7 +115,8 @@ stop_server
 
 echo "== 2: the receive bound kills the endless frame"
 
-start_server "$WORK/srv2.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem"
+start_server "$WORK/srv2.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
+    --password-system off
 
 S3INTEROP_BAD_CHANNEL=overgrow timeout 30 "$BUILD/s3interop_client" -3 -C \
     -a "127.0.0.1:$PORT" -t 20000 > "$WORK/cli-og.log" 2>&1
@@ -136,7 +138,7 @@ stop_server
 echo "== 3: the connection cap (--max-connections 1)"
 
 start_server "$WORK/srv3.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
-    --max-connections 1
+    --password-system off --max-connections 1
 
 # the first connection holds the only slot with the sleeping exec
 
@@ -175,7 +177,7 @@ dd if=/dev/zero of="$WORK/sftp-big.bin" bs=1048576 count=128 2>/dev/null
 mkdir -p "$WORK/jail"
 
 start_server "$WORK/srv4.log" "$BIN" -3 -l 127.0.0.1:0 -c "$WORK/cert.pem" -k "$WORK/key.pem" \
-    -H "$WORK/jail" --max-sftp-sessions-per-user 1
+    --password-system off -H "$WORK/jail" --max-sftp-sessions-per-user 1
 
 timeout 60 "$BUILD/s3interop_client" -3 -J "put:$WORK/sftp-big.bin:p1.bin" \
     -a "127.0.0.1:$PORT" -t 55000 > "$WORK/put1.log" 2>&1 &
