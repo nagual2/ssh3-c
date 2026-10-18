@@ -120,6 +120,41 @@ Go (`-f`); их скрипты ssh2 ломают молча — приорите
 4. **Волна D — заморожено:** клиентский OIDC, `proxy-jump`, `keylog`,
    окна flow-control (№4/№6 §8).
 
+**Статус 2026-10-18 — волны A–C по ssh3-c закрыты** (merge
+`5e43ba8` + `44d1947`):
+
+- Клиент: занятые разведены — `-l` логин (`--log-level N|all` для
+  уровня), `-e` escape (`^x`/`none`, процессор `~.`/`~^Z`/`~#`/`~V`),
+  `-A` агент (`-X` deprecated-алиас, `-x`/`-Y` — no-X11 warn), `-J`
+  jump однохоповый (старая голова `put:`/`get:` — deprecated, новым
+  формам трансфера `--sftp spec` и `-s sftp spec`), `-S` контрол-мастер
+  (`-U`-путь deprecated, `-U user:pass` Basic — без изменений). Добор:
+  `-p -N -n -t/-tt/-T -F -D -q -4/-6` + `-o`-переменные канона:
+  ForwardAgent, Port, User, IdentityFile, LocalForward, RemoteForward,
+  DynamicForward, ProxyJump, EscapeChar, ControlMaster (auto = yes с
+  note), ControlPath, ControlPersist (warn-only — механики persist в
+  продуктовом мастере нет); `-F` — подмножество ssh_config (Host-паттерны,
+  HostName/Port/User/IdentityFile/ForwardAgent/…, дефолт `~/.ssh/config`,
+  `-F none` отключает, CLI wins); `-D` — socks4/5, имена резолвит клиент
+  (v4). `-L` — канон `[bind:]port:host:hostport` (`tcp://` deprecated,
+  `udp://` — проектное расширение); `-R` — канон-подмножество
+  (stdio-форма голого «port» отказывается).
+- Сервер: `-h` host key (алиас `-k`; help переехал на `--help`), `-p`
+  порт-алиас (дефолт-слушатель `[::]:443` введён — до волны без `-l`
+  демон не стартовал), `-o`: PermitOpen/PermitListen (`any`/`none`),
+  GatewayPorts (y/n-алиасы), MaxStartups (плоский счёт; форма
+  `a:b:c` — config-error), AuthorizedKeysFile (`%u`/`%h`,
+  абсолютные пути; относительные от home — не реализовано),
+  ChrootDirectory (глобальный упрощённый, warn). Usage, man и
+  packaging-deb строки синхронизированы.
+- Приёмка на слитой main: ctest 42/42 (linux-release + linux-asan),
+  clang-format чисто; e2e — `cli-compat-e2e.sh` (17 ног клиента),
+  `cli-compat-srv-e2e.sh` (20 ног сервера), s3cm / product-reverse /
+  client-opt / idle-close / proxyjump — зелёные.
+- Лакуны: jump — одиночный хоп (цепочка — clean error); ControlPersist
+  без механики; `-f` background — будущий инкремент; Go-сторона —
+  `CTO_TASK.md` §7c форка.
+
 Пакетная взаимозамена ssh3-go ↔ ssh3-c (`Conflicts`/`Replaces`) сохраняет
 смысл: после волн A–C скрипты, написанные под любой из трёх бинарников,
 ведут себя одинаково.
