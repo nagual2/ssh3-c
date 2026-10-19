@@ -305,3 +305,69 @@ Residual risk list (highest first):
 4. priority 3 (`s3_quic_migration.c`, `s3_quic_output.c` congestion, transport parameters, idle
    timeout, key update), then priority 4 (`s3_quic_ssl.c`, `s3_ssl.c`) and the P2-1/P2-3 probes;
 5. only then restate §8's verdict with the probes behind it.
+
+## 10. Continuation addendum (same branch, later session)
+**Probe numbers are still not claimed.** The audit machine was replaced between sessions: `/tmp`
+(OpenSSL tarball, driver, build script) and `/opt/openssl35` were gone, so the toolchain was rebuilt
+from scratch. The 3.5.0 release tarball was re-fetched from the GitHub release mirror (**53 136 912
+bytes**, byte-count identical to the earlier session) and a `--prefix=/opt/openssl35` shared build
+was started again; it was still compiling when this session ended. **No ctest count and no fuzz
+input count are asserted here.**
+Probe infrastructure preserved **outside** the repo in `/home/team/shared/` so a later session does
+not have to rewrite it:
+- `pass3_run.sh` — waits for `/opt/openssl35/lib/libssl.so`, then for `linux-release` and
+  `linux-asan`: `cmake --preset <p> -DOPENSSL_ROOT_DIR=/opt/openssl35`, `cmake --build --preset <p>`,
+  `ctest --preset <p>`; logs `/tmp/{cfg,bld,ctest}_linux-<p>.log`.
+- `pass3_fuzz_run.sh` + `pass3_fuzz_drv.c` — gcc + ASan/UBSan driver for
+  `tests/fuzz/fuzz_quic_state.c` (deterministic xorshift64\* PRNG; three generators: raw random,
+  structured records with frame-type-directed payloads and varint boundary values
+  0/63/64/16383/16384/1073741823/2^62-1, mutated seeds with bit flips and truncation; prints
+  inputs, seconds, inputs/s). It reuses `build/linux-asan`'s include flags, so the library under
+  test is the sanitised one.
+### 10.1 Priority 3 (connection state) — read this session, with anchors
+| Topic | Finding | Anchors |
+|-------|---------|---------|
+| PTO / loss timer | `s3_quic_pto()` = `avg_rtt + max(4*rttvar, S3_QUIC_TIME_GRANULARITY) + ctp.max_ack_delay` (last term application level only) — RFC 9002 A.8 shape | `s3_quic_ack.c:1003-1015`, `:659` |
+| The TZ's "500 ms tick cap" | **No such cap exists here**: `S3_QUIC_TIME_GRANULARITY` is **1 ms**, and `grep -nE '\b500\b' src/event/quic src/event/*.c` is **empty**. The only `5000` in the loss path is the Newton-Raphson seed of the CUBIC time, not a timer | `s3_quic_ack.c:20`, `:903` |
+| Loss detection | packet- and time-threshold detection, then congestion feedback; the **same** posted event doubles as loss and PTO timer (the port says so itself) | `s3_quic_ack.c:564-645`, `:924-999`; `s3_quic.c:204-209` |
+| Congestion control | **CUBIC** — neither a fixed window nor NewReno: cube-root solve loop, idle/k bookkeeping, lost path | `s3_quic_ack.c:880-905`, `:340-505`, `:482`, `:807-865` |
+| Idle timeout | effective value is `min(peer, local)`; the read timer is re-armed on receive and on send | `s3_quic.c:99-100`, `:140`, `:675`, `:2144`; `s3_quic_output.c:127`, `:1439` |
+| 24 h advertisement | **matches the code**: `-i` default `86400000`, server `idle_ms = 86400000`, client `conf->idle_timeout = 24*60*60*1000` | `app/ssh3_server.c:6781`, `:6936`; `app/ssh3_client.c:8701`, `:13029` |
+| Migration refusal | client refuses a peer migration outright; NAT rebinding is a new path that must pass PATH_CHALLENGE, else revert to the last validated path | `s3_quic_migration.c:448`, `:460-464`, `:485-490`, `:516-529`, `:569-593`, `:784` |
+| Transport parameters | typed parse (zero-length vs varint classes) then value validation before use | `s3_quic_transport.c:1793-1940`; `s3_quic.c:60-104` |
+| Key update | driven by the received KEY_PHASE bit: flip phase, switch keys, post the update event | `s3_quic.c:1250-1264`, `:1727-1740`, `:223-225`, `:2036-2038` |
+Two **Info** observations from this slice, neither demonstrated exploitable:
+- **I3-5** — `tp->disable_active_migration` is parsed (`s3_quic_transport.c:1808`) and emitted
+  (`:2163`, `:2230`) but **never enforced** in `s3_quic_migration.c`, and no `app/` code sets it, so
+  it is unreachable in the shipped binaries. RFC 9000 §9 would want an error if a peer migrates
+  after we advertised it.
+- **I3-6** — the five idle re-arm sites hand `qc->tp.max_idle_timeout` straight to
+  `s3_event_add_timer()`; `0` means "no limit" (RFC 9000 §10.1) and the shipped configs always pass
+  86 400 000, so this is a library-embedder risk only. Not probed.
+### 10.2 Priority 4 (the OpenSSL 3.5 seam) — read this session, with anchors
+- The QUIC-TLS seam is one `OSSL_DISPATCH` table — `send`, `recv_rcd`, `release_rcd`, `yield_secret`,
+  `got_transport_params`, `alert` (`s3_quic_ssl.c:44-57`); secrets are mapped from
+  `SSL_CIPHER_get_id()` and the record-protection level (`:201-260`); ALPN is checked in the send
+  callback (`:77-99`); CRYPTO frames enter through `s3_quic_handle_crypto_frame()` (`:345`) and the
+  handshake is pumped by `SSL_do_handshake()` (`:463`, post-handshake `:415`).
+- **P2-3 (`EXPORTER-SSH3` binding)** — the exporter is taken from the *live connection's* SSL:
+  `app/ssh3_server.c:2244` (`s3_srv_h3_pc->ssl->connection`, label `"EXPORTER-SSH3"`, length 13,
+  32 bytes out), `app/ssh3_client.c:2138`, `src/ssh3/s3_ssh3_oidc.c:1679`. Both sides use the same
+  label and no context, and the same SSL object carries the QUIC handshake (`s3_quic_ssl.c` operates
+  on `c->ssl->connection`), so the exporter material is bound to the QUIC connection's TLS session.
+  **Static result only**; the runtime probe is prepared but not run — with the 3.5.0 build in place,
+  `openssl s_server -quic` against `openssl s_client -quic -keymatexport EXPORTER-SSH3
+  -keymatexportlen 32` checks that the plugin path yields symmetric material over QUIC.
+- **P2-1 (peer bound)** — the peer reaches the upper layer only from the datagram source address on
+  the socket/recv path (`s3_quic_set_path()`, `s3_quic.c:1185` region, and `s3_quic_migration.c`);
+  no packet field feeds it. Shape confirmed by grep, not line by line; the spoofing probe (a
+  raw-socket datagram with a foreign source address) has not been run.
+### 10.3 Still not covered — resume points
+1. **ctest baseline, both presets** — run `/home/team/shared/pass3_run.sh`; it needs only the OpenSSL
+   3.5 build to finish.
+2. **Fuzz ≥ 1 M inputs** — run `/home/team/shared/pass3_fuzz_run.sh` after the `linux-asan` build.
+3. Unchanged from §9: the ACK-range algebra bodies (`s3_quic_ack.c:512-556`, `:1110-1300`),
+   `s3_quic_streams.c` flow control, `s3_quic_connid.c`, `s3_quic_tokens.c`, the GSO/io_uring guards.
+4. The runtime exporter probe (§10.2) and the P2-1 spoofing probe.
+**Verdict stays as in §8:** no defect reported; the mandatory probes are still outstanding, so this
+pass still entitles no one to call the QUIC stack clean.
