@@ -144,7 +144,7 @@ cap's effect on PTO, spurious-retransmit logic, congestion control, idle timeout
 24 h / `--max-idle-timeout`, migration refusal, and transport-parameter validation are **not read**
 and no statement is made about them.
 
-### 3.5 Priority 4 — the OpenSSL QUIC API seam (TZ §3.5) — **not read** (§9)
+### 3.5 Priority 4 — the OpenSSL QUIC API seam (TZ §3.5) — **read** (§10.2)
 
 `s3_quic_ssl.c` (712 lines) and `s3_ssl.c` (409 lines) are untouched: the
 `SSL_provide_quic_data` ordering, `SSL_handle_events` polling, API-error propagation and the
@@ -190,7 +190,7 @@ the 3.5.0 toolchain was still compiling when the session ended (source fetched t
 as the toolchain lands; it is deliberately left uncommitted (this branch is report-only, and the
 delegation forbids code changes outside `fix/*`).
 
-### 4.2 ctest baseline (TZ §6: 42/42 `linux-release` and 42/42 `linux-asan`)
+### 4.2 ctest baseline — **executed, both green, fresh build** (§10.4)
 
 **Not established** — same blocker (the presets need OpenSSL 3.5; only 3.0.13 is installed).
 Nothing is claimed about the test-suite state, and the "42/42" of the TZ is *not* confirmed for
@@ -371,3 +371,117 @@ Two **Info** observations from this slice, neither demonstrated exploitable:
 4. The runtime exporter probe (§10.2) and the P2-1 spoofing probe.
 **Verdict stays as in §8:** no defect reported; the mandatory probes are still outstanding, so this
 pass still entitles no one to call the QUIC stack clean.
+
+### 10.4 Probes — **executed** (continuation session, same branch)
+
+Toolchain: OpenSSL **3.5.0** is built and usable at `/opt/openssl35`
+(`LD_LIBRARY_PATH=/opt/openssl35/lib /opt/openssl35/bin/openssl version` →
+`OpenSSL 3.5.0 8 Apr 2025`).
+
+Environment note that explains the earlier failure (no defect in the project): the CMake presets
+declare `"generator": "Ninja"`, and Ninja was **absent** from this host — `CMAKE_MAKE_PROGRAM` in the
+leftover `build/linux-release/CMakeCache.txt` pointed at `/usr/bin/ninja`, which no longer existed.
+That is exactly why the earlier `linux-asan` configure died with *"CMAKE_C_COMPILER not set, after
+EnableLanguage"* (the generator probe failed before the compiler check) while `linux-release`
+appeared to work only because its cache was complete. Ninja 1.13.2 was installed and **both presets
+were configured, built and tested from scratch** (the build directories were removed first, so
+nothing below comes from a stale cache):
+
+| Preset | Configure | Build | ctest | Result |
+|--------|-----------|-------|-------|--------|
+| `linux-release` | fresh | 153/153 targets | `ctest --preset linux-release` | **42/42 passed, 0 failed** (`CTEST_EXIT=0`) |
+| `linux-asan` | fresh | 153/153 targets | `ctest --preset linux-asan` | **42/42 passed, 0 failed** (`CTEST_EXIT=0`) |
+
+Both counts match the TZ expectation (42/42 for each configuration). Logs:
+`/home/team/shared/pass3/logs/{run.out,cfg,bld,ctest}_linux-<preset>.log`.
+
+Fuzzing: harness `pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, built with gcc
+`-fsanitize=address,undefined -fno-sanitize-recover=all` against the sanitised
+`build/linux-asan/libs3core.a`, run with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`,
+`UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`. Driver and scripts now live in
+`/home/team/shared/pass3/` (they had been left in `/tmp`; `/tmp` on this host was **not** wiped).
+Run status and counts: see the probe-log line under this section.
+
+## 11. Reading — the residual-risk items of §10.3
+
+### 11.1 ACK-range algebra (the top residual risk) — **read, no defect**
+
+Receive side, `s3_quic_handle_ack_frame()` (`s3_quic_ack.c:88-190`), which consumes
+peer-controlled numbers:
+
+- `if (ack->first_range > ack->largest)` → connection error `FRAME_ENCODING_ERROR` **before** the
+  subtraction `min = ack->largest - ack->first_range` (`:115-119`, `:121`). This is the RFC 9000
+  §19.3.1 guard (*"if any computed packet number is negative …"*) and it is what makes the first
+  range arithmetic wrap-free.
+- Inside the range loop the two later subtractions are guarded the same way: `gap + 2 > min` →
+  `FRAME_ENCODING_ERROR` (`:168-172`) before `max = min - gap - 2` (`:174`), and `range > max` →
+  `FRAME_ENCODING_ERROR` (`:176-180`) before `min = max - range` (`:182`). `gap` and `range` are
+  QUIC varints (≤ 2⁶²−1), so `gap + 2` cannot itself overflow.
+- A range that matches no sent packet closes the connection with `PROTOCOL_VIOLATION`
+  ("unknown packet number", `:300-313`) unless `max < ctx->pnum`, i.e. a duplicate ACK — the
+  ngtcp2 behaviour, and it is a *hardening* extra relative to a plain "ignore" policy.
+
+Bookkeeping side, `s3_quic_ack_packet()` (`:1107-1337`), where the ack-range array is mutated: every
+write is bounded. The insert tail refuses to grow past `S3_QUIC_MAX_RANGES` (`:1326`) and the
+`memmove` size `nranges - i - 1` keeps the largest touched index below the array size from either
+call site — new-front gap (`:1199`, `i = 0`) and gap split (`:1281`, `i < nranges`); the "packet too
+old to keep" case (`:1311-1319`) sends a one-packet ACK range instead of inserting. The two
+subtractions that could underflow are guarded by their preconditions: `gap = pn - base - 2` runs only
+after `pn > base` **and** `pn - base != 1` (`:1162-1188`), so the difference is ≥ 2; and the
+`pn == smallest - 1` extension (`:1296`) cannot be reached with `smallest == 0` under the 62-bit PN
+bound. `s3_quic_drop_ack_ranges()` (`:508-561`) only rewrites state it has already ordered
+(`largest > pn > smallest`, `:532-559`) and shrinks `nranges` monotonically.
+
+### 11.2 Stream flow control — **core read, no defect**
+
+`s3_quic_update_flow()` (`s3_quic_streams.c:1738-1774`): `if (last <= qs->recv_offset) return`
+(`:1748-1750`) makes `len = last - qs->recv_offset` (`:1752`) wrap-free; the stream credit
+(`:1757`) and the connection credit (`:1765`) advance by that same `len`, and each re-advertises
+(`s3_quic_update_max_stream_data()` / `s3_quic_update_max_data()`) on the half-window rule
+(`:1759`, `:1767`). No accumulator is added twice and no credit is granted for data not received.
+
+*Limit:* only this core was read line by line; the `last = f->offset + f->length` bound in the
+callers (`:1304`, `:1748` region) was confirmed by grep (upstream final-size/`MAX_DATA` checks), not
+read in full.
+
+### 11.3 Connection IDs and tokens — **spot-checked**
+
+- `s3_quic_connid.c` rejects malformed CIDs with `PROTOCOL_VIOLATION` (`:138`, `:376`, `:395`) —
+  the >20-byte and zero-length cases.
+- `s3_quic_tokens.c`: token buffers are fixed-size arrays (`u_char in[S3_QUIC_MAX_TOKEN_SIZE]`
+  `:117`, `tdec[...]` `:198`); the received token length is checked against
+  `iv_len + S3_QUIC_MAX_TOKEN_SIZE + AES-256-GCM tag` before it is used (`:214`), and the ODCID is
+  checked against `S3_QUIC_MAX_CID_LEN` (`:270`). The decrypt/derive path was not read line by line.
+
+### 11.4 Probe results
+
+- **ctest**: `linux-release` 42/42, `linux-asan` 42/42 — §10.4.
+- **Fuzz (≥ 1 M inputs)**: run in flight when this revision was written (see the follow-up commit for the counts)
+- **Runtime `EXPORTER-SSH3` probe** — **not run**: it needs `openssl s_server -quic` to complete a
+  handshake against this stack's QUIC glue, which requires building/serving the app-side TLS helper
+  on the same 3.5.0; the prepared command pair remains in §10.2. The static result of P2-3 (both
+  sides take the exporter from the live QUIC connection SSL, identical label and length) is
+  unchanged.
+- **P2-1 spoofing probe** — **not run** (needs a raw-socket datagram with a foreign source address on
+  an established path; not attempted in this session). The static shape from §10.2 stands.
+- Still unread after this session: the GSO/io_uring guards, the ACK-ECN path, the
+  `s3_quic_transport.c` per-parameter validation bodies beyond the classes already checked in §10.1,
+  and the caller-side `offset + length` bound of §11.2.
+
+## 12. Verdict after the executed probes (supersedes the closing line of §10.3)
+
+**Over the full TZ scope read so far, no memory-safety defect was found** — not by the reading
+(pre-auth parsing §3.2, frames §3.3, connection state §10.1, the OpenSSL seam §10.2, the ACK-range
+algebra §11.1, flow control §11.2) and not by the machine probes (fresh `linux-release` **42/42**
+and `linux-asan` **42/42**; fuzz: in flight at this commit). No fix branch was opened, and none is
+claimable from this pass.
+
+**Residual risk that a later pass should still carry, in order:**
+1. the runtime `EXPORTER-SSH3` probe (not run — P2-3 is a static result only);
+2. the P2-1 spoofing probe (not run — the peer-source shape is grep-confirmed only);
+3. `disable_active_migration` is parsed and emitted but never enforced (**I3-5**), unreachable in
+   the shipped binaries because no `app/` code sets it;
+4. idle re-arm sites pass a possibly-zero timeout straight to `s3_event_add_timer()` (**I3-6**),
+   a library-embedder risk only;
+5. the unread bodies listed at the end of §11.4 (GSO/io_uring, ACK-ECN, the remaining transport
+   parameter validators, the flow-control callers).
