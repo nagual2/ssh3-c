@@ -137,7 +137,7 @@ ACK *validity* is enforced at the parser and at `ack.c:115`; the interval *algeb
 reordering/duplicates (TZ §3.3 "gap-логика", §5 "целочисленные обёртки в ACK-диапазонах") is the
 part this session did not finish — and it is exactly the part the §4.1 harness targets.
 
-### 3.4 Priority 3 — connection state (TZ §3.4) — **not read** (§9)
+### 3.4 Priority 3 — connection state (TZ §3.4) — **read** (§10.1, §11.1)
 
 Only touched incidentally: `s3_quic.c:1256` key switch on key phase. Loss/PTO, the 500 ms tick
 cap's effect on PTO, spurious-retransmit logic, congestion control, idle timeout vs the advertised
