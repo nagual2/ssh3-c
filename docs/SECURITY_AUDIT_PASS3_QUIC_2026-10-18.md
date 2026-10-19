@@ -400,7 +400,31 @@ Fuzzing: harness `pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, built with
 `build/linux-asan/libs3core.a`, run with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`,
 `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`. Driver and scripts now live in
 `/home/team/shared/pass3/` (they had been left in `/tmp`; `/tmp` on this host was **not** wiped).
-Run status and counts: see the probe-log line under this section.
+**Fuzz run — completed, clean.** The ≥ 1 M-input run finished with exit status 0 and no sanitizer
+report:
+```
+PASS3_FUZZ inputs=1000000 seed=20261018 seconds=237.31 inputs_per_sec=4214 \
+  generators=random,structured,mutated resume_seed=9921936635634431398
+PASS3_FUZZ_RESULT: no ASan/UBSan report
+FUZZ_EXIT=0
+PASS3_FUZZ_DONE
+```
+| Fuzz metric | Value |
+|-------------|-------|
+| inputs executed | **1 000 000** (the full `S3_FUZZ_ITERS` budget, not an early stop) |
+| PRNG seed | `20261018` (fixed, reproducible) |
+| wall time | **237.31 s** |
+| throughput | **4 214 inputs/s** (ASan + UBSan, `-O1`) |
+| generators | `random`, `structured`, `mutated` (all three active, per the driver's `mode=3`) |
+| resume seed | `9921936635634431398` — state after the last input, for a resumed run |
+| exit status | **0** (`FUZZ_EXIT=0`, `PASS3_FUZZ_DONE`) |
+| ASan/UBSan findings | **none** — no report of any kind on stdout or stderr |
+
+Raw logs: `/home/team/shared/pass3/logs/fuzz.out` (driver output) and
+`/home/team/shared/pass3/logs/fuzz_driver.out` (`FUZZ_EXIT`, `PASS3_FUZZ_DONE`).
+Scope note: the harness drives the QUIC **input/frame handler** (`s3_quic_input_handler` →
+`LLVMFuzzerTestOneInput`) with attacker-shaped bytes; it does not exercise the OpenSSL handshake or
+the socket/GSO paths, which remain reading-only coverage (§11.4).
 
 ## 11. Reading — the residual-risk items of §10.3
 
@@ -456,7 +480,10 @@ read in full.
 ### 11.4 Probe results
 
 - **ctest**: `linux-release` 42/42, `linux-asan` 42/42 — §10.4.
-- **Fuzz (≥ 1 M inputs)**: run in flight when this revision was written (see the follow-up commit for the counts)
+- **Fuzz (≥ 1 M inputs)**: **executed and clean** — `inputs=1000000 seed=20261018 seconds=237.31
+  inputs_per_sec=4214 generators=random,structured,mutated resume_seed=9921936635634431398`,
+  `FUZZ_EXIT=0`, no ASan/UBSan report (§10.4 for the table and the raw-log paths). The run reached
+  the full input budget, so it was not an early exit.
 - **Runtime `EXPORTER-SSH3` probe** — **not run**: it needs `openssl s_server -quic` to complete a
   handshake against this stack's QUIC glue, which requires building/serving the app-side TLS helper
   on the same 3.5.0; the prepared command pair remains in §10.2. The static result of P2-3 (both
@@ -473,8 +500,9 @@ read in full.
 **Over the full TZ scope read so far, no memory-safety defect was found** — not by the reading
 (pre-auth parsing §3.2, frames §3.3, connection state §10.1, the OpenSSL seam §10.2, the ACK-range
 algebra §11.1, flow control §11.2) and not by the machine probes (fresh `linux-release` **42/42**
-and `linux-asan` **42/42**; fuzz: in flight at this commit). No fix branch was opened, and none is
-claimable from this pass.
+and `linux-asan` **42/42**; a **1 000 000-input** ASan+UBSan fuzz run, seed `20261018`, 237.31 s at
+4 214 inputs/s, exit 0, **no sanitizer finding** — §10.4/§11.4). No fix branch was opened, and none
+is claimable from this pass.
 
 **Residual risk that a later pass should still carry, in order:**
 1. the runtime `EXPORTER-SSH3` probe (not run — P2-3 is a static result only);
