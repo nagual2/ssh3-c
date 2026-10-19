@@ -491,10 +491,112 @@ read in full.
   unchanged.
 - **P2-1 spoofing probe** — **not run** (needs a raw-socket datagram with a foreign source address on
   an established path; not attempted in this session). The static shape from §10.2 stands.
-- Still unread after this session: the GSO/io_uring guards, the ACK-ECN path, the
-  `s3_quic_transport.c` per-parameter validation bodies beyond the classes already checked in §10.1,
-  and the caller-side `offset + length` bound of §11.2.
+- **Previously-unread bodies**: **read in this session** — the GSO guard, the ACK-ECN path, the
+  remaining transport-parameter validators and the caller-side `offset + length` bound, with anchors
+  and observations, are in **§11.5**. `io_uring` is closed as *not applicable*: the tree contains no
+  io_uring code at all (§11.5(d)). Still genuinely unread: the iovec-coalescing body of
+  `src/os/unix/s3_udp_sendmsg_chain.c`, the `s3_quic_tokens.c` decrypt/derive path (§11.3), and the
+  `s3_quic_connid.c` issuance path beyond the three rejection sites.
 
+### 11.5 Second-session reading — the last four §10.3/§11.4 items — **read, no memory-safety defect**
+These are the bodies §11.4 previously listed as unread. Every anchor below was read in this session.
+**(a) Caller-side `offset + length` bound (closes the §11.2 limit).**
+`s3_quic_handle_stream_frame()` (`s3_quic_streams.c:1282-1360`): `last = f->offset + f->length`
+(`:1302`) carries the in-code justification *"no overflow since both values are 62-bit"* — correct,
+because two values ≤ 2⁶²−1 sum to < 2⁶⁴, so the addition cannot wrap in `uint64_t`. `last` is then
+used only for comparisons and for `s3_quic_control_flow(qs, last)` (`:1332`), which is what turns it
+into credit: `if (last <= qs->recv_last) return S3_OK; len = last - qs->recv_last` (`:1748-1752`,
+wrap-free by the guard), then `FLOW_CONTROL_ERROR` if either `qs->recv_last` or
+`qc->streams.recv_last` exceeds its advertised maximum. **The write comes after the gate**:
+`s3_quic_write_buffer(..., f->length, f->offset)` (`:1345`) is reached only once `last` has passed
+final-size checks (`:1313-1325`) and flow control, so a peer cannot use an over-large `offset` to
+inflate a receive buffer past the window it was granted. `f->length` is itself bounded by the frame
+parser (`transport.c`), which never yields a length beyond the packet.
+*Observation (not a defect):* `s3_quic_control_flow()` advances `qs->recv_last` and
+`qc->streams.recv_last` **before** testing the limits, so on a violation the counters have already
+moved. Harmless — the very next statement raises a connection error and the connection state is
+torn down — but it is why the function must not be re-used in a path that can continue after
+`S3_ERROR`.
+**(b) The ACK-ECN path — no ECN-specific surface.** `S3_QUIC_FT_ACK_ECN` shares one parser arm with
+`ACK` (`s3_quic_transport.c:726-790`): `largest`, `delay`, `range_count`, `first_range`, then
+`range_count` × (gap, range) pairs, then the three counters `ect0`, `ect1`, `ce`. Every field goes
+through `s3_quic_parse_int(p, end, …)` with a `NULL` check, so the ranges loop is bounded by the
+**packet**, not by `range_count` — a varint of 2⁶²−1 cannot cause 2⁶² iterations, the first
+out-of-data parse jumps to `error`. `f->u.ack.ranges_length = b->last - b->pos` is derived from the
+parsed span, so it can never exceed the frame. Downstream, `ACK_ECN` is handled by exactly the same
+two arms as `ACK` — `s3_quic_drop_ack_ranges()` on ack (`s3_quic_ack.c:271`) and the send-ack
+refresh on discard (`:743`) — and the counters are only logged (`transport.c:786-788`): no
+arithmetic, no congestion-control input, no index derived from them.
+**(c) The GSO guard.** Two halves, both bounded:
+- *Eligibility* — `s3_quic_allow_segmentation()` (`s3_quic_output.c:347-395`) refuses unless
+  `conf->gso_enabled`, the path is **validated**, both the Initial and Handshake send queues are
+  empty, and the queued application frames would fill ≥ ~3 packets without exceeding the congestion
+  window. So batching never starts on an unvalidated path (the amplification-safe property).
+- *Write* — `s3_quic_output_gso()` (`:409-470`) fills one `static u_char dst[65487]`
+  (`S3_QUIC_MAX_UDP_SEGMENT_BUF`, `:23`). Each iteration takes `len = s3_min(segsize, end - p)`
+  (`:428`), i.e. the write is clamped to the bytes left in the buffer, and the packet builder returns
+  at most `len`; when `p` reaches `end`, `len` becomes 0 → `n = 0` → the flush branch fires. The
+  segment count is capped at `S3_QUIC_MAX_SEGMENTS` = 64 (`:24`, `:459`), and the loop exits when
+  `p == dst` (nothing produced). **No write can pass `end`.**
+- *Ancillary data* — `s3_quic_send_segments()` (`:485-540`) reserves
+  `CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(s3_addrinfo_t))` and the second cmsg is only
+  added when the listener is wildcard **and** `c->local_sockaddr` is set; `s3_addrinfo_t` is a union
+  that already contains `struct in_pktinfo`/`struct in6_pktinfo` (`src/os/unix/s3_cmsg.h:18-26`), so
+  the reservation covers what `s3_set_srcaddr_cmsg()` (`src/os/unix/s3_cmsg.c:52-100`) writes, and
+  `msg_controllen` is set to the exact consumed size. `msg_control` is zeroed before use, so the
+  `CMSG_FIRSTHDR`/`CMSG_NXTHDR` chain never reads uninitialised padding.
+*Observation (latent constraint, not a defect):* `dst` and `preserved_pnum` are `static`, so the GSO
+send path is **not reentrant** across connections. That is safe under this library's single-threaded
+event loop, and it is the same shape upstream uses, but it is a hard constraint on any future
+multi-threaded or per-connection-isolate embedding.
+*Observation (functional, not memory-safety):* in `s3_set_srcaddr_cmsg()` the IPv4 branch requires
+`cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_PKTINFO` (`s3_cmsg.c:61`), which the QUIC
+caller never sets on the freshly created second cmsg — so for an IPv4 wildcard listener the source
+address is silently not attached while the IPv6 branch still is. Worth a maintainer look; it changes
+no memory safety.
+**(d) "io_uring guards" — nothing to read: the tree contains no io_uring code.**
+`grep -rn 'io_uring' src/ --include=*.c --include=*.h` → **0 matches**. The earlier "io_uring" hit
+was the word *"neighbouring"* in a comment in `src/os/unix/s3_udp_sendmsg_chain.c:44`. The residual
+item is therefore closed as **not applicable to this revision**, not as "unread". What that file
+actually implements — iovec coalescing for batched sends — is on the ordinary `sendmsg(2)` path and
+is reached from `s3_quic_send_segments()`; its body was **not** read line by line and is carried
+forward as an open item in §12 (5).
+**(e) The remaining transport-parameter validators — all length-gated, values range-checked.**
+- `s3_quic_parse_transport_params()` (`s3_quic_transport.c:1920-1975`): per parameter, `id` and
+  `len` are varints with `NULL` checks; `if ((size_t)(end - p) < len)` rejects a length that would
+  run past the extension **before** dispatch; the sub-parser is given the exact window `[p, p+len)`;
+  `p += len`; and any trailing bytes are an error (`p != end`). Server-only parameters
+  (`ORIGINAL_DCID`, `PREFERRED_ADDRESS`, `RETRY_SCID`, `SR_TOKEN`) are refused when they arrive from
+  a client (`:1940-1953`), per RFC 9000 §7.3.
+- `s3_quic_parse_transport_param()` (`:1793-1910`): the zero-length-only parameter checks
+  `end - p != 0`; the numeric class must consume a varint (`parse_int` bounded by `end`); `sr_token`
+  must be exactly `S3_QUIC_SR_TOKEN_LEN` and is copied into a fixed member (`:1837-1841`); the three
+  connection-ID parameters are stored as `(ptr, len)` into the extension — no copy, no bound needed
+  at this layer because the *consumer* validates.
+- `s3_quic_apply_transport_params()` (`s3_quic.c:47-108`) is that consumer: `initial_scid` must
+  match our own CID in **both** length and bytes (`:57-58`, so a longer or shorter peer value cannot
+  reach the `memcmp`); `max_udp_payload_size` ∈ [`S3_QUIC_MIN_INITIAL_SIZE`,
+  `S3_QUIC_MAX_UDP_PAYLOAD_SIZE`] (`:65`); `active_connection_id_limit ≥ 2` (`:73`);
+  `ack_delay_exponent ≤ 20` (`:79`); `max_ack_delay < 16384` (`:85`).
+*Observation (hardening, no memory-safety effect):* `initial_max_streams_bidi` /
+`initial_max_streams_uni` are taken verbatim (`s3_quic.c:103-104`) with no upper bound, where
+RFC 9000 §18.2 asks a receiver to reject values above 2⁶⁰. The value only bounds how many streams
+*we* may open and stream IDs are 62-bit, so a huge advertisement grants permission rather than
+allocating anything — worth tightening for spec conformance, not for safety.
+*Observation (latent hazard worth a fix in a later pass):* `s3_memcpy(&qc->ctp, ctp, sizeof(s3_quic_tp_t))`
+(`s3_quic.c:106`) copies the whole parameter block, **including** the `s3_str_t` members
+`initial_scid` / `original_dcid` / `retry_scid`, which alias the TLS extension buffer passed to the
+`got_transport_params` callback (`s3_quic_ssl.c:298-305`). That buffer is not pool-owned. Today this
+is **dormant**: the only reads of those three fields are the `initial_scid` check inside
+`apply_transport_params()` itself (`s3_quic.c:57-58`), and every later reader of `qc->ctp` takes a
+scalar (`ack_delay_exponent`, `max_ack_delay`, `active_connection_id_limit`, `max_udp_payload_size`,
+`max_datagram_frame_size`, `initial_max_stream_data_*` — `ack.c:213/216/660/1016`,
+`connid.c:461`, `migration.c:634-636`, `output.c:1481`, `streams.c:833/845`). Our *own* parameters
+(`qc->tp`) are the ones that are serialised, and their string members are pool-allocated
+(`s3_quic.c:261-268`, `:323-330`, `:345-352`). So no use-after-free is reachable now — but any
+future change that reads `qc->ctp.initial_scid` (or the other two) after the handshake would be one.
+Copying those three into `c->pool` — or nulling them right after the check — removes the trap
+cheaply.
 ## 12. Verdict after the executed probes (supersedes the closing line of §10.3)
 
 **Over the full TZ scope read so far, no memory-safety defect was found** — not by the reading
@@ -511,10 +613,19 @@ is claimable from this pass.
    the shipped binaries because no `app/` code sets it;
 4. idle re-arm sites pass a possibly-zero timeout straight to `s3_event_add_timer()` (**I3-6**),
    a library-embedder risk only;
-5. the unread bodies listed at the end of §11.4 (GSO/io_uring, ACK-ECN, the remaining transport
-   parameter validators, the flow-control callers).
+5. the bodies that stayed unread after §11.5 (iovec coalescing in
+   `src/os/unix/s3_udp_sendmsg_chain.c`, the token decrypt/derive path, the CID issuance path), plus
+   the four **observations** of §11.5 that a maintainer should decide on: the non-reentrant `static`
+   GSO buffer, the dormant `qc->ctp` string aliases into the TLS extension buffer, the unbounded
+   `initial_max_streams_*`, and the IPv4 source-address cmsg that is never attached.
 
-## 10. Continuation addendum (same branch, later session)
+## Appendix A — earlier continuation draft (superseded by §10.4 and §12)
+> **History, not status.** This block is the draft written while the OpenSSL 3.5 build was
+> still compiling, before any probe ran. Its "probe numbers are still not claimed" and its
+> "mandatory probes still outstanding" are **superseded**: both presets are 42/42 and the
+> 1 000 000-input fuzz run is clean (§10.4, §11.4); its resume list is superseded by §11.5.
+> Kept because the build/probe infrastructure notes below remain accurate.
+
 **Probe numbers are still not claimed.** The audit machine was replaced between sessions: `/tmp`
 (OpenSSL tarball, driver, build script) and `/opt/openssl35` were gone, so the toolchain was rebuilt
 from scratch. The 3.5.0 release tarball was re-fetched from the GitHub release mirror (**53 136 912
