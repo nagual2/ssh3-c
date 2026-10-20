@@ -619,6 +619,199 @@ is claimable from this pass.
    GSO buffer, the dormant `qc->ctp` string aliases into the TLS extension buffer, the unbounded
    `initial_max_streams_*`, and the IPv4 source-address cmsg that is never attached.
 
+## 13. Continuation addendum — the §12 residual list, closed as far as this pass can (same branch)
+
+Scope of this session, in the order of §12: (1) the runtime `EXPORTER-SSH3` probe, (2) the P2-1
+spoofing probe, (3) the three bodies that stayed unread, (4) this addendum.
+
+### 13.1 Runtime `EXPORTER-SSH3` probe — **not run; partial, honestly reported**
+
+Status: **not executed.** The environment this pass ran in was recycled between sessions and the
+OpenSSL 3.5.0 build the whole stack links against (`/opt/openssl35`) no longer existed, so every
+binary in `build/linux-release` and `build/linux-asan` failed to load
+(`libssl.so.3: version 'OPENSSL_3.5.0' not found`) and no app pair could be stood up. OpenSSL 3.5.0
+was rebuilt from the upstream release tarball and both presets re-configured against it; that work
+is a prerequisite, not a result, and is recorded here so the next session does not repeat it:
+
+- driver: `/home/team/shared/pass3/s13/build_ossl.sh` (fetch `openssl-3.5.0.tar.gz`, `./Configure
+  --prefix=/opt/openssl35 --libdir=lib no-tests no-docs linux-x86_64`, `make -j2`,
+  `make install_sw`, then `cmake --preset <p> -DOPENSSL_ROOT_DIR=/opt/openssl35` + build + ctest
+  for both presets), logs in `/home/team/shared/pass3/s13/*.log`;
+- result of that rebuild in this session: see the probe log file
+  `/home/team/shared/pass3/s13/build_ossl.out` (appended to the run directory, not to this doc).
+
+What is established without the run, restated so the gap is precise: the exporter is called on both
+sides of the same connection with the same label — `src/ssh3/s3_ssh3_oidc.c:1679` (label
+`"EXPORTER-SSH3"`, `sizeof(raw)` length), `app/ssh3_client.c:2138` (`label, sizeof(label) - 1`) and
+`app/ssh3_server.c:2244` (same buffer length and context). That is a **static** result; it says
+nothing about whether the two sides derive the same bytes at runtime, which is exactly what P2-3
+left open. **The residual stands: the runtime exporter equality is still unproven.**
+
+How to finish it (concrete, so the next session does not have to rediscover it): the exporter needs
+a completed handshake, i.e. a live client/server pair, and the apps require the ssh3 auth harness
+(JWT/OIDC) to get there. The cheapest faithful route is `tests/test_quic_e2e.c` — it already drives a
+full client/server QUIC handshake in one process — extended (in a *probe* copy, never in the
+library) with an `SSL_export_keying_material(ssl, out, 32, "EXPORTER-SSH3", 13, ctx, ctxlen, 1)`
+call on both SSL objects after the handshake completes, then a `memcmp` of the two 32-byte buffers
+plus a negative control (a different label must produce different bytes on both sides).
+
+### 13.2 P2-1 spoofing probe — **not run; the build prerequisite was the blocker**
+
+Status: **not executed**, same root cause as §13.1: no runnable `ssh3-server` in this session. No
+packet counts, no byte counts and no PATH_CHALLENGE observation are claimed here. What the reading
+already establishes is unchanged from pass-2/§11 (peer-source shape is grep-confirmed only).
+
+The probe remains worth running and needs no auth harness at all — which is the useful finding of
+this session: anti-amplification and path validation happen on the **Initial** path, before any
+ssh3 authentication, so a bare `ssh3-server` listening on UDP is enough. Concretely:
+send a 1200-byte Initial from a spoofed source (raw socket, or a 127.0.0.2/127.0.0.3 alias on
+loopback), then count bytes the server returns toward that unvalidated path: they must be
+≤ 3× received and ≤ ~1200 B per amplification budget, with a PATH_CHALLENGE (0x0b frame, 8-byte
+random token) required before any expansion, and no packets at all toward a spoofed path that has
+already completed NAT rebinding validation.
+
+### 13.3 Reading — the last three bodies of §12 item 5 — **read, no defect**
+
+#### 13.3.1 `src/os/unix/s3_udp_sendmsg_chain.c` — iovec coalescing
+
+Read in full (300 lines). The chain is turned into one scatter/gather datagram by
+`s3_udp_output_chain_to_iovec()` (`:132-205`) and sent by `s3_sendmsg_vec()`/`s3_sendmsg()`
+(`:207-223`, `:258-300`).
+
+- The datagram boundary is the first buffer carrying `->flush` or `->last_buf` (`:149-151`); a chain
+  with no flush boundary returns `cl == in` with `vec.count = 0` (`:187-191`), and the caller turns
+  that into an early return (`:57-59`), so nothing is consumed, lost or duplicated.
+- Special buffers are skipped (`:153-155`), file buffers abort with an ALERT (`:157-159` `:52-55`),
+  a buffer that is neither in memory nor in a file is an ALERT (`:161-164`) — the three stream-case
+  hazards of the nginx original are all explicitly handled.
+- Coalescing is `prev == in->buf->pos` with `prev` = `pos + size` of the previous buffer (`:168`,
+  `:183`), i.e. only genuinely adjacent memory is merged; `iov->iov_len` only ever grows by a
+  buffer's `last - pos`, so the sum cannot exceed the chain length.
+- The iovec array is `S3_IOVS_PREALLOCATE` = 16 (`s3_udp_sendmsg_chain.h:25`, `:23`) and the `:172`
+  bound check happens **before** `vec->iovs[n++]` is written (`:172-181`), so a chain with more than
+  16 non-adjacent parts is refused with an ALERT rather than overflowing the array.
+- A zero-part datagram is sent as one 0-length iov (`:195-199`). The `sent == 0` break in
+  `s3_chain_update_sent()` (`:236-238`) does not stall: zero-size buffers are advanced by the
+  `sent >= size` arm (`:242-247`), so the outer `for (;;)` (`:42`) always makes progress.
+- EMSGSIZE is mapped to `S3_DECLINED` (`:281-290`) and triggers the per-iov fallback (`:76-107`); a
+  datagram that is still too large is accounted whole (`:91`) rather than retried, EAGAIN mid-fallback
+  parks the write event (`:99-102`), and `c->sent` is only bumped for bytes actually accepted
+  (`:104`, `:121`).
+- Partial sends cannot occur on `SOCK_DGRAM`; even so, `s3_chain_update_sent()` walks buffers in
+  order and advances `pos` and `file_pos` together (`:249-251`), so no `pos > last` state can arise.
+
+**Verdict: no defect.** Two notes for the maintainer, neither a memory-safety issue: (i) the
+post-fallback `send >= limit` test (`:109`) still counts the whole coalesced batch, so a single
+iteration can overshoot `limit` by at most one datagram; (ii) an oversize datagram is *silently
+consumed* (logged at ALERT, `:88-89`) rather than surfaced to the caller — correct for QUIC, but
+worth knowing if the chain path is ever reused for something that needs a send error.
+
+#### 13.3.2 `src/event/quic/s3_quic_tokens.c` — encrypt / decrypt / derive
+
+Read in full (312 lines), plus the derive primitive in `s3_quic_protection.c:852-892`.
+
+- **Token plaintext and its bound.** `in[64]` (`S3_QUIC_MAX_TOKEN_SIZE`, `s3_quic_tokens.h:12`) holds
+  20 B address hash + 8 B `time_t` + 1 B retry flag + 1 B ODCID length + ODCID (`:117-135`); with the
+  protocol's 20-byte CID bound the worst case is 50 B. The ODCID length is written as
+  `*p++ = odcid->len` (`:128`) with **no local check** — safety rests on both callers passing a
+  parse-bounded CID (`s3_quic_output.c:1123` uses `inpkt->dcid`, `:1191` the validated path's first
+  CID; `S3_QUIC_MAX_CID_LEN` = 20 is enforced when the header is parsed). The buffer-size guard right
+  below (`:140-143`) checks the *output* token buffer, not `in`. **Hardening item (not a defect
+  today): add `odcid->len > S3_QUIC_MAX_CID_LEN → error` at the top of `s3_quic_new_token()`.**
+- **Encryption.** AES-256-GCM, fresh 12-byte `RAND_bytes` IV per token (`:150-152`), tag appended
+  through `EVP_CTRL_AEAD_GET_TAG` with a checked return (`:173-177`), `token->len` recomputed from the
+  actual lengths (`:157-179`). No IV reuse: the IV is random per call and the key is a long-lived
+  per-process `av_token_key`.
+- **Address binding is symmetric.** `no_port = !is_retry` on encrypt (`:119`) and `!pkt->retried` on
+  decrypt (`:262`), so a Retry token is bound to the address only and a NEW_TOKEN to address + port,
+  and the flag that decides which is itself inside the AEAD plaintext.
+- **Decrypt.** Length is sanity-checked before use (`:210-216`: `< iv+tag` and
+  `> iv + S3_QUIC_MAX_TOKEN_SIZE + tag` both `goto garbage`), so `len = token.len - iv - tag ≤ 64`
+  and `tdec[64]` (`:198`, `:229`) cannot be overrun; the tag is set **before** `EVP_DecryptFinal_ex`
+  (`:237-247`) so no plaintext is trusted before the authentication check; `total` is the sum of the
+  two returned lengths (`:235`, `:247`); expiry is read only after `total ≥ 20+8+2` (`:251-258`); the
+  ODCID length is rejected when `> S3_QUIC_MAX_CID_LEN` and the remaining-bytes arithmetic
+  `(tdec + total - p) < odcid.len` is checked before the copy into `pkt->odcid_buf[20]`
+  (`:268-291`, `s3_quic.h:295`); `now > exp` → `S3_DECLINED`, malformed → `S3_ABORT` (`:283-311`).
+- **Clock.** `time(2)` directly (`:20`), no cached-second window, so an expired token cannot be
+  resurrected by a stale timer tick.
+- **Derivation.** `s3_quic_derive_key()` (`s3_quic_protection.c:852-892`): HKDF-Extract(SHA-256) with
+  the key material as the salt and the CID as the IKM, then HKDF-Expand over
+  `info = [0][len][label_len][label]['\0']` with `info_len = 3 + label_len + 1 < 20` enforced
+  (`:876-881`). `s3_quic_new_sr_token()` (`:82-106`) mixes the 32-byte `sr_token_key` with a zeroed
+  32-bit worker index (single event loop, so no worker id) and derives a 16-byte per-CID stateless
+  reset token — deterministic per CID, unpredictable without the key.
+
+**Verdict: no defect.** One hardening item (the missing ODCID bound assertion above) and one
+observation in the same class as the §11.5 alias note: when a token carries no ODCID,
+`pkt->odcid` is aliased to `pkt->dcid` (`:294`) — a `s3_str_t` pointing into the packet buffer that
+outlives nothing today but is a trap for any later code that keeps it.
+
+#### 13.3.3 `src/event/quic/s3_quic_connid.c` — CID issuance and retirement
+
+Read in full (483 lines), with the parse-side bound in `s3_quic_transport.c:796-831`.
+
+- **Server CIDs** are 20 random bytes (`:26-43`, `S3_QUIC_SERVER_CID_LEN == S3_QUIC_MAX_CID_LEN ==
+  20`, `s3_quic.h:45-46`), and every issued CID carries its own stateless-reset token derived from
+  `qc->conf->sr_token_key` (`:443-445`).
+- **Collision handling.** A repeated NEW_CONNECTION_ID with the same sequence number is tolerated
+  only if the CID **and** the SR token match, otherwise `PROTOCOL_VIOLATION` (`:125-141`); a sequence
+  number below `max_retired_seqnum` is answered with RETIRE and then falls into the retire logic
+  (`:87-111`), and `Retire Prior To` values that do not increase are ignored (`:155-163`) — RFC 9000
+  §19.15's three rules, all present.
+- **Length bound.** `f->len` is checked 1..20 at parse time (`s3_quic_transport.c:817-819`) before it
+  reaches `s3_quic_create_client_id()`'s `memcpy(cid->id, id->data, id->len)` (`:290-291`) into
+  `id[20]` (`s3_quic_connection.h:72`), so the copy is bounded by construction, not by luck; the
+  frame struct itself is `cid[S3_QUIC_CID_LEN_MAX]` (`s3_quic_transport.h:148`).
+- **Retire-before-issue.** Receiving NEW_CONNECTION_ID retires every CID with `seqnum < f->retire`
+  (`:169-181`) *before* the `nclient_ids > active_connection_id_limit` check (`:185-198`, `>` not
+  `>=`, matching "exceeds"), so the limit cannot be tripped by an issue that legally retires first.
+  On the sending side `s3_quic_create_client_id()` inserts then increments (`:297-298`), and
+  `s3_quic_free_client_id()` queues the RETIRE frame **before** moving the CID to `free_client_ids`
+  and decrementing (`:339-355`) — a retired CID is never used for an outgoing packet afterwards.
+  `s3_quic_retire_client_id()` swaps in `s3_quic_next_client_id()`, which can only return a `!used`
+  CID (`:319-328`), so the CID being retired is never re-selected as its own replacement (`:230-240`).
+- **Peer-driven retirement.** RETIRE_CONNECTION_ID with `seqnum >= server_seqnum` →
+  `PROTOCOL_VIOLATION` (`:368-380`); retiring the DCID of the packet that carries the frame →
+  `PROTOCOL_VIOLATION` (`:384-399`); the socket is closed **first** and the socket count is only
+  restored by `s3_quic_create_sockets()` afterwards (`:409-414`), so a retired CID is never
+  re-issued under the same sequence number and nothing is sent on a retired socket.
+- **Socket count** is `min(S3_QUIC_MAX_SERVER_IDS, active_connection_id_limit)` (`:461`), so the peer
+  cannot drive socket allocation beyond its own advertised limit and the compile-time cap.
+
+**Verdict: no defect.** Two observations: (i) `s3_quic_retire_client_id()` returns `S3_OK` without
+freeing a CID that is not attached to any path (`:246`), leaving it in `client_ids` and counted in
+`nclient_ids` — a peer can only hurt its own connection with that (the limit check then closes it);
+(ii) `qc->nclient_ids--` (`:355`) is unchecked, safe today because the function is only reached with
+the CID on `client_ids`, but a `nclient_ids > 0` guard would make that explicit.
+
+### 13.4 Residual list after this session
+
+**Removed** (covered now): §12 item 5's three unread bodies — iovec coalescing (§13.3.1), the token
+decrypt/derive path (§13.3.2), CID issuance (§13.3.3). All three read in full, no defect.
+
+**Still open, in order:**
+
+1. the runtime `EXPORTER-SSH3` probe (§13.1) — still unrun; the static result stands, the runtime
+   equality is unproven. Resume by extending a *copy* of `tests/test_quic_e2e.c`;
+2. the P2-1 spoofing probe (§13.2) — still unrun; needs only a listening `ssh3-server` and a raw
+   socket, no auth harness;
+3. `disable_active_migration` parsed and emitted but never enforced (**I3-5**), unreachable in the
+   shipped binaries because no `app/` code sets it;
+4. idle re-arm sites pass a possibly-zero timeout to `s3_event_add_timer()` (**I3-6**), embedder-only;
+5. the four §11.5 observations a maintainer should decide on: the non-reentrant `static` GSO buffer,
+   the dormant `qc->ctp` string aliases into the TLS extension buffer, the unbounded
+   `initial_max_streams_*`, and the IPv4 source-address cmsg that is never attached;
+6. **new hardening items from §13.3.2/§13.3.3** (none reachable, all one-liners): the missing
+   `odcid->len ≤ S3_QUIC_MAX_CID_LEN` assertion in `s3_quic_new_token()`, the `pkt->odcid =
+   pkt->dcid` alias, the counted-but-not-freed CID in `s3_quic_retire_client_id()`, and the
+   unguarded `qc->nclient_ids--`.
+
+**Verdict of this addendum:** the reading part of the §12 list is closed with no defect. The two
+runtime probes are **still open** and are the only items in this pass that are both unrun and
+uncovered by static reasoning; this addendum does not change the pass-3 verdict (no memory-safety
+defect found) but it does not extend it either.
+
 ## Appendix A — earlier continuation draft (superseded by §10.4 and §12)
 > **History, not status.** This block is the draft written while the OpenSSL 3.5 build was
 > still compiling, before any probe ran. Its "probe numbers are still not claimed" and its
