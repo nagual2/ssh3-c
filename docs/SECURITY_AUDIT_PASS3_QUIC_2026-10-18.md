@@ -626,7 +626,10 @@ spoofing probe, (3) the three bodies that stayed unread, (4) this addendum.
 
 ### 13.1 Runtime `EXPORTER-SSH3` probe — **not run; partial, honestly reported**
 
-Status: **not executed.** The environment this pass ran in was recycled between sessions and the
+Status: **still not executed in this session either** — the build blocker of the earlier session is
+gone (the 3.5.0 tree and both presets are in place, the e2e test runs 42/42, and a bare listener can be
+stood up: see §13.2, which ran in the same session), so this is now a *work* item, not an
+environment one. The run below is what the next session needs. The environment this pass ran in was recycled between sessions and the
 OpenSSL 3.5.0 build the whole stack links against (`/opt/openssl35`) no longer existed, so every
 binary in `build/linux-release` and `build/linux-asan` failed to load
 (`libssl.so.3: version 'OPENSSL_3.5.0' not found`) and no app pair could be stood up. OpenSSL 3.5.0
@@ -655,20 +658,88 @@ library) with an `SSL_export_keying_material(ssl, out, 32, "EXPORTER-SSH3", 13, 
 call on both SSL objects after the handshake completes, then a `memcmp` of the two 32-byte buffers
 plus a negative control (a different label must produce different bytes on both sides).
 
-### 13.2 P2-1 spoofing probe — **not run; the build prerequisite was the blocker**
+### 13.2 P2-1 spoofing probe — **run this session (spoofed source), no defect**
+Status: **executed.** Environment: `build/linux-release/ssh3-server` (the exact binary of the 42/42
+`linux-release` preset, OpenSSL 3.5.0 from `/opt/openssl35`), listening on `127.0.0.1:18080` with
+`-c cert.pem -k key.pem -L debug`, self-signed cert generated with the same 3.5.0 binary. No auth
+harness was needed: the whole measurement lives on the Initial path, before ssh3 authentication,
+exactly as predicted in the first version of this section. Run directory
+`/home/team/shared/pass3/s13/p1/` (probe `probe.py`, logs `srv_a.log`, results `pa.json`, `pb.json`;
+the captured Initial itself is `initial_a.bin`).
 
-Status: **not executed**, same root cause as §13.1: no runnable `ssh3-server` in this session. No
-packet counts, no byte counts and no PATH_CHALLENGE observation are claimed here. What the reading
-already establishes is unchanged from pass-2/§11 (peer-source shape is grep-confirmed only).
+**Method.** No `tcpdump`/`tshark` exists in this image, so bytes are counted with an `AF_PACKET`
+(`ETH_P_ALL`) socket bound to `lo` in the probe itself, which sees every datagram in both directions
+and classifies QUIC packet types from the long-header first byte (`Initial` 0xc0-0xcf,
+`Handshake` 0xe0-0xef, short header = 1-RTT). Spoofing is a raw `IPPROTO_RAW`/`IP_HDRINCL` socket
+that emits an IPv4+UDP datagram with `src = 127.0.0.3:40000` toward the listener — no socket is bound
+at `127.0.0.3:40000`, so the only copy of the server's answer that exists is the one the sniffer
+counts. The payload is **not** a hand-built fake: it is a genuine 1200-byte QUIC Initial captured from
+a real `openssl s_client -quic -alpn h3` handshake, so the server derives the client keys from the
+DCID and really decrypts it (confirmed by its own debug log, below) — a garbage Initial would be
+dropped undecryptable and would measure nothing.
 
-The probe remains worth running and needs no auth harness at all — which is the useful finding of
-this session: anti-amplification and path validation happen on the **Initial** path, before any
-ssh3 authentication, so a bare `ssh3-server` listening on UDP is enough. Concretely:
-send a 1200-byte Initial from a spoofed source (raw socket, or a 127.0.0.2/127.0.0.3 alias on
-loopback), then count bytes the server returns toward that unvalidated path: they must be
-≤ 3× received and ≤ ~1200 B per amplification budget, with a PATH_CHALLENGE (0x0b frame, 8-byte
-random token) required before any expansion, and no packets at all toward a spoofed path that has
-already completed NAT rebinding validation.
+**Positive control (non-spoofed, `127.0.0.1`).** A full genuine handshake against the same listener:
+
+| direction | datagrams | bytes | packet types |
+|---|---|---|---|
+| client → server | 18 | 10 216 | Initial (retransmit copies included) |
+| server → client | 36 | 14 320 | 6×Initial (1200 B each), 2×Handshake, 1-RTT |
+| ratio tx/rx | | **1.40** | `openssl s_client` rc **0**, `CONNECTED`, cert presented |
+
+So the server answers a *reachable* peer normally, validates the path and proceeds into the
+handshake — the listener, the cert pair, the ALPN and the sniffer are all exercised, and this run
+also produced the Initial used by the spoofed replay.
+
+**Spoofed replay (`src = 127.0.0.3:40000`, one datagram, no socket bound there).**
+
+| measurement | value |
+|---|---|
+| bytes sent into the server (1 datagram) | **1 200** |
+| datagrams the server sent toward `127.0.0.3:40000` | **0** |
+| bytes the server sent toward the unvalidated path | **0** |
+| amplification ratio (bytes out / bytes in) | **0.000** (limit 3.0) |
+| largest datagram toward the path | none (limit ~1200 B) |
+| path validation state | `valid:0` — the spoofed path is **never** marked validated |
+
+The server's own `-L debug` log (same instance, during the spoofed replay) shows that the datagram was
+**not** ignored — it was parsed, decrypted and turned into a connection, whose path stayed
+unvalidated:
+
+```
+[debug] quic packet rx long flags:c9 version:1
+[debug] quic packet rx init len:1182
+[debug] quic packet rx dcid len:8 7100a2b376727d10
+[debug] quic s3_quic_keys_set_initial_secret
+[debug] quic path seq:0 created addr:127.0.0.3:40000
+[debug] quic connection created
+[debug] quic packet len:1200 via sock seq:0 path seq:0
+[debug] quic path seq:0 status tx:0 rx:1200 valid:0 mtu:1200
+```
+
+The `status tx:0 rx:1200 valid:0` line is the measurement in the server's own accounting: 1 200 bytes
+received, **0 bytes sent**, path unvalidated. Nothing followed it — no expansion, no lost budget.
+
+**Interpretation, honestly bounded.**
+- (a) *not marked validated* — **verified**: `valid:0`, and the source address in the log is the
+  spoofed one (`127.0.0.3:40000`), never the peer-derived identity.
+- (b) *bytes back ≤ 3× and ≤ ~1200 B/datagram* — **verified trivially and with a wide margin**:
+  0 bytes against a 3 600-byte budget, zero datagrams, ratio 0.000. Nothing the server sent toward an
+  unvalidated path exists to count.
+- (c) *PATH_CHALLENGE before any expansion* — **no expansion happened at all**, so the property
+  "challenge precedes expansion" cannot be violated; but note what was *not* observed: **no
+  PATH_CHALLENGE was emitted toward the spoofed path either**, because the server sends nothing at all
+  towards it. That is stricter than RFC 9000 §8.2.1 (a server *may* spend up to 3× and *should* probe
+  the path) and laxer in one respect (an unvalidated path is never probed, so a genuine NAT-rebinding
+  peer cannot complete validation on this path from this state). This is a **liveness / RFC-shape
+  observation, not an amplification defect**; it is added to §13.4 as an observation, not a finding,
+  because the audit did not attempt a genuine rebinding client to see whether the challenge appears
+  once a validated path already exists.
+- **Scope caveat.** Loopback, one Initial, one spoofed address per run; the replay reuses a genuine
+  datagram (its DCID was unknown to the restarted listener, so the server really had to build a new
+  connection and did). This does **not** cover internet conditions: no packet loss, no reordering, no
+  Retry, no IP fragmentation, no mid-handshake spoofed bursts, no v6 (`[2001:db8::1]` source), and no
+  measurement of CPU/memory cost per spoofed Initial. The `AF_PACKET` sniffer reports what reached the
+  loopback interface, which is exactly what the kernel delivered to the listener on this host.
 
 ### 13.3 Reading — the last three bodies of §12 item 5 — **read, no defect**
 
@@ -788,14 +859,16 @@ the CID on `client_ids`, but a `nclient_ids > 0` guard would make that explicit.
 ### 13.4 Residual list after this session
 
 **Removed** (covered now): §12 item 5's three unread bodies — iovec coalescing (§13.3.1), the token
-decrypt/derive path (§13.3.2), CID issuance (§13.3.3). All three read in full, no defect.
+decrypt/derive path (§13.3.2), CID issuance (§13.3.3). All three read in full, no defect. Also
+**removed: the P2-1 spoofing probe (§13.2)** — executed this session on a raw-spoofed source: 1 200 B
+in, **0 B out**, path `valid:0`, ratio 0.000 against the 3× budget; the run and its limits are in
+13.2.
 
 **Still open, in order:**
 
-1. the runtime `EXPORTER-SSH3` probe (§13.1) — still unrun; the static result stands, the runtime
-   equality is unproven. Resume by extending a *copy* of `tests/test_quic_e2e.c`;
-2. the P2-1 spoofing probe (§13.2) — still unrun; needs only a listening `ssh3-server` and a raw
-   socket, no auth harness;
+1. the runtime `EXPORTER-SSH3` probe (§13.1) — **still unrun**; the static result stands, the runtime
+   equality is unproven. Resume by extending a *copy* of `tests/test_quic_e2e.c`. This is the only
+   probe of pass-3 that has not been executed;
 3. `disable_active_migration` parsed and emitted but never enforced (**I3-5**), unreachable in the
    shipped binaries because no `app/` code sets it;
 4. idle re-arm sites pass a possibly-zero timeout to `s3_event_add_timer()` (**I3-6**), embedder-only;
@@ -807,9 +880,16 @@ decrypt/derive path (§13.3.2), CID issuance (§13.3.3). All three read in full,
    pkt->dcid` alias, the counted-but-not-freed CID in `s3_quic_retire_client_id()`, and the
    unguarded `qc->nclient_ids--`.
 
-**Verdict of this addendum:** the reading part of the §12 list is closed with no defect. The two
-runtime probes are **still open** and are the only items in this pass that are both unrun and
-uncovered by static reasoning; this addendum does not change the pass-3 verdict (no memory-safety
+7. **new observation from §13.2 (liveness, not amplification):** toward a path whose source address is
+   spoofed the server neither sends data nor emits a PATH_CHALLENGE — 0 datagrams, 0 bytes. If a
+   *genuine* peer ever needs a new path validated from that state (NAT rebinding after a zero-length
+   idle period on this listener configuration), the challenge must come from somewhere; the probe did
+   not exercise a live rebinding client, so the maintainer should confirm the challenge is sent in the
+   "validated path already exists" case, and consider sending it unconditionally otherwise.
+**Verdict of this addendum:** the reading part of the §12 list is closed with no defect. Of the two
+runtime probes, the **spoofing probe is now executed and clean (§13.2)**; the **exporter probe (§13.1)
+is still open** and is the only item in this pass that is both unrun and uncovered by static
+reasoning; this addendum does not change the pass-3 verdict (no memory-safety
 defect found) but it does not extend it either.
 
 ## Appendix A — earlier continuation draft (superseded by §10.4 and §12)
