@@ -1,3 +1,20 @@
+ssh3-c (0.5.1-1) unstable; urgency=medium
+
+  * New upstream release 0.5.1: the wildcard listener never told the
+    QUIC layer its local address, so the local address path of the
+    0.5.0 release stayed inert - the replies of a multi-address host
+    carried the routed source address and the client did not
+    recognise its own answer.  The field verification (two network
+    namespaces: the server with the dialed address and a tunnel
+    address, the client behind the tunnel) measured it: the answer
+    came from the tunnel address, now it carries the dialed one.  The
+    idle timeout of 0 means "no limit" (RFC 9000, 10.1) and no longer
+    closes the connection on the next event loop pass.  See
+    docs/SECURITY_AUDIT_PASS3_QUIC_2026-10-18.md and the pull request
+    #6.
+
+ -- Max <nahual15@gmail.com>  Wed, 21 Oct 2026 19:05:00 +0000
+
 ssh3-c (0.5.0-1) unstable; urgency=medium
 
   * New upstream release 0.5.0: the pass-3 security audit of the QUIC
