@@ -313,8 +313,8 @@ s3_test_encoders(void)
 
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_lri(buf, 0, 17, value.data, value.len);
-    S3_ASSERT((uintptr_t)(end - buf) == 7);
-    S3_ASSERT(s3_memcmp(buf, "\x5f\x02\x04ssh3", 7) == 0);
+    S3_ASSERT((uintptr_t)(end - buf) == 6);
+    S3_ASSERT(s3_memcmp(buf, "\x5f\x02\x83\x42\x27\x67", 6) == 0);
 
     /* literal with dynamic name reference 0, value "ab" */
     s3_memzero(buf, sizeof(buf));
@@ -332,7 +332,7 @@ s3_test_encoders(void)
     S3_ASSERT(s3_memcmp(buf, "\x53\x00", 2) == 0);
 
     n = s3_h3_encode_field_lri(NULL, 0, 17, value.data, value.len);
-    S3_ASSERT(n == 7);
+    S3_ASSERT(n == 6);
 
     /* literal with literal name: "x-h3": "v1" */
     name.data = (u_char *)"x-h3";
@@ -356,11 +356,11 @@ s3_test_encoders(void)
 
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_l(buf, &name, &value);
-    S3_ASSERT((uintptr_t)(end - buf) == 14);
-    S3_ASSERT(s3_memcmp(buf, "\x27\x03user-agent\x01t", 14) == 0);
+    S3_ASSERT((uintptr_t)(end - buf) == 11);
+    S3_ASSERT(s3_memcmp(buf, "\x2f\x00\xb5\x05\xb1\x61\xcc\x5a\x93\x01\x74", 11) == 0);
 
     n = s3_h3_encode_field_l(NULL, &name, &value);
-    S3_ASSERT(n == 14);
+    S3_ASSERT(n == 11);
 
     /* indexed post-base: 10 | 5 */
     s3_memzero(buf, sizeof(buf));
@@ -374,14 +374,13 @@ s3_test_encoders(void)
     /* literal post-base with name reference 3, value "abc" */
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_lpbi(buf, 3, (u_char *)"abc", 3);
-    S3_ASSERT((uintptr_t)(end - buf) == 5);
+    S3_ASSERT((uintptr_t)(end - buf) == 4);
     S3_ASSERT(s3_memcmp(buf,
-                        "\x03\x03"
-                        "abc",
-                        5) == 0);
+                        "\x03\x82\x1c\x64",
+                        4) == 0);
 
     n = s3_h3_encode_field_lpbi(NULL, 3, (u_char *)"abc", 3);
-    S3_ASSERT(n == 5);
+    S3_ASSERT(n == 4);
 }
 
 static void
