@@ -138,7 +138,11 @@ test_address_token(void)
     S3_ASSERT(pkt.validated == 1);
     S3_ASSERT(pkt.retried == 0);
     S3_ASSERT(pkt.odcid.len == 8);
-    S3_ASSERT(pkt.odcid.data == pkt.dcid.data);
+
+    /* the odcid is a copy, not an alias into the packet buffer */
+
+    S3_ASSERT(pkt.odcid.data == pkt.odcid_buf);
+    S3_ASSERT(s3_memcmp(pkt.odcid.data, dcid.data, 8) == 0);
 
     /* expired token */
 
@@ -226,6 +230,50 @@ test_sr_token(void)
 }
 
 static int
+test_odcid_bound(void)
+{
+    s3_connection_t    c;
+    s3_str_t           token, odcid;
+    u_char             key[32], tokbuf[S3_QUIC_TOKEN_BUF_SIZE];
+    u_char             cid[S3_QUIC_MAX_CID_LEN + 1];
+    struct sockaddr_in sin;
+    size_t             i;
+
+    for (i = 0; i < 32; i++) {
+        key[i] = (u_char)(0x30 + i);
+    }
+
+    make_addr(&sin, 8443);
+
+    s3_memzero(&c, sizeof(s3_connection_t));
+    c.log = &s3_test_log;
+    c.sockaddr = (struct sockaddr *)&sin;
+    c.socklen = sizeof(sin);
+
+    s3_memzero(cid, sizeof(cid));
+
+    token.len = sizeof(tokbuf);
+    token.data = tokbuf;
+
+    /* an odcid longer than the connection id bound must be refused */
+
+    odcid.len = S3_QUIC_MAX_CID_LEN + 1;
+    odcid.data = cid;
+
+    S3_ASSERT(s3_quic_new_token(&s3_test_log, c.sockaddr, c.socklen, key, &token, &odcid,
+                                time(NULL) + 3600, 1) == S3_ERROR);
+
+    /* the bound itself is accepted */
+
+    odcid.len = S3_QUIC_MAX_CID_LEN;
+
+    S3_ASSERT(s3_quic_new_token(&s3_test_log, c.sockaddr, c.socklen, key, &token, &odcid,
+                                time(NULL) + 3600, 1) == S3_OK);
+
+    return s3_test_failures;
+}
+
+static int
 s3_test_quic_tokens(void)
 {
     s3_test_log.log_level = S3_LOG_ALERT;
@@ -234,6 +282,7 @@ s3_test_quic_tokens(void)
     test_retry_token();
     test_address_token();
     test_sr_token();
+    test_odcid_bound();
 
     return s3_test_failures;
 }
