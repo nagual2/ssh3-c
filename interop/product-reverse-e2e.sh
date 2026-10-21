@@ -10,11 +10,25 @@
 #      driver pushes a byte-exact 64 KiB pattern through the bound
 #      port into the client-side echo target
 #      (the PRODUCT-REVERSE-TCP-OK marker)
-#   3. the udp relay: 20 numbered datagrams ride the same shape
+#   3. the udp relay: 20 numbered datagrams ride the same shape, the
+#      echo sends a zero-length datagram ahead of them and the bridge
+#      must stay alive (an empty datagram is a datagram, RFC 768)
 #      (the PRODUCT-REVERSE-UDP-OK marker)
 #   4. the permit-listen denial: the allow-list without the loopback
 #      refuses the bind before any socket (the SSH3-RFWD-DENIED
 #      marker, the client exits 255)
+#   5. the ipv6 target refuses at the parse: the reverse bridge dials
+#      the ipv4 targets only, so the refusal rides the parse and the
+#      server never binds a port that could not carry a byte
+#   6. the ipv6 bind is refused by the server: the client spells the
+#      bind, the server refuses it fail-closed (the v4-only listener
+#      machinery) and the client fails closed
+#   7. the per-user budget: the cap of one listener refuses the
+#      second -R of the same conversation (the REVERSE-CAP-DENIED
+#      marker) and the client fails closed
+#   8. the run-as attribution (the root runs only): the daemon with
+#      --run-as-user on books the budget under the authenticated user
+#      (the marker carries the name, not the daemon placeholder)
 #
 # the client home pre-pins the daemon certificate (the hold run
 # rides no console, the TOFU question cannot run): the pin line is
@@ -124,6 +138,12 @@ def udp_srv():
     print("ECHO-READY udp", flush=True)
     while 1:
         d, a = s.recvfrom(65536)
+
+        # the zero-length datagram rides ahead of the echo: it is a
+        # datagram (RFC 768), not a closed target - the client bridge
+        # must stay alive and carry the numbered echo behind it
+
+        s.sendto(b"", a)
         s.sendto(d, a)
 
 
@@ -237,7 +257,7 @@ start_cli() {
     fi
 
     setsid nohup env HOME="$WORK/home" "$BUILD/ssh3" "$@" \
-        -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
+        -i "$WORK/priv.pem" "${S3CLI_USER:-client}@127.0.0.1:$SRVPORT/ssh3-term" \
         > "$S3CLILOG" 2>&1 < /dev/null &
     CLIPID=$!
 }
@@ -321,6 +341,13 @@ got = {}
 try:
     while len(got) < n:
         d, _ = s.recvfrom(65536)
+
+        # the short datagrams carry no index (the empty one of the
+        # echo probe): they do not count
+
+        if len(d) < 4:
+            continue
+
         idx = struct.unpack("<I", d[:4])[0]
         if idx < n and idx not in got:
             got[idx] = d
@@ -366,7 +393,7 @@ start_echo udp
 wait_echo tcp || die "the tcp echo did not start"
 wait_echo udp || die "the udp echo did not start"
 
-start_srv || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+start_srv --run-as-user off || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
 echo "== leg 2: the tcp relay carries 64 KiB byte-exact (PRODUCT-REVERSE-TCP-OK)"
 
@@ -386,7 +413,7 @@ fi
 
 stop_cli
 
-echo "== leg 3: the udp relay echoes 20 datagrams (PRODUCT-REVERSE-UDP-OK)"
+echo "== leg 3: the udp relay echoes 20 datagrams and survives the empty one (PRODUCT-REVERSE-UDP-OK)"
 
 S3CLILOG="$WORK/cli-udp.log"
 start_cli -R "0/udp:127.0.0.1:19122"
@@ -396,7 +423,7 @@ if wait_bind; then
 
     if timeout 30 python3 "$WORK/udp_probe.py" "$RPORT" > "$WORK/udp.log" 2>&1 &&
         grep -q "UDP-PROBE-OK count=20" "$WORK/udp.log"; then
-        pass "the udp relay echoed the 20 datagrams byte-exact (PRODUCT-REVERSE-UDP-OK, port $RPORT)"
+        pass "the udp relay echoed the 20 datagrams byte-exact past the empty one (PRODUCT-REVERSE-UDP-OK, port $RPORT)"
     else
         fail "the udp relay leg: $(tail -2 "$WORK/udp.log") srv:$(grep RFWD "$WORK/srv.log" | tail -2)"
     fi
@@ -412,7 +439,8 @@ echo "== leg 4: the permit-listen denial refuses the bind"
 
 S3CLILOG="$WORK/cli-deny.log"
 
-start_srv --permit-listen '192.0.2.1:*' || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+start_srv --run-as-user off --permit-listen '192.0.2.1:*' \
+    || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
 start_cli -R "0:127.0.0.1:19121"
 
@@ -441,6 +469,133 @@ else
 fi
 
 stop_srv
+
+echo "== leg 5: the ipv6 target refuses at the parse (the ipv4-only bridge)"
+
+if timeout 10 "$BUILD/ssh3" -R "0:[::1]:19121" bob@127.0.0.1:1/ssh3-term \
+    > "$WORK/leg5.out" 2> "$WORK/leg5.err"; then
+    fail "the ipv6 target leg: the run exited 0"
+else
+    RC=$?
+
+    if [ "$RC" -eq 255 ] && grep -q "is not an ipv4 socket" "$WORK/leg5.err"; then
+        pass "the ipv6 target refused at the parse (rc $RC)"
+    else
+        fail "the ipv6 target leg: rc=$RC $(tail -1 "$WORK/leg5.err")"
+    fi
+fi
+
+echo "== leg 6: the ipv6 bind is refused by the server (fail-closed)"
+
+start_srv --run-as-user off || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+S3CLILOG="$WORK/cli-v6bind.log"
+start_cli -R "[::1]:0:127.0.0.1:19121"
+
+i=0
+CLI_RC=
+
+while [ "$i" -lt 60 ]; do
+
+    if ! kill -0 "$CLIPID" 2>/dev/null; then
+        wait "$CLIPID"
+        CLI_RC=$?
+        CLIPID=
+        break
+    fi
+
+    sleep 0.1
+    i=$((i + 1))
+done
+
+if [ -n "$CLI_RC" ] && [ "$CLI_RC" -ne 0 ] &&
+    grep -q "SSH3-RFWD-DENIED spec=0" "$S3CLILOG" &&
+    grep -q "unsupported ipv6 bind" "$WORK/srv.log"; then
+    pass "the ipv6 bind refused by the server (the client rc $CLI_RC)"
+else
+    fail "the ipv6 bind leg: rc=${CLI_RC:-running} $(tail -2 "$S3CLILOG")"
+fi
+
+stop_cli
+stop_srv
+
+echo "== leg 7: the per-user budget refuses the second -R"
+
+start_srv --run-as-user off --max-reverse-forwards 1 \
+    || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+S3CLILOG="$WORK/cli-cap.log"
+start_cli -R "0:127.0.0.1:19121" -R "0:127.0.0.1:19122"
+
+i=0
+CLI_RC=
+
+while [ "$i" -lt 60 ]; do
+
+    if ! kill -0 "$CLIPID" 2>/dev/null; then
+        wait "$CLIPID"
+        CLI_RC=$?
+        CLIPID=
+        break
+    fi
+
+    sleep 0.1
+    i=$((i + 1))
+done
+
+if [ -n "$CLI_RC" ] && [ "$CLI_RC" -ne 0 ] &&
+    grep -q "SSH3-RFWD-DENIED" "$S3CLILOG" &&
+    grep -q "REVERSE-CAP-DENIED" "$WORK/srv.log"; then
+    pass "the per-user budget refused the second bind (the client rc $CLI_RC)"
+else
+    fail "the budget leg: rc=${CLI_RC:-running} $(tail -2 "$S3CLILOG")"
+fi
+
+stop_cli
+stop_srv
+
+echo "== leg 8: the run-as budget rides the authenticated user"
+
+if [ "$(id -u)" != "0" ]; then
+    echo "   SKIP: the run-as leg needs the root privilege (the daemon is the one that drops the session identity)"
+
+else
+    RUNAS_USER=$(id -un)
+
+    start_srv --run-as-user on --max-reverse-forwards 1 \
+        || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+    S3CLILOG="$WORK/cli-runas.log"
+    S3CLI_USER="$RUNAS_USER"
+    start_cli -R "0:127.0.0.1:19121" -R "0:127.0.0.1:19122"
+
+    i=0
+    CLI_RC=
+
+    while [ "$i" -lt 60 ]; do
+
+        if ! kill -0 "$CLIPID" 2>/dev/null; then
+            wait "$CLIPID"
+            CLI_RC=$?
+            CLIPID=
+            break
+        fi
+
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if [ -n "$CLI_RC" ] && [ "$CLI_RC" -ne 0 ] &&
+        grep -q "REVERSE-CAP-DENIED" "$WORK/srv.log" &&
+        grep -q "user=$RUNAS_USER" "$WORK/srv.log"; then
+        pass "the run-as budget booked the authenticated user $RUNAS_USER (the client rc $CLI_RC)"
+    else
+        fail "the run-as leg: rc=${CLI_RC:-running} $(grep RFWD "$WORK/srv.log" | tail -2)"
+    fi
+
+    stop_cli
+    stop_srv
+fi
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "PRODUCT-REVERSE-E2E OK"

@@ -6597,6 +6597,20 @@ s3_cli_rev_parse_spec(const char *arg)
         return S3_ERROR;
     }
 
+    /*
+     * the family policy of the bridge (the -L canon): the local half
+     * of the reverse bridge dials the ipv4 targets only, so a v6
+     * target would bind the port on the server and never carry a
+     * byte - the refusal rides the parse, before the request is sent
+     * (the fail-closed shape of the direct forward)
+     */
+
+    if (s3_cli_rtarget[s3_cli_rspec_count].family != 4) {
+        fprintf(stderr, "ssh3: the -R target %s:%u is not an ipv4 socket\n", spec->target_host,
+                (unsigned)spec->target_port);
+        return S3_ERROR;
+    }
+
     if (s3_ssh3_reverse_target_ntop(&s3_cli_rtarget[s3_cli_rspec_count], text, sizeof(text)) !=
         S3_OK) {
         fprintf(stderr, "ssh3: the -R target of %s:%u has no canonical text\n", spec->target_host,
@@ -7353,9 +7367,19 @@ s3_cli_rev_pump(void)
                     break;
                 }
 
-                if (n <= 0) {
-                    s3_cli_rev_bridge_kill(b, "the local -R udp target closed");
+                if (n < 0) {
+                    s3_cli_rev_bridge_kill(b, "the local -R udp target read failed");
                     break;
+                }
+
+                if (n == 0) {
+
+                    /* the zero-length datagram is a datagram (RFC 768):
+                     * the tunnel drops it (the inbound router drops the
+                     * empty payload the same way), it does not close the
+                     * bridge - the half-close is the tcp leg's shape */
+
+                    continue;
                 }
 
                 p = s3_ssh3_dgram_encode(dg, s3_cli_conv_id, b->ch_id, buf, (size_t)n);

@@ -12,6 +12,13 @@
 
 #include <string.h>
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_reverse.h>
 #include <s3_ssh3_wire.h>
@@ -91,6 +98,45 @@ s3_test_reverse_spec_parse(void)
     return s3_test_failures;
 }
 
+/*
+ * the host texts of the spec: the printable characters only.  the bind
+ * address rides the wire verbatim and the server logs it as it stands
+ * (the refusal reason rides the reply), so a control character in the
+ * spec would reach the server log as a terminal escape - the parse
+ * refuses it before anything is sent
+ */
+
+static int
+s3_test_reverse_spec_printable(void)
+{
+    s3_ssh3_reverse_spec_t spec;
+
+    /* the control characters of the target host: the c0 set and the
+     * delete */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\x01:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\n:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\t:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\x7f:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\x1b[31m:80", &spec) == S3_ERROR);
+
+    /* the same rule on the bind host of the four-part form */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1\x02:3000:192.0.2.10:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1\n:3000:192.0.2.10:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1\x7f:3000:192.0.2.10:80", &spec) == S3_ERROR);
+
+    /* the plain texts keep passing: the printable space is not a
+     * control character */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1:80", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1:3000:192.0.2.10:80", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:host.example:80", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:host-example:80", &spec) == S3_OK);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_reverse_resolve(void)
 {
@@ -109,7 +155,10 @@ s3_test_reverse_resolve(void)
     S3_ASSERT(target.port == 80);
 
     /* the ipv6 target rides the bracket form, the bare colons would
-     * split into a wrong part count (the reference tokenizer) */
+     * split into a wrong part count (the reference tokenizer); the
+     * resolution answers the family 6, the caller owns the family
+     * policy (the client refuses a non-ipv4 target before the
+     * request is sent) */
 
     S3_ASSERT(s3_ssh3_reverse_parse_spec("3000/udp:[::1]:53", &spec) == S3_OK);
     S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
@@ -124,10 +173,20 @@ s3_test_reverse_resolve(void)
 
     S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:localhost:80", &spec) == S3_OK);
     S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
-    S3_ASSERT(target.family == 4 || target.family == 6);
+    S3_ASSERT(target.family == 4);
 
     S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:no-such-host.invalid.:80", &spec) == S3_OK);
     S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_ERROR);
+
+    /* the names resolve over AF_INET (the ipv4 canon of the direct
+     * forward path): the udp leg resolves the same way, the socket
+     * type of the hint does not touch the address */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("5353/udp:localhost:53", &spec) == S3_OK);
+    S3_ASSERT(spec.proto == S3_SSH3_REVERSE_PROTO_UDP);
+    S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
+    S3_ASSERT(target.family == 4);
+    S3_ASSERT(target.port == 53);
 
     /* the canonical text of the resolution rides the wire as the
      * target address of the bind request (the reference
@@ -142,6 +201,54 @@ s3_test_reverse_resolve(void)
         S3_ASSERT(s3_ssh3_reverse_target_ntop(&target, text, sizeof(text)) == S3_OK);
         S3_ASSERT(strcmp(text, "127.0.0.1") == 0);
     }
+
+    return s3_test_failures;
+}
+
+/*
+ * the no-special-target invariant: the wire text of the target is the
+ * canonical text of the local resolution, so the server re-parses it
+ * into the very address the client resolved (the server gate is the
+ * inet_pton of that text) - the client cannot hand the server a
+ * target the two sides read differently
+ */
+
+static int
+s3_test_reverse_target_text(void)
+{
+    s3_ssh3_reverse_spec_t   spec;
+    s3_ssh3_forward_target_t target;
+    char                     text[64];
+    struct in_addr           a4;
+    struct in6_addr          a6;
+
+    /* the ipv4 literal: the canonical text reads back as the same
+     * four bytes */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1:80", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_target_ntop(&target, text, sizeof(text)) == S3_OK);
+    S3_ASSERT(strcmp(text, "127.0.0.1") == 0);
+    S3_ASSERT(inet_pton(AF_INET, text, &a4) == 1);
+    S3_ASSERT(s3_memcmp(&a4, target.ip, 4) == 0);
+
+    /* the v4-mapped literal: the canonical text keeps the v6 form and
+     * the server reads the same sixteen bytes (the fork sends the
+     * target in this shape) */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:[::ffff:127.0.0.1]:80", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
+    S3_ASSERT(target.family == 6);
+    S3_ASSERT(target.ip_len == 16);
+    S3_ASSERT(s3_ssh3_reverse_target_ntop(&target, text, sizeof(text)) == S3_OK);
+    S3_ASSERT(inet_pton(AF_INET6, text, &a6) == 1);
+    S3_ASSERT(s3_memcmp(&a6, target.ip, 16) == 0);
+
+    /* the port of the resolution rides the request as it stands */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1:8080", &spec) == S3_OK);
+    S3_ASSERT(s3_ssh3_reverse_resolve_target(&spec, &target) == S3_OK);
+    S3_ASSERT(target.port == 8080);
 
     return s3_test_failures;
 }
@@ -175,6 +282,13 @@ s3_test_reverse_request_golden(void)
     r.target_port = 80;
 
     S3_ASSERT(s3_ssh3_reverse_request_size(&r) == sizeof(golden));
+
+    /* the size is the sum of the fields and nothing else: the request
+     * carries no identity, so a client cannot ask for the budget of
+     * another user (the attribution is the server's, the
+     * authenticated CONNECT) */
+
+    S3_ASSERT(s3_ssh3_reverse_request_size(&r) == 1 + (1 + 9) + 2 + (1 + 10) + 2);
 
     s3_memzero(buf, sizeof(buf));
     p = s3_ssh3_reverse_build_request(buf, &r);
@@ -347,7 +461,15 @@ s3_test_ssh3_reverse(void)
         return s3_test_failures;
     }
 
+    if (s3_test_reverse_spec_printable() != 0) {
+        return s3_test_failures;
+    }
+
     if (s3_test_reverse_resolve() != 0) {
+        return s3_test_failures;
+    }
+
+    if (s3_test_reverse_target_text() != 0) {
         return s3_test_failures;
     }
 

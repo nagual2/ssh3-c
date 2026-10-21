@@ -41,6 +41,7 @@ static const char *s3_reverse_spec_part(const char **pos, const char *end, const
                                         size_t *host_len);
 static unsigned    s3_reverse_port_parse(const char *f, const char *fend);
 static void        s3_reverse_spec_unbracket(const char **f, size_t *len);
+static unsigned    s3_reverse_host_printable(const char *f, size_t len);
 
 /*
  * one colon-separated part of the spec, the colons inside the ipv6
@@ -121,6 +122,32 @@ s3_reverse_spec_unbracket(const char **f, size_t *len)
         (*f)++;
         *len -= 2;
     }
+}
+
+/*
+ * the host text of the spec: the printable text only.  the bind
+ * address rides the wire verbatim and the server logs it as it
+ * stands (the reason of a refusal rides the reply), so a control
+ * character in the spec would reach the server log as a terminal
+ * escape - the fail-closed rule refuses the spec before anything is
+ * sent (the reference parser keeps the same plain-text shape)
+ */
+
+static unsigned
+s3_reverse_host_printable(const char *f, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+
+        u_char c = (u_char)f[i];
+
+        if (c < 0x20 || c == 0x7f) {
+            return 0;
+        }
+    }
+
+    return 1;
 }
 
 s3_int_t
@@ -231,6 +258,10 @@ s3_ssh3_reverse_parse_spec(const char *text, s3_ssh3_reverse_spec_t *out)
         return S3_ERROR;
     }
 
+    if (!s3_reverse_host_printable(target_f, target_len)) {
+        return S3_ERROR;
+    }
+
     s3_memcpy(out->target_host, target_f, target_len);
     out->target_host[target_len] = '\0';
 
@@ -266,6 +297,10 @@ s3_ssh3_reverse_parse_spec(const char *text, s3_ssh3_reverse_spec_t *out)
         } else {
 
             if (bind_len > S3_SSH3_REVERSE_HOST_MAX) {
+                return S3_ERROR;
+            }
+
+            if (!s3_reverse_host_printable(bind_f, bind_len)) {
                 return S3_ERROR;
             }
 
@@ -318,7 +353,14 @@ s3_ssh3_reverse_resolve_target(const s3_ssh3_reverse_spec_t *spec, s3_ssh3_forwa
 
     s3_memzero(&hints, sizeof(hints));
 
-    hints.ai_family = AF_UNSPEC;
+    /*
+     * the names resolve over AF_INET (the canon of the direct forward
+     * path: the target of a forward is an ipv4 socket here): a name
+     * that only carries an AAAA record refuses instead of resolving
+     * into an address the ipv4-only bridge cannot dial
+     */
+
+    hints.ai_family = AF_INET;
     hints.ai_socktype = (spec->proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM;
 
     if (snprintf(port_text, sizeof(port_text), "%u", (unsigned)spec->target_port) <= 0) {
