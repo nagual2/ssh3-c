@@ -57,7 +57,9 @@ typedef struct {
  * [bind_address:]bind_port[/tcp|/udp]:target_host:target_port; the
  * parts split on the colons outside the ipv6 brackets, the "*" bind
  * maps to "::"; the bind port may be 0 (the ephemeral bind), the
- * target host and port must not be empty or 0
+ * target host and port must not be empty or 0; the host texts carry
+ * the printable characters only (the bind address rides the wire and
+ * the server logs it as it stands)
  *
  * S3_OK fills the spec; S3_ERROR leaves it unspecified
  */
@@ -67,9 +69,15 @@ s3_int_t s3_ssh3_reverse_parse_spec(const char *text, s3_ssh3_reverse_spec_t *ou
 /*
  * resolves the target of the spec locally, like the reference client
  * (the -R target resolves where the client runs): an ip literal comes
- * straight from inet_pton, a name rides getaddrinfo; the canonical
- * family/ip/port triple lands in the direct-channel target shape, the
- * channel headers and the local sockets both take it
+ * straight from inet_pton (an ipv6 literal answers the family 6), a
+ * name rides getaddrinfo over AF_INET (the ipv4 canon of the direct
+ * forward path); the canonical family/ip/port triple lands in the
+ * direct-channel target shape, the channel headers and the local
+ * sockets both take it
+ *
+ * the caller owns the family policy: the reverse bridge dials the
+ * ipv4 targets only, so a family 6 result is a refusal for the
+ * caller (the client refuses the spec before the request is sent)
  *
  * S3_OK fills the target; S3_ERROR leaves it unspecified
  */
