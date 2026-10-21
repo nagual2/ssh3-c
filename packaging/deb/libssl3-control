@@ -1,6 +1,6 @@
 Package: ssh3c-libssl3
 Version: @VERSION@
-Architecture: amd64
+Architecture: @ARCH@
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: libs
 Priority: optional

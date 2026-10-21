@@ -6958,7 +6958,7 @@ s3_srv_usage(FILE *out, const char *prog)
 int
 main(int argc, char **argv)
 {
-    char        opt;
+    int         opt;
     const char *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
     const char *alpn_name = "h3";
     const char *url_path_arg = NULL, *permit_open_arg = NULL;
@@ -7460,7 +7460,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:h:A:d:i:L:P:H:K:3p:o:vV")) != -1) {
+    while ((opt = getopt(argc, argv, "l:c:k:h:A:d:i:L:P:H:K:3p:o:vV")) != -1) {
 
         switch (opt) {
 

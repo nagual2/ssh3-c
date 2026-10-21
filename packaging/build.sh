@@ -28,7 +28,34 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-BIN_DIR="$REPO_DIR/build/linux-release"
+
+# the target architecture of the channel: amd64 (the default) or arm64
+# (the F3/B7 wave: the arm rollout of the hosting - Graviton/Ampere).
+# the deb architecture, the rpm architecture, the Debian multiarch
+# triple and the build directory of the binary follow from it
+ARCH=${ARCH:-amd64}
+case "$ARCH" in
+    amd64)
+        DEB_ARCH=amd64
+        RPM_ARCH=x86_64
+        MULTIARCH=x86_64-linux-gnu
+        BUILD_DIR=linux-release
+        STRIP_CMD=strip
+        ;;
+    arm64)
+        DEB_ARCH=arm64
+        RPM_ARCH=aarch64
+        MULTIARCH=aarch64-linux-gnu
+        BUILD_DIR=linux-arm64
+        STRIP_CMD=aarch64-linux-gnu-strip
+        ;;
+    *)
+        echo "build.sh: unknown ARCH=$ARCH (amd64|arm64)" >&2
+        exit 1
+        ;;
+esac
+
+BIN_DIR="$REPO_DIR/build/$BUILD_DIR"
 BIN="$BIN_DIR/ssh3-server"
 OUT_DIR="$SCRIPT_DIR/_build"
 mkdir -p "$OUT_DIR"
@@ -49,7 +76,7 @@ die() { printf 'build.sh: %s\n' "$1"; exit 1; }
 # mirrors the NEEDED of the bundle pair (libc6, zlib1g, libzstd1) - the
 # system libssl3t64/libssl3 is no longer required at all.
 BUNDLE_LIB_DIR=/usr/lib/ssh3-c/lib
-LIBSSL3T64_URL="https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u3_amd64.deb"
+LIBSSL3T64_URL="https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u3_${DEB_ARCH}.deb"
 BUNDLE_CACHE="$OUT_DIR/cache"
 BUNDLE_STAGE="$STAGE_ROOT/bundle"
 BUNDLE_DEB_ROOT="$BUNDLE_STAGE/root"
@@ -129,9 +156,9 @@ fetch_bundle() {
         || die "cannot extract $deb"
     mkdir -p "$BUNDLE_STAGE"
     for lib in libssl.so.3 libcrypto.so.3; do
-        [ -e "$BUNDLE_DEB_ROOT/usr/lib/x86_64-linux-gnu/$lib" ] \
-            || die "$deb: $lib not found under usr/lib/x86_64-linux-gnu - unexpected deb layout"
-        cp -L "$BUNDLE_DEB_ROOT/usr/lib/x86_64-linux-gnu/$lib" "$BUNDLE_STAGE/$lib"
+        [ -e "$BUNDLE_DEB_ROOT/usr/lib/$MULTIARCH/$lib" ] \
+            || die "$deb: $lib not found under usr/lib/$MULTIARCH - unexpected deb layout"
+        cp -L "$BUNDLE_DEB_ROOT/usr/lib/$MULTIARCH/$lib" "$BUNDLE_STAGE/$lib"
     done
     if [ -e "$BUNDLE_DEB_ROOT/usr/share/doc/libssl3t64/copyright" ]; then
         cp "$BUNDLE_DEB_ROOT/usr/share/doc/libssl3t64/copyright" \
@@ -205,7 +232,8 @@ build_deb() {
     chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN"
     install -m 0755 "$BIN" "$stage/usr/sbin/ssh3-server"
     set_runpath "$stage/usr/sbin/ssh3-server"
-    install -m 0644 "$SCRIPT_DIR/deb/control" "$stage/DEBIAN/control"
+    sed "s/@ARCH@/$DEB_ARCH/" "$SCRIPT_DIR/deb/control" \
+        > "$stage/DEBIAN/control"
     install -m 0755 "$SCRIPT_DIR/deb/postinst" "$stage/DEBIAN/postinst"
     install -m 0644 "$SCRIPT_DIR/deb/copyright" "$stage/usr/share/doc/ssh3-server/copyright"
     install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" \
@@ -220,7 +248,7 @@ build_deb() {
         "$stage/usr/lib/systemd/system/ssh3-server.service"
     bundle_report
     dpkg-deb --root-owner-group --build "$stage" \
-        "$OUT_DIR/ssh3-server_${debver}_amd64.deb"
+        "$OUT_DIR/ssh3-server_${debver}_${DEB_ARCH}.deb"
 }
 
 # the bundled OpenSSL 3.5 of the deb channel is a package of its own
@@ -242,10 +270,11 @@ build_deb_libs() {
         "$stage/usr/lib/ssh3-c/lib/libssl.so.3"
     install -m 0644 "$BUNDLE_STAGE/libcrypto.so.3" \
         "$stage/usr/lib/ssh3-c/lib/libcrypto.so.3"
-    sed "s/@VERSION@/$debver/" "$SCRIPT_DIR/deb/libssl3-control" \
+    sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" \
+        "$SCRIPT_DIR/deb/libssl3-control" \
         > "$stage/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$stage" \
-        "$OUT_DIR/ssh3c-libssl3_${debver}_amd64.deb"
+        "$OUT_DIR/ssh3c-libssl3_${debver}_${DEB_ARCH}.deb"
 }
 
 # the client deb: /usr/bin/ssh3 with the RUNPATH into the private
@@ -267,10 +296,11 @@ build_deb_client() {
     set_runpath "$stage/usr/bin/ssh3"
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
     install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
-    sed "s/@VERSION@/$debver/" "$SCRIPT_DIR/deb/client-control" \
+    sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" \
+        "$SCRIPT_DIR/deb/client-control" \
         > "$stage/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$stage" \
-        "$OUT_DIR/ssh3-client_${debver}_amd64.deb"
+        "$OUT_DIR/ssh3-client_${debver}_${DEB_ARCH}.deb"
 }
 
 build_rpm() {
@@ -284,11 +314,14 @@ build_rpm() {
     install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" "$top/SOURCES/THIRD-PARTY-NOTICES.md"
     install -m 0644 "$REPO_DIR/README.md" "$top/SOURCES/README.md"
     # @VERSION@ in the spec template is substituted here, so the package and
-    # the binary always carry the same version
-    sed -e "s/@VERSION@/$VERSION/" \
+    # the binary always carry the same version; @RPMARCH@ is the build
+    # architecture of the spec (the rpm of a foreign architecture needs a
+    # cross toolchain the host does not have - that build stays refused)
+    sed -e "s/@VERSION@/$VERSION/" -e "s/@RPMARCH@/$RPM_ARCH/" \
         "$SCRIPT_DIR/rpm/ssh3-server.spec" > "$top/SPECS/ssh3-server.spec"
-    rpmbuild -bb --define "_topdir $top" "$top/SPECS/ssh3-server.spec"
-    mv "$top"/RPMS/x86_64/ssh3-server-*.rpm "$OUT_DIR/"
+    rpmbuild -bb --define "_topdir $top" \
+        "$top/SPECS/ssh3-server.spec"
+    mv "$top"/RPMS/$RPM_ARCH/ssh3-server-*.rpm "$OUT_DIR/"
 }
 
 build_apk() {

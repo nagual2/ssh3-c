@@ -3614,7 +3614,7 @@ s3_interop_usage(const char *prog)
 int
 main(int argc, char **argv)
 {
-    char               opt;
+    int                opt;
     const char        *listen_text = NULL, *cert_path = NULL, *key_path = NULL;
     const char        *alpn_name = "s3interop/1";
     unsigned           dg_size = 1200, idle_ms = 60000;
@@ -3698,7 +3698,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3h")) != -1) {
+    while ((opt = getopt(argc, argv, "l:c:k:A:d:i:L:P:H:K:3h")) != -1) {
 
         switch (opt) {
 
