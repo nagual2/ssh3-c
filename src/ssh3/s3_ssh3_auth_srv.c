@@ -410,7 +410,13 @@ s3_ssh3_auth_password_file_check(const char *path, const s3_str_t *user, const s
                 if ((size_t)(colon - p) == user->len && s3_memcmp(p, user->data, user->len) == 0) {
                     n = (size_t)(line_end - colon) - 1;
 
-                    rc = (n == pass->len && s3_memcmp(colon + 1, pass->data, pass->len) == 0)
+                    /*
+                     * the password is a secret: the compare is the
+                     * constant-time one (the length check in front of
+                     * it leaks nothing but the length)
+                     */
+
+                    rc = (n == pass->len && s3_memcmp_ct(colon + 1, pass->data, pass->len) == 0)
                              ? S3_OK
                              : S3_DECLINED;
 
@@ -526,7 +532,9 @@ s3_ssh3_auth_password_hash_check(const s3_str_t *pass, const char *hash)
         return S3_DECLINED;
     }
 
-    return (s3_memcmp(got, hash, n) == 0) ? S3_OK : S3_DECLINED;
+    /* the digest is a secret: the constant-time compare */
+
+    return (s3_memcmp_ct((const u_char *)got, (const u_char *)hash, n) == 0) ? S3_OK : S3_DECLINED;
 
 #else
 

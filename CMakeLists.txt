@@ -231,6 +231,25 @@ check_c_source_compiles(
     "
     S3_HAVE_ADDRINFO_CMSG)
 
+# the permanent privilege drop of the sftp jail child: setresuid and
+# setresgid drop the saved set ids too, so the child cannot restore
+# the root with seteuid(0) (the setuid alone leaves the saved id at
+# zero).  The fallback without them verifies the drop instead.
+
+check_c_source_compiles(
+    "
+    #include <sys/types.h>
+    #include <unistd.h>
+    int main(void) {
+        uid_t uid = 0;
+        gid_t gid = 0;
+        setresgid(gid, gid, gid);
+        setresuid(uid, uid, uid);
+        return 0;
+    }
+    "
+    S3_HAVE_SETRESUID)
+
 unset(CMAKE_REQUIRED_DEFINITIONS)
 
 # the system password verifier (the shadow step, PLAN.md 8.2): the
@@ -349,6 +368,10 @@ if(S3_HAVE_UDP_SEGMENT)
     target_compile_definitions(s3core PUBLIC S3_HAVE_UDP_SEGMENT=1)
 endif()
 
+if(S3_HAVE_SETRESUID)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_SETRESUID=1)
+endif()
+
 if(S3_HAVE_ADDRINFO_CMSG)
     target_compile_definitions(s3core PUBLIC S3_HAVE_ADDRINFO_CMSG=1)
 endif()
@@ -414,7 +437,7 @@ endif()
 
 if(S3_BUILD_FUZZ)
     foreach(S3_FUZZ fuzz_sftp_frame fuzz_cm_frame fuzz_forward_target fuzz_wire fuzz_message
-                    fuzz_quic_state)
+                    fuzz_quic_state fuzz_h3_parse)
         add_executable(${S3_FUZZ} tests/fuzz/${S3_FUZZ}.c)
         target_compile_options(${S3_FUZZ} PRIVATE -Wall -Wextra -Werror)
         target_link_options(${S3_FUZZ} PRIVATE -fsanitize=fuzzer)
@@ -500,6 +523,7 @@ set(S3_TESTS
     test_ssh3_sftp_jail
     test_ssh3_sftp_cli
     test_ssh3_cm
+    test_auth_ct
 )
 
 enable_testing()
@@ -510,6 +534,12 @@ if(NOT S3_BUILD_FUZZ)
         target_link_libraries(${S3_TEST} PRIVATE s3core)
         target_include_directories(${S3_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_compile_options(${S3_TEST} PRIVATE -Wall -Wextra -Werror)
+
+        # the source path of the tree: the pins that read the sources
+        # (the constant-time compares of the secrets) need it
+        target_compile_definitions(${S3_TEST}
+            PRIVATE S3_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
         add_test(NAME ${S3_TEST} COMMAND ${S3_TEST})
     endforeach()
 endif()
