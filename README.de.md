@@ -22,6 +22,8 @@ jeder Datei verweist auf die Versionen). Der kanonische Text der
 | 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | Benchmark-Bericht, Release v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
 | 11 | [packaging/README.md](packaging/README.md) | Bau der Distributionspakete (deb/rpm/apk/OpenWrt, gebündeltes OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
 | 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Copyright- und Lizenzhinweise Dritter (juristischer Text, nicht übersetzt) | EN |
+| 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | Bewertung des illumos-Ports: Plattformfakten, Archivierungs-Pipeline, verteiltes ZFS (eingefrorener Punkt F6b) | RU |
+| 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | operativer Plan-Ausschnitt: vom letzten erledigten Punkt zum ersten offenen (Wellen A/B, Distro-Reste, eingefrorene Punkte) | RU |
 
 Eine SSH3-Implementierung in reinem C17 im nginx-Stil: Speicherpools,
 Buffer-Sichten, ein Chain-Interface für sämtliche I/O, ein Zero-Copy-

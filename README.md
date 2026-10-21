@@ -22,6 +22,8 @@ Russian; EN/DE are faithful translations.
 | 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | benchmark report, release v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
 | 11 | [packaging/README.md](packaging/README.md) | building the distribution packages (deb/rpm/apk/OpenWrt, bundled OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
 | 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | third-party copyright and license notices (legal text, not translated) | EN |
+| 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | illumos porting assessment: platform facts, the traffic-archiving pipeline, distributed ZFS (frozen plan item F6b) | RU |
+| 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | the operational plan slice: from the last done item to the first not-done one (waves A/B, distro leftovers, frozen list) | RU |
 
 A pure-C17 SSH3 implementation in the nginx style: memory pools, buffer
 views, a chain interface for all I/O, a zero-copy data path. The target

@@ -22,6 +22,8 @@ EN/DE — точные переводы.
 | 10 | [docs/BENCH-V0.3.0-2026-10-15.md](docs/BENCH-V0.3.0-2026-10-15.md) | отчёт бенчей релиза v0.3.0 | RU · [EN](docs/BENCH-V0.3.0-2026-10-15.en.md) · [DE](docs/BENCH-V0.3.0-2026-10-15.de.md) |
 | 11 | [packaging/README.md](packaging/README.md) | сборка дистрибутивных пакетов (deb/rpm/apk/OpenWrt, бандл OpenSSL) | EN · [RU](packaging/README.ru.md) · [DE](packaging/README.de.md) |
 | 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | сторонние копирайты и лицензии (юридический текст, без перевода) | EN |
+| 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | оценка порта под illumos: факты платформы, конвейер архивации трафика, распределённый ZFS (замороженный пункт F6b) | RU |
+| 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | операционный срез плана: от последнего сделанного к первому не сделанному (волны A/B, остатки по дистрибутивам, замороженные пункты) | RU |
 
 Реализация SSH3 на чистом C17 в стиле nginx: пулы памяти, буферы-вьюхи,
 chain-интерфейс всего I/O, zero-copy data path. Целевая позиция — «OpenSSH
