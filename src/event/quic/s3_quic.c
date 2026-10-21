@@ -96,16 +96,59 @@ s3_quic_apply_transport_params(s3_connection_t *c, s3_quic_tp_t *ctp)
         return S3_ERROR;
     }
 
-    if (ctp->max_idle_timeout > 0 && ctp->max_idle_timeout < qc->tp.max_idle_timeout) {
-        qc->tp.max_idle_timeout = ctp->max_idle_timeout;
-    }
+    /*
+     * the effective idle timeout is not stored in qc->tp: that is the
+     * advertised set, and it must not be overwritten with the peer's
+     * value (a retransmitted transport parameter frame would carry
+     * the peer's timeout).  The arming sites compute the effective
+     * value from both sets.
+     */
+
+    qc->idle_timeout = s3_quic_idle_timeout(qc->tp.max_idle_timeout, ctp->max_idle_timeout);
 
     qc->streams.server_max_streams_bidi = ctp->initial_max_streams_bidi;
     qc->streams.server_max_streams_uni = ctp->initial_max_streams_uni;
 
     s3_memcpy(&qc->ctp, ctp, sizeof(s3_quic_tp_t));
 
+    /* the peer's timeout can be the tighter one: re-arm the timer */
+
+    s3_quic_arm_idle_timer(c->read, qc->idle_timeout);
+
     return S3_OK;
+}
+
+s3_msec_t
+s3_quic_idle_timeout(s3_msec_t local, s3_msec_t remote)
+{
+    /*
+     * RFC 9000, 10.1: the effective idle timeout is the minimum of
+     * the two advertised values, and a 0 means "no limit", so a 0
+     * never wins the minimum
+     */
+
+    if (remote > 0 && (local == 0 || remote < local)) {
+        return remote;
+    }
+
+    return local;
+}
+
+void
+s3_quic_arm_idle_timer(s3_event_t *ev, s3_msec_t timeout)
+{
+    if (timeout == 0) {
+
+        /* no limit: the timer must not be armed at all */
+
+        if (ev->timer_set) {
+            s3_event_del_timer(ev);
+        }
+
+        return;
+    }
+
+    s3_event_add_timer(ev, timeout);
 }
 
 void
@@ -137,7 +180,7 @@ s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf)
      */
     c->recv = s3_quic_shared_recv;
 
-    s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
+    s3_quic_arm_idle_timer(c->read, qc->idle_timeout);
 
     if (!qc->streams.initialized) {
         s3_event_add_timer(&qc->close, qc->conf->handshake_timeout);
@@ -229,6 +272,10 @@ s3_quic_new_connection(s3_connection_t *c, s3_quic_conf_t *conf, s3_quic_header_
     if (s3_quic_init_transport_params(&qc->tp, conf) != S3_OK) {
         return NULL;
     }
+
+    /* the effective idle timeout starts at the advertised value */
+
+    qc->idle_timeout = qc->tp.max_idle_timeout;
 
     ctp = &qc->ctp;
 
@@ -672,7 +719,7 @@ s3_quic_input_handler(s3_event_t *rev)
         /* rc == S3_OK */
 
         qc->send_timer_set = 0;
-        s3_event_add_timer(rev, qc->tp.max_idle_timeout);
+        s3_quic_arm_idle_timer(rev, qc->idle_timeout);
     }
 }
 
@@ -2043,6 +2090,10 @@ s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf)
         return S3_ERROR;
     }
 
+    /* the effective idle timeout starts at the advertised value */
+
+    qc->idle_timeout = qc->tp.max_idle_timeout;
+
     ctp = &qc->ctp;
 
     /* defaults to be used before actual server parameters are received */
@@ -2141,7 +2192,7 @@ s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf)
 
     c->recv = s3_udp_recv;
 
-    s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
+    s3_quic_arm_idle_timer(c->read, qc->idle_timeout);
     s3_event_add_timer(&qc->close, qc->conf->handshake_timeout);
 
     c->read->handler = s3_quic_input_handler;

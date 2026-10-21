@@ -8,11 +8,13 @@
 - **Pass-1 report:** `docs/SECURITY_AUDIT_2026-10-17.md`; **pass-2 report:** `docs/SECURITY_AUDIT_PASS2_2026-10-18.md`
 - **Deliverable:** this document is report-only (TZ §7, precedent pass-2 §10). Any defect found is fixed on a separate `fix/pass3-quic*` branch with its own test and PR; this branch carries no code change.
 
-> **STATUS — PARTIAL, and deliberately so.** This is the first slice of pass 3: the inventory,
-> the change-set map, priority 1 (pre-auth parsing) read to the end with anchors, the frame
-> parser of priority 2, and the probes *prepared*. The probes could **not be executed** in this
-> session (reason in §4) and priority 3/4 plus the DoS accounting are **not read** (§9). The
-> verdict in §8 says what that does and does not entitle anyone to claim.
+> **STATUS — the pass is complete.** The document was written in three sessions: the first
+> slice (§1–§9) was the inventory, the change-set map, priority 1 (pre-auth parsing) and the
+> frame parser of priority 2; §10–§11 added the connection state, the OpenSSL seam and the
+> executed probes (both presets 42/42, a 1 000 000-input ASan+UBSan fuzz run, clean); §13
+> closed the remaining reading and the P2-1 spoofing probe. The verdict is §12, the residual
+> list is §13.4, the coverage limits are §9. The code defects found in the review of this
+> report (the idle timer, the local address path) are fixed on the `fix/pass3-quic` branch.
 
 ## 1. Scope and method
 

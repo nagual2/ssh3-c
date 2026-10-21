@@ -124,7 +124,7 @@ s3_quic_output(s3_connection_t *c)
 
     if (!qc->send_timer_set) {
         qc->send_timer_set = 1;
-        s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
+        s3_quic_arm_idle_timer(c->read, qc->idle_timeout);
     }
 
     s3_quic_set_lost_timer(c);
@@ -1436,7 +1436,7 @@ s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_
 
     if (!qc->send_timer_set) {
         qc->send_timer_set = 1;
-        s3_event_add_timer(c->read, qc->tp.max_idle_timeout);
+        s3_quic_arm_idle_timer(c->read, qc->idle_timeout);
     }
 
     s3_quic_set_lost_timer(c);

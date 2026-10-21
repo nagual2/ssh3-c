@@ -33,9 +33,17 @@ size_t s3_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *sockaddr);
 
 /*
  * writes sockaddr into the control data and returns the size to add
- * to msg_controllen (0 when the address family is not supported)
+ * to msg_controllen (0 when the address family is not supported); the
+ * level and the type of the control message are set here
  */
 size_t s3_set_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *sockaddr);
+
+/*
+ * enables the local address ancillary data of a wildcard datagram
+ * socket (a no-op for a socket bound to a specific address); without
+ * it the kernel never delivers the pktinfo control message
+ */
+s3_int_t s3_enable_pktinfo(int fd, struct sockaddr *sockaddr);
 
 #endif /* S3_HAVE_ADDRINFO_CMSG */
 

@@ -116,6 +116,17 @@ s3_quic_new_token(s3_log_t *log, struct sockaddr *sockaddr, socklen_t socklen, u
 
     u_char in[S3_QUIC_MAX_TOKEN_SIZE];
 
+    /*
+     * the odcid rides the token plaintext, and the plaintext buffer is
+     * a fixed one: the length must fit it (the callers pass a parsed
+     * cid, the bound is the contract)
+     */
+
+    if (odcid != NULL && odcid->len > S3_QUIC_MAX_CID_LEN) {
+        s3_log_error(S3_LOG_ALERT, log, 0, "quic token odcid is too long");
+        return S3_ERROR;
+    }
+
     s3_quic_address_hash(sockaddr, socklen, !is_retry, NULL, 0, in);
 
     p = in + 20;
@@ -290,8 +301,21 @@ s3_quic_validate_token(s3_connection_t *c, u_char *key, s3_quic_header_t *pkt)
         pkt->odcid.data = pkt->odcid_buf;
         s3_memcpy(pkt->odcid.data, odcid.data, odcid.len);
 
+    } else if (pkt->dcid.len <= S3_QUIC_MAX_CID_LEN) {
+
+        /*
+         * the token carries no odcid: the dcid is its own.  The copy
+         * keeps the field out of the packet buffer — an alias into it
+         * outlives nothing today, but a later keeper of pkt->odcid
+         * would read a buffer it does not own
+         */
+
+        pkt->odcid.len = pkt->dcid.len;
+        pkt->odcid.data = pkt->odcid_buf;
+        s3_memcpy(pkt->odcid.data, pkt->dcid.data, pkt->dcid.len);
+
     } else {
-        pkt->odcid = pkt->dcid;
+        goto bad_token;
     }
 
     pkt->validated = 1;

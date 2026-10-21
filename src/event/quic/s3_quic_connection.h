@@ -252,6 +252,13 @@ struct s3_quic_connection_s {
     s3_quic_tp_t tp;
     s3_quic_tp_t ctp;
 
+    /*
+     * the effective idle timeout (RFC 9000, 10.1): the minimum of the
+     * advertised and the received values, where a 0 means "no limit".
+     * It is kept apart from tp, which is the advertised set
+     */
+    s3_msec_t idle_timeout;
+
     s3_quic_send_ctx_t send_ctx[S3_QUIC_SEND_CTX_LAST];
 
     s3_quic_keys_t *keys;

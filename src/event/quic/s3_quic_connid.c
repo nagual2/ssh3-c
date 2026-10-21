@@ -352,7 +352,9 @@ s3_quic_free_client_id(s3_connection_t *c, s3_quic_client_id_t *cid)
     s3_queue_remove(&cid->queue);
     s3_queue_insert_head(&qc->free_client_ids, &cid->queue);
 
-    qc->nclient_ids--;
+    if (qc->nclient_ids > 0) {
+        qc->nclient_ids--;
+    }
 
     return S3_OK;
 }
