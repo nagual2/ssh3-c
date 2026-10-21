@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# build.sh - assemble the ssh3-server distribution packages (deb/rpm/apk).
+# build.sh - assemble the ssh3 distribution packages (deb/rpm/apk).
 #
 # usage: bash packaging/build.sh [deb|rpm|apk|all]      (default: all)
 #
-# the payload is build/linux-release/ssh3-server; when the binary is
-# missing, the script configures and builds the linux-release preset
-# itself. staging happens under /tmp (dpkg-deb and rpm enforce real
-# POSIX file modes, which a windows drvfs checkout cannot provide);
-# the final packages are copied into packaging/_build/ (gitignored).
-# the package sources stay in packaging/{deb,rpm,apk,openwrt}/.
+# the payload is build/linux-release/ssh3-server (the daemon) and
+# build/linux-release/ssh3 (the client); when a binary is missing, the
+# script configures and builds the linux-release preset itself. the
+# deb/rpm/apk channels ship both halves as two packages of the same
+# release - ssh3-server and ssh3-client (the openssh canon, the same
+# split as the debian source package). staging happens under /tmp
+# (dpkg-deb and rpm enforce real POSIX file modes, which a windows drvfs
+# checkout cannot provide); the final packages are copied into
+# packaging/_build/ (gitignored). the package sources stay in
+# packaging/{deb,rpm,apk,openwrt}/.
 #
 # the deb embeds the OpenSSL 3.5 bundle: fetch-bundle pulls the unmodified
 # libssl3t64 shared libraries of Debian 13 (3.5.x, cached under
@@ -38,6 +42,7 @@ case "$ARCH" in
     amd64)
         DEB_ARCH=amd64
         RPM_ARCH=x86_64
+        APK_ARCH=x86_64
         MULTIARCH=x86_64-linux-gnu
         BUILD_DIR=linux-release
         STRIP_CMD=strip
@@ -45,6 +50,7 @@ case "$ARCH" in
     arm64)
         DEB_ARCH=arm64
         RPM_ARCH=aarch64
+        APK_ARCH=aarch64
         MULTIARCH=aarch64-linux-gnu
         BUILD_DIR=linux-arm64
         STRIP_CMD=aarch64-linux-gnu-strip
@@ -57,6 +63,7 @@ esac
 
 BIN_DIR="$REPO_DIR/build/$BUILD_DIR"
 BIN="$BIN_DIR/ssh3-server"
+CLIENT_BIN="$BIN_DIR/ssh3"
 OUT_DIR="$SCRIPT_DIR/_build"
 mkdir -p "$OUT_DIR"
 STAGE_ROOT=$(mktemp -d /tmp/ssh3-pkg.XXXXXX)
@@ -219,6 +226,18 @@ ensure_bin() {
     log "packaging ssh3-server $VERSION"
 }
 
+# the client half: its own binary next to the daemon and its own version
+# output ("ssh3 version SSH 3.0 ssh3-c X.Y.Z experimental_spec_version=...").
+# the two halves ship as one release, so their versions must agree
+ensure_client() {
+    [ -x "$CLIENT_BIN" ] \
+        || die "no client binary at '$CLIENT_BIN' (cmake --build --preset linux-release)"
+    local cver
+    cver=$("$CLIENT_BIN" -V | sed -n 's/.*ssh3-c \([0-9][0-9.]*\).*/\1/p')
+    [ "$cver" = "$VERSION" ] \
+        || die "the client binary reports '$cver', the daemon '$VERSION' - the two halves must be the same release"
+}
+
 build_deb() {
     log "building the deb package"
     local stage="$STAGE_ROOT/deb/pkg"
@@ -283,7 +302,7 @@ build_deb_libs() {
 build_deb_client() {
     log "building the client deb package"
     local stage="$STAGE_ROOT/deb/client"
-    local client="$BIN_DIR/ssh3"
+    local client="$CLIENT_BIN"
     [ -x "$client" ] || die "no client binary at '$client' (cmake --build --preset linux-release)"
     local debver
     debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
@@ -303,13 +322,21 @@ build_deb_client() {
         "$OUT_DIR/ssh3-client_${debver}_${DEB_ARCH}.deb"
 }
 
+# the rpm channel ships the pair as one spec with two packages: the daemon
+# (ssh3-server) and the client (ssh3-client, with its man page). the two
+# halves are independent packages - no cross dependency, the system-openssl
+# scheme needs no shared libs package.
 build_rpm() {
-    log "building the rpm package"
+    log "building the rpm packages (ssh3-server, ssh3-client)"
     command -v rpmbuild >/dev/null 2>&1 || die "rpmbuild not found (apt-get install rpm)"
+    ensure_client
     local top="$STAGE_ROOT/rpm/rpmbuild"
     mkdir -p "$top/BUILD" "$top/RPMS" "$top/SOURCES" "$top/SPECS" "$top/SRPMS"
     install -m 0755 "$BIN" "$top/SOURCES/ssh3-server"
     strip_runpath "$top/SOURCES/ssh3-server"
+    install -m 0755 "$CLIENT_BIN" "$top/SOURCES/ssh3"
+    strip_runpath "$top/SOURCES/ssh3"
+    gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$top/SOURCES/ssh3.1.gz"
     install -m 0644 "$REPO_DIR/LICENSE" "$top/SOURCES/LICENSE"
     install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" "$top/SOURCES/THIRD-PARTY-NOTICES.md"
     install -m 0644 "$REPO_DIR/README.md" "$top/SOURCES/README.md"
@@ -321,25 +348,80 @@ build_rpm() {
         "$SCRIPT_DIR/rpm/ssh3-server.spec" > "$top/SPECS/ssh3-server.spec"
     rpmbuild -bb --define "_topdir $top" \
         "$top/SPECS/ssh3-server.spec"
-    mv "$top"/RPMS/$RPM_ARCH/ssh3-server-*.rpm "$OUT_DIR/"
+    mv "$top"/RPMS/$RPM_ARCH/ssh3-*.rpm "$OUT_DIR/"
 }
 
-build_apk() {
-    log "building the apk package (apk-tools v2: control.tar.gz + data.tar.gz)"
-    local stage="$STAGE_ROOT/apk"
-    mkdir -p "$stage/control" "$stage/data/usr/sbin"
-    install -m 0755 "$BIN" "$stage/data/usr/sbin/ssh3-server"
-    strip_runpath "$stage/data/usr/sbin/ssh3-server"
+# the apk-tools v2 control file: the template with the version, the build
+# date, the installed size and the architecture substituted
+apk_control() {
+    local stage="$1" tmpl="$2"
     sed -e "s/@VERSION@/$VERSION/" \
         -e "s/@BUILDDATE@/$(date +%s)/" \
         -e "s/@SIZE@/$(du -sb "$stage/data" | cut -f1)/" \
-        "$SCRIPT_DIR/apk/PKGINFO.in" > "$stage/control/.PKGINFO"
-    tar --owner=0 --group=0 --numeric-owner \
-        -czf "$stage/control.tar.gz" -C "$stage/control" .PKGINFO
-    tar --owner=0 --group=0 --numeric-owner \
+        -e "s/@APKARCH@/$APK_ARCH/" \
+        "$tmpl" > "$stage/control/.PKGINFO"
+}
+
+# the apk package: two concatenated gzip streams (control + data), each of
+# them a tar. the tar format is the POSIX ustar on purpose: apk-tools has
+# its own tar parser and rejects the GNU format ("ustar  " magic) with
+# "BAD archive" - alpine writes the ustar magic ("ustar\000" + "00").
+#
+# the CONTROL stream must NOT carry the tar end-of-archive marker (the two
+# empty headers): apk-tools v2 mis-parses a control segment with the marker
+# and rejects the whole package with "BAD archive" (verified against
+# apk-tools 2.14 in an alpine 3.22 container - the marker cut off of an
+# alpine package turns it into the same error). the alpine packages have
+# the marker cut off the same way: the segment ends right after the
+# .PKGINFO entry. the data stream keeps the marker (apk tolerates it there).
+apk_control_tar() {
+    local stage="$1"
+    local size tar_size
+    size=$(stat -c %s "$stage/control/.PKGINFO")
+    # one regular file entry: a 512-byte header plus the padded payload
+    tar_size=$((512 + ((size + 511) / 512) * 512))
+    tar --format=ustar --owner=0 --group=0 --numeric-owner \
+        -cf "$stage/control.tar" -C "$stage/control" .PKGINFO
+    truncate -s "$tar_size" "$stage/control.tar"
+    gzip -n -c "$stage/control.tar" > "$stage/control.tar.gz"
+}
+
+build_apk_server() {
+    log "building the apk server package (apk-tools v2: control.tar.gz + data.tar.gz)"
+    local stage="$STAGE_ROOT/apk/server"
+    mkdir -p "$stage/control" "$stage/data/usr/sbin"
+    install -m 0755 "$BIN" "$stage/data/usr/sbin/ssh3-server"
+    strip_runpath "$stage/data/usr/sbin/ssh3-server"
+    apk_control "$stage" "$SCRIPT_DIR/apk/PKGINFO.in"
+    apk_control_tar "$stage"
+    tar --format=ustar --owner=0 --group=0 --numeric-owner \
         -czf "$stage/data.tar.gz" -C "$stage/data" usr
     cat "$stage/control.tar.gz" "$stage/data.tar.gz" \
         > "$OUT_DIR/ssh3-server_${VERSION}-r0.apk"
+}
+
+# the client apk: the CLI, the man page, the same control layout
+build_apk_client() {
+    log "building the apk client package (apk-tools v2: control.tar.gz + data.tar.gz)"
+    ensure_client
+    local stage="$STAGE_ROOT/apk/client"
+    mkdir -p "$stage/control" "$stage/data/usr/bin" \
+        "$stage/data/usr/share/man/man1"
+    install -m 0755 "$CLIENT_BIN" "$stage/data/usr/bin/ssh3"
+    strip_runpath "$stage/data/usr/bin/ssh3"
+    gzip -c "$SCRIPT_DIR/debian/ssh3.1" \
+        > "$stage/data/usr/share/man/man1/ssh3.1.gz"
+    apk_control "$stage" "$SCRIPT_DIR/apk/PKGINFO-client.in"
+    apk_control_tar "$stage"
+    tar --format=ustar --owner=0 --group=0 --numeric-owner \
+        -czf "$stage/data.tar.gz" -C "$stage/data" usr
+    cat "$stage/control.tar.gz" "$stage/data.tar.gz" \
+        > "$OUT_DIR/ssh3-client_${VERSION}-r0.apk"
+}
+
+build_apk() {
+    build_apk_server
+    build_apk_client
 }
 
 FMT="${1:-all}"

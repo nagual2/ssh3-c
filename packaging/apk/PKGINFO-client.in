@@ -1,0 +1,24 @@
+# the apk-tools v2 control file of the ssh3 client - the twin of
+# PKGINFO.in (the server): a tar.gz stream whose members all start with a
+# dot (here just .PKGINFO). the version, the build date, the installed size
+# and the architecture are substituted by packaging/build.sh; the package
+# file is the two concatenated tar.gz streams control + data.
+#
+# NOTE on dependencies: the shipped binary must be built against musl inside
+# an alpine (3.22+) environment - the stock alpine userland has no glibc.
+# so:libssl.so.3 / so:libcrypto.so.3 are satisfied by openssl 3.5 (the QUIC
+# API); the musl libc dependency line belongs to the alpine-built binary and
+# is intentionally not hardcoded here.
+pkgname = ssh3-client
+pkgver = @VERSION@-r0
+pkgdesc = SSH3 client - SSH over QUIC/HTTP3 transport
+builddate = @BUILDDATE@
+size = @SIZE@
+arch = @APKARCH@
+origin = ssh3-client
+packager = ssh3-c maintainers <maintainers@example.com>
+license = BSD-2-Clause
+depend = so:libssl.so.3
+depend = so:libcrypto.so.3
+conflicts = ssh3-go-client
+replaces = ssh3-go-client

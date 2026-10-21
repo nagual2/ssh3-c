@@ -1,8 +1,8 @@
-# packaging — дистрибутивные пакеты для ssh3-server
+# packaging — дистрибутивные пакеты для ssh3
 > Languages: [EN](README.md) · RU (this file) · [DE](README.de.md)
 
-Собирает дистрибутивные пакеты для демона `ssh3-server` из бинарника
-`build/linux-release/ssh3-server` (при отсутствии собирается по требованию
+Собирает дистрибутивные пакеты для демона `ssh3-server` и клиента `ssh3`
+из бинарников `build/linux-release/` (при отсутствии собираются по требованию
 через пресет `linux-release`).
 
 ## Структура
@@ -11,8 +11,8 @@
 |------|----------|
 | `build.sh` | the orchestrator: `bash packaging/build.sh [deb\|rpm\|apk\|all]` |
 | `deb/` | debian control, postinst, copyright payloads |
-| `rpm/` | rpm spec template (`@VERSION@` substituted from the binary) |
-| `apk/` | apk-tools v2 `.PKGINFO` template |
+| `rpm/` | rpm spec template: пакеты `ssh3-server` и `ssh3-client` (`@VERSION@` substituted from the binary) |
+| `apk/` | apk-tools v2 шаблоны `.PKGINFO`: `PKGINFO.in` (сервер) и `PKGINFO-client.in` (клиент) |
 | `openwrt/` | openwrt feed makefile (built inside the openwrt SDK, not here) |
 | `_build/` | final packages (gitignored, never committed) |
 
@@ -30,7 +30,55 @@ Staging выполняется под `/tmp` и автоматически оч�
 
 Версия пакета берётся из самого демона (`ssh3-server -V`); `deb/control`
 содержит её буквально, а `build.sh` сверяет её с бинарником. Шаблоны rpm/apk
-подставляются на этапе сборки.
+подставляются на этапе сборки. Клиентская половина сверяется тоже: `ssh3 -V`
+называет свою версию (`ssh3 version SSH 3.0 ssh3-c X.Y.Z ...`), и `build.sh`
+отказывается паковать клиент, чья версия отличается от версии демона — две
+половины выходят одним релизом.
+
+## Пакеты
+
+Расщепление по канону openssh и по исходному debian-пакету
+(`debian/control`): демон и CLI — два пакета одной версии; клиенту
+безсерверного хоста демон не нужен, демону клиент тоже.
+
+| Формат | Пакеты | Состав клиентской половины |
+|--------|--------|-----------------------------|
+| deb | `ssh3-server`, `ssh3-client`, `ssh3c-libssl3` | `/usr/bin/ssh3`, `ssh3(1)` |
+| rpm | `ssh3-server`, `ssh3-client` (одна спека, два пакета) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+| apk | `ssh3-server`, `ssh3-client` (два шаблона `.PKGINFO`) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+
+rpm-спека собирает оба пакета за один прогон `rpmbuild`: демон — главный
+пакет (`%{_sbindir}/ssh3-server`), клиент — подпакет `%package -n ssh3-client`
+(`%{_bindir}/ssh3` и man-страница). Танец с drop-in заменой против go-форка
+повторяет deb-сторону: клиент конфликтует с (и вытесняет) `ssh3-go-client`,
+демон — с обоими, `ssh3-go-client` и `ssh3-go-server`.
+
+Man-страница клиента — тот же файл, который ставит исходный debian-пакет:
+`debian/ssh3.1` (mdoc). Отдельного шаблона для apk нет — страница
+упаковывается в payload пакета.
+
+Архитектура rpm и apk берётся из переключателя `ARCH` в `build.sh`
+(`amd64` -> x86_64, `arm64` -> aarch64); сами arm64-бинарники — пункт B7
+плана.
+
+## Пакет apk (APKv2)
+
+Пакет apk — два склеенных gzip-потока: control-сегмент (`.PKGINFO`) и
+data-сегмент (payload). Две детали неочевидны и проверены на настоящем
+apk-tools (2.14, контейнер alpine 3.22):
+
+1. tar обоих сегментов — POSIX ustar (`tar --format=ustar`): у apk-tools
+   свой парсер tar, и GNU-формат (магия `ustar  `) он отвергает с
+   «BAD archive»;
+2. control-сегмент НЕ должен нести маркер конца архива tar (две пустые
+   шапки): apk-tools v2 разбирает control-сегмент с маркером неверно и
+   отвергает весь пакет с «BAD archive» — alpine-пакеты обрезают маркер
+   так же, их сегмент кончается сразу после записи `.PKGINFO`. `build.sh`
+   срезает маркер через `truncate`.
+
+data-сегмент маркер сохраняет (там apk его терпит). В шаблоне control есть
+и плейсхолдер `@APKARCH@` — подставляется из того же переключателя `ARCH`,
+что и в rpm.
 
 ## Матрица целевых платформ (OpenSSL >= 3.5 с QUIC TLS API)
 
@@ -107,7 +155,12 @@ Backlog: перенос той же схемы (приватный катало�
    RUNPATH и требуют системный OpenSSL 3.5.
 2. Пакет apk собирается вручную (два склеенных потока tar.gz,
    apk-tools v2); настоящий пакет alpine нужно собирать под musl внутри
-   окружения alpine — поставляемый бинарник слинкован с glibc.
+   окружения alpine — поставляемый бинарник слинкован с glibc. Формат
+   проверен: `apk verify` принимает оба пакета, `apk add --allow-untrusted`
+   их ставит (файлы ложатся на место); зависимость `so:libssl.so.3` в
+   голом alpine-контейнере не разрешается (alpine 3.22 дробит библиотеку
+   на `libssl3`/`libcrypto3`), поэтому apk считает по одной неразрешённой
+   зависимости на пакет — ровно как у старого серверного пакета.
 3. Ни apk, ни rpm не подписаны (ключа подписи в дереве нет);
    неподписанные пакеты apk ставятся через `apk add --allow-untrusted`.
 4. openwrt ipk — заглушка в виде feed makefile: ему нужен openwrt SDK с
