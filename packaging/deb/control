@@ -1,5 +1,5 @@
 Package: ssh3-server
-Version: 0.4.1-1
+Version: 0.5.0-1
 Architecture: amd64
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: net

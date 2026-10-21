@@ -1,3 +1,22 @@
+ssh3-c (0.5.0-1) unstable; urgency=medium
+
+  * New upstream release 0.5.0: the pass-3 security audit of the QUIC
+    stack (src/event/quic/*) and the closure of the review of its
+    report.  The audit itself found no defect (the probes are clean:
+    both presets 42/42, a 1 000 000-input ASan+UBSan fuzz run), the
+    review did: the idle timeout of 0 means "no limit" (RFC 9000, 10.1)
+    and not "fire now" - a server with -i 0 closed every connection
+    before the handshake finished; the local address path of a wildcard
+    listener was compiled out (the ancillary data check could never
+    pass under the strict POSIX feature set, the setter decided
+    nothing, and the kernel option was never set), so the replies of a
+    multi-address host carried the routed source address; the odcid of
+    a token is length-checked and copied instead of aliased into the
+    packet buffer; the client id counter decrement is guarded.  See
+    docs/SECURITY_AUDIT_PASS3_QUIC_2026-10-18.md.
+
+ -- Max <nahual15@gmail.com>  Wed, 21 Oct 2026 18:20:00 +0000
+
 ssh3-c (0.4.1-1) unstable; urgency=medium
 
   * New upstream release 0.4.1: the pass-2 security audit closure -
