@@ -219,6 +219,20 @@ void s3_quic_run(s3_connection_t *c, s3_quic_conf_t *conf);
 s3_int_t s3_quic_connect(s3_connection_t *c, s3_quic_conf_t *conf);
 
 /*
+ * the idle timeout (RFC 9000, 10.1): the effective value is the
+ * minimum of the two advertised ones, and a 0 means "no limit", so a
+ * 0 never wins the minimum
+ */
+s3_msec_t s3_quic_idle_timeout(s3_msec_t local, s3_msec_t remote);
+
+/*
+ * arms the idle timer of a connection; a 0 timeout means "no limit"
+ * and clears the timer instead of arming it (the reference arms a 0
+ * timer, which closes the connection on the next event loop pass)
+ */
+void s3_quic_arm_idle_timer(s3_event_t *ev, s3_msec_t timeout);
+
+/*
  * the receive window setters of the client tuning, to call before the
  * handshake: the connection-level MAX_DATA and the per-stream
  * MAX_STREAM_DATA advertised in the transport parameters, in bytes;

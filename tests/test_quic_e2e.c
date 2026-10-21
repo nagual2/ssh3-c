@@ -678,6 +678,17 @@ s3_test_env_done(s3_test_e2e_env_t *env)
         s3_destroy_pool(env->pool);
         env->pool = NULL;
     }
+
+    /*
+     * the pool of the event context: the next case re-initializes the
+     * context, and the overwritten pool would be a leak (the receive
+     * buffers live there)
+     */
+
+    if (env->ctx.pool != NULL) {
+        s3_destroy_pool(env->ctx.pool);
+        env->ctx.pool = NULL;
+    }
 }
 
 static int
@@ -980,11 +991,106 @@ s3_test_quic_e2e_idle_close(void)
     return s3_test_failures;
 }
 
+/*
+ * the "no limit" regression: an idle timeout of 0 means "no limit"
+ * (RFC 9000, 10.1), so the connection must survive the idle period.
+ * The reference arms a 0 timer, which closes the connection on the
+ * first event loop pass — the handshake never completes there.
+ */
+
+static void
+s3_test_guard_handler(s3_event_t *ev)
+{
+    int *fired = (int *)ev->data;
+
+    *fired = 1;
+}
+
+static int
+s3_test_quic_e2e_idle_zero(void)
+{
+    s3_test_e2e_env_t *env = &s3_test_e2e;
+    s3_event_t         guard;
+    int                i, guard_fired;
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    s3_memzero(env, sizeof(*env));
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+
+    env->cli_conf.handshake_timeout = 2000;
+    env->cli_conf.idle_timeout = 0;
+    env->srv_conf.handshake_timeout = 2000;
+    env->srv_conf.idle_timeout = 0;
+
+    /*
+     * the guard keeps the pump bounded: with an empty timer tree
+     * epoll_wait() blocks forever, and a connection that dies early
+     * leaves the tree empty
+     */
+
+    guard_fired = 0;
+    s3_memzero(&guard, sizeof(guard));
+    guard.data = &guard_fired;
+    guard.handler = s3_test_guard_handler;
+    guard.log = &s3_test_tls_log;
+
+    s3_event_add_timer(&guard, 1000);
+
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    /* pump the handshake */
+
+    for (i = 0; i < 5000 && !guard_fired; i++) {
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked) {
+            break;
+        }
+    }
+
+    /* the guard must not have fired: the handshake is quick */
+
+    S3_ASSERT(!guard_fired);
+    S3_ASSERT(env->cli->ssl != NULL && env->cli->ssl->handshaked);
+
+    if (guard.timer_set) {
+        s3_event_del_timer(&guard);
+    }
+
+    /* the idle connection must stay alive: nothing closes it */
+
+    guard_fired = 0;
+    s3_event_add_timer(&guard, 200);
+
+    for (i = 0; i < 5000 && !guard_fired; i++) {
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+    }
+
+    /* the idle period passed and the connection is still alive */
+
+    S3_ASSERT(guard_fired);
+    S3_ASSERT(env->cli->ssl != NULL && env->cli->ssl->handshaked);
+
+    if (guard.timer_set) {
+        s3_event_del_timer(&guard);
+    }
+
+    s3_test_env_done(env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_e2e(void)
 {
     (void)s3_test_quic_e2e_run();
     (void)s3_test_quic_e2e_idle_close();
+    (void)s3_test_quic_e2e_idle_zero();
 
     OPENSSL_cleanup();
 

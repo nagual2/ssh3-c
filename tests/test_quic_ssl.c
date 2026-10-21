@@ -23,6 +23,7 @@ typedef struct {
     s3_event_ctx_t       ctx;
     s3_quic_conf_t       conf;
     s3_connection_t      conn;
+    s3_event_t           read; /* the idle timer of the connection lives here */
     s3_quic_socket_t     qsock;
     s3_quic_connection_t qc;
     s3_quic_keys_t       keys;
@@ -31,6 +32,12 @@ typedef struct {
     SSL_CTX             *client_ctx;
     size_t               cli_off[S3_TEST_TLS_LEVELS];
 } s3_test_env_t;
+
+static void
+s3_test_read_handler(s3_event_t *ev)
+{
+    (void)ev;
+}
 
 static s3_int_t
 s3_test_env_init(s3_test_env_t *env, const u_char *cert, size_t cert_len, const u_char *key,
@@ -85,6 +92,12 @@ s3_test_env_init(s3_test_env_t *env, const u_char *cert, size_t cert_len, const 
     s3_memzero(&env->conn, sizeof(s3_connection_t));
     env->conn.log = &s3_test_tls_log;
     env->conn.pool = env->pool;
+
+    /* the read event: the idle timer of the connection lives there */
+    env->read.log = &s3_test_tls_log;
+    env->read.data = &env->conn;
+    env->read.handler = s3_test_read_handler;
+    env->conn.read = &env->read;
 
     /* the quic connection bookkeeping, as s3_quic_new_connection() does */
     s3_memzero(&env->qc, sizeof(s3_quic_connection_t));
@@ -146,6 +159,9 @@ s3_test_env_init(s3_test_env_t *env, const u_char *cert, size_t cert_len, const 
 
     env->qc.tp.original_dcid.data = (u_char *)s3_test_dcid;
     env->qc.tp.original_dcid.len = sizeof(s3_test_dcid);
+
+    /* the effective idle timeout, as s3_quic_new_connection() does */
+    env->qc.idle_timeout = env->qc.tp.max_idle_timeout;
 
     /* the peer client id and the active path, as open_sockets() does */
 
