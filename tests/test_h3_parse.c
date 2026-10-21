@@ -665,6 +665,69 @@ s3_test_uni(s3_connection_t *c)
     S3_ASSERT(st.u.control.type == S3_H3_FRAME_SETTINGS);
 }
 
+/*
+ * the lifetime of the field values (PLAN.md 9, B1): the parse hands
+ * out the name and the value of a field line, and the pre-auth
+ * verdict reads them after the parse - the receive buffer is recycled
+ * by the next read, so a view into it would dangle.
+ *
+ * the literals are allocated off the connection pool (s3_h3_parse.c
+ * copies them), and this pins that: the buffer is scribbled over and
+ * the value must stay intact
+ */
+static void
+s3_test_field_lifetime(s3_connection_t *c)
+{
+    u_char                buf[512];
+    u_char               *p;
+    u_char               *sec;
+    size_t                sec_len;
+    s3_buf_t              b;
+    s3_int_t              rc;
+    s3_h3_parse_headers_t st;
+    s3_str_t              name = s3_string("authorization");
+    s3_str_t              value = s3_string("Bearer the-token-of-the-pre-auth-request");
+
+    /* the section: the zero prefix and one literal field line */
+
+    sec = buf + 2; /* the frame header takes the first two bytes */
+    p = (u_char *)s3_h3_encode_field_section_prefix(sec, 0, 0, 0);
+    p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
+    sec_len = (size_t)(p - sec);
+
+    buf[0] = 0x01; /* the HEADERS frame */
+    buf[1] = (u_char)sec_len; /* the frame length (the one-byte varint) */
+
+    s3_memzero(&st, sizeof(st));
+    b = s3_test_buf(buf, 2 + sec_len);
+    rc = s3_h3_parse_headers(c, &st, &b);
+
+    /* the last field line of a section lands together with the section
+     * end (the DONE), the earlier ones answer S3_OK */
+
+    S3_ASSERT(rc == S3_DONE || rc == S3_OK);
+
+    /* the parsed field line */
+
+    S3_ASSERT(st.field_rep.field.name.len == name.len);
+    S3_ASSERT(s3_memcmp(st.field_rep.field.name.data, name.data, name.len) == 0);
+    S3_ASSERT(st.field_rep.field.value.len == value.len);
+    S3_ASSERT(s3_memcmp(st.field_rep.field.value.data, value.data, value.len) == 0);
+
+    /* the value does not point into the receive buffer */
+
+    S3_ASSERT(st.field_rep.field.value.data < buf ||
+              st.field_rep.field.value.data >= buf + 2 + sec_len);
+
+    /* the proof by the scribble: the buffer is overwritten and the
+     * value must stay intact */
+
+    s3_memzero(buf, 2 + sec_len);
+
+    S3_ASSERT(st.field_rep.field.value.len == value.len);
+    S3_ASSERT(s3_memcmp(st.field_rep.field.value.data, value.data, value.len) == 0);
+}
+
 static int
 s3_test_h3_parse(void)
 {
@@ -683,6 +746,7 @@ s3_test_h3_parse(void)
     s3_test_prefix_int(c);
     s3_test_headers_frames(c);
     s3_test_literal(c);
+    s3_test_field_lifetime(c);
     s3_test_huffman();
     s3_test_encoder_decoder(c);
     s3_test_control(c);
