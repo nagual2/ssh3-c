@@ -6,6 +6,15 @@
  * tests for the event core: context, timers, posted events
  */
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
 #include <s3_core.h>
 
 #include "s3_test.h"
@@ -231,6 +240,39 @@ s3_test_timer_wraparound(s3_event_ctx_t *ctx)
     return s3_test_failures;
 }
 
+/*
+ * the wildcard listener test: the socket bound to any local address
+ * takes the packets of every local address, so the local address of an
+ * arrived packet is unknown until the ancillary data names it
+ */
+
+static int
+s3_test_wildcard(void)
+{
+    struct sockaddr_in  sin;
+    struct sockaddr_in6 sin6;
+
+    s3_memzero(&sin, sizeof(sin));
+    sin.sin_family = AF_INET;
+
+    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+    S3_ASSERT(s3_sockaddr_wildcard((struct sockaddr *)&sin) == 1);
+
+    sin.sin_addr.s_addr = htonl(0x7f000001);
+    S3_ASSERT(s3_sockaddr_wildcard((struct sockaddr *)&sin) == 0);
+
+    s3_memzero(&sin6, sizeof(sin6));
+    sin6.sin6_family = AF_INET6;
+
+    sin6.sin6_addr = in6addr_any;
+    S3_ASSERT(s3_sockaddr_wildcard((struct sockaddr *)&sin6) == 1);
+
+    sin6.sin6_addr = in6addr_loopback;
+    S3_ASSERT(s3_sockaddr_wildcard((struct sockaddr *)&sin6) == 0);
+
+    return s3_test_failures;
+}
+
 int
 s3_test_event(void)
 {
@@ -244,6 +286,7 @@ s3_test_event(void)
     (void)s3_test_posted(&ctx);
 
     (void)s3_test_timer_wraparound(&ctx);
+    (void)s3_test_wildcard();
 
     s3_destroy_pool(ctx.pool);
 

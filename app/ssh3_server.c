@@ -6724,6 +6724,15 @@ s3_srv_listener_add(s3_event_ctx_t *ctx, s3_fd_t fd, const struct sockaddr_stora
     ul->handler = s3_srv_accept;
     ul->quic = 1;
 
+    /*
+     * the wildcard listener: the local address of an arrived packet
+     * is unknown until the ancillary data names it, and the replies
+     * must carry it as their source (the reference keeps the same flag
+     * in the listening socket, src/core/ngx_connection.c)
+     */
+
+    ul->wildcard = s3_sockaddr_wildcard((const struct sockaddr *)sa);
+
     /* the quic listener: the rbtree is keyed by the packet dcid */
 
     s3_rbtree_init(&ul->rbtree, &ul->sentinel, s3_quic_rbtree_insert_socket);
