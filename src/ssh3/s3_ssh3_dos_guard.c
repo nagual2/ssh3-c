@@ -14,12 +14,20 @@
 #include <s3_ssh3_dos_guard.h>
 
 /*
- * the lockout table is a fixed array, not a tree: the keys are
+ * the lockout table is a bounded array, not a tree: the keys are
  * attacker-controlled, the array is the hard memory bound (no
  * per-name allocation for a flood of random usernames - the exact
  * pressure a DoS guard must not create) and the linear scan runs
  * once per failed CONNECT, noise next to the password-file read it
  * guards
+ *
+ * the array grows on demand (the daemon books the accounts the
+ * password backends know, so the population is the real accounts):
+ * a fixed table starved the bookkeeping of a host with many accounts,
+ * and a starved table is a brute-force protection that silently stops
+ * working.  the hard ceiling stays, so the invented-name flood (a
+ * future wiring that books unknown users) cannot grow the memory
+ * past it
  */
 
 typedef struct s3_dos_pw_record_s s3_dos_pw_record_t;
@@ -32,12 +40,18 @@ struct s3_dos_pw_record_s {
     unsigned  used;
 };
 
+/* the growth step of the table: the records are appended in blocks */
+
+#define S3_DOS_PW_TABLE_GROW 64
+
 static unsigned s3_dos_unauth_max = S3_DOS_UNAUTH_MAX_DEFAULT;
 static unsigned s3_dos_unauth_n;
 
 static unsigned           s3_dos_pw_failures_max = S3_DOS_PW_FAILURES_MAX_DEFAULT;
 static s3_msec_t          s3_dos_pw_lockout_ms = S3_DOS_PW_LOCKOUT_MSEC_DEFAULT;
-static s3_dos_pw_record_t s3_dos_pw_table[S3_DOS_PW_RECORDS_MAX];
+static s3_dos_pw_record_t *s3_dos_pw_table;
+static unsigned           s3_dos_pw_table_n;  /* the records in use */
+static unsigned           s3_dos_pw_table_cap; /* the records allocated */
 
 static s3_dos_pw_record_t *s3_dos_pw_find(const s3_str_t *user, s3_msec_t now);
 static s3_dos_pw_record_t *s3_dos_pw_slot(const s3_str_t *user, s3_msec_t now);
@@ -102,7 +116,7 @@ s3_dos_pw_find(const s3_str_t *user, s3_msec_t now)
         return NULL;
     }
 
-    for (i = 0; i < S3_DOS_PW_RECORDS_MAX; i++) {
+    for (i = 0; i < s3_dos_pw_table_n; i++) {
 
         s3_dos_pw_record_t *r = &s3_dos_pw_table[i];
 
@@ -127,29 +141,76 @@ s3_dos_pw_find(const s3_str_t *user, s3_msec_t now)
 }
 
 /*
- * the entry for a fresh booking: an unused slot first, then an entry
- * without an active lockout (a bare failure counter or an expired
- * window carries no protection and yields); NULL when every record
- * locks - the booking drops, the live lockouts stay
+ * the entry for a fresh booking: an unused slot first (a success or
+ * an expired window freed it), then the table grows while the hard
+ * ceiling allows it, and only a table at the ceiling reclaims an
+ * entry without an active lockout (a bare failure counter or an
+ * expired window carries no protection and yields); NULL when every
+ * record locks - the booking drops, the live lockouts stay
  */
 
 static s3_dos_pw_record_t *
 s3_dos_pw_slot(const s3_str_t *user, s3_msec_t now)
 {
-    size_t i;
+    unsigned i;
 
     if (!s3_dos_pw_name_ok(user)) {
         return NULL;
     }
 
-    for (i = 0; i < S3_DOS_PW_RECORDS_MAX; i++) {
+    for (i = 0; i < s3_dos_pw_table_n; i++) {
 
         if (!s3_dos_pw_table[i].used) {
             return &s3_dos_pw_table[i];
         }
     }
 
-    for (i = 0; i < S3_DOS_PW_RECORDS_MAX; i++) {
+    /* the table grows: the records are appended in blocks, so the
+     * reallocation copies amortize */
+
+    if (s3_dos_pw_table_n < s3_dos_pw_table_cap) {
+
+        /* a free slot inside the allocated block (the records are
+         * zeroed at the allocation) */
+
+        s3_dos_pw_record_t *r = &s3_dos_pw_table[s3_dos_pw_table_n];
+
+        s3_dos_pw_table_n++;
+
+        return r;
+    }
+
+    if (s3_dos_pw_table_cap < S3_DOS_PW_RECORDS_MAX) {
+
+        unsigned cap = s3_dos_pw_table_cap + S3_DOS_PW_TABLE_GROW;
+
+        if (cap > S3_DOS_PW_RECORDS_MAX) {
+            cap = S3_DOS_PW_RECORDS_MAX;
+        }
+
+        s3_dos_pw_record_t *grown =
+            realloc(s3_dos_pw_table, cap * sizeof(s3_dos_pw_record_t));
+
+        if (grown == NULL) {
+            return NULL;
+        }
+
+        s3_dos_pw_table = grown;
+        s3_dos_pw_table_cap = cap;
+
+        /* the fresh records of the block start zeroed */
+
+        s3_memzero(&s3_dos_pw_table[s3_dos_pw_table_n],
+                   (cap - s3_dos_pw_table_n) * sizeof(s3_dos_pw_record_t));
+
+        s3_dos_pw_record_t *r = &s3_dos_pw_table[s3_dos_pw_table_n];
+
+        s3_dos_pw_table_n++;
+
+        return r;
+    }
+
+    for (i = 0; i < s3_dos_pw_table_n; i++) {
 
         s3_dos_pw_record_t *r = &s3_dos_pw_table[i];
 
@@ -222,7 +283,7 @@ s3_dos_pw_success(const s3_str_t *user)
         return;
     }
 
-    for (i = 0; i < S3_DOS_PW_RECORDS_MAX; i++) {
+    for (i = 0; i < s3_dos_pw_table_n; i++) {
 
         s3_dos_pw_record_t *r = &s3_dos_pw_table[i];
 

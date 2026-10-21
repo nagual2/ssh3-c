@@ -53,10 +53,16 @@
  * the hard memory ceiling of the lockout bookkeeping: the keys are
  * attacker-controlled and the table - not a tree - is the bound, a
  * flood of invented usernames cannot grow the memory past this
- * shape (256 x ~72 bytes, static)
+ * shape (the record is ~88 bytes, so the ceiling is ~360 KiB)
+ *
+ * the table grows on demand: the daemon books the accounts the
+ * password backends know, so the population is the real accounts and
+ * not the attacker's invention.  a fixed table of 256 starved the
+ * bookkeeping of a host with more accounts than that, and a starved
+ * table is a brute-force protection that silently stops working
  */
 
-#define S3_DOS_PW_RECORDS_MAX 256
+#define S3_DOS_PW_RECORDS_MAX 4096
 
 /*
  * the unauthenticated-conversation cap: S3_OK admits the request and
