@@ -10,7 +10,9 @@
 #      driver pushes a byte-exact 64 KiB pattern through the bound
 #      port into the client-side echo target
 #      (the PRODUCT-REVERSE-TCP-OK marker)
-#   3. the udp relay: 20 numbered datagrams ride the same shape
+#   3. the udp relay: 20 numbered datagrams ride the same shape, the
+#      echo sends a zero-length datagram ahead of them and the bridge
+#      must stay alive (an empty datagram is a datagram, RFC 768)
 #      (the PRODUCT-REVERSE-UDP-OK marker)
 #   4. the permit-listen denial: the allow-list without the loopback
 #      refuses the bind before any socket (the SSH3-RFWD-DENIED
@@ -136,6 +138,12 @@ def udp_srv():
     print("ECHO-READY udp", flush=True)
     while 1:
         d, a = s.recvfrom(65536)
+
+        # the zero-length datagram rides ahead of the echo: it is a
+        # datagram (RFC 768), not a closed target - the client bridge
+        # must stay alive and carry the numbered echo behind it
+
+        s.sendto(b"", a)
         s.sendto(d, a)
 
 
@@ -333,6 +341,13 @@ got = {}
 try:
     while len(got) < n:
         d, _ = s.recvfrom(65536)
+
+        # the short datagrams carry no index (the empty one of the
+        # echo probe): they do not count
+
+        if len(d) < 4:
+            continue
+
         idx = struct.unpack("<I", d[:4])[0]
         if idx < n and idx not in got:
             got[idx] = d
@@ -398,7 +413,7 @@ fi
 
 stop_cli
 
-echo "== leg 3: the udp relay echoes 20 datagrams (PRODUCT-REVERSE-UDP-OK)"
+echo "== leg 3: the udp relay echoes 20 datagrams and survives the empty one (PRODUCT-REVERSE-UDP-OK)"
 
 S3CLILOG="$WORK/cli-udp.log"
 start_cli -R "0/udp:127.0.0.1:19122"
@@ -408,7 +423,7 @@ if wait_bind; then
 
     if timeout 30 python3 "$WORK/udp_probe.py" "$RPORT" > "$WORK/udp.log" 2>&1 &&
         grep -q "UDP-PROBE-OK count=20" "$WORK/udp.log"; then
-        pass "the udp relay echoed the 20 datagrams byte-exact (PRODUCT-REVERSE-UDP-OK, port $RPORT)"
+        pass "the udp relay echoed the 20 datagrams byte-exact past the empty one (PRODUCT-REVERSE-UDP-OK, port $RPORT)"
     else
         fail "the udp relay leg: $(tail -2 "$WORK/udp.log") srv:$(grep RFWD "$WORK/srv.log" | tail -2)"
     fi

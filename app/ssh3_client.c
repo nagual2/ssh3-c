@@ -7343,9 +7343,19 @@ s3_cli_rev_pump(void)
                     break;
                 }
 
-                if (n <= 0) {
-                    s3_cli_rev_bridge_kill(b, "the local -R udp target closed");
+                if (n < 0) {
+                    s3_cli_rev_bridge_kill(b, "the local -R udp target read failed");
                     break;
+                }
+
+                if (n == 0) {
+
+                    /* the zero-length datagram is a datagram (RFC 768):
+                     * the tunnel drops it (the inbound router drops the
+                     * empty payload the same way), it does not close the
+                     * bridge - the half-close is the tcp leg's shape */
+
+                    continue;
                 }
 
                 p = s3_ssh3_dgram_encode(dg, s3_cli_conv_id, b->ch_id, buf, (size_t)n);
