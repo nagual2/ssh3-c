@@ -61,6 +61,28 @@ static s3_int_t         s3_udp_key_text(u_char *buf, size_t max, s3_str_t *key, 
 static s3_uint32_t      s3_udp_key_hash(s3_str_t *key);
 static s3_int_t         s3_udp_key_cmp(s3_str_t *k1, s3_str_t *k2);
 
+unsigned
+s3_sockaddr_wildcard(const struct sockaddr *sa)
+{
+    /*
+     * the wildcard listener: the socket takes the packets of every
+     * local address, so the local address of an arrived packet is
+     * unknown until the ancillary data names it.  The reference keeps
+     * the flag in the listening socket (the NGX_HAVE_ADDRINFO_CMSG
+     * path of src/core/ngx_connection.c)
+     */
+
+    if (sa->sa_family == AF_INET) {
+        return ((const struct sockaddr_in *)sa)->sin_addr.s_addr == htonl(INADDR_ANY);
+    }
+
+    if (sa->sa_family == AF_INET6) {
+        return IN6_IS_ADDR_UNSPECIFIED(&((const struct sockaddr_in6 *)sa)->sin6_addr);
+    }
+
+    return 0;
+}
+
 void
 s3_event_recvmsg(s3_event_t *ev)
 {

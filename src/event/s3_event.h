@@ -247,4 +247,11 @@ void    s3_udp_rbtree_insert_value(s3_rbtree_node_t *temp, s3_rbtree_node_t *nod
                                    s3_rbtree_node_t *sentinel);
 void    s3_delete_udp_connection(void *data);
 
+/*
+ * the wildcard listener test: a socket bound to any local address
+ * takes the packets of every local address, so the local address of
+ * an arrived packet is unknown until the ancillary data names it
+ */
+unsigned s3_sockaddr_wildcard(const struct sockaddr *sa);
+
 #endif /* _S3_EVENT_H_INCLUDED_ */

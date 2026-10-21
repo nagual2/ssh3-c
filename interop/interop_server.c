@@ -3948,6 +3948,10 @@ main(int argc, char **argv)
     ul.handler = s3_interop_accept;
     ul.quic = 1;
 
+    /* the wildcard listener: the same flag as the product daemon */
+
+    ul.wildcard = s3_sockaddr_wildcard((const struct sockaddr *)&sa);
+
     s3_rbtree_init(&ul.rbtree, &ul.sentinel, s3_quic_rbtree_insert_socket);
 
     listener->data = &ul;
