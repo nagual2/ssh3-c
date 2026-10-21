@@ -54,6 +54,15 @@ typedef struct {
     unsigned software_major;
     unsigned software_minor;
     unsigned software_patch;
+
+    /*
+     * the compression capability of the peer (PLAN.md 9, B8): the mask
+     * of the algorithms the peer announced in the "compress=" field of
+     * the version string, zero when the peer announced nothing (every
+     * peer before the extension)
+     */
+
+    uint32_t compress_mask;
 } s3_ssh3_version_t;
 
 /*
@@ -70,5 +79,14 @@ s3_int_t s3_ssh3_version_parse(const u_char *data, size_t len, s3_ssh3_version_t
  * the experimental spec version we speak (alpha-00)
  */
 s3_int_t s3_ssh3_version_supported(const s3_ssh3_version_t *v);
+
+/*
+ * writes the version string of this build into buf and returns the
+ * length: the base string plus the "compress=<list>" capability field
+ * when the build has a codec (the runtime form, the capability depends
+ * on the compiled-in codecs)
+ */
+
+size_t s3_ssh3_version_string(u_char *buf, size_t cap);
 
 #endif /* _S3_SSH3_VERSION_H_INCLUDED_ */

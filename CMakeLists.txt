@@ -22,6 +22,33 @@ set(S3_FEATURE_DEFINITIONS -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L)
 
 add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 
+# the compression codecs of the channel body (PLAN.md 9, B8): the
+# availability is a build property.  a build without a codec announces
+# no capability in the version string and never sends a compressed
+# frame, so the feature stays optional and the wire format works with
+# every peer
+find_package(ZLIB QUIET)
+
+find_path(S3_LZ4_INCLUDE_DIR lz4.h)
+find_library(S3_LZ4_LIBRARY NAMES lz4)
+
+find_path(S3_ZSTD_INCLUDE_DIR zstd.h)
+find_library(S3_ZSTD_LIBRARY NAMES zstd)
+
+if(ZLIB_FOUND)
+    set(S3_HAVE_ZLIB 1)
+endif()
+
+if(S3_LZ4_INCLUDE_DIR AND S3_LZ4_LIBRARY)
+    set(S3_HAVE_LZ4 1)
+endif()
+
+if(S3_ZSTD_INCLUDE_DIR AND S3_ZSTD_LIBRARY)
+    set(S3_HAVE_ZSTD 1)
+endif()
+
+message(STATUS "ssh3 compression codecs: zlib=${S3_HAVE_ZLIB} lz4=${S3_HAVE_LZ4} zstd=${S3_HAVE_ZSTD}")
+
 # the Windows beachhead (P9 wave 1, docs/PLAN.md): cross-built with
 # mingw-w64 (preset windows-core, from WSL).  platform-free core,
 # codecs and the os/win layer only -- the event/quic layers land with
@@ -77,6 +104,8 @@ if(WIN32)
         src/h3/s3_h3_parse.c
         src/h3/s3_h3_uni.c
         src/ssh3/s3_ssh3_version.c
+        src/ssh3/s3_ssh3_compress.c
+        src/ssh3/s3_ssh3_frame.c
         src/ssh3/s3_ssh3_wire.c
         src/ssh3/s3_ssh3_message.c
         src/ssh3/s3_ssh3_request.c
@@ -315,6 +344,8 @@ set(S3_CORE_SOURCES
     src/h3/s3_h3_parse.c
     src/h3/s3_h3_uni.c
     src/ssh3/s3_ssh3_version.c
+    src/ssh3/s3_ssh3_compress.c
+    src/ssh3/s3_ssh3_frame.c
     src/ssh3/s3_ssh3_wire.c
     src/ssh3/s3_ssh3_message.c
     src/ssh3/s3_ssh3_request.c
@@ -394,6 +425,25 @@ message(STATUS "OpenSSL ${OPENSSL_VERSION} (crypto: ${OPENSSL_CRYPTO_LIBRARY})")
 # the QUIC modules link libcrypto and libssl through s3core;
 # the QUIC TLS API (SSL_set_quic_tls_cbs) lives in libssl
 target_link_libraries(s3core PUBLIC OpenSSL::Crypto OpenSSL::SSL)
+
+# the compression codecs of the channel body (PLAN.md 9, B8): the
+# definitions travel with the library, the test binaries inherit them
+if(S3_HAVE_ZLIB)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_ZLIB=1)
+    target_link_libraries(s3core PUBLIC ZLIB::ZLIB)
+endif()
+
+if(S3_HAVE_LZ4)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_LZ4=1)
+    target_include_directories(s3core PUBLIC ${S3_LZ4_INCLUDE_DIR})
+    target_link_libraries(s3core PUBLIC ${S3_LZ4_LIBRARY})
+endif()
+
+if(S3_HAVE_ZSTD)
+    target_compile_definitions(s3core PUBLIC S3_HAVE_ZSTD=1)
+    target_include_directories(s3core PUBLIC ${S3_ZSTD_INCLUDE_DIR})
+    target_link_libraries(s3core PUBLIC ${S3_ZSTD_LIBRARY})
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -506,6 +556,7 @@ set(S3_TESTS
     test_ssh3_message
     test_ssh3_request
     test_ssh3_channel
+    test_ssh3_compress
     test_ssh3_conversation
     test_ssh3_dgram
     test_ssh3_session_srv

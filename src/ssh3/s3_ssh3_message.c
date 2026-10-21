@@ -65,6 +65,19 @@ s3_ssh3_msg_encode_extended_data(u_char *p, const s3_ssh3_msg_extended_data_t *m
 }
 
 uintptr_t
+s3_ssh3_msg_encode_compressed_data(u_char *p, const s3_ssh3_msg_compressed_data_t *m)
+{
+    if (p == NULL) {
+        return s3_ssh3_varint_size(m->algorithm) + s3_ssh3_sshstring_size(m->data.len);
+    }
+
+    p = s3_ssh3_encode_varint(p, m->algorithm);
+    p = s3_ssh3_encode_sshstring(p, m->data.data, m->data.len);
+
+    return (uintptr_t)p;
+}
+
+uintptr_t
 s3_ssh3_msg_encode_request(u_char *p, const s3_ssh3_msg_request_t *m)
 {
     if (p == NULL) {
@@ -166,6 +179,30 @@ s3_ssh3_msg_parse_extended_data(const u_char **pos, const u_char *end,
     }
 
     m->data_type = data_type;
+    m->data = data;
+
+    *pos = p;
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_msg_parse_compressed_data(const u_char **pos, const u_char *end,
+                                  s3_ssh3_msg_compressed_data_t *m)
+{
+    const u_char *p = *pos;
+    uint64_t      algorithm;
+    s3_str_t      data;
+
+    if (s3_ssh3_parse_varint(&p, end, &algorithm) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_parse_sshstring(&p, end, &data) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    m->algorithm = algorithm;
     m->data = data;
 
     *pos = p;

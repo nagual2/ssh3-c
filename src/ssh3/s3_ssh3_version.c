@@ -12,6 +12,8 @@
 
 #include <s3_ssh3_version.h>
 
+#include <s3_ssh3_compress.h>
+
 /*
  * the component numbers are digits only, no sign latitude (the
  * reference Atoi accepts "-1"; a negative version component is
@@ -157,11 +159,14 @@ s3_ssh3_version_parse(const u_char *data, size_t len, s3_ssh3_version_t *v)
     s3_str_t      extra;
 
     static const s3_str_t spec_key = s3_string("experimental_spec_version=");
+    static const s3_str_t compress_key = s3_string(S3_SSH3_COMPRESS_KEY);
 
     p = data;
     end = data + len;
 
     nfield = 0;
+
+    v->compress_mask = 0;
 
     while (p < end && nfield < S3_SSH3_VERSION_FIELDS_MAX) {
 
@@ -209,22 +214,71 @@ s3_ssh3_version_parse(const u_char *data, size_t len, s3_ssh3_version_t *v)
 
     for (n = 4; n < nfield; n++) {
 
-        if (flen[n] <= spec_key.len) {
-            continue;
-        }
-
         extra.data = (u_char *)field[n];
         extra.len = flen[n];
 
-        if (s3_memcmp(extra.data, spec_key.data, spec_key.len) != 0) {
+        if (extra.len > spec_key.len &&
+            s3_memcmp(extra.data, spec_key.data, spec_key.len) == 0) {
+
+            v->spec_version.data = extra.data + spec_key.len;
+            v->spec_version.len = extra.len - spec_key.len;
+
             continue;
         }
 
-        v->spec_version.data = extra.data + spec_key.len;
-        v->spec_version.len = extra.len - spec_key.len;
+        /*
+         * the compression capability (PLAN.md 9, B8): the peer tells
+         * which algorithms it can decode with, and the field rides the
+         * version string, whose unknown fields every peer skips
+         */
+
+        if (extra.len > compress_key.len &&
+            s3_memcmp(extra.data, compress_key.data, compress_key.len) == 0) {
+
+            v->compress_mask = s3_ssh3_compress_parse(extra.data + compress_key.len,
+                                                       extra.len - compress_key.len);
+        }
     }
 
     return S3_OK;
+}
+
+size_t
+s3_ssh3_version_string(u_char *buf, size_t cap)
+{
+    static const char *base = S3_SSH3_VERSION_STRING;
+
+    size_t   len = s3_strlen(base);
+    u_char   cap_buf[64];
+    size_t   cap_len;
+
+    if (cap < len) {
+        return 0;
+    }
+
+    s3_memcpy(buf, base, len);
+
+    /* the capability field: the runtime form, the list depends on the
+     * compiled-in codecs; a build without a codec announces nothing and
+     * the field is omitted */
+
+    cap_len = s3_ssh3_compress_capability(cap_buf, sizeof(cap_buf));
+
+    if (cap_len == 0) {
+        return len;
+    }
+
+    if (cap < len + 1 + sizeof(S3_SSH3_COMPRESS_KEY) - 1 + cap_len) {
+        return len;
+    }
+
+    buf[len++] = ' ';
+    s3_memcpy(buf + len, S3_SSH3_COMPRESS_KEY, sizeof(S3_SSH3_COMPRESS_KEY) - 1);
+    len += sizeof(S3_SSH3_COMPRESS_KEY) - 1;
+    s3_memcpy(buf + len, cap_buf, cap_len);
+    len += cap_len;
+
+    return len;
 }
 
 s3_int_t

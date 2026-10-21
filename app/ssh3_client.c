@@ -122,6 +122,8 @@ typedef unsigned short u_short;
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_compress.h>
+#include <s3_ssh3_frame.h>
 #include <s3_ssh3_agent.h>
 #include <s3_ssh3_cm.h>
 #include <s3_ssh3_dgram.h>
@@ -205,6 +207,31 @@ typedef int s3_cli_cm_h_t;
 /* the receive accumulator cap of the sftp channel (the driver window
  * is 32 inflight requests, an endless stream is a peer bug) */
 #define S3_CLI_SFTP_BUF_MAX (16 << 20)
+
+/*
+ * the compression of the channel body (PLAN.md 9, B8): the flag of the
+ * -C option, the algorithm negotiated with the peer (the intersection
+ * of the peer's capability and the local codecs) and the scratch of
+ * the decoded payload (the peer sends frames below the advertised
+ * channel max packet size)
+ */
+
+static unsigned s3_cli_compress_flag; /* the -C option */
+static uint32_t s3_cli_compress_mask;  /* the capability of the peer */
+static uint32_t s3_cli_compress_alg;  /* the negotiated algorithm */
+
+/* the compression report: the compressed frames, the plain bytes they
+ * carried and the bytes on the wire */
+
+static size_t s3_cli_compress_frames;
+static size_t s3_cli_compress_plain;
+static size_t s3_cli_compress_packed;
+
+/* the payload bytes of the last built frame (the compression report) */
+
+static size_t s3_cli_sftp_wire;
+
+static u_char s3_cli_sftp_plain[S3_CLI_CHANNEL_MAX_PACKET + 1024];
 
 #define S3_CLI_ES256_HALF 32
 
@@ -1150,7 +1177,8 @@ s3_cli_usage(const char *prog)
             "  --log-level 0..9|all  the s3 log level\n"
             "  --sftp put|get:local:remote  the transfer (get: local first)\n"
             "  --help      this help\n"
-            "  -C          accepted, ignored (no compression)\n"
+            "  -C          the compression of the channel body (the peer must announce\n"
+            "              the capability; the default is off)\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
             " certificate pins into %s\n",
@@ -2241,6 +2269,31 @@ s3_cli_h3_field_l(u_char *p, const char *name, const char *value)
 }
 
 /*
+ * the version string of this build: the base string plus the
+ * capability field of the compression (PLAN.md 9, B8) - the runtime
+ * form, the capability depends on the compiled-in codecs.  the same
+ * value rides the measure pass and the write pass of the request
+ * builder
+ */
+
+static char s3_cli_version[192];
+
+static const char *
+s3_cli_version_string(void)
+{
+    size_t len = s3_ssh3_version_string((u_char *)s3_cli_version, sizeof(s3_cli_version) - 1);
+
+    if (len == 0) {
+        s3_cli_version[0] = '\0';
+        return s3_cli_version;
+    }
+
+    s3_cli_version[len] = '\0';
+
+    return s3_cli_version;
+}
+
+/*
  * the extended CONNECT request section: a zero prefix plus the
  * literal field lines, it decodes against any peer QPACK state (the
  * harness shape); the :authority carries the real host:port, the
@@ -2262,7 +2315,7 @@ s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const
         n += (size_t)s3_cli_h3_field_l(NULL, ":scheme", "https");
         n += (size_t)s3_cli_h3_field_l(NULL, ":authority", authority);
         n += (size_t)s3_cli_h3_field_l(NULL, ":path", target);
-        n += (size_t)s3_cli_h3_field_l(NULL, "user-agent", S3_SSH3_VERSION_STRING);
+        n += (size_t)s3_cli_h3_field_l(NULL, "user-agent", s3_cli_version_string());
 
         if (auth != NULL) {
             n += (size_t)s3_cli_h3_field_l(NULL, "authorization", auth);
@@ -2277,7 +2330,7 @@ s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const
     p = (u_char *)s3_cli_h3_field_l(p, ":scheme", "https");
     p = (u_char *)s3_cli_h3_field_l(p, ":authority", authority);
     p = (u_char *)s3_cli_h3_field_l(p, ":path", target);
-    p = (u_char *)s3_cli_h3_field_l(p, "user-agent", S3_SSH3_VERSION_STRING);
+    p = (u_char *)s3_cli_h3_field_l(p, "user-agent", s3_cli_version_string());
 
     if (auth != NULL) {
         p = (u_char *)s3_cli_h3_field_l(p, "authorization", auth);
@@ -3997,15 +4050,55 @@ s3_cli_ctrl_read(s3_event_t *ev)
                                      "the server refused the session (HTTP %ud)", code);
                         s3_cli_rc = S3_CLI_EXIT_ERROR;
                         s3_quic_finalize_connection(pc, 0, "connect refused");
+                        return;
                     }
 
-                    return;
+                    /* the server header follows the status: the
+                     * capability of the peer rides it (PLAN.md 9, B8) */
+
+                    continue;
+                }
+
+                if (name->len == 6 && memcmp(name->data, "server", 6) == 0) {
+
+                    s3_ssh3_version_t ver;
+
+                    s3_memzero(&ver, sizeof(ver));
+
+                    if (s3_ssh3_version_parse(value->data, value->len, &ver) == S3_OK) {
+
+                        s3_cli_compress_mask = ver.compress_mask;
+
+                        if (s3_cli_compress_flag) {
+                            s3_cli_compress_alg = s3_ssh3_compress_choose(s3_cli_compress_mask);
+
+                            if (s3_cli_compress_alg != S3_SSH3_COMPRESS_NONE) {
+                                fprintf(stderr,
+                                        "ssh3: the compression of the channel body is on "
+                                        "(algorithm %lu)\n",
+                                        (unsigned long)s3_cli_compress_alg);
+                            } else {
+                                fprintf(stderr, "ssh3: the peer does not support the compression of "
+                                                "the channel body\n");
+                            }
+                        }
+                    }
+
+                    continue;
                 }
 
                 if (rc == S3_DONE) {
-                    s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the response has no :status");
-                    s3_cli_rc = S3_CLI_EXIT_ERROR;
-                    s3_quic_finalize_connection(pc, 0, "no status");
+
+                    if (!s3_cli_status_seen) {
+                        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the response has no :status");
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        s3_quic_finalize_connection(pc, 0, "no status");
+                        return;
+                    }
+
+                    /* the header section is over: the session may start
+                     * (the status was seen) */
+
                     return;
                 }
 
@@ -4146,6 +4239,15 @@ s3_cli_sftp_finish(void)
     } else {
         s3_cli_exit_code = S3_CLI_EXIT_SFTP;
     }
+
+    /* the compression report (PLAN.md 9, B8): the frames sent, the
+     * plain bytes they carried and the bytes on the wire */
+
+    if (s3_cli_compress_frames > 0) {
+        fprintf(stderr, "ssh3: the compression of the channel body: %lu frames, %lu bytes -> %lu bytes\n",
+                (unsigned long)s3_cli_compress_frames, (unsigned long)s3_cli_compress_plain,
+                (unsigned long)s3_cli_compress_packed);
+    }
 }
 
 /*
@@ -4188,20 +4290,33 @@ s3_cli_sftp_pump(void)
 
         if (s3_cli_sftp_frame_sent == s3_cli_sftp_frame_total) {
 
-            u_char *p;
-
             chunk = s3_ssh3_channel_chunk_size(s3_cli_ch_peer_mps, 0);
 
             if (chunk > s3_cli_sftp_out_len) {
                 chunk = s3_cli_sftp_out_len;
             }
 
-            p = s3_cli_sftp_frame;
-            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
-            memcpy(p, s3_cli_sftp_out, chunk);
+            /* the frame of the chunk: the compressed form when the
+             * negotiation settled on an algorithm, the plain one
+             * otherwise (PLAN.md 9, B8) */
 
-            s3_cli_sftp_frame_total = (size_t)(p - s3_cli_sftp_frame) + chunk;
+            if (s3_ssh3_frame_data_build(s3_cli_sftp_frame, sizeof(s3_cli_sftp_frame),
+                                         &s3_cli_sftp_frame_total, s3_cli_compress_alg,
+                                         s3_cli_sftp_out, chunk, &s3_cli_sftp_wire) != S3_OK) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp frame does not fit");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                s3_cli_chan = NULL;
+                s3_quic_finalize_connection(((s3_quic_stream_t *)s3_cli_ctrl->data)->parent, 0,
+                                            "the sftp frame does not fit");
+                return;
+            }
+
+            if (s3_cli_sftp_wire < chunk) {
+                s3_cli_compress_frames++;
+                s3_cli_compress_plain += chunk;
+                s3_cli_compress_packed += s3_cli_sftp_wire;
+            }
+
             s3_cli_sftp_frame_sent = 0;
 
             memmove(s3_cli_sftp_out, s3_cli_sftp_out + chunk, s3_cli_sftp_out_len - chunk);
@@ -4417,16 +4532,33 @@ s3_cli_sftp_read(s3_event_t *ev)
                 continue;
             }
 
-            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+            if (type == S3_SSH3_MSG_CHANNEL_DATA ||
+                type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
 
-                s3_ssh3_msg_data_t data;
+                s3_str_t payload;
+                s3_int_t rc;
 
-                if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                /* the plain frame gives a view into the receive buffer,
+                 * the compressed one is decoded into the scratch (the
+                 * compression of the channel body, PLAN.md 9, B8) */
+
+                rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_cli_sftp_plain,
+                                              sizeof(s3_cli_sftp_plain), &payload);
+
+                if (rc == S3_ERROR) {
                     pos = msg;
                     break;
                 }
 
-                if (s3_ssh3_sftp_cli_input(&s3_cli_sftp, data.data.data, data.data.len) != S3_OK) {
+                if (rc != S3_OK) {
+                    s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp payload does not decode");
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                    s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
+                                                "sftp payload decode error");
+                    return;
+                }
+
+                if (s3_ssh3_sftp_cli_input(&s3_cli_sftp, payload.data, payload.len) != S3_OK) {
                     s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp protocol violation");
                     s3_cli_rc = S3_CLI_EXIT_ERROR;
                     s3_quic_finalize_connection(((s3_quic_stream_t *)sc->data)->parent, 0,
@@ -12123,7 +12255,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "46AC:D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
+    while ((opt = getopt(argc, argv, "46ACD:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
@@ -12435,7 +12567,11 @@ main(int argc, char **argv)
             break;
 
         case 'C':
-            s3_cli_note("ssh3: compression is not supported by ssh3, ignoring");
+            /* the compression of the channel body (PLAN.md 9, B8): the
+             * flag asks for it, the peer decides whether it happens
+             * (the capability of its version string) */
+
+            s3_cli_compress_flag = 1;
             break;
 
         case 'V':

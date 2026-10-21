@@ -24,6 +24,16 @@
 #define S3_SSH3_MSG_CHANNEL_EXTENDED_DATA     95
 #define S3_SSH3_MSG_CHANNEL_REQUEST           98
 
+/*
+ * the compressed channel data (PLAN.md 9, B8): the type number sits in
+ * the RFC 4253 private range (192-255), so the extension does not
+ * collide with the SSH2 numbering (93, 96, 97, 99 and 100 stay the
+ * unused SSH2 constants).  the body is the algorithm id and the
+ * compressed payload
+ */
+
+#define S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED 192
+
 /* the data types of the channel extended data message */
 
 #define S3_SSH3_EXTENDED_DATA_NONE   0
@@ -47,6 +57,17 @@ typedef struct {
     uint64_t data_type;
     s3_str_t data;
 } s3_ssh3_msg_extended_data_t;
+
+/*
+ * the compressed channel data: the algorithm id tells the peer how to
+ * decode the payload, the payload is the compressed form of the plain
+ * channel data
+ */
+
+typedef struct {
+    uint64_t algorithm;
+    s3_str_t data;
+} s3_ssh3_msg_compressed_data_t;
 
 /*
  * the envelope of the channel request message: the body stays a raw
@@ -73,6 +94,8 @@ uintptr_t s3_ssh3_msg_encode_data(u_char *p, const s3_ssh3_msg_data_t *m);
 
 uintptr_t s3_ssh3_msg_encode_extended_data(u_char *p, const s3_ssh3_msg_extended_data_t *m);
 
+uintptr_t s3_ssh3_msg_encode_compressed_data(u_char *p, const s3_ssh3_msg_compressed_data_t *m);
+
 uintptr_t s3_ssh3_msg_encode_request(u_char *p, const s3_ssh3_msg_request_t *m);
 
 /*
@@ -92,6 +115,9 @@ s3_int_t s3_ssh3_msg_parse_data(const u_char **pos, const u_char *end, s3_ssh3_m
 
 s3_int_t s3_ssh3_msg_parse_extended_data(const u_char **pos, const u_char *end,
                                          s3_ssh3_msg_extended_data_t *m);
+
+s3_int_t s3_ssh3_msg_parse_compressed_data(const u_char **pos, const u_char *end,
+                                           s3_ssh3_msg_compressed_data_t *m);
 
 s3_int_t s3_ssh3_msg_parse_request(const u_char **pos, const u_char *end, s3_ssh3_msg_request_t *m);
 

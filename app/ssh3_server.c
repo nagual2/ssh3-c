@@ -76,6 +76,8 @@
 #include <s3_ssh3_auth_jwt.h>
 #include <s3_ssh3_auth_srv.h>
 #include <s3_ssh3_channel.h>
+#include <s3_ssh3_compress.h>
+#include <s3_ssh3_frame.h>
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_dos_guard.h>
 #include <s3_ssh3_forward.h>
@@ -1446,6 +1448,15 @@ struct s3_srv_h3_channel_s {
     s3_event_t         fwd_timer;
 
     /*
+     * the scratch of the decoded payload: the compressed frames of the
+     * channel body (PLAN.md 9, B8) decode into it, the plain frames do
+     * not touch it; it grows with the first compressed frame
+     */
+
+    u_char            *fwd_plain;
+    size_t             fwd_plain_cap;
+
+    /*
      * the server-initiated channels (the agent bridge, the reverse
      * forward): the 91 of the client answers the opener header (the
      * consume sits in the message loop), the reverse_fwd flag counts
@@ -1758,7 +1769,17 @@ s3_srv_h3_send_status(unsigned code)
 
     {
         s3_str_t name = s3_string("server");
-        s3_str_t value = s3_string(S3_SSH3_VERSION_STRING);
+        u_char   version[192];
+        size_t   version_len;
+        s3_str_t value;
+
+        /* the runtime version string: the capability field of the
+         * compression rides it (PLAN.md 9, B8) */
+
+        version_len = s3_ssh3_version_string(version, sizeof(version) - 1);
+
+        value.data = version;
+        value.len = version_len;
 
         p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
     }
@@ -2792,6 +2813,7 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
     free(ch->buf);
     free(ch->fwd_in);
     free(ch->fwd_out);
+    free(ch->fwd_plain);
 
     s3_memzero(ch, sizeof(*ch));
 }
@@ -5928,12 +5950,36 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 break;
             }
 
-            if (type == S3_SSH3_MSG_CHANNEL_DATA) {
-                s3_ssh3_msg_data_t msg_data;
+            if (type == S3_SSH3_MSG_CHANNEL_DATA ||
+                type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
+                s3_str_t msg_data;
+                s3_int_t rc;
 
-                if (s3_ssh3_msg_parse_data(&pos, end, &msg_data) != S3_OK) {
+                /*
+                 * the compressed frames decode into the per-channel
+                 * scratch (the compression of the channel body,
+                 * PLAN.md 9, B8); the plain frames give a view into the
+                 * receive buffer and do not touch the scratch
+                 */
+
+                if (type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED && ch->fwd_plain == NULL) {
+                    ch->fwd_plain = malloc(S3_SRV_CHANNEL_MAX_PACKET + 1024);
+                    ch->fwd_plain_cap =
+                        (ch->fwd_plain != NULL) ? S3_SRV_CHANNEL_MAX_PACKET + 1024 : 0;
+                }
+
+                rc = s3_ssh3_frame_data_parse(&pos, end, type, ch->fwd_plain, ch->fwd_plain_cap,
+                                              &msg_data);
+
+                if (rc == S3_ERROR) {
                     pos = msg;
                     break;
+                }
+
+                if (rc != S3_OK) {
+                    fprintf(stderr, "ssh3-server: the channel payload does not decode\n");
+                    s3_srv_h3_channel_cancel(ch, "the payload does not decode");
+                    return;
                 }
 
                 if (ch->fwd_kind == S3_SRV_FWD_RCTRL) {
@@ -5950,7 +5996,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                         return;
                     }
 
-                    s3_srv_reverse_request(ch, &msg_data.data);
+                    s3_srv_reverse_request(ch, &msg_data);
 
                     /* the refusal freed the channel, the bind stays */
 
@@ -5967,7 +6013,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                      * (the tcp target or the accepted agent socket) */
 
                     if (s3_srv_fwd_append(&ch->fwd_in, &ch->fwd_in_cap, &ch->fwd_in_len,
-                                          msg_data.data.data, msg_data.data.len) != S3_OK) {
+                                          msg_data.data, msg_data.len) != S3_OK) {
                         fprintf(stderr, "ssh3-server: forward buffer growth failed\n");
                         s3_srv_h3_channel_free(ch);
                         return;
@@ -5991,7 +6037,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                      * stdin, the pump drains both directions */
 
                     if (s3_srv_fwd_append(&ch->fwd_in, &ch->fwd_in_cap, &ch->fwd_in_len,
-                                          msg_data.data.data, msg_data.data.len) != S3_OK) {
+                                          msg_data.data, msg_data.len) != S3_OK) {
                         fprintf(stderr, "ssh3-server: sftp buffer growth failed\n");
                         s3_srv_h3_channel_free(ch);
                         return;
@@ -6015,16 +6061,16 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                         size_t z;
 
-                        fprintf(stderr, "sftpsrv in %zu:", msg_data.data.len);
+                        fprintf(stderr, "sftpsrv in %zu:", msg_data.len);
 
-                        for (z = 0; z < msg_data.data.len && z < 24; z++) {
-                            fprintf(stderr, " %02x", msg_data.data.data[z]);
+                        for (z = 0; z < msg_data.len && z < 24; z++) {
+                            fprintf(stderr, " %02x", msg_data.data[z]);
                         }
 
                         fprintf(stderr, "\n");
                     }
 
-                    if (s3_ssh3_sftp_srv_input(ch->sftp, msg_data.data.data, msg_data.data.len) !=
+                    if (s3_ssh3_sftp_srv_input(ch->sftp, msg_data.data, msg_data.len) !=
                         S3_OK) {
                         fprintf(stderr, "ssh3-server: sftp input failed\n");
                     }
@@ -6050,9 +6096,8 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                      * (the plain -C ping)
                      */
 
-                    if (msg_data.data.len == strlen(S3_SSH3_AGENT_TRIGGER) &&
-                        s3_memcmp(msg_data.data.data, S3_SSH3_AGENT_TRIGGER, msg_data.data.len) ==
-                            0) {
+                    if (msg_data.len == strlen(S3_SSH3_AGENT_TRIGGER) &&
+                        s3_memcmp(msg_data.data, S3_SSH3_AGENT_TRIGGER, msg_data.len) == 0) {
 
                         if (s3_srv_agent_listen(ch) != S3_OK) {
                             fprintf(stderr, "ssh3-server: agent listen failed\n");
@@ -6064,8 +6109,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                 else if (ch->sess != NULL && ch->sess->open) {
 
-                    if (s3_ssh3_session_srv_input(ch->sess, msg_data.data.data,
-                                                  msg_data.data.len) != S3_OK) {
+                    if (s3_ssh3_session_srv_input(ch->sess, msg_data.data, msg_data.len) != S3_OK) {
                         fprintf(stderr, "ssh3-server: session input failed\n");
                     }
 
@@ -6079,7 +6123,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                 /* the echo mode: the data goes back unchanged */
 
-                if (s3_srv_h3_channel_echo(sc, msg_data.data.data, msg_data.data.len) != S3_OK) {
+                if (s3_srv_h3_channel_echo(sc, msg_data.data, msg_data.len) != S3_OK) {
                     s3_srv_h3_channel_cancel(ch, "echo send stalled");
                     return;
                 }
