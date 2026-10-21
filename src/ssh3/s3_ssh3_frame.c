@@ -81,7 +81,10 @@ s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, uint32_t al
     memmove(p, buf + S3_SSH3_FRAME_COMPRESSED_ROOM, packed_len);
 
     *frame_len = (size_t)(p - buf) + packed_len;
-    *wire_len = packed_len;
+
+    if (wire_len != NULL) {
+        *wire_len = packed_len;
+    }
 
     return S3_OK;
 
@@ -97,7 +100,10 @@ plain:
     s3_memcpy(p, payload, payload_len);
 
     *frame_len = plain_len;
-    *wire_len = payload_len;
+
+    if (wire_len != NULL) {
+        *wire_len = payload_len;
+    }
 
     return S3_OK;
 }

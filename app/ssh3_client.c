@@ -481,6 +481,7 @@ static unsigned           s3_cli_sftp_parked; /* the flush parks on the stream w
 /* the in-flight 94 frame (the tail parks, the write event retries) */
 
 static u_char s3_cli_sftp_frame[S3_CLI_SFTP_FRAME];
+
 static size_t s3_cli_sftp_frame_sent;
 static size_t s3_cli_sftp_frame_total;
 
@@ -520,6 +521,11 @@ static unsigned s3_cli_ch_confirmed;
  * frame below the channel maxPacketSize) */
 
 #define S3_CLI_FWD_FRAME 33000
+
+/* the scratch of the decoded forward payload (the compressed frames of
+ * the channel body, PLAN.md 9, B8) */
+
+static u_char s3_cli_fwd_plain[S3_CLI_FWD_FRAME + 1024];
 
 /* the local read chunk and the parked caps of one bridge */
 
@@ -5272,7 +5278,6 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
 
         if (fc->frame_sent == fc->frame_total) {
 
-            u_char *p;
             size_t  chunk =
                 s3_ssh3_channel_chunk_size(fc->peer_mps ? fc->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
@@ -5280,12 +5285,19 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
                 chunk = fc->to_chan_len;
             }
 
-            p = fc->frame;
-            p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-            p = (u_char *)s3_ssh3_encode_varint(p, chunk);
-            memcpy(p, fc->to_chan, chunk);
+            /* the frame of the chunk: the compressed form when the
+             * peer can decode it, the plain one otherwise (the
+             * compression of the channel body, PLAN.md 9, B8) */
 
-            fc->frame_total = (size_t)(p - fc->frame) + chunk;
+            if (s3_ssh3_frame_data_build(fc->frame, S3_CLI_FWD_FRAME, &fc->frame_total,
+                                         s3_cli_compress_alg, fc->to_chan, chunk, NULL) != S3_OK) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the forward frame does not fit");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                s3_quic_finalize_connection(((s3_quic_stream_t *)fc->chan->data)->parent, 0,
+                                            "the forward frame does not fit");
+                return;
+            }
+
             fc->frame_sent = 0;
 
             memmove(fc->to_chan, fc->to_chan + chunk, fc->to_chan_len - chunk);
@@ -5453,27 +5465,41 @@ s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
                     continue;
                 }
 
-                if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+                if (type == S3_SSH3_MSG_CHANNEL_DATA ||
+                    type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
 
-                    s3_ssh3_msg_data_t data;
-                    size_t             off = 0;
+                    s3_str_t data;
+                    size_t   off = 0;
+                    s3_int_t rc;
 
                     if (!fc->confirmed) {
                         s3_cli_fwd_tcp_drop(fc);
                         return;
                     }
 
-                    if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                    rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_cli_fwd_plain,
+                                                 sizeof(s3_cli_fwd_plain), &data);
+
+                    if (rc == S3_ERROR) {
                         pos = msg;
                         break;
                     }
 
+                    if (rc != S3_OK) {
+                        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                                     "the forward payload does not decode");
+                        s3_cli_rc = S3_CLI_EXIT_ERROR;
+                        s3_quic_finalize_connection(((s3_quic_stream_t *)fc->chan->data)->parent, 0,
+                                                    "the forward payload decode error");
+                        return;
+                    }
+
                     /* the payload parks or rides the local socket */
 
-                    while (off < data.data.len) {
+                    while (off < data.len) {
 
-                        int m = (int)send(fc->fd, (const char *)data.data.data + off,
-                                          (int)(data.data.len - off), 0);
+                        int m = (int)send(fc->fd, (const char *)data.data + off,
+                                          (int)(data.len - off), 0);
 
                         if (m > 0) {
                             off += (size_t)m;
@@ -5482,22 +5508,20 @@ s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
 
                         /* the local socket blocked: the rest parks */
 
-                        if (fc->to_local_len + (data.data.len - off) > S3_CLI_FWD_PARK_MAX) {
+                        if (fc->to_local_len + (data.len - off) > S3_CLI_FWD_PARK_MAX) {
                             s3_cli_fwd_tcp_drop(fc);
                             return;
                         }
 
                         if (s3_cli_fwd_park_grow(&fc->to_local, &fc->to_local_cap,
-                                                 fc->to_local_len + (data.data.len - off)) !=
-                            S3_OK) {
+                                                 fc->to_local_len + (data.len - off)) != S3_OK) {
                             s3_cli_fwd_tcp_drop(fc);
                             return;
                         }
 
-                        memcpy(fc->to_local + fc->to_local_len, data.data.data + off,
-                               data.data.len - off);
-                        fc->to_local_len += data.data.len - off;
-                        off = data.data.len;
+                        memcpy(fc->to_local + fc->to_local_len, data.data + off, data.len - off);
+                        fc->to_local_len += data.len - off;
+                        off = data.len;
                     }
 
                     continue;

@@ -1350,6 +1350,14 @@ typedef struct {
     uint64_t  conv_id;
     unsigned  responded;
 
+    /*
+     * the compression of the channel body (PLAN.md 9, B8): the
+     * algorithm negotiated with the peer - the peer announced the
+     * codecs it can decode in the version string of its CONNECT
+     */
+
+    uint32_t  compress_alg;
+
     u_char    method[32];
     size_t    method_len;
     u_char    protocol[32];
@@ -1516,6 +1524,7 @@ struct s3_srv_h3_channel_s {
      * the RUDP per-peer datagram channel)
      */
     unsigned           fwd_kind; /* S3_SRV_FWD_NONE/TCP/UDP/AGENT/RCTRL/RUDP */
+    uint32_t           compress_alg; /* the negotiated codec of the channel body */
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
     struct sockaddr_in fwd_sa;
@@ -2527,6 +2536,19 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
      * daemon identity there */
 
     s3_srv_auth_user[0] = '\0';
+
+    /*
+     * the compression of the channel body (PLAN.md 9, B8): the peer
+     * announced the codecs it can decode in the version string of its
+     * CONNECT, the intersection with the local codecs picks the one
+     * the channels of this connection ride
+     */
+
+    pa->compress_alg = S3_SSH3_COMPRESS_NONE;
+
+    if (pa->ua_len > 0 && s3_ssh3_version_parse(pa->ua, pa->ua_len, &ver) == S3_OK) {
+        pa->compress_alg = s3_ssh3_compress_choose(ver.compress_mask);
+    }
 
     /* RFC 9220: :protocol marks an extended CONNECT, the :path route
      * is the configured --url-path (the reference -url-path); the
@@ -3552,14 +3574,15 @@ s3_srv_fwd_flush(s3_srv_h3_channel_t *ch)
                 chunk = ch->fwd_out_len;
             }
 
-            {
-                u_char *p = frame;
+            /* the frame of the chunk: the compressed form when the
+             * peer can decode it, the plain one otherwise (the
+             * compression of the channel body, PLAN.md 9, B8) */
 
-                p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-                p = (u_char *)s3_ssh3_encode_varint(p, chunk);
-                s3_memcpy(p, ch->fwd_out, chunk);
-
-                ch->fwd_frame_total = (size_t)(p - frame) + chunk;
+            if (s3_ssh3_frame_data_build(frame, sizeof(frame), &ch->fwd_frame_total,
+                                         ch->compress_alg, ch->fwd_out, chunk, NULL) != S3_OK) {
+                fprintf(stderr, "ssh3-server: the forward frame does not fit\n");
+                s3_srv_h3_channel_cancel(ch, "the forward frame does not fit");
+                return;
             }
 
             ch->fwd_frame_sent = 0;
@@ -6480,6 +6503,18 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
     s3_memzero(ch, sizeof(*ch));
     ch->sc = sc;
     ch->pc = ((s3_quic_stream_t *)sc->data)->parent;
+
+    /*
+     * the compression of the channel body (PLAN.md 9, B8): the codec
+     * negotiated with the peer rides the channel (the peer's
+     * capability came with the version string of its CONNECT)
+     */
+
+    {
+        s3_srv_preauth_t *pa = s3_srv_preauth_find(ch->pc);
+
+        ch->compress_alg = (pa != NULL) ? pa->compress_alg : S3_SSH3_COMPRESS_NONE;
+    }
 
     /* the fd fields start closed: the memzero zeros turn into the
      * fd 0 closes of the free path (the stdin of the daemon died
