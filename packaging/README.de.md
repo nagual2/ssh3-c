@@ -1,9 +1,9 @@
-# packaging — Distributionspakete für ssh3-server
+# packaging — Distributionspakete für ssh3
 > Languages: [EN](README.md) · [RU](README.ru.md) · DE (this file)
 
-Baut die Distributionspakete für den `ssh3-server`-Daemon aus dem Binary
-`build/linux-release/ssh3-server` (fehlt es, wird es bei Bedarf über das
-Preset `linux-release` gebaut).
+Baut die Distributionspakete für den `ssh3-server`-Daemon und den
+`ssh3`-Client aus den Binaries in `build/linux-release/` (fehlen sie,
+werden sie bei Bedarf über das Preset `linux-release` gebaut).
 
 ## Aufbau
 
@@ -11,8 +11,8 @@ Preset `linux-release` gebaut).
 |------|----------|
 | `build.sh` | the orchestrator: `bash packaging/build.sh [deb\|rpm\|apk\|all]` |
 | `deb/` | debian control, postinst, copyright payloads |
-| `rpm/` | rpm spec template (`@VERSION@` substituted from the binary) |
-| `apk/` | apk-tools v2 `.PKGINFO` template |
+| `rpm/` | rpm spec template: die Pakete `ssh3-server` und `ssh3-client` (`@VERSION@` substituted from the binary) |
+| `apk/` | apk-tools-v2-`.PKGINFO`-Vorlagen: `PKGINFO.in` (Server) und `PKGINFO-client.in` (Client) |
 | `openwrt/` | openwrt feed makefile (built inside the openwrt SDK, not here) |
 | `_build/` | final packages (gitignored, never committed) |
 
@@ -31,6 +31,59 @@ fertigen Pakete landen in `packaging/_build/`.
 Die Paketversion wird aus dem Daemon selbst gelesen (`ssh3-server -V`);
 `deb/control` trägt die Version wörtlich und `build.sh` gleicht sie mit
 dem Binary ab. Die rpm/apk-Vorlagen werden zur Build-Zeit substituiert.
+Die Client-Hälfte wird ebenfalls geprüft: `ssh3 -V` nennt ihre eigene
+Version (`ssh3 version SSH 3.0 ssh3-c X.Y.Z ...`), und `build.sh`
+verweigert das Packen eines Clients, dessen Version von der des Daemons
+abweicht — beide Hälften gehen als ein Release raus.
+
+## Die Pakete
+
+Der Split folgt der openssh-Kanon und dem debian-Quellpaket
+(`debian/control`): Daemon und CLI sind zwei Pakete derselben Version;
+der Client eines serverlosen Hosts braucht keinen Daemon und der Daemon
+keinen Client.
+
+| Format | Pakete | Inhalt der Client-Hälfte |
+|--------|--------|---------------------------|
+| deb | `ssh3-server`, `ssh3-client`, `ssh3c-libssl3` | `/usr/bin/ssh3`, `ssh3(1)` |
+| rpm | `ssh3-server`, `ssh3-client` (eine Spec, zwei Pakete) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+| apk | `ssh3-server`, `ssh3-client` (zwei `.PKGINFO`-Vorlagen) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+
+Die rpm-Spec baut beide Pakete in einem `rpmbuild`-Durchgang: der Daemon
+ist das Hauptpaket (`%{_sbindir}/ssh3-server`), der Client das Teilpaket
+`%package -n ssh3-client` (`%{_bindir}/ssh3` plus die Man-Seite). Der
+Drop-in-Tanz gegen den go-Fork folgt der deb-Seite: der Client konfligiert
+mit (und obsoletiert) `ssh3-go-client`, der Daemon mit beiden,
+`ssh3-go-client` und `ssh3-go-server`.
+
+Die Man-Seite des Clients ist dieselbe Datei, die das debian-Quellpaket
+installiert: `debian/ssh3.1` (mdoc). Für apk gibt es keine eigene
+Vorlage — die Seite wird in den Payload gepackt.
+
+Die Architektur von rpm und apk folgt dem `ARCH`-Schalter in `build.sh`
+(`amd64` -> x86_64, `arm64` -> aarch64); die arm64-Binaries selbst sind
+der B7-Punkt des Plans.
+
+## Das apk-Paket (APKv2)
+
+Das apk-Paket sind zwei aneinandergehängte gzip-Streams: das
+Control-Segment (`.PKGINFO`) und das Data-Segment (der Payload). Zwei
+Details sind nicht offensichtlich und wurden gegen das echte apk-tools
+(2.14, alpine-3.22-Container) verifiziert:
+
+1. das tar beider Segmente ist das POSIX-ustar (`tar --format=ustar`):
+   apk-tools hat einen eigenen tar-Parser und weist das GNU-Format (die
+   Magic `ustar  `) mit „BAD archive" ab;
+2. das Control-Segment darf das tar-End-of-archive-Zeichen (die zwei
+   leeren Header) NICHT tragen: apk-tools v2 parst ein Control-Segment
+   mit diesem Zeichen falsch und weist das ganze Paket mit „BAD
+   archive" ab — die alpine-Pakete schneiden das Zeichen genauso ab,
+   ihr Segment endet direkt nach dem `.PKGINFO`-Eintrag. `build.sh`
+   schneidet es mit `truncate` ab.
+
+Das Data-Segment behält das Zeichen (dort toleriert apk es). Die
+Control-Vorlage trägt auch den Platzhalter `@APKARCH@` — substituiert aus
+demselben `ARCH`-Schalter wie im rpm.
 
 ## Zielmatrix (OpenSSL >= 3.5 mit der QUIC-TLS-API)
 
@@ -115,7 +168,13 @@ entfernen weiterhin den Build-RUNPATH und erwarten das System-OpenSSL
 2. Das apk-Paket wird von Hand zusammengesetzt (zwei aneinandergehängte
    tar.gz-Streams, apk-tools v2); ein echtes alpine-Paket muss gegen
    musl in einer alpine-Umgebung gebaut werden — das ausgelieferte
-   Binary ist gegen glibc gelinkt.
+   Binary ist gegen glibc gelinkt. Das Format selbst ist verifiziert:
+   `apk verify` akzeptiert beide Pakete, `apk add --allow-untrusted`
+   installiert sie (die Dateien landen an Ort und Stelle); die Abhängigkeit
+   `so:libssl.so.3` ist in einem nackten alpine-Container nicht
+   auflösbar (alpine 3.22 splittet die Bibliothek in `libssl3`/`libcrypto3`),
+   also zählt apk eine unaufgelöste Abhängigkeit pro Paket — genau wie beim
+   alten Serverpaket.
 3. Weder das apk noch das rpm sind signiert (kein Signaturschlüssel im
    Baum); unsignierte apk-Pakete installieren mit
    `apk add --allow-untrusted`.

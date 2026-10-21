@@ -1,9 +1,9 @@
-# packaging - distribution packages for ssh3-server
+# packaging - distribution packages for ssh3
 > Languages: EN (this file) · [RU](README.ru.md) · [DE](README.de.md)
 
-Assembles the distribution packages for the `ssh3-server` daemon from the
-`build/linux-release/ssh3-server` binary (built on demand via the
-`linux-release` preset when missing).
+Assembles the distribution packages for the `ssh3-server` daemon and the
+`ssh3` client from the `build/linux-release/` binaries (built on demand
+via the `linux-release` preset when missing).
 
 ## Layout
 
@@ -11,8 +11,8 @@ Assembles the distribution packages for the `ssh3-server` daemon from the
 |------|----------|
 | `build.sh` | the orchestrator: `bash packaging/build.sh [deb\|rpm\|apk\|all]` |
 | `deb/` | debian control, postinst, copyright payloads |
-| `rpm/` | rpm spec template (`@VERSION@` substituted from the binary) |
-| `apk/` | apk-tools v2 `.PKGINFO` template |
+| `rpm/` | rpm spec template: the `ssh3-server` and the `ssh3-client` packages (`@VERSION@` substituted from the binary) |
+| `apk/` | apk-tools v2 `.PKGINFO` templates: `PKGINFO.in` (the server) and `PKGINFO-client.in` (the client) |
 | `openwrt/` | openwrt feed makefile (built inside the openwrt SDK, not here) |
 | `_build/` | final packages (gitignored, never committed) |
 
@@ -31,6 +31,58 @@ everything 0777) cannot provide. Only the final packages land in
 The package version is parsed from the daemon itself (`ssh3-server -V`);
 `deb/control` carries the version literally and `build.sh` cross-checks it
 against the binary. The rpm/apk templates are substituted at build time.
+The client half is cross-checked too: `ssh3 -V` announces its own version
+(`ssh3 version SSH 3.0 ssh3-c X.Y.Z ...`) and `build.sh` refuses to pack a
+client whose version differs from the daemon's - the two halves ship as one
+release.
+
+## The packages
+
+The split follows the openssh canon and the debian source package
+(`debian/control`): the daemon and the CLI are two packages of the same
+version, the client of a serverless host needs no daemon and the daemon
+needs no client.
+
+| Format | Packages | Payload of the client half |
+|--------|----------|---------------------------|
+| deb | `ssh3-server`, `ssh3-client`, `ssh3c-libssl3` | `/usr/bin/ssh3`, `ssh3(1)` |
+| rpm | `ssh3-server`, `ssh3-client` (one spec, two packages) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+| apk | `ssh3-server`, `ssh3-client` (two `.PKGINFO` templates) | `/usr/bin/ssh3`, `/usr/share/man/man1/ssh3.1.gz` |
+
+The rpm spec builds both packages in one `rpmbuild` run: the daemon is the
+main package (`%{_sbindir}/ssh3-server`), the client is the subpackage
+`%package -n ssh3-client` (`%{_bindir}/ssh3` plus the man page). The
+drop-in dance against the go fork follows the deb side: the client
+conflicts with (and obsoletes) `ssh3-go-client`, the daemon with both
+`ssh3-go-client` and `ssh3-go-server`.
+
+The client man page is the same file the debian source package installs:
+`debian/ssh3.1` (mdoc). The apk side has no separate template for it -
+the page is gzipped into the package payload.
+
+The architecture of the rpm and the apk follows the `ARCH` switch of
+`build.sh` (`amd64` -> x86_64, `arm64` -> aarch64); the arm64 binaries
+themselves are the B7 item of the plan.
+
+## The apk package (APKv2)
+
+The apk package is two concatenated gzip streams: the control segment
+(`.PKGINFO`) and the data segment (the payload). Two details are not
+obvious and were verified against the real apk-tools (2.14, an alpine 3.22
+container):
+
+1. the tar of both segments is the POSIX ustar (`tar --format=ustar`):
+   apk-tools has its own tar parser and rejects the GNU format (the
+   `ustar  ` magic) with "BAD archive";
+2. the control segment must NOT carry the tar end-of-archive marker (the
+   two empty headers): apk-tools v2 mis-parses a control segment with the
+   marker and rejects the whole package with "BAD archive" - the alpine
+   packages have the marker cut off the same way, their segment ends right
+   after the `.PKGINFO` entry. `build.sh` cuts it off with `truncate`.
+
+The data segment keeps the marker (apk tolerates it there). The control
+template also carries the `@APKARCH@` placeholder - substituted from the
+same `ARCH` switch as the rpm.
 
 ## Target matrix (OpenSSL >= 3.5 with the QUIC TLS API)
 
@@ -160,7 +212,13 @@ template straight from the source/build tree.
    apk still strip the RUNPATH and require the system OpenSSL 3.5.
 2. The apk package is assembled by hand (two concatenated tar.gz streams,
    apk-tools v2); a real alpine package must be built against musl inside
-   an alpine environment - the shipped binary is glibc-linked.
+   an alpine environment - the shipped binary is glibc-linked. The format
+   itself is verified: `apk verify` accepts both packages and `apk add
+   --allow-untrusted` installs them (the files land in place); the
+   `so:libssl.so.3` dependency is not resolvable in a plain alpine
+   container (alpine 3.22 splits the library into `libssl3`/`libcrypto3`),
+   so apk counts one unresolved dependency per package - the same for the
+   old server package.
 3. Neither the apk nor the rpm is signed (no signing key in the tree);
    unsigned apk packages install with `apk add --allow-untrusted`.
 4. The openwrt ipk is a feed makefile stub: it needs the openwrt SDK with
