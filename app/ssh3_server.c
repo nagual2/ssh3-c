@@ -1358,6 +1358,11 @@ typedef struct {
 
     uint32_t  compress_alg;
 
+    /* the verdict of the CONNECT (200 = the conversation is
+     * authenticated, the reverse forward may bind) */
+
+    unsigned  code;
+
     u_char    method[32];
     size_t    method_len;
     u_char    protocol[32];
@@ -2656,6 +2661,8 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
     } else {
         code = 400;
     }
+
+    pa->code = code;
 
     if (code == 200) {
         s3_srv_report("INTEROP-H3-CONNECT-OK authlen=%zu\n", pa->auth_len);
@@ -5232,6 +5239,25 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     unsigned                   rewritten;
     unsigned                   booked = 0;
     unsigned                   i;
+
+    /*
+     * the gate (the finding of the B3 trace): the bind rides an
+     * authenticated conversation - the CONNECT of the connection must
+     * have answered 200.  Without it a client that opens the CONNECT
+     * stream without a request gets a bind before the authentication,
+     * and the bind lands on the budget of the daemon identity
+     */
+
+    {
+        s3_srv_preauth_t *pa = s3_srv_preauth_find(ch->pc);
+
+        if (pa == NULL || pa->code != 200) {
+            fprintf(stderr, "ssh3-server: the reverse forward wants an authenticated"
+                            " conversation\n");
+            s3_srv_h3_channel_cancel(ch, "the reverse forward needs an authenticated conversation");
+            return;
+        }
+    }
 
     /* the string views ride the channel accumulator: the next recv
      * may move it, everything needed copies before the handler runs */

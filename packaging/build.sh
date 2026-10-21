@@ -214,6 +214,30 @@ set_runpath() {
     patchelf --set-rpath "$BUNDLE_LIB_DIR" "$bin"
 }
 
+# the version of a build: the binary prints it (-V), but a cross build
+# cannot run the binary of a foreign arch - the source carries the
+# same constants, so the fallback reads them there
+version_of() {
+    local bin="$1"
+    local v
+
+    v=$("$bin" -V 2>/dev/null | awk '{print $3}')
+
+    if [ -z "$v" ]; then
+        v=$(awk '
+            /^#define S3_SSH3_SOFTWARE_MAJOR/ { maj = $3 }
+            /^#define S3_SSH3_SOFTWARE_MINOR/ { min = $3 }
+            /^#define S3_SSH3_SOFTWARE_PATCH/ { pat = $3 }
+            END {
+                if (maj != "" && min != "" && pat != "") print maj "." min "." pat
+            }
+        ' "$REPO_DIR/src/ssh3/s3_ssh3_version.h")
+    fi
+
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+}
+
 # the version comes from the daemon itself: -V prints "ssh3-server version X.Y.Z"
 ensure_bin() {
     if [ ! -x "$BIN" ]; then
@@ -221,7 +245,7 @@ ensure_bin() {
         (cd "$REPO_DIR" && cmake --preset linux-release)
         (cd "$REPO_DIR" && cmake --build --preset linux-release)
     fi
-    VERSION=$("$BIN" -V | awk '{print $3}')
+    VERSION=$(version_of "$BIN")
     [ -n "$VERSION" ] || die "cannot parse the version from '$BIN -V'"
     log "packaging ssh3-server $VERSION"
 }
@@ -233,7 +257,7 @@ ensure_client() {
     [ -x "$CLIENT_BIN" ] \
         || die "no client binary at '$CLIENT_BIN' (cmake --build --preset linux-release)"
     local cver
-    cver=$("$CLIENT_BIN" -V | sed -n 's/.*ssh3-c \([0-9][0-9.]*\).*/\1/p')
+    cver=$(version_of "$CLIENT_BIN")
     [ "$cver" = "$VERSION" ] \
         || die "the client binary reports '$cver', the daemon '$VERSION' - the two halves must be the same release"
 }
@@ -346,7 +370,15 @@ build_rpm() {
     # cross toolchain the host does not have - that build stays refused)
     sed -e "s/@VERSION@/$VERSION/" -e "s/@RPMARCH@/$RPM_ARCH/" \
         "$SCRIPT_DIR/rpm/ssh3-server.spec" > "$top/SPECS/ssh3-server.spec"
-    rpmbuild -bb --define "_topdir $top" \
+    # the foreign architecture needs the target hint: rpmbuild refuses
+    # to build a package of an arch the host does not run
+    local target_args=()
+
+    if [ "$RPM_ARCH" != "$(uname -m)" ]; then
+        target_args=(--target "$RPM_ARCH")
+    fi
+
+    rpmbuild -bb "${target_args[@]}" --define "_topdir $top" \
         "$top/SPECS/ssh3-server.spec"
     mv "$top"/RPMS/$RPM_ARCH/ssh3-*.rpm "$OUT_DIR/"
 }
