@@ -337,6 +337,19 @@ static uint64_t         s3_interop_jump_conv_id;
 static uint64_t         s3_interop_jump_ch_id;
 static unsigned         s3_interop_jump_req_sent;
 static unsigned         s3_interop_jump_ch_sent;
+
+/*
+ * the split knob of the CONNECT request (B9): the first half goes out
+ * at once, the second half on a timer - the pause lets another
+ * client's CONNECT land on the server in between
+ */
+
+static s3_event_t      s3_interop_split_timer;
+static u_char          s3_interop_split_tail[1024];
+static size_t          s3_interop_split_tail_len;
+static s3_connection_t *s3_interop_split_stream;
+
+static void s3_interop_split_send(s3_event_t *ev);
 static unsigned         s3_interop_jump_ch_confirmed;
 
 /* the receive accumulator of the jump channel (the 91 confirmation) */
@@ -1253,6 +1266,30 @@ s3_interop_h3_field_l(u_char *p, const char *name, const char *value)
     v.len = strlen(value);
 
     return s3_h3_encode_field_l(p, &n, &v);
+}
+
+/*
+ * the second half of the split CONNECT request (B9): the timer fires
+ * after the pause, the engine has flushed the first half by then
+ */
+
+static void
+s3_interop_split_send(s3_event_t *ev)
+{
+    ssize_t m;
+
+    (void)ev;
+
+    if (s3_interop_split_stream == NULL) {
+        return;
+    }
+
+    m = s3_quic_stream_send(s3_interop_split_stream, s3_interop_split_tail,
+                            s3_interop_split_tail_len);
+
+    if (m != (ssize_t)s3_interop_split_tail_len) {
+        fprintf(stderr, "interop-client: the second half of the request send failed\n");
+    }
 }
 
 static size_t
@@ -8620,21 +8657,63 @@ main(int argc, char **argv)
                     exit(1);
                 }
 
-                m = s3_quic_stream_send(s3_interop_h3_stream, frame, total);
+                if (getenv("S3INTEROP_SPLIT_CONNECT") != NULL) {
 
-                if (m == (ssize_t)S3_AGAIN) {
-                    /* the window opens on the write event, retried next pass */
-                    ;
-                }
+                    /*
+                     * the split knob (B9): the first half of the request
+                     * goes out, the second half on a timer.  A second
+                     * client that connects in between must not touch
+                     * this request's fields - the pre-auth state is per
+                     * connection, and the server proves it here
+                     *
+                     * the pause rides a timer, not a sleep: the engine
+                     * flushes the first half in the event loop, and a
+                     * blocking sleep would hold the flush back
+                     */
 
-                else if (m != (ssize_t)total) {
-                    fprintf(stderr, "interop-client: h3 request send failed\n");
-                    rc = 1;
-                    goto teardown;
-                }
+                    const char *split_env = getenv("S3INTEROP_SPLIT_CONNECT");
+                    long        split_ms = split_env ? atol(split_env) : 1500;
+                    size_t      half = total / 2;
 
-                else {
+                    if (split_ms <= 0) {
+                        split_ms = 1500;
+                    }
+
+                    m = s3_quic_stream_send(s3_interop_h3_stream, frame, half);
+
+                    if (m != (ssize_t)half) {
+                        fprintf(stderr, "interop-client: the first half of the request send failed\n");
+                        rc = 1;
+                        goto teardown;
+                    }
+
+                    s3_memcpy(s3_interop_split_tail, frame + half, total - half);
+                    s3_interop_split_tail_len = total - half;
+                    s3_interop_split_stream = s3_interop_h3_stream;
+
+                    s3_interop_split_timer.handler = s3_interop_split_send;
+                    s3_event_add_timer(&s3_interop_split_timer, (unsigned)split_ms);
+
                     s3_interop_h3_req_sent = 1;
+
+                } else {
+
+                    m = s3_quic_stream_send(s3_interop_h3_stream, frame, total);
+
+                    if (m == (ssize_t)S3_AGAIN) {
+                        /* the window opens on the write event, retried next pass */
+                        ;
+                    }
+
+                    else if (m != (ssize_t)total) {
+                        fprintf(stderr, "interop-client: h3 request send failed\n");
+                        rc = 1;
+                        goto teardown;
+                    }
+
+                    else {
+                        s3_interop_h3_req_sent = 1;
+                    }
                 }
             }
 

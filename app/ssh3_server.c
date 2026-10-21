@@ -1329,46 +1329,128 @@ s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 /*
  * the h3 request side (-3): one bidi stream carries the RFC 9220
  * extended CONNECT, the uni streams belong to the session port.  The
- * harness drives a single request stream at a time, so the state below
- * is static.  The parsed field strings are pool copies (s3_h3_parse.c
- * allocates the literals off the connection pool), the buffers below
- * just snapshot them for the verdict.
+ * pre-auth state is PER CONNECTION: two clients that connect at the
+ * same time must not share the field snapshots - the verdict of one
+ * must not read the fields of the other.  The process-global state
+ * this replaces mixed them (the path of one session with the header
+ * of another).  The parsed field strings are pool copies
+ * (s3_h3_parse.c allocates the literals off the connection pool), the
+ * buffers below just snapshot them for the verdict.
  */
 
-static s3_h3_parse_headers_t s3_srv_h3_parse;
+typedef struct {
+    s3_h3_parse_headers_t parse;
 
-static u_char *s3_srv_h3_buf;
-static size_t  s3_srv_h3_cap;
-static size_t  s3_srv_h3_len;
+    u_char   *buf; /* the request bytes of the CONNECT */
+    size_t    cap;
+    size_t    len;
 
-static s3_connection_t *s3_srv_h3_sc;
-static s3_connection_t *s3_srv_h3_pc; /* the quic conn of the CONNECT */
-static unsigned         s3_srv_h3_responded;
+    s3_connection_t *sc; /* the CONNECT stream */
+    s3_connection_t *pc; /* the quic conn of the CONNECT */
+    uint64_t  conv_id;
+    unsigned  responded;
 
-static u_char s3_srv_h3_method[32];
-static size_t s3_srv_h3_method_len;
-static u_char s3_srv_h3_protocol[32];
-static size_t s3_srv_h3_protocol_len;
-static u_char s3_srv_h3_path[256];
-static size_t s3_srv_h3_path_len;
+    u_char    method[32];
+    size_t    method_len;
+    u_char    protocol[32];
+    size_t    protocol_len;
+    u_char    path[256];
+    size_t    path_len;
+    /*
+     * the Authorization snapshot: the biggest Bearer the CONNECT carries
+     * (an Ed25519 pubkey JWT is ~340 bytes, an RS256 one goes past 600,
+     * an RS256 OIDC id_token rides ~1.2 KB), the 256-byte capture of the
+     * Basic wave truncated it and the verdict failed on the tail
+     */
+    u_char    auth[4096];
+    size_t    auth_len;
+    u_char    ua[128];
+    size_t    ua_len;
+    u_char    authority[256];
+    size_t    authority_len;
+    u_char    scheme[16];
+    size_t    scheme_len;
+
+    u_char    out[512]; /* the response tail pending on the send window */
+    size_t    out_len;
+} s3_srv_preauth_t;
+
 /*
- * the Authorization snapshot: the biggest Bearer the CONNECT carries
- * (an Ed25519 pubkey JWT is ~340 bytes, an RS256 one goes past 600,
- * an RS256 OIDC id_token rides ~1.2 KB), the 256-byte capture of the
- * Basic wave truncated it and the verdict failed on the tail
+ * the pre-auth states of the live connections: the table is the bound
+ * (a connection per slot), the state dies with the connection pool
  */
-static u_char s3_srv_h3_auth[4096];
-static size_t s3_srv_h3_auth_len;
-static u_char s3_srv_h3_ua[128];
-static size_t s3_srv_h3_ua_len;
-static u_char s3_srv_h3_authority[256];
-static size_t s3_srv_h3_authority_len;
-static u_char s3_srv_h3_scheme[16];
-static size_t s3_srv_h3_scheme_len;
 
-/* the response tail pending on the send window */
-static u_char s3_srv_h3_out[512];
-static size_t s3_srv_h3_out_len;
+#define S3_SRV_PREAUTH_MAX 64
+
+static s3_srv_preauth_t *s3_srv_preauth[S3_SRV_PREAUTH_MAX];
+
+static s3_srv_preauth_t *
+s3_srv_preauth_find(s3_connection_t *pc)
+{
+    unsigned i;
+
+    for (i = 0; i < S3_SRV_PREAUTH_MAX; i++) {
+
+        if (s3_srv_preauth[i] != NULL && s3_srv_preauth[i]->pc == pc) {
+            return s3_srv_preauth[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* the state dies with the connection pool */
+
+static void
+s3_srv_preauth_gone(void *data)
+{
+    s3_srv_preauth_t **slot = data;
+
+    if (*slot != NULL) {
+
+        free((*slot)->buf);
+        free(*slot);
+
+        *slot = NULL;
+    }
+}
+
+static s3_srv_preauth_t *
+s3_srv_preauth_create(s3_connection_t *pc)
+{
+    s3_pool_cleanup_t *cln;
+    unsigned           i;
+
+    for (i = 0; i < S3_SRV_PREAUTH_MAX && s3_srv_preauth[i] != NULL; i++)
+        ;
+
+    if (i == S3_SRV_PREAUTH_MAX) {
+        return NULL;
+    }
+
+    s3_srv_preauth[i] = calloc(1, sizeof(s3_srv_preauth_t));
+
+    if (s3_srv_preauth[i] == NULL) {
+        return NULL;
+    }
+
+    s3_srv_preauth[i]->pc = pc;
+
+    cln = s3_pool_cleanup_add(pc->pool, 0);
+
+    if (cln == NULL) {
+
+        free(s3_srv_preauth[i]);
+        s3_srv_preauth[i] = NULL;
+
+        return NULL;
+    }
+
+    cln->data = &s3_srv_preauth[i];
+    cln->handler = s3_srv_preauth_gone;
+
+    return s3_srv_preauth[i];
+}
 
 /*
  * the ssh3 session channels (-3): every bidi stream after the CONNECT
@@ -1622,8 +1704,16 @@ s3_srv_teardown_channels(void)
     s3_srv_reverse_teardown();
 }
 
-/* the StreamID of the CONNECT stream, the channels must quote it */
-static uint64_t s3_srv_h3_conv_id;
+/* the StreamID of the CONNECT stream of a connection: the channels
+ * must quote it, and the conversation of a connection is its own */
+
+static uint64_t
+s3_srv_h3_conv_id_of(s3_connection_t *pc)
+{
+    s3_srv_preauth_t *pa = s3_srv_preauth_find(pc);
+
+    return (pa != NULL) ? pa->conv_id : 0;
+}
 
 /* one echo frame: varint 94 + SSHString, capped by the maxPacketSize */
 static u_char s3_srv_h3_ch_out[32768];
@@ -1645,7 +1735,7 @@ s3_srv_h3_store(u_char *dst, size_t size, size_t *len, s3_str_t *value)
 }
 
 static void
-s3_srv_h3_capture(s3_h3_parse_field_t *f)
+s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
 {
     static s3_str_t method = s3_string(":method");
     static s3_str_t protocol = s3_string(":protocol");
@@ -1656,30 +1746,30 @@ s3_srv_h3_capture(s3_h3_parse_field_t *f)
     static s3_str_t scheme = s3_string(":scheme");
 
     if (f->name.len == method.len && s3_memcmp(f->name.data, method.data, method.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_method, sizeof(s3_srv_h3_method), &s3_srv_h3_method_len,
+        s3_srv_h3_store(pa->method, sizeof(pa->method), &pa->method_len,
                         &f->value);
 
     } else if (f->name.len == protocol.len &&
                s3_memcmp(f->name.data, protocol.data, protocol.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_protocol, sizeof(s3_srv_h3_protocol), &s3_srv_h3_protocol_len,
+        s3_srv_h3_store(pa->protocol, sizeof(pa->protocol), &pa->protocol_len,
                         &f->value);
 
     } else if (f->name.len == path.len && s3_memcmp(f->name.data, path.data, path.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_path, sizeof(s3_srv_h3_path), &s3_srv_h3_path_len, &f->value);
+        s3_srv_h3_store(pa->path, sizeof(pa->path), &pa->path_len, &f->value);
 
     } else if (f->name.len == auth.len && s3_memcmp(f->name.data, auth.data, auth.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_auth, sizeof(s3_srv_h3_auth), &s3_srv_h3_auth_len, &f->value);
+        s3_srv_h3_store(pa->auth, sizeof(pa->auth), &pa->auth_len, &f->value);
 
     } else if (f->name.len == ua.len && s3_memcmp(f->name.data, ua.data, ua.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_ua, sizeof(s3_srv_h3_ua), &s3_srv_h3_ua_len, &f->value);
+        s3_srv_h3_store(pa->ua, sizeof(pa->ua), &pa->ua_len, &f->value);
 
     } else if (f->name.len == authority.len &&
                s3_memcmp(f->name.data, authority.data, authority.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_authority, sizeof(s3_srv_h3_authority), &s3_srv_h3_authority_len,
+        s3_srv_h3_store(pa->authority, sizeof(pa->authority), &pa->authority_len,
                         &f->value);
 
     } else if (f->name.len == scheme.len && s3_memcmp(f->name.data, scheme.data, scheme.len) == 0) {
-        s3_srv_h3_store(s3_srv_h3_scheme, sizeof(s3_srv_h3_scheme), &s3_srv_h3_scheme_len,
+        s3_srv_h3_store(pa->scheme, sizeof(pa->scheme), &pa->scheme_len,
                         &f->value);
     }
 
@@ -1716,14 +1806,14 @@ s3_srv_h3_put_status(u_char *p, unsigned code)
 }
 
 static void
-s3_srv_h3_flush(void)
+s3_srv_h3_flush(s3_srv_preauth_t *pa)
 {
-    s3_connection_t *sc = s3_srv_h3_sc;
+    s3_connection_t *sc = pa->sc;
     ssize_t          m;
 
-    while (s3_srv_h3_out_len > 0) {
+    while (pa->out_len > 0) {
 
-        m = s3_quic_stream_send(sc, s3_srv_h3_out, s3_srv_h3_out_len);
+        m = s3_quic_stream_send(sc, pa->out, pa->out_len);
 
         if (m == (ssize_t)S3_AGAIN) {
             return;
@@ -1731,17 +1821,17 @@ s3_srv_h3_flush(void)
 
         if (m <= 0) {
             fprintf(stderr, "ssh3-server: h3 response send failed\n");
-            s3_srv_h3_out_len = 0;
+            pa->out_len = 0;
             return;
         }
 
-        s3_memmove(s3_srv_h3_out, s3_srv_h3_out + m, s3_srv_h3_out_len - m);
-        s3_srv_h3_out_len -= m;
+        s3_memmove(pa->out, pa->out + m, pa->out_len - m);
+        pa->out_len -= m;
     }
 }
 
 static void
-s3_srv_h3_send_status(unsigned code)
+s3_srv_h3_send_status(s3_srv_preauth_t *pa, unsigned code)
 {
     u_char  sec[512];
     u_char *p;
@@ -1786,19 +1876,19 @@ s3_srv_h3_send_status(unsigned code)
 
     sec_len = (size_t)(p - sec);
 
-    s3_srv_h3_out[0] = S3_H3_FRAME_HEADERS;
+    pa->out[0] = S3_H3_FRAME_HEADERS;
 
-    p = (u_char *)s3_h3_encode_varlen_int(s3_srv_h3_out + 1, sec_len);
+    p = (u_char *)s3_h3_encode_varlen_int(pa->out + 1, sec_len);
 
     memcpy(p, sec, sec_len);
 
-    total = (size_t)(p - s3_srv_h3_out) + sec_len;
+    total = (size_t)(p - pa->out) + sec_len;
 
-    m = s3_quic_stream_send(s3_srv_h3_sc, s3_srv_h3_out, total);
+    m = s3_quic_stream_send(pa->sc, pa->out, total);
 
     if (m == (ssize_t)S3_AGAIN) {
         /* the window opens on the write event, the tail is queued */
-        s3_srv_h3_out_len = total;
+        pa->out_len = total;
         return;
     }
 
@@ -1808,8 +1898,8 @@ s3_srv_h3_send_status(unsigned code)
     }
 
     if ((size_t)m < total) {
-        s3_memmove(s3_srv_h3_out, s3_srv_h3_out + m, total - m);
-        s3_srv_h3_out_len = total - m;
+        s3_memmove(pa->out, pa->out + m, total - m);
+        pa->out_len = total - m;
     }
 }
 
@@ -1943,13 +2033,13 @@ s3_srv_passfile_has_user(const char *path, const s3_str_t *user)
  * clears
  */
 static unsigned
-s3_srv_h3_basic_verdict(void)
+s3_srv_h3_basic_verdict(s3_srv_preauth_t *pa)
 {
     s3_str_t header, path, basic_user, basic_pass, user;
     s3_int_t rc, known;
 
-    header.data = s3_srv_h3_auth;
-    header.len = s3_srv_h3_auth_len;
+    header.data = pa->auth;
+    header.len = pa->auth_len;
 
     s3_str_null(&basic_user);
     s3_str_null(&basic_pass);
@@ -1962,8 +2052,8 @@ s3_srv_h3_basic_verdict(void)
         return 401;
     }
 
-    path.data = s3_srv_h3_path;
-    path.len = s3_srv_h3_path_len;
+    path.data = pa->path;
+    path.len = pa->path_len;
 
     rc = s3_ssh3_auth_user_from_path(&path, &user);
 
@@ -2203,7 +2293,7 @@ s3_srv_keyfile_user_path(const char *pattern, const s3_str_t *user, char *out, s
  */
 
 static unsigned
-s3_srv_h3_jwt_verdict(void)
+s3_srv_h3_jwt_verdict(s3_srv_preauth_t *pa)
 {
     s3_str_t    header, path, user;
     u_char      conv[32];
@@ -2213,11 +2303,11 @@ s3_srv_h3_jwt_verdict(void)
     unsigned    nfiles = 0, i;
     s3_int_t    rc;
 
-    header.data = s3_srv_h3_auth;
-    header.len = s3_srv_h3_auth_len;
+    header.data = pa->auth;
+    header.len = pa->auth_len;
 
-    path.data = s3_srv_h3_path;
-    path.len = s3_srv_h3_path_len;
+    path.data = pa->path;
+    path.len = pa->path_len;
 
     s3_str_null(&user);
 
@@ -2261,9 +2351,9 @@ s3_srv_h3_jwt_verdict(void)
         }
     }
 
-    if (s3_srv_h3_pc == NULL || s3_srv_h3_pc->ssl == NULL ||
-        s3_srv_h3_pc->ssl->connection == NULL ||
-        SSL_export_keying_material(s3_srv_h3_pc->ssl->connection, conv, sizeof(conv),
+    if (pa->pc == NULL || pa->pc->ssl == NULL ||
+        pa->pc->ssl->connection == NULL ||
+        SSL_export_keying_material(pa->pc->ssl->connection, conv, sizeof(conv),
                                    "EXPORTER-SSH3", 13, NULL, 0, 0) != 1) {
         fprintf(stderr, "ssh3-server: pubkey auth: exporter failed\n");
         return 401;
@@ -2338,7 +2428,7 @@ s3_srv_oidc_timer_handler(s3_event_t *ev)
 }
 
 static unsigned
-s3_srv_h3_oidc_verdict(s3_connection_t *pc)
+s3_srv_h3_oidc_verdict(s3_srv_preauth_t *pa, s3_connection_t *pc)
 {
     static const s3_str_t scheme = s3_string("Bearer ");
 
@@ -2347,8 +2437,8 @@ s3_srv_h3_oidc_verdict(s3_connection_t *pc)
     s3_str_t    token;
     s3_int_t    rc;
 
-    token.data = s3_srv_h3_auth;
-    token.len = s3_srv_h3_auth_len;
+    token.data = pa->auth;
+    token.len = pa->auth_len;
 
     if (token.len <= scheme.len || s3_memcmp(token.data, scheme.data, scheme.len) != 0) {
         fprintf(stderr, "ssh3-server: oidc auth: the scheme is not Bearer\n");
@@ -2421,13 +2511,13 @@ s3_srv_h3_oidc_verdict(s3_connection_t *pc)
 }
 
 static void
-s3_srv_h3_respond(s3_connection_t *pc)
+s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
 {
     unsigned          code;
     unsigned          dos_slot = 0;
     s3_ssh3_version_t ver;
 
-    if (s3_srv_h3_responded) {
+    if (pa->responded) {
         return;
     }
 
@@ -2443,20 +2533,20 @@ s3_srv_h3_respond(s3_connection_t *pc)
      * query part carries the auth username (docs/P4-WIRE.md 7 step 3)
      * and does not affect the route */
 
-    if (s3_srv_h3_method_len == 7 && s3_memcmp(s3_srv_h3_method, "CONNECT", 7) == 0 &&
-        s3_srv_h3_protocol_len == 4 && s3_memcmp(s3_srv_h3_protocol, "ssh3", 4) == 0 &&
-        s3_srv_h3_path_len >= s3_srv_url_path_len &&
-        s3_memcmp(s3_srv_h3_path, s3_srv_url_path, s3_srv_url_path_len) == 0 &&
-        (s3_srv_h3_path_len == s3_srv_url_path_len || s3_srv_h3_path[s3_srv_url_path_len] == '?')) {
+    if (pa->method_len == 7 && s3_memcmp(pa->method, "CONNECT", 7) == 0 &&
+        pa->protocol_len == 4 && s3_memcmp(pa->protocol, "ssh3", 4) == 0 &&
+        pa->path_len >= s3_srv_url_path_len &&
+        s3_memcmp(pa->path, s3_srv_url_path, s3_srv_url_path_len) == 0 &&
+        (pa->path_len == s3_srv_url_path_len || pa->path[s3_srv_url_path_len] == '?')) {
 
         /* RFC 9114, 4.4: the extended CONNECT carries :scheme and
          * :authority next to :method, :protocol and :path */
 
-        if (s3_srv_h3_scheme_len == 0 || s3_srv_h3_authority_len == 0) {
+        if (pa->scheme_len == 0 || pa->authority_len == 0) {
             code = 400;
 
-        } else if (s3_srv_h3_ua_len == 0 ||
-                   s3_ssh3_version_parse(s3_srv_h3_ua, s3_srv_h3_ua_len, &ver) != S3_OK ||
+        } else if (pa->ua_len == 0 ||
+                   s3_ssh3_version_parse(pa->ua, pa->ua_len, &ver) != S3_OK ||
                    s3_ssh3_version_supported(&ver) != S3_OK) {
 
             /* the reference rejects a bad user-agent before anything
@@ -2501,21 +2591,21 @@ s3_srv_h3_respond(s3_connection_t *pc)
 
             s3_str_t header;
 
-            header.data = s3_srv_h3_auth;
-            header.len = s3_srv_h3_auth_len;
+            header.data = pa->auth;
+            header.len = pa->auth_len;
 
             if (s3_srv_oidc_issuer != NULL) {
 
-                code = s3_srv_h3_oidc_verdict(pc);
+                code = s3_srv_h3_oidc_verdict(pa, pc);
 
-            } else if (s3_srv_h3_auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+            } else if (pa->auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
 
                 /* the pubkey step: the Bearer token verifies against
                  * the -K files, or against the default identities
                  * chain of the session user when none is given (the
                  * reference always runs it) */
 
-                code = s3_srv_h3_jwt_verdict();
+                code = s3_srv_h3_jwt_verdict(pa);
 
             } else if (s3_srv_passfile != NULL || s3_srv_password_system) {
 
@@ -2526,7 +2616,7 @@ s3_srv_h3_respond(s3_connection_t *pc)
                  * (--enable-password-login off) closes the step with
                  * 401 - the sshd PasswordAuthentication no shape */
 
-                code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict() : 401;
+                code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict(pa) : 401;
 
             } else if (s3_srv_keyfiles_n == 0) {
 
@@ -2534,7 +2624,7 @@ s3_srv_h3_respond(s3_connection_t *pc)
                  * any authorization header passes (the interop
                  * fixtures send a filler token) */
 
-                code = s3_srv_h3_auth_len ? 200 : 401;
+                code = pa->auth_len ? 200 : 401;
 
             } else {
                 code = 401;
@@ -2546,13 +2636,13 @@ s3_srv_h3_respond(s3_connection_t *pc)
     }
 
     if (code == 200) {
-        s3_srv_report("INTEROP-H3-CONNECT-OK authlen=%zu\n", s3_srv_h3_auth_len);
+        s3_srv_report("INTEROP-H3-CONNECT-OK authlen=%zu\n", pa->auth_len);
 
     } else {
         s3_srv_report("INTEROP-H3-REJECT code=%u\n", code);
     }
 
-    s3_srv_h3_send_status(code);
+    s3_srv_h3_send_status(pa, code);
 
     if (dos_slot) {
 
@@ -2569,10 +2659,10 @@ s3_srv_h3_respond(s3_connection_t *pc)
 
     if (code != 200) {
         /* the rejected request stream closes right after the status */
-        (void)s3_quic_shutdown_stream(s3_srv_h3_sc, S3_WRITE_SHUTDOWN);
+        (void)s3_quic_shutdown_stream(pa->sc, S3_WRITE_SHUTDOWN);
     }
 
-    s3_srv_h3_responded = 1;
+    pa->responded = 1;
 }
 
 static void
@@ -2581,6 +2671,7 @@ s3_srv_h3_request_read(s3_event_t *ev)
     s3_connection_t  *sc;
     s3_quic_stream_t *qs;
     s3_connection_t  *pc;
+    s3_srv_preauth_t *pa;
     s3_buf_t          b;
     u_char            scratch[4096];
     s3_int_t          rc;
@@ -2590,9 +2681,21 @@ s3_srv_h3_request_read(s3_event_t *ev)
     qs = sc->data;
     pc = qs->parent;
 
+    /* the pre-auth state of this connection (the CONNECT stream) */
+
+    pa = s3_srv_preauth_find(pc);
+
+    if (pa == NULL) {
+
+        fprintf(stderr, "ssh3-server: the pre-auth state of the connection is gone\n");
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+
+        return;
+    }
+
     for (;;) {
 
-        if (s3_srv_h3_responded) {
+        if (pa->responded) {
 
             /*
              * the tunnel phase: the stream carries the ssh3 protocol
@@ -2612,7 +2715,7 @@ s3_srv_h3_request_read(s3_event_t *ev)
             return;
         }
 
-        if (s3_srv_h3_len == s3_srv_h3_cap) {
+        if (pa->len == pa->cap) {
             size_t  cap;
             u_char *grown;
 
@@ -2620,31 +2723,31 @@ s3_srv_h3_request_read(s3_event_t *ev)
              * no complete request inside is a peer trickling bytes,
              * the stream is torn down instead of growing */
 
-            if (s3_srv_h3_cap >= S3_SRV_H3_BUF_MAX) {
+            if (pa->cap >= S3_SRV_H3_BUF_MAX) {
                 fprintf(stderr, "ssh3-server: h3 request overgrown\n");
                 (void)s3_quic_cancelable_stream(sc);
                 (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
                 return;
             }
 
-            cap = s3_srv_h3_cap + 262144;
+            cap = pa->cap + 262144;
 
             if (cap > S3_SRV_H3_BUF_MAX) {
                 cap = S3_SRV_H3_BUF_MAX;
             }
 
-            grown = realloc(s3_srv_h3_buf, cap);
+            grown = realloc(pa->buf, cap);
 
             if (grown == NULL) {
                 fprintf(stderr, "ssh3-server: h3 buffer growth failed\n");
                 exit(1);
             }
 
-            s3_srv_h3_buf = grown;
-            s3_srv_h3_cap = cap;
+            pa->buf = grown;
+            pa->cap = cap;
         }
 
-        n = sc->recv(sc, s3_srv_h3_buf + s3_srv_h3_len, s3_srv_h3_cap - s3_srv_h3_len);
+        n = sc->recv(sc, pa->buf + pa->len, pa->cap - pa->len);
 
         if (n == (ssize_t)S3_AGAIN) {
             return;
@@ -2661,10 +2764,10 @@ s3_srv_h3_request_read(s3_event_t *ev)
             return;
         }
 
-        s3_srv_h3_len += (size_t)n;
+        pa->len += (size_t)n;
 
-        b.pos = s3_srv_h3_buf;
-        b.last = s3_srv_h3_buf + s3_srv_h3_len;
+        b.pos = pa->buf;
+        b.last = pa->buf + pa->len;
 
         for (;;) {
 
@@ -2674,7 +2777,7 @@ s3_srv_h3_request_read(s3_event_t *ev)
              * session hangs exactly there; the stream connection's
              * data is the s3_quic_stream_t (the reference sc->quic)
              */
-            rc = s3_h3_parse_headers(pc, &s3_srv_h3_parse, &b);
+            rc = s3_h3_parse_headers(pc, &pa->parse, &b);
 
             if (rc == S3_AGAIN || rc == S3_BUSY) {
                 break;
@@ -2682,14 +2785,14 @@ s3_srv_h3_request_read(s3_event_t *ev)
 
             if (rc == S3_OK) {
                 /* one field line done, the section continues */
-                s3_srv_h3_capture(&s3_srv_h3_parse.field_rep.field);
+                s3_srv_h3_capture(pa, &pa->parse.field_rep.field);
                 continue;
             }
 
             if (rc == S3_DONE) {
                 /* the last field line lands together with the section end */
-                s3_srv_h3_capture(&s3_srv_h3_parse.field_rep.field);
-                s3_srv_h3_respond(pc);
+                s3_srv_h3_capture(pa, &pa->parse.field_rep.field);
+                s3_srv_h3_respond(pa, pc);
                 break;
             }
 
@@ -2700,17 +2803,28 @@ s3_srv_h3_request_read(s3_event_t *ev)
         }
 
         /* the consumed bytes compact to the front of the receive buffer */
-        s3_srv_h3_len = (size_t)(b.last - b.pos);
-        s3_memmove(s3_srv_h3_buf, b.pos, s3_srv_h3_len);
+        pa->len = (size_t)(b.last - b.pos);
+        s3_memmove(pa->buf, b.pos, pa->len);
     }
 }
 
 static void
 s3_srv_h3_stream_write(s3_event_t *ev)
 {
-    (void)ev;
+    s3_connection_t  *sc;
+    s3_quic_stream_t *qs;
+    s3_srv_preauth_t *pa;
 
-    s3_srv_h3_flush();
+    sc = ev->data;
+    qs = sc->data;
+
+    pa = s3_srv_preauth_find(qs->parent);
+
+    if (pa == NULL) {
+        return;
+    }
+
+    s3_srv_h3_flush(pa);
 }
 
 /*
@@ -3501,7 +3615,7 @@ s3_srv_fwd_udp_reply(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
         return;
     }
 
-    p = s3_ssh3_dgram_encode(dg, s3_srv_h3_conv_id, qs->id, data, len);
+    p = s3_ssh3_dgram_encode(dg, s3_srv_h3_conv_id_of(ch->pc), qs->id, data, len);
 
     (void)s3_quic_send_datagram(qs->parent, dg, (size_t)(p - dg));
 }
@@ -4363,7 +4477,7 @@ s3_srv_agent_conn_open(s3_srv_h3_channel_t *sess_ch, int fd)
 
     s3_memzero(&hdr, sizeof(hdr));
 
-    hdr.conversation_stream_id = s3_srv_h3_conv_id;
+    hdr.conversation_stream_id = s3_srv_h3_conv_id_of(sess_ch->pc);
     hdr.max_packet_size = S3_SRV_CHANNEL_MAX_PACKET;
     hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_AGENT;
     hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_AGENT);
@@ -4783,7 +4897,7 @@ s3_srv_reverse_channel_open(s3_srv_reverse_listener_t *l, const char *type)
 
     s3_memzero(&hdr, sizeof(hdr));
 
-    hdr.conversation_stream_id = s3_srv_h3_conv_id;
+    hdr.conversation_stream_id = s3_srv_h3_conv_id_of(s3_srv_reverse.pc);
     hdr.max_packet_size = S3_SRV_CHANNEL_MAX_PACKET;
     hdr.type.data = (u_char *)type;
     hdr.type.len = strlen(type);
@@ -4958,7 +5072,7 @@ s3_srv_reverse_udp_datagram(s3_srv_reverse_listener_t *l, const u_char *buf, siz
 
     qs = peer->sc->data;
 
-    p = s3_ssh3_dgram_encode(dg, s3_srv_h3_conv_id, qs->id, buf, len);
+    p = s3_ssh3_dgram_encode(dg, s3_srv_h3_conv_id_of(qs->parent), qs->id, buf, len);
 
     if (s3_quic_send_datagram(qs->parent, dg, (size_t)(p - dg)) != S3_OK) {
         s3_srv_report("INTEROP-RFWD-UDP-DROP bytes=%zu reason=transport\n", len);
@@ -5026,7 +5140,7 @@ s3_srv_reverse_datagram_route(s3_connection_t *c, const u_char *buf, size_t len)
         return 0;
     }
 
-    if (csid != s3_srv_h3_conv_id) {
+    if (csid != s3_srv_h3_conv_id_of(c)) {
 
         return 0;
     }
@@ -5254,7 +5368,7 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     }
 
     if (s3_srv_reverse.pc != ch->pc) {
-        s3_srv_reverse.conv_id = s3_srv_h3_conv_id;
+        s3_srv_reverse.conv_id = s3_srv_h3_conv_id_of(ch->pc);
         s3_srv_reverse.pc = ch->pc;
     }
 
@@ -5568,7 +5682,7 @@ s3_srv_udp_fwd_datagram(s3_connection_t *c, const u_char *buf, size_t len)
 
     qs = s3_srv_h3_udp_fwd->sc->data;
 
-    if (csid != s3_srv_h3_conv_id || chid != qs->id) {
+    if (csid != s3_srv_h3_conv_id_of(c) || chid != qs->id) {
         (void)s3_quic_send_datagram(c, buf, len);
         return;
     }
@@ -5619,7 +5733,7 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
 
     /* the receiver must verify the conversation of the channel */
 
-    if (hdr.conversation_stream_id != s3_srv_h3_conv_id) {
+    if (hdr.conversation_stream_id != s3_srv_h3_conv_id_of(ch->pc)) {
         s3_srv_h3_channel_cancel(ch, "conversation mismatch");
         return S3_ERROR;
     }
@@ -6411,8 +6525,9 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
 static void
 s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 {
-    s3_connection_t *sc, *pc;
-    s3_event_t      *rev, *wev;
+    s3_connection_t   *sc, *pc;
+    s3_event_t        *rev, *wev;
+    s3_srv_preauth_t  *pa;
 
     /*
      * ssh3-c: the stream_handler receives the stream connection (its
@@ -6448,7 +6563,9 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
         return;
     }
 
-    if (s3_srv_h3_sc != NULL && pc == s3_srv_h3_pc) {
+    pa = s3_srv_preauth_find(pc);
+
+    if (pa != NULL) {
 
         /*
          * every bidi stream after the CONNECT is an ssh3 channel
@@ -6461,18 +6578,30 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
         return;
     }
 
-    s3_srv_h3_sc = sc;
-    s3_srv_h3_pc = pc;
-    s3_srv_h3_conv_id = qs->id;
-    s3_srv_h3_responded = 0;
-    s3_srv_h3_len = 0;
-    s3_srv_h3_out_len = 0;
-    s3_srv_h3_method_len = 0;
-    s3_srv_h3_protocol_len = 0;
-    s3_srv_h3_path_len = 0;
-    s3_srv_h3_auth_len = 0;
+    /* the fresh CONNECT of this connection: the pre-auth state is
+     * per connection, so a second client that connects at the same
+     * time gets its own fields and its own verdict */
 
-    s3_memzero(&s3_srv_h3_parse, sizeof(s3_h3_parse_headers_t));
+    pa = s3_srv_preauth_create(pc);
+
+    if (pa == NULL) {
+        fprintf(stderr, "ssh3-server: the pre-auth table is full, the CONNECT is refused\n");
+        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+        return;
+    }
+
+    pa->sc = sc;
+    pa->pc = pc;
+    pa->conv_id = qs->id;
+    pa->responded = 0;
+    pa->len = 0;
+    pa->out_len = 0;
+    pa->method_len = 0;
+    pa->protocol_len = 0;
+    pa->path_len = 0;
+    pa->auth_len = 0;
+
+    s3_memzero(&pa->parse, sizeof(s3_h3_parse_headers_t));
 
     rev = sc->read;
     wev = sc->write;
@@ -8146,7 +8275,6 @@ main(int argc, char **argv)
 
     s3_ssl_free(s3_srv_conf.ssl);
 
-    free(s3_srv_h3_buf);
 
     s3_event_ctx_shutdown(&ctx);
 
