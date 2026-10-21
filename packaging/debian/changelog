@@ -1,3 +1,20 @@
+ssh3-c (0.5.2-1) unstable; medium
+
+  * New upstream release 0.5.2: the sftp jail of wave A - the jail
+    root is pinned by a descriptor (open O_NOFOLLOW, then the chroot
+    through /proc/self/fd), so the user can no longer swap the home
+    for a symlink while the child is still root; the privilege drop
+    is permanent (the saved set-user id goes too, so the child cannot
+    restore the root); and the lexical jail is refused for a
+    privileged daemon (the engine's prefix check follows the
+    symlinks, so it confines nothing against root).  The password and
+    its digest compare in constant time now, the h3 parse layer has
+    a fuzz harness (300000 inputs under ASan+UBSan, clean), and the
+    release ships the raw linux client and the checksums of the
+    assets.
+
+ -- Max <nahual15@gmail.com>  Wed, 21 Oct 2026 20:40:00 +0000
+
 ssh3-c (0.5.1-1) unstable; urgency=medium
 
   * New upstream release 0.5.1: the wildcard listener never told the
