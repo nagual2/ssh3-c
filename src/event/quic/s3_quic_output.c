@@ -410,8 +410,18 @@ s3_quic_create_segments(s3_connection_t *c)
     s3_quic_send_ctx_t   *ctx;
     s3_quic_congestion_t *cg;
     s3_quic_connection_t *qc;
-    static u_char         dst[S3_QUIC_MAX_UDP_SEGMENT_BUF];
-    static uint64_t       preserved_pnum[S3_QUIC_SEND_CTX_LAST];
+
+    /*
+     * the GSO staging buffer and the packet number bookkeeping are
+     * static: the send path is not reentrant across the connections
+     * of one event loop.  It is safe under the single-threaded loop of
+     * the library and it is the shape of the reference, but it is a
+     * hard constraint for a future multi-threaded or per-connection
+     * isolate embedding.
+     */
+
+    static u_char   dst[S3_QUIC_MAX_UDP_SEGMENT_BUF];
+    static uint64_t preserved_pnum[S3_QUIC_SEND_CTX_LAST];
 
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;

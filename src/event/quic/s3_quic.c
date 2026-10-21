@@ -111,6 +111,15 @@ s3_quic_apply_transport_params(s3_connection_t *c, s3_quic_tp_t *ctp)
 
     s3_memcpy(&qc->ctp, ctp, sizeof(s3_quic_tp_t));
 
+    /*
+     * the peer's transport parameters: the strings inside (the
+     * preferred address, the original dcid) alias the TLS extension
+     * buffer they were parsed from.  The buffer lives as long as the
+     * connection, and the parameters are read only while it does - a
+     * keeper of qc->ctp beyond the connection's life would read a
+     * buffer it does not own
+     */
+
     /* the peer's timeout can be the tighter one: re-arm the timer */
 
     s3_quic_arm_idle_timer(c->read, qc->idle_timeout);

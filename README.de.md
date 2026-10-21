@@ -194,6 +194,28 @@ Vollständige Referenz: `man 8 ssh3-server`.
 - Der Build läuft mit `-Wall -Wextra -Werror`; das Preset `linux-asan`
   ergänzt `-fsanitize=address,undefined -fno-sanitize-recover=all`.
 
+## Die Adresse der Antworten (Wildcard-Listener)
+
+Ein Listener, der an jede lokale Adresse gebunden ist (`[::]`,
+`0.0.0.0` — die Vorgabe), nimmt die Pakete aller lokalen Adressen
+an; die lokale Adresse des ankommenden Pakets bleibt dem Server
+unbekannt, bis die ancillary data des Kernels sie nennt. Der Server
+fragt sie an (`IP_PKTINFO` / `IPV6_RECVPKTINFO`) und antwortet **mit
+der Adresse, die der Client angesprochen hat** — nicht mit der, die
+die Routing-Tabelle bevorzugt. Auf einem Host mit einer Adresse ist
+der Unterschied keiner; auf einem mit mehreren (Tunnel, zweite IP)
+entscheidet er, ob der Client seine eigene Antwort erkennt: QUIC
+verwirft ein Paket, das nicht von der angesprochenen Adresse kommt
+(RFC 9000, 8.1).
+
+Ein gespoofter Pfad bekommt nichts: vor dem Handshake antwortet der
+Server auf ein Datagramm von einer unbekannten Adresse mit keinem
+Byte — strenger als RFC 9000, 8.2.1 es erlaubt, und die Amplifikation
+bleibt bei null. Nach dem Handshake wird ein Peer, der seine Adresse
+wechselt (NAT-Rebinding), nach RFC 9000, 9.3.3 behandelt: der zuvor
+aktive Pfad wird mit einem PATH_CHALLENGE geprüft, und ein Pfad, der
+die Prüfung nicht besteht, weicht dem zuletzt validierten.
+
 ## Leistung
 
 Mediane der Kontrollbenchmarks (Methodik R3, `bench/p7-compare.sh`):

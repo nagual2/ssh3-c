@@ -188,6 +188,27 @@ Full reference: `man 8 ssh3-server`.
 - The build runs with `-Wall -Wextra -Werror`; the `linux-asan` preset
   adds `-fsanitize=address,undefined -fno-sanitize-recover=all`.
 
+## The address of the replies (wildcard listener)
+
+A listener bound to any local address (`[::]`, `0.0.0.0` — the default)
+takes the packets of every local address, so the local address of an
+arrived packet is unknown to the server until the kernel's ancillary
+data names it. The server asks for it (`IP_PKTINFO` /
+`IPV6_RECVPKTINFO`) and answers with **the address the client dialed**,
+not with the one the routing table prefers. On a single-address host
+the two are the same; on a multi-address host (a tunnel, a second IP)
+the difference decides whether the client recognises its own answer —
+QUIC drops a packet that arrives from an address the client did not
+dial (RFC 9000, 8.1).
+
+A spoofed path gets nothing: before the handshake the server answers a
+datagram from an unknown address with no bytes at all, which is
+stricter than RFC 9000, 8.2.1 allows and keeps the amplification at
+zero. After the handshake a peer that changes its address (the NAT
+rebinding) is handled per RFC 9000, 9.3.3: the previously active
+path is validated with a PATH_CHALLENGE, and a path that fails the
+validation is dropped in favour of the last validated one.
+
 ## Performance
 
 Medians of the control benchmark (methodology R3, `bench/p7-compare.sh`):
