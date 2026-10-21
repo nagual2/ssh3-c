@@ -64,6 +64,7 @@
 
 #include <openssl/rand.h>
 
+#include <s3_cmsg.h>
 #include <s3_h3.h>
 #include <s3_h3_uni.h>
 #include <s3_nonblocking.h>
@@ -6590,6 +6591,17 @@ s3_srv_sd_listen_fds(int                     fds[S3_SRV_SD_LISTEN_MAX],
             exit(1);
         }
 
+        /*
+         * the same local address ancillary data as the own socket: the
+         * unit binds the wildcard, so the kernel must be told to
+         * deliver the address of the arrived packet
+         */
+
+        if (s3_enable_pktinfo(fds[i], (struct sockaddr *)&sa[i]) != S3_OK) {
+            s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
+                         "setsockopt(IP_PKTINFO) of the socket-activated fd %d failed", fds[i]);
+        }
+
         if (sa[i].ss_family == AF_INET6) {
 
             /* the unit owns the mode: both (the default) or v6-only,
@@ -7830,6 +7842,21 @@ main(int argc, char **argv)
 
             s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
                          "the [v6] bind serves both families (V6ONLY=0)");
+        }
+
+        /*
+         * the local address ancillary data of a wildcard listener: the
+         * kernel delivers the address of the arrived packet only with
+         * the option on, and the replies must carry that address as
+         * their source (the reference sets it in the listening socket
+         * setup, src/core/ngx_connection.c).  A failure is not fatal:
+         * the daemon serves the single-address hosts as before, the
+         * multi-address ones answer with the routed source address
+         */
+
+        if (s3_enable_pktinfo(fd, (struct sockaddr *)&listen_sa[0]) != S3_OK) {
+            s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
+                         "setsockopt(IP_PKTINFO) failed, the local address of a packet is unknown");
         }
 
         if (s3_nonblocking(fd) != S3_OK) {

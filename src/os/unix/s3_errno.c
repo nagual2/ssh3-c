@@ -9,15 +9,27 @@
 u_char *
 s3_strerror(s3_err_t err, u_char *errbuf, size_t len)
 {
-    char        buf[256];
     const char *msg;
     size_t      n;
 
+#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 32)
+
     /*
-     * the XSI strerror_r() is async-signal-safe on glibc 2.32+ via
-     * strerrordesc_np() only; here it is used for its portability
-     * (no _GNU_SOURCE, no global buffer)
+     * strerrordesc_np() is a table lookup: it is async-signal-safe and
+     * returns a static string, so the errno text costs neither a
+     * buffer nor a global state.  The build uses the GNU feature set
+     * (the reference does too, auto/os/linux: the BSD structures of
+     * the local address ancillary data live behind it), and the GNU
+     * variant of strerror_r() is neither of the two.
      */
+
+    msg = strerrordesc_np(err);
+
+#else
+
+    char buf[256];
+
+    /* the XSI strerror_r() (int return, musl and the old glibc) */
 
     buf[0] = '\0';
 
@@ -26,6 +38,12 @@ s3_strerror(s3_err_t err, u_char *errbuf, size_t len)
 
     } else {
         msg = buf;
+    }
+
+#endif
+
+    if (msg == NULL) {
+        msg = "Unknown error";
     }
 
     n = s3_strlen(msg);

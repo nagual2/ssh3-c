@@ -12,7 +12,13 @@ set(CMAKE_C_EXTENSIONS OFF)
 # build, otherwise they answer a question nobody asked: CMake runs
 # check_c_source_compiles in a separate project that does not inherit
 # add_compile_definitions
-set(S3_FEATURE_DEFINITIONS -D_POSIX_C_SOURCE=200809L)
+#
+# _GNU_SOURCE is the feature set of the reference on Linux (auto/os/linux):
+# the BSD structures of the local address ancillary data (struct in_pktinfo,
+# struct in6_pktinfo) live behind __USE_MISC, and the strict POSIX mode
+# hides them — with the POSIX mode alone the S3_HAVE_ADDRINFO_CMSG check
+# below can never pass and the whole local address path stays compiled out
+set(S3_FEATURE_DEFINITIONS -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L)
 
 add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 
@@ -458,6 +464,7 @@ set(S3_TESTS
     test_log
     test_event
     test_udp
+    test_cmsg
     test_quic_transport
     test_quic_frames
     test_quic_protection
