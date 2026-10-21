@@ -3741,6 +3741,19 @@ s3_srv_sftp_start(s3_srv_h3_channel_t *ch)
         return s3_srv_sftp_chroot_start(ch);
     }
 
+    /*
+     * the lexical mode: the engine confines the paths by itself, and
+     * its prefix check follows the symlinks - a privileged daemon
+     * would hand the session user the files behind a symlink in the
+     * home.  The kernel jail (the chroot mode) is the only one a
+     * root daemon may serve
+     */
+
+    if (s3_ssh3_sftp_jail_lexical_check((uint32_t)geteuid()) != S3_OK) {
+        fprintf(stderr, "ssh3-server: sftp: the lexical jail needs an unprivileged daemon\n");
+        return S3_ERROR;
+    }
+
     if (s3_srv_sftp_home[0] != '\0') {
 
         home.data = (u_char *)s3_srv_sftp_home;

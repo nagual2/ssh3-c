@@ -246,6 +246,7 @@ static int
 test_enter_guard(void)
 {
     char     dir[S3_TEST_JAIL_CAP];
+    char     link[S3_TEST_JAIL_CAP + 64];
     uint32_t uid, gid;
 
     if (geteuid() == 0) {
@@ -267,9 +268,48 @@ test_enter_guard(void)
     /* a chroot request without the privilege fails closed */
 
     S3_ASSERT(s3_ssh3_sftp_jail_enter(dir, "", uid, gid) == S3_PERM);
-    S3_ASSERT(s3_ssh3_sftp_jail_enter("/tmp/s3jail-no-such-path", "", uid, gid) == S3_PERM);
+
+    /* a jail root that does not exist is an error, not a permission */
+
+    S3_ASSERT(s3_ssh3_sftp_jail_enter("/tmp/s3jail-no-such-path", "", uid, gid) == S3_ERROR);
+
+    /*
+     * the jail root is pinned by a descriptor: a symlink in place of
+     * the directory is refused before the privilege check - the child
+     * is still root at that point, and the user owns the home
+     */
+
+    snprintf(link, sizeof(link), "%s-link", dir);
+
+    S3_ASSERT(symlink(dir, link) == 0);
+    S3_ASSERT(s3_ssh3_sftp_jail_enter(link, "", uid, gid) == S3_ERROR);
+    (void)unlink(link);
 
     s3_test_rmtree(dir);
+
+    return s3_test_failures;
+}
+
+static int
+test_drop_and_lexical(void)
+{
+    uint32_t uid = (uint32_t)getuid();
+    uint32_t gid = (uint32_t)getgid();
+
+    /* the permanent drop: the identity of an unprivileged drop does
+     * not change, and the restore of the root stays impossible */
+
+    S3_ASSERT(s3_ssh3_sftp_jail_drop(uid, gid) == S3_OK);
+    S3_ASSERT((uint32_t)geteuid() == uid);
+    S3_ASSERT((uint32_t)getegid() == gid);
+
+    /* the lexical jail confines nothing against a privileged
+     * process: the engine's prefix check follows the symlinks */
+
+    S3_ASSERT(s3_ssh3_sftp_jail_lexical_check(0) == S3_DECLINED);
+    S3_ASSERT(s3_ssh3_sftp_jail_lexical_check(1000) == S3_OK);
+    S3_ASSERT(s3_ssh3_sftp_jail_lexical_check(uid)
+              == (uid == 0 ? S3_DECLINED : S3_OK));
 
     return s3_test_failures;
 }
@@ -282,6 +322,10 @@ test_ssh3_sftp_jail(void)
     (void)test_resolve_home();
     (void)test_resolve_refusals();
     (void)test_enter_guard();
+
+    /* the drop runs last: under root it drops the test process too */
+
+    (void)test_drop_and_lexical();
 
     return s3_test_failures;
 }

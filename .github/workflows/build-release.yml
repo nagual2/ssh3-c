@@ -77,6 +77,7 @@ jobs:
           mkdir -p dist
           cp packaging/_build/*.deb packaging/_build/*.rpm packaging/_build/*.apk dist/
           cp build/linux-release/ssh3-server dist/ssh3-server_linux_amd64
+          cp build/linux-release/ssh3 dist/ssh3_linux_amd64
           ls -l dist/
 
       - uses: actions/upload-artifact@v4
@@ -153,6 +154,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: The checksums of the assets
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -160,15 +167,19 @@ jobs:
             dist/*.rpm
             dist/*.apk
             dist/ssh3-server_linux_amd64
+            dist/ssh3_linux_amd64
             dist/ssh3_windows_amd64.exe
             dist/libssl-3-x64.dll
             dist/libcrypto-3-x64.dll
+            dist/checksums.txt
           body: |
             ssh3-c ${{ github.ref_name }}
 
             - `ssh3-server`: deb / rpm / apk packages (amd64); the deb bundles
               OpenSSL 3.5 for OpenSSL 3.0.x targets (mint 22.x, ubuntu 24.04)
             - `ssh3-server_linux_amd64`: raw server binary
+            - `ssh3_linux_amd64`: raw client binary
+            - `checksums.txt`: the sha256 of every asset of the release
             - `ssh3_windows_amd64.exe`: the Windows client, icon and version
               resources embedded; needs `libssl-3-x64.dll` / `libcrypto-3-x64.dll`
               from this release next to it (or in PATH)

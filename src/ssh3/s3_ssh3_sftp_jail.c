@@ -17,10 +17,16 @@
  * the kernel gate of this module needs the BSD surface: initgroups()
  * hides behind __USE_MISC and chroot() behind _DEFAULT_SOURCE, the
  * build pins _POSIX_C_SOURCE on the command line; the definition
- * lives in the file so only the jail TU pays for the extra surface
+ * lives in the file so only the jail TU pays for the extra surface.
+ * fchroot() is the GNU spelling of the same call and hides behind
+ * __USE_GNU
  */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE 1
+#endif
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
 #endif
 
 #include <s3_core.h>
@@ -28,6 +34,7 @@
 #include <s3_ssh3_sftp_jail.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -177,10 +184,60 @@ s3_ssh3_sftp_jail_check(const char *jail)
     return S3_OK;
 }
 
+/*
+ * the chroot by the pinned descriptor: the magic symlink of
+ * /proc/self/fd resolves to the inode the descriptor names, so the
+ * chroot cannot land somewhere else - the path spelling would
+ * follow a swap the user can make (they own the home, and the child
+ * is still root at that point).  fchroot() is not an option here:
+ * the Linux x86-64 syscall table carries no fchroot
+ */
+
+static s3_int_t
+s3_ssh3_sftp_jail_fchroot(int fd, const char *jail)
+{
+    char link[64];
+
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+
+    if (access("/proc/self/fd", X_OK) == 0) {
+        if (chroot(link) != 0) {
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    /* no procfs: the path spelling, with the O_NOFOLLOW open above
+     * as the only guard (the swap window stays) */
+
+    if (chroot(jail) != 0) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
 s3_int_t
 s3_ssh3_sftp_jail_enter(const char *jail, const char *name, uint32_t uid, uint32_t gid)
 {
+    int fd;
+
     if (jail == NULL || *jail != '/') {
+        return S3_ERROR;
+    }
+
+    /*
+     * the jail root is pinned by a descriptor: the path spelling
+     * cannot be swapped for a symlink between the resolution (in the
+     * daemon) and the chroot (in the child) - the user owns the home
+     * and the child is still root at this point, so a swapped path
+     * would jail the child somewhere the user chose
+     */
+
+    fd = open(jail, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    if (fd < 0) {
         return S3_ERROR;
     }
 
@@ -188,6 +245,7 @@ s3_ssh3_sftp_jail_enter(const char *jail, const char *name, uint32_t uid, uint32
      * privilege refuses rather than serving unjailed (fail closed) */
 
     if (geteuid() != 0) {
+        (void)close(fd);
         return S3_PERM;
     }
 
@@ -197,17 +255,95 @@ s3_ssh3_sftp_jail_enter(const char *jail, const char *name, uint32_t uid, uint32
      * - the chroot below still runs with the full privilege */
 
     if (name != NULL && *name != '\0' && initgroups(name, (gid_t)gid) != 0) {
+        (void)close(fd);
         return S3_ERROR;
     }
 
-    if (chdir(jail) != 0 || chroot(jail) != 0 || chdir("/") != 0) {
+    /* the chroot rides the pinned descriptor (fchroot), the OpenSSH
+     * safe_chroot shape: the kernel confines the child to the inode
+     * the descriptor names, not to a path */
+
+    if (fchdir(fd) != 0 || s3_ssh3_sftp_jail_fchroot(fd, jail) != S3_OK || chdir("/") != 0) {
+        (void)close(fd);
         return S3_ERROR;
     }
+
+    (void)close(fd);
 
     /* the drop removes every privilege before the first path opens */
 
-    if (setgid((gid_t)gid) != 0 || setuid((uid_t)uid) != 0) {
+    if (s3_ssh3_sftp_jail_drop(uid, gid) != S3_OK) {
         return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_sftp_jail_drop(uint32_t uid, uint32_t gid)
+{
+    /*
+     * the drop is permanent: the saved set-user id goes too, so the
+     * child cannot restore the root with seteuid(0).  The setuid()
+     * alone leaves the saved id at zero, and a child that can regain
+     * the root must not serve the jail
+     */
+
+#if (S3_HAVE_SETRESUID)
+
+    if (setresgid((gid_t)gid, (gid_t)gid, (gid_t)gid) != 0) {
+        return S3_ERROR;
+    }
+
+    if (setresuid((uid_t)uid, (uid_t)uid, (uid_t)uid) != 0) {
+        return S3_ERROR;
+    }
+
+#else
+
+    if (setgid((gid_t)gid) != 0) {
+        return S3_ERROR;
+    }
+
+    if (setuid((uid_t)uid) != 0) {
+        return S3_ERROR;
+    }
+
+    /* the verification of the drop: the restore of the root must
+     * fail, otherwise the saved id is still zero (the OpenSSH
+     * permanently_drop_privs idiom) */
+
+    if (seteuid((uid_t)uid) != 0) {
+        return S3_ERROR;
+    }
+
+    if (seteuid(0) == 0) {
+        return S3_ERROR;
+    }
+
+#endif
+
+    if (geteuid() != (uid_t)uid) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssh3_sftp_jail_lexical_check(uint32_t euid)
+{
+    /*
+     * the lexical jail is the engine's own prefix check: it follows
+     * the symlinks, so it is not a confinement against a privileged
+     * process - a root daemon in the lexical mode would hand the
+     * session user the files behind a symlink in the home.  The
+     * chroot mode is the kernel jail and the only one a privileged
+     * daemon may serve
+     */
+
+    if (euid == 0) {
+        return S3_DECLINED;
     }
 
     return S3_OK;

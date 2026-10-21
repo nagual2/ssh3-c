@@ -49,14 +49,34 @@ s3_int_t s3_ssh3_sftp_jail_resolve(const char *override, const char *username, c
 s3_int_t s3_ssh3_sftp_jail_check(const char *jail);
 
 /*
- * enters the jail, the child side only: the supplementary groups
- * first (initgroups reads /etc/group, the jail carries no /etc
- * inside - the OpenSSH in_chroot order), then chdir/chroot/chdir("/"),
- * then the setgid/setuid drop; a request without the root privilege
- * answers S3_PERM - the caller fails closed (_exit) instead of
- * serving unjailed; S3_OK or the error codes above
+ * enters the jail, the child side only: the jail root is pinned by
+ * a descriptor (open O_NOFOLLOW, then fchdir/fchroot/fchdir("/") -
+ * the OpenSSH safe_chroot shape, the path spelling cannot be swapped
+ * for a symlink while the child is still root), the supplementary
+ * groups first (initgroups reads /etc/group, the jail carries no
+ * /etc inside - the OpenSSH in_chroot order), then the permanent
+ * drop; a request without the root privilege answers S3_PERM - the
+ * caller fails closed (_exit) instead of serving unjailed; S3_OK or
+ * the error codes above
  */
 
 s3_int_t s3_ssh3_sftp_jail_enter(const char *jail, const char *name, uint32_t uid, uint32_t gid);
+
+/*
+ * the permanent privilege drop: the saved set-user id goes too, so
+ * the child cannot restore the root with seteuid(0).  A drop that
+ * leaves the restore possible is a refusal, not a warning
+ */
+
+s3_int_t s3_ssh3_sftp_jail_drop(uint32_t uid, uint32_t gid);
+
+/*
+ * the lexical jail gate: the engine's own prefix check follows the
+ * symlinks, so it confines nothing against a privileged process - the
+ * chroot mode is the kernel jail and the only one a root daemon may
+ * serve.  S3_OK for an unprivileged daemon, S3_DECLINED for the root
+ */
+
+s3_int_t s3_ssh3_sftp_jail_lexical_check(uint32_t euid);
 
 #endif /* _S3_SSH3_SFTP_JAIL_H_INCLUDED_ */
