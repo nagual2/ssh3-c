@@ -1,4 +1,4 @@
-ssh3-c (0.5.2-1) unstable; medium
+ssh3-c (0.5.2-1) unstable; urgency=medium
 
   * New upstream release 0.5.2: the sftp jail of wave A - the jail
     root is pinned by a descriptor (open O_NOFOLLOW, then the chroot
