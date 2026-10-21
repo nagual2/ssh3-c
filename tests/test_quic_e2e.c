@@ -1085,12 +1085,74 @@ s3_test_quic_e2e_idle_zero(void)
     return s3_test_failures;
 }
 
+/*
+ * the runtime EXPORTER-SSH3 probe (the pass-3 audit, §13.1): the
+ * exporter bytes of the two sides must be equal.  The static result -
+ * both sides take the exporter from the live connection SSL with the
+ * same label and the same length - is not a proof that the bytes
+ * match; only the runtime call is.
+ */
+
+static int
+s3_test_quic_e2e_exporter(void)
+{
+    s3_test_e2e_env_t *env = &s3_test_e2e;
+    u_char            cli_mat[32], srv_mat[32], cli_other[32];
+    int               i;
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    s3_memzero(env, sizeof(*env));
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    /* the pump until the handshake is complete on both sides */
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked &&
+            env->server != NULL && env->server->ssl != NULL &&
+            env->server->ssl->handshaked) {
+            break;
+        }
+    }
+
+    S3_ASSERT(env->cli->ssl != NULL && env->cli->ssl->handshaked == 1);
+    S3_ASSERT(env->server != NULL);
+    S3_ASSERT(env->server->ssl != NULL && env->server->ssl->handshaked == 1);
+
+    /* the same label, the same length, no context: the same bytes */
+
+    S3_ASSERT(SSL_export_keying_material(env->cli->ssl->connection, cli_mat, sizeof(cli_mat),
+                                         "EXPORTER-SSH3", 13, NULL, 0, 0) == 1);
+    S3_ASSERT(SSL_export_keying_material(env->server->ssl->connection, srv_mat, sizeof(srv_mat),
+                                         "EXPORTER-SSH3", 13, NULL, 0, 0) == 1);
+    S3_ASSERT(s3_memcmp(cli_mat, srv_mat, sizeof(cli_mat)) == 0);
+
+    /* the negative control: another label must not give the same bytes */
+
+    S3_ASSERT(SSL_export_keying_material(env->cli->ssl->connection, cli_other, sizeof(cli_other),
+                                         "EXPORTER-SSH3-OTHER", 19, NULL, 0, 0) == 1);
+    S3_ASSERT(s3_memcmp(cli_mat, cli_other, sizeof(cli_mat)) != 0);
+
+    s3_test_env_done(env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_e2e(void)
 {
     (void)s3_test_quic_e2e_run();
     (void)s3_test_quic_e2e_idle_close();
     (void)s3_test_quic_e2e_idle_zero();
+    (void)s3_test_quic_e2e_exporter();
 
     OPENSSL_cleanup();
 

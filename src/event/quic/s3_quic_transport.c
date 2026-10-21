@@ -1805,6 +1805,12 @@ s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id, s3_quic_tp_t 
         if (end - p != 0) {
             return S3_ERROR;
         }
+        /*
+         * the flag is parsed and emitted, not enforced: the reference
+         * (nginx) does not enforce it either and no configuration of
+         * the product advertises it - a peer that migrates after we
+         * advertised the flag is not answered with an error
+         */
         dst->disable_active_migration = 1;
         return S3_OK;
 
@@ -1874,6 +1880,13 @@ s3_quic_parse_transport_param(u_char *p, u_char *end, uint16_t id, s3_quic_tp_t 
         break;
 
     case S3_QUIC_TP_INITIAL_MAX_STREAMS_BIDI:
+        /*
+         * the value is a permission, not a reservation: it bounds the
+         * streams the peer lets us open, and we decide how many we
+         * open - the simultaneous streams are bounded by the flow
+         * control and the memory, so a peer value of 2^62 is accepted
+         * and costs nothing
+         */
         dst->initial_max_streams_bidi = varint;
         break;
 
