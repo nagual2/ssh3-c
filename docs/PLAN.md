@@ -124,10 +124,10 @@
 
 | № | Пункт | Суть | Приёмка |
 |---|-------|------|---------|
-| A1 | Pass-3: lexical SFTP drop ordering | Порядок chroot/setuid в child (`app/ssh3_server.c:3943+`), symlink-атака против недропнутого child, identity lexical-режима — highest consequence аудитора | фиксы + тесты, ctest 42/42 release+asan |
-| A2 | Pass-3: password/OIDC секретные сравнения | `s3_ssh3_oidc*.c`/auth_srv — `s3_memcmp_ct` (готов с P2-2) на все секретные сравнения | grep-ревизия + пины |
-| A3 | Fuzz harness `s3_h3_parse.c` | libFuzzer-обёртка (API buffer+state, allocation-free), ASan+UBSan, corpus pass-1 | ~160k+ инпутов без репортов |
-| A4 | checksums.txt + linux-клиент в release-ассеты | `build-release.yml`: `sha256sum dist/*`, `cp build/linux-release/ssh3 dist/ssh3_linux_amd64` | ассеты v0.4.2 |
+| A1 | Pass-3: lexical SFTP drop ordering | Порядок chroot/setuid в child (`app/ssh3_server.c:3943+`), symlink-атака против недропнутого child, identity lexical-режима — highest consequence аудитора | фиксы + тесты, ctest 42/42 release+asan — **ЗАКРЫТО 2026-10-21** (v0.5.2, PR #8) |
+| A2 | Pass-3: password/OIDC секретные сравнения | `s3_ssh3_oidc*.c`/auth_srv — `s3_memcmp_ct` (готов с P2-2) на все секретные сравнения | grep-ревизия + пины — **ЗАКРЫТО 2026-10-21** (v0.5.2, PR #8) |
+| A3 | Fuzz harness `s3_h3_parse.c` | libFuzzer-обёртка (API buffer+state, allocation-free), ASan+UBSan, corpus pass-1 | ~160k+ инпутов без репортов — **ЗАКРЫТО 2026-10-21** (v0.5.2, PR #8) |
+| A4 | checksums.txt + linux-клиент в release-ассеты | `build-release.yml`: `sha256sum dist/*`, `cp build/linux-release/ssh3 dist/ssh3_linux_amd64` | ассеты v0.4.2 — **ЗАКРЫТО 2026-10-21** (v0.5.2, PR #8) |
 | A5 | mentors-подготовка | source-only changes, ITP-письмо, dupload-команды (загрузка — Debian-аккаунты владельца) | пакет готов к спонсорской загрузке |
 
 **Волна B — среднее:**
