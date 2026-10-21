@@ -1,6 +1,6 @@
 Package: ssh3-server
 Version: 0.5.2-1
-Architecture: amd64
+Architecture: @ARCH@
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: net
 Priority: optional

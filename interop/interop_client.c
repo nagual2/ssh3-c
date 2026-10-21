@@ -7623,7 +7623,7 @@ s3_interop_client_stream_close(s3_connection_t *sc)
 int
 main(int argc, char **argv)
 {
-    char                  opt;
+    int                   opt;
     const char           *peer_text = NULL, *alpn_name = "s3interop/1";
     unsigned              timeout = 20000, dg_size = 1200;
     long                  n_arg = 8, s_arg = 512, m_arg = -1;
@@ -7700,7 +7700,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = (char)getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:R:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
+    while ((opt = getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:R:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
            -1) {
 
         switch (opt) {

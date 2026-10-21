@@ -11,7 +11,7 @@ Version:        @VERSION@
 Release:        1%{?dist}
 Summary:        SSH3 server - SSH over QUIC/HTTP3 transport
 License:        BSD-2-Clause
-BuildArch:      x86_64
+BuildArch:      @RPMARCH@
 
 Source0:        ssh3-server
 Source1:        LICENSE

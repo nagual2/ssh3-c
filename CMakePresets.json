@@ -22,6 +22,17 @@
       }
     },
     {
+      "name": "linux-arm64",
+      "displayName": "Linux arm64 Cross (aarch64-linux-gnu, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/aarch64-linux-gnu.cmake",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
       "name": "linux-asan",
       "displayName": "Linux Debug + ASan/UBSan (Ninja)",
       "inherits": "linux-release",
@@ -82,6 +93,10 @@
     {
       "name": "linux-asan",
       "configurePreset": "linux-asan"
+    },
+    {
+      "name": "linux-arm64",
+      "configurePreset": "linux-arm64"
     },
     {
       "name": "linux-fuzz",

@@ -140,7 +140,7 @@
 | B4 | Client rpm/apk | вторые пакеты в rpm-спеке и apk-контроле | сборка + установка |
 | B5 | go-форк: linux integration | разбор логов build-linux job (обвязка против нового CLI) | job зелёный |
 | B6 | apt-репозиторий | reprepro на минисфоруме (хостинг — решение владельца), `Scripts/`-публикатор | чистая Mint VM: apt install |
-| B7 | **arm64/arm deb+rpm (клиент+сервер)** — решение Пилота 2026-10-18: приоритет сейчас, хостинги массово внедряют arm (Graviton/Ampere) | кросс-тулчейн `gcc-aarch64-linux-gnu` + сборка arm64 OpenSSL 3.5 (build.sh fetch_bundle расширяется на arm64-дебы Debian), `patchelf`, deb/rpm клиента и сервера; linux-release arm64 ctest-лег | сборка зелёная, deb ставится на arm64-хост (Graviton/Ampere VM) |
+| B7 | **arm64/arm deb+rpm (клиент+сервер)** — решение Пилота 2026-10-18: приоритет сейчас, хостинги массово внедряют arm (Graviton/Ampere) — **ЧАСТИЧНО 2026-10-21** (deb ✓, rpm ✗) | кросс-тулчейн `gcc-aarch64-linux-gnu` + сборка arm64 OpenSSL 3.5 (build.sh fetch_bundle расширяется на arm64-дебы Debian), `patchelf`, deb/rpm клиента и сервера; linux-release arm64 ctest-лег | сборка зелёная, deb ставится на arm64-хост (Graviton/Ampere VM) |
 
 **Заморожено (не планируем; условия разморозки):**
 
