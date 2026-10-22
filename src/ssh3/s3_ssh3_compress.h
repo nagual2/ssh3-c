@@ -125,6 +125,50 @@ uint32_t s3_ssh3_compress_choose(uint32_t peer_mask);
 uint32_t s3_ssh3_compress_prefer(uint32_t mask);
 
 /*
+ * the reusable codec context of a channel (the audit fix wave of the
+ * 2026-10-22 review): the deflate and the zstd state is created once
+ * per channel and reset per frame - the per-frame init/free of the
+ * one-shot encode/decode is the hot-path allocation the zero-copy
+ * rule of the project forbids.  lz4 carries no state, the context is
+ * a placeholder there
+ */
+
+typedef struct s3_ssh3_compress_ctx_s s3_ssh3_compress_ctx_t;
+
+/*
+ * creates the context of the algorithm (S3_SSH3_COMPRESS_NONE and an
+ * unknown id give NULL); decode selects the decompress side, the
+ * deflate and the zstd states of the two sides are not interchangeable.
+ * NULL on the allocation or the codec init failure
+ */
+
+s3_ssh3_compress_ctx_t *s3_ssh3_compress_ctx_create(uint32_t algorithm, unsigned decode);
+
+/*
+ * the algorithm the context carries; S3_SSH3_COMPRESS_NONE for NULL
+ */
+
+uint32_t s3_ssh3_compress_ctx_algorithm(const s3_ssh3_compress_ctx_t *ctx);
+
+/*
+ * releases the codec state and the context itself; NULL is a no-op
+ */
+
+void s3_ssh3_compress_ctx_destroy(s3_ssh3_compress_ctx_t *ctx);
+
+/*
+ * the frame codec over a channel context: the same contracts as the
+ * one-shot forms above, the codec state stays resident between the
+ * frames
+ */
+
+s3_int_t s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap,
+                                     size_t *out_len, const u_char *in, size_t in_len);
+
+s3_int_t s3_ssh3_compress_ctx_decode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap,
+                                     size_t *out_len, const u_char *in, size_t in_len);
+
+/*
  * compresses the frame payload; on S3_OK out_len carries the compressed
  * length, which may be not smaller than the input - the caller then
  * sends the payload as it is (the ZFS cutoff).  S3_DECLINED means the

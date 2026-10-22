@@ -228,15 +228,6 @@ static unsigned s3_srv_run_as;
 static unsigned s3_srv_run_as_set; /* the explicit on|off of the CLI */
 
 /*
- * the authenticated username of the current CONNECT: the verdict
- * snapshot fills it (the resolution gate answers the 401 there), the
- * session channels spawn from it; empty keeps the daemon identity -
- * the CONNECTs without a session user (the harness shapes, the oidc
- * identity) ride it
- */
-static char s3_srv_auth_user[128];
-
-/*
  * the OIDC issuer mode (--oidc-issuer): the CONNECT passes only with
  * the Bearer id_token of that provider, the audience is the client
  * id of the token, the nonce binds the token to the conversation
@@ -1358,6 +1349,16 @@ typedef struct {
 
     uint32_t  compress_alg;
 
+    /*
+     * the authenticated username of THIS connection (the audit fix
+     * wave): the verdict fills it through the resolution gate, the
+     * channel snapshots read it - the process-global of the earlier
+     * shape let a parallel verdict overwrite the identity between the
+     * verdict of one connection and the channels of another
+     */
+
+    char      user[128];
+
     /* the verdict of the CONNECT (200 = the conversation is
      * authenticated, the reverse forward may bind) */
 
@@ -1530,6 +1531,18 @@ struct s3_srv_h3_channel_s {
      */
     unsigned           fwd_kind; /* S3_SRV_FWD_NONE/TCP/UDP/AGENT/RCTRL/RUDP */
     uint32_t           compress_alg; /* the negotiated codec of the channel body */
+
+    /*
+     * the codec contexts of the channel body (the audit fix wave): the
+     * resident states of the negotiated codec, the encode side for the
+     * bulk relay out and the decode side for the inbound frames - both
+     * grow with the first frame that needs them, a NULL rides plain
+     * (and the inbound NULL refuses the compressed frame)
+     */
+
+    s3_ssh3_compress_ctx_t *compress_enc;
+    s3_ssh3_compress_ctx_t *compress_dec;
+
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
     struct sockaddr_in fwd_sa;
@@ -1924,23 +1937,25 @@ s3_srv_h3_send_status(s3_srv_preauth_t *pa, unsigned code)
  * refuses the unknown user the same way, this is the earlier verdict
  * of the same rule; the plain-name guard itself lives in the module,
  * the authoritative refusal of the spawn); S3_OK once the name is
- * snapshotted for the session channels
+ * snapshotted into the pre-auth state of the connection (the audit
+ * fix wave: the identity rides the connection, not the process, so a
+ * parallel verdict cannot overwrite it)
  */
 static s3_int_t
-s3_srv_auth_user_gate(const s3_str_t *user)
+s3_srv_auth_user_gate(s3_srv_preauth_t *pa, const s3_str_t *user)
 {
-    s3_srv_auth_user[0] = '\0';
+    pa->user[0] = '\0';
 
     if (user == NULL || user->data == NULL || user->len == 0 ||
-        user->len >= sizeof(s3_srv_auth_user)) {
+        user->len >= sizeof(pa->user)) {
         return S3_DECLINED;
     }
 
-    s3_memcpy(s3_srv_auth_user, user->data, user->len);
-    s3_srv_auth_user[user->len] = '\0';
+    s3_memcpy(pa->user, user->data, user->len);
+    pa->user[user->len] = '\0';
 
-    if (getpwnam(s3_srv_auth_user) == NULL) {
-        s3_srv_auth_user[0] = '\0';
+    if (getpwnam(pa->user) == NULL) {
+        pa->user[0] = '\0';
         return S3_DECLINED;
     }
 
@@ -2149,7 +2164,7 @@ s3_srv_h3_basic_verdict(s3_srv_preauth_t *pa)
     /* the setuid gate of the session identity (P7.3): the name that
      * no passwd entry backs never spawns, the CONNECT refuses */
 
-    if (s3_srv_run_as && s3_srv_auth_user_gate(&user) != S3_OK) {
+    if (s3_srv_run_as && s3_srv_auth_user_gate(pa, &user) != S3_OK) {
         fprintf(stderr, "ssh3-server: run-as user=%.*s does not resolve\n", (int)user.len,
                 (const char *)user.data);
         return 401;
@@ -2399,7 +2414,7 @@ s3_srv_h3_jwt_verdict(s3_srv_preauth_t *pa)
     /* the setuid gate of the session identity (P7.3), the Basic
      * verdict note applies verbatim */
 
-    if (s3_srv_run_as && s3_srv_auth_user_gate(&user) != S3_OK) {
+    if (s3_srv_run_as && s3_srv_auth_user_gate(pa, &user) != S3_OK) {
         fprintf(stderr, "ssh3-server: run-as user=%.*s does not resolve\n", (int)user.len,
                 (const char *)user.data);
         return 401;
@@ -2538,9 +2553,11 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
     /* the identity snapshot rides the verdicts that carry a session
      * username (the Basic and the pubkey gates); the oidc and the
      * no-auth shapes answer without one - the sessions keep the
-     * daemon identity there */
+     * daemon identity there.  the identity lives in the pre-auth
+     * state of the connection (the audit fix wave), the stale name of
+     * an earlier verdict on another connection cannot leak here */
 
-    s3_srv_auth_user[0] = '\0';
+    pa->user[0] = '\0';
 
     /*
      * the compression of the channel body (PLAN.md 9, B8): the peer
@@ -2958,6 +2975,12 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
     free(ch->fwd_out);
     free(ch->fwd_plain);
 
+    /* the codec contexts of the channel body die with the channel
+     * (the audit fix wave) */
+
+    s3_ssh3_compress_ctx_destroy(ch->compress_enc);
+    s3_ssh3_compress_ctx_destroy(ch->compress_dec);
+
     s3_memzero(ch, sizeof(*ch));
 }
 
@@ -2983,16 +3006,20 @@ s3_srv_h3_channel_of(s3_connection_t *sc)
  */
 
 /*
- * the identity snapshot of the CONNECT (P7.3): the verdict serialized
- * the username, the session spawns from the channel copy - the static
- * verdict buffer may move on with the next CONNECT; the accept paths
- * (the channel alloc and the inline stream accept) ride it
+ * the identity snapshot of the CONNECT (P7.3): the verdict filled the
+ * pre-auth state of the connection, the session spawns from the
+ * channel copy - the accept paths (the channel alloc and the inline
+ * stream accept) ride it.  the audit fix wave: the name is read from
+ * the state of the OWNING connection, so the verdict on a parallel
+ * connection cannot rename the session
  */
 static void
 s3_srv_channel_user_snapshot(s3_srv_h3_channel_t *ch)
 {
-    if (s3_srv_auth_user[0] != '\0') {
-        snprintf(ch->sess_user, sizeof(ch->sess_user), "%s", s3_srv_auth_user);
+    s3_srv_preauth_t *pa = s3_srv_preauth_find(ch->pc);
+
+    if (pa != NULL && pa->user[0] != '\0') {
+        snprintf(ch->sess_user, sizeof(ch->sess_user), "%s", pa->user);
     }
 }
 
@@ -3583,10 +3610,17 @@ s3_srv_fwd_flush(s3_srv_h3_channel_t *ch)
 
             /* the frame of the chunk: the compressed form when the
              * peer can decode it, the plain one otherwise (the
-             * compression of the channel body, PLAN.md 9, B8) */
+             * compression of the channel body, PLAN.md 9, B8); the
+             * encode context rides the first frame too, a failed
+             * create rides plain (the encode degradation is a
+             * performance loss, not a protocol break) */
+
+            if (ch->compress_enc == NULL && ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
+                ch->compress_enc = s3_ssh3_compress_ctx_create(ch->compress_alg, 0);
+            }
 
             if (s3_ssh3_frame_data_build(frame, sizeof(frame), &ch->fwd_frame_total,
-                                         ch->compress_alg, ch->fwd_out, chunk, NULL) != S3_OK) {
+                                         ch->compress_enc, ch->fwd_out, chunk, NULL) != S3_OK) {
                 fprintf(stderr, "ssh3-server: the forward frame does not fit\n");
                 s3_srv_h3_channel_cancel(ch, "the forward frame does not fit");
                 return;
@@ -5759,6 +5793,27 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
     unsigned                        fwd;
     unsigned                        is_session;
 
+    /*
+     * the funnel gate of the audit fix wave: EVERY client channel
+     * rides an authenticated conversation - the CONNECT of the
+     * connection must have answered 200 before any channel is
+     * confirmed.  the reverse-forward branch keeps its own check (the
+     * specific refusal text), but the gate belongs here: without it a
+     * client that opens the CONNECT stream without a request served
+     * itself session, sftp and direct-forward channels pre-auth - the
+     * exec spawned with the daemon identity and the forward target
+     * opened before any verdict
+     */
+
+    {
+        s3_srv_preauth_t *pa = s3_srv_preauth_find(ch->pc);
+
+        if (pa == NULL || pa->code != 200) {
+            s3_srv_h3_channel_cancel(ch, "the channel wants an authenticated conversation");
+            return S3_ERROR;
+        }
+    }
+
     s3_memzero(&hdr, sizeof(hdr));
 
     pos = ch->buf;
@@ -5908,8 +5963,12 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
         ch->fwd_kind = S3_SRV_FWD_RCTRL;
     }
 
-    s3_srv_report("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s\n", (unsigned long long)qs->id,
-                  (int)hdr.type.len, (const char *)hdr.type.data);
+    /* the user rides last: the e2e greps assert the id and the type
+     * prefix of the line (the shape of the pre-fix-wave markers) */
+
+    s3_srv_report("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s user=%s\n",
+                  (unsigned long long)qs->id, (int)hdr.type.len, (const char *)hdr.type.data,
+                  (ch->sess_user[0] != '\0') ? ch->sess_user : "-");
 
     /* the header bytes are consumed, the type view dies here */
     ch->len = (size_t)(end - pos);
@@ -6119,19 +6178,30 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 s3_int_t rc;
 
                 /*
-                 * the compressed frames decode into the per-channel
-                 * scratch (the compression of the channel body,
-                 * PLAN.md 9, B8); the plain frames give a view into the
-                 * receive buffer and do not touch the scratch
+                 * the decode side of the negotiated codec rides the
+                 * first compressed frame (the audit fix wave: the
+                 * contexts live on the channel, not on the frame); a
+                 * channel without the codec passes the NULL context
+                 * and the seam refuses the compressed frame
+                 * outright
                  */
 
-                if (type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED && ch->fwd_plain == NULL) {
-                    ch->fwd_plain = malloc(S3_SRV_CHANNEL_MAX_PACKET + 1024);
-                    ch->fwd_plain_cap =
-                        (ch->fwd_plain != NULL) ? S3_SRV_CHANNEL_MAX_PACKET + 1024 : 0;
+                if (type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
+
+                    if (ch->compress_dec == NULL &&
+                        ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
+                        ch->compress_dec = s3_ssh3_compress_ctx_create(ch->compress_alg, 1);
+                    }
+
+                    if (ch->compress_dec != NULL && ch->fwd_plain == NULL) {
+                        ch->fwd_plain = malloc(S3_SRV_CHANNEL_MAX_PACKET + 1024);
+                        ch->fwd_plain_cap =
+                            (ch->fwd_plain != NULL) ? S3_SRV_CHANNEL_MAX_PACKET + 1024 : 0;
+                    }
                 }
 
-                rc = s3_ssh3_frame_data_parse(&pos, end, type, ch->fwd_plain, ch->fwd_plain_cap,
+                rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_ssh3_compress_available(),
+                                              ch->compress_dec, ch->fwd_plain, ch->fwd_plain_cap,
                                               &msg_data);
 
                 if (rc == S3_ERROR) {

@@ -220,6 +220,17 @@ static unsigned s3_cli_compress_flag; /* the -C option */
 static uint32_t s3_cli_compress_mask;  /* the capability of the peer */
 static uint32_t s3_cli_compress_alg;  /* the negotiated algorithm */
 
+/*
+ * the codec contexts of the negotiated algorithm (the audit fix wave):
+ * the resident states behind the frame seam - the encode side for the
+ * sftp driver and the bulk forwards out, the decode side for the
+ * inbound frames; created with the negotiation, a NULL rides plain
+ * (and the inbound NULL refuses the compressed frame)
+ */
+
+static s3_ssh3_compress_ctx_t *s3_cli_compress_enc;
+static s3_ssh3_compress_ctx_t *s3_cli_compress_dec;
+
 /* the pinned codec of the -C option (the automatic pick when the flag
  * rides without a name; the benchmark of the codecs pins one) */
 
@@ -4106,6 +4117,23 @@ s3_cli_ctrl_read(s3_event_t *ev)
 
                         s3_cli_compress_mask = ver.compress_mask;
 
+                        /*
+                         * the decode side rides the peer's pick over
+                         * this client's announcement - the convention
+                         * both sides compute the same way: the peer
+                         * may send any codec this build announced, so
+                         * the inbound frames decode even without -C
+                         * (the audit fix wave; the inbound gate still
+                         * refuses a codec outside the announcement)
+                         */
+
+                        if (s3_cli_compress_dec == NULL) {
+                            s3_cli_compress_dec = s3_ssh3_compress_ctx_create(
+                                s3_ssh3_compress_prefer(s3_ssh3_compress_available() &
+                                                        s3_cli_compress_mask),
+                                1);
+                        }
+
                         if (s3_cli_compress_flag) {
 
                             if (s3_cli_compress_pin != S3_SSH3_COMPRESS_NONE) {
@@ -4131,10 +4159,27 @@ s3_cli_ctrl_read(s3_event_t *ev)
                             }
 
                             if (s3_cli_compress_alg != S3_SSH3_COMPRESS_NONE) {
-                                fprintf(stderr,
-                                        "ssh3: the compression of the channel body is on "
-                                        "(%s)\n",
-                                        s3_ssh3_compress_name(s3_cli_compress_alg));
+
+                                /* the encode context grows once per
+                                 * run, the frames only reset the state
+                                 * (the audit fix wave); a failed
+                                 * create rides plain */
+
+                                s3_cli_compress_enc =
+                                    s3_ssh3_compress_ctx_create(s3_cli_compress_alg, 0);
+
+                                if (s3_cli_compress_enc == NULL) {
+                                    s3_cli_compress_alg = S3_SSH3_COMPRESS_NONE;
+                                    fprintf(stderr,
+                                            "ssh3: the compression of the channel body stays "
+                                            "off (the codec context failed)\n");
+                                } else {
+                                    fprintf(stderr,
+                                            "ssh3: the compression of the channel body is on "
+                                            "(%s)\n",
+                                            s3_ssh3_compress_name(s3_cli_compress_alg));
+                                }
+
                             } else {
                                 fprintf(stderr, "ssh3: the peer does not support the compression of "
                                                 "the channel body\n");
@@ -4359,7 +4404,7 @@ s3_cli_sftp_pump(void)
              * otherwise (PLAN.md 9, B8) */
 
             if (s3_ssh3_frame_data_build(s3_cli_sftp_frame, sizeof(s3_cli_sftp_frame),
-                                         &s3_cli_sftp_frame_total, s3_cli_compress_alg,
+                                         &s3_cli_sftp_frame_total, s3_cli_compress_enc,
                                          s3_cli_sftp_out, chunk, &s3_cli_sftp_wire) != S3_OK) {
                 s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the sftp frame does not fit");
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
@@ -4600,7 +4645,8 @@ s3_cli_sftp_read(s3_event_t *ev)
                  * the compressed one is decoded into the scratch (the
                  * compression of the channel body, PLAN.md 9, B8) */
 
-                rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_cli_sftp_plain,
+                rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_ssh3_compress_available(),
+                                              s3_cli_compress_dec, s3_cli_sftp_plain,
                                               sizeof(s3_cli_sftp_plain), &payload);
 
                 if (rc == S3_ERROR) {
@@ -5342,7 +5388,7 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
              * compression of the channel body, PLAN.md 9, B8) */
 
             if (s3_ssh3_frame_data_build(fc->frame, S3_CLI_FWD_FRAME, &fc->frame_total,
-                                         s3_cli_compress_alg, fc->to_chan, chunk, NULL) != S3_OK) {
+                                         s3_cli_compress_enc, fc->to_chan, chunk, NULL) != S3_OK) {
                 s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the forward frame does not fit");
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 s3_quic_finalize_connection(((s3_quic_stream_t *)fc->chan->data)->parent, 0,
@@ -5529,7 +5575,8 @@ s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
                         return;
                     }
 
-                    rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_cli_fwd_plain,
+                    rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_ssh3_compress_available(),
+                                                 s3_cli_compress_dec, s3_cli_fwd_plain,
                                                  sizeof(s3_cli_fwd_plain), &data);
 
                     if (rc == S3_ERROR) {
@@ -13841,6 +13888,14 @@ s3_cli_teardown(void)
     s3_quic_connection_t *qc;
     unsigned              i;
     unsigned              quic_alive;
+
+    /* the codec contexts of the channel body die with the run (the
+     * audit fix wave) */
+
+    s3_ssh3_compress_ctx_destroy(s3_cli_compress_enc);
+    s3_ssh3_compress_ctx_destroy(s3_cli_compress_dec);
+    s3_cli_compress_enc = NULL;
+    s3_cli_compress_dec = NULL;
 
     s3_cli_console_done();
 

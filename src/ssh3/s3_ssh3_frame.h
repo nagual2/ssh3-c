@@ -15,6 +15,8 @@
 
 #include <s3_base.h>
 
+#include <s3_ssh3_compress.h>
+
 /*
  * the buffer size the frame of the payload needs: the plain frame
  * (the overhead of the type and of the string length) plus the room
@@ -27,10 +29,11 @@ size_t s3_ssh3_frame_data_bound(size_t payload_len);
  * builds the frame of the payload into buf (the size comes from
  * s3_ssh3_frame_data_bound):
  *
- * - the compressed frame (192) when the algorithm is set, the
+ * - the compressed frame (192) when the codec context is set, the
  *   compressed form fits the buffer and is smaller than the payload
  *   (the ZFS cutoff: the not-smaller form travels as it is);
- * - the plain frame (94) otherwise.
+ * - the plain frame (94) otherwise (a NULL context is the no-codec
+ *   channel and always rides plain).
  *
  * on S3_OK frame_len carries the frame length and wire_len the
  * payload bytes on the wire (the compressed size, or the plain size
@@ -38,21 +41,29 @@ size_t s3_ssh3_frame_data_bound(size_t payload_len);
  * length means the frame was compressed)
  */
 
-s3_int_t s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, uint32_t algorithm,
-                                  const u_char *payload, size_t payload_len, size_t *wire_len);
+s3_int_t s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len,
+                                  s3_ssh3_compress_ctx_t *ctx, const u_char *payload,
+                                  size_t payload_len, size_t *wire_len);
 
 /*
  * reads the payload of a data frame: the plain frame gives a view into
  * the receive buffer, the compressed frame is decoded into the scratch
  * buffer of the caller (the scratch must hold the plain size of the
- * payload).  the type is the message type of the frame
+ * payload).  the type is the message type of the frame; decode_mask is
+ * the set of codecs THIS side announced (the sender may pick any of
+ * them), the context is the fast path of the expected codec
  *
  * S3_ERROR means the frame is incomplete (the caller waits for the
- * rest), S3_DECLINED that the frame is whole but the payload does not
- * decode (a protocol violation)
+ * rest), S3_DECLINED that the frame is whole but is refused: the
+ * payload does not decode, or the frame violates the negotiation - a
+ * compressed frame on a side that announced no codec, or with an id
+ * outside the announced mask (an unknown id, an id past 32 bits), is
+ * a protocol violation and the caller tears the channel down
+ * (SPEC-wire.md 15.2, fail-closed)
  */
 
 s3_int_t s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type,
-                                  u_char *scratch, size_t scratch_cap, s3_str_t *payload);
+                                  uint32_t decode_mask, s3_ssh3_compress_ctx_t *ctx, u_char *scratch,
+                                  size_t scratch_cap, s3_str_t *payload);
 
 #endif /* _S3_SSH3_FRAME_H_INCLUDED_ */

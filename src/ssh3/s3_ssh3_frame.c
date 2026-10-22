@@ -45,13 +45,14 @@ s3_ssh3_frame_data_bound(size_t payload_len)
 }
 
 s3_int_t
-s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, uint32_t algorithm,
+s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, s3_ssh3_compress_ctx_t *ctx,
                          const u_char *payload, size_t payload_len, size_t *wire_len)
 {
     size_t plain_len;
     size_t bound;
     size_t packed_len = 0;
     u_char *p;
+    uint32_t algorithm = s3_ssh3_compress_ctx_algorithm(ctx);
 
     plain_len = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) + s3_ssh3_sshstring_size(payload_len);
 
@@ -65,8 +66,9 @@ s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, uint32_t al
         goto plain;
     }
 
-    if (s3_ssh3_compress_encode(buf + S3_SSH3_FRAME_COMPRESSED_ROOM, cap - S3_SSH3_FRAME_COMPRESSED_ROOM,
-                                &packed_len, algorithm, payload, payload_len) != S3_OK) {
+    if (s3_ssh3_compress_ctx_encode(ctx, buf + S3_SSH3_FRAME_COMPRESSED_ROOM,
+                                    cap - S3_SSH3_FRAME_COMPRESSED_ROOM, &packed_len, payload,
+                                    payload_len) != S3_OK) {
         goto plain;
     }
 
@@ -113,8 +115,9 @@ plain:
 }
 
 s3_int_t
-s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type, u_char *scratch,
-                         size_t scratch_cap, s3_str_t *payload)
+s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type, uint32_t decode_mask,
+                         s3_ssh3_compress_ctx_t *ctx, u_char *scratch, size_t scratch_cap,
+                         s3_str_t *payload)
 {
     if (type == S3_SSH3_MSG_CHANNEL_DATA) {
 
@@ -133,17 +136,48 @@ s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type, u
 
         s3_ssh3_msg_compressed_data_t msg;
         size_t                        plain_len = 0;
+        uint32_t                      algorithm;
+        s3_int_t                      rc;
 
         if (s3_ssh3_msg_parse_compressed_data(pos, end, &msg) != S3_OK) {
             return S3_ERROR;
+        }
+
+        /*
+         * the fail-closed gate of the audit fix wave: a compressed
+         * frame is a protocol violation unless THIS side announced
+         * the codec - the sender picks any codec of the receiver's
+         * announcement, so the wire id must sit in the announced mask
+         * (an unknown id and an id past 32 bits refuse before the
+         * truncation, SPEC-wire.md 15.2).  a side that announced
+         * nothing (the mask of zero, the build without codecs)
+         * refuses every compressed frame
+         */
+
+        algorithm = (uint32_t) msg.algorithm;
+
+        if (msg.algorithm != (uint64_t) algorithm ||
+            (s3_ssh3_compress_bit(algorithm) & decode_mask) == 0) {
+            return S3_DECLINED;
         }
 
         if (scratch == NULL) {
             return S3_DECLINED;
         }
 
-        if (s3_ssh3_compress_decode(scratch, scratch_cap, &plain_len, (uint32_t)msg.algorithm,
-                                    msg.data.data, msg.data.len) != S3_OK) {
+        /* the context is the fast path of the expected codec: a legal
+         * but unexpected id (the sender pinned another common codec)
+         * decodes through the one-shot form */
+
+        if (ctx != NULL && algorithm == s3_ssh3_compress_ctx_algorithm(ctx)) {
+            rc = s3_ssh3_compress_ctx_decode(ctx, scratch, scratch_cap, &plain_len, msg.data.data,
+                                             msg.data.len);
+        } else {
+            rc = s3_ssh3_compress_decode(scratch, scratch_cap, &plain_len, algorithm,
+                                         msg.data.data, msg.data.len);
+        }
+
+        if (rc != S3_OK) {
             /* the frame is whole but the payload does not decode: a
              * protocol violation, not a partial frame */
 

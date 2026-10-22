@@ -446,6 +446,271 @@ s3_test_compress_version(void)
     return s3_test_failures;
 }
 
+static int
+s3_test_compress_ctx(void)
+{
+    u_char                    payload[512];
+    u_char                    compressed[4096];
+    u_char                    plain[4096];
+    size_t                    payload_len;
+    size_t                    packed = 0;
+    size_t                    packed_two = 0;
+    size_t                    plain_len = 0;
+    uint32_t                  available = s3_ssh3_compress_available();
+    uint32_t                  codecs[3] = { S3_SSH3_COMPRESS_ZSTD, S3_SSH3_COMPRESS_DEFLATE,
+                                            S3_SSH3_COMPRESS_LZ4 };
+    size_t                    i;
+
+    /* the contexts of the audit fix wave: the codec state is created
+     * once per channel and reset per frame */
+
+    S3_ASSERT(s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_NONE, 0) == NULL);
+    S3_ASSERT(s3_ssh3_compress_ctx_algorithm(NULL) == S3_SSH3_COMPRESS_NONE);
+
+    s3_ssh3_compress_ctx_destroy(NULL); /* the no-op form */
+
+    payload_len = s3_compress_payload(payload, sizeof(payload), 64);
+
+    for (i = 0; i < 3; i++) {
+
+        s3_ssh3_compress_ctx_t *enc;
+        s3_ssh3_compress_ctx_t *dec;
+
+        if ((available & s3_ssh3_compress_bit(codecs[i])) == 0) {
+            continue;
+        }
+
+        enc = s3_ssh3_compress_ctx_create(codecs[i], 0);
+        dec = s3_ssh3_compress_ctx_create(codecs[i], 1);
+
+        S3_ASSERT(enc != NULL);
+        S3_ASSERT(dec != NULL);
+        S3_ASSERT(s3_ssh3_compress_ctx_algorithm(enc) == codecs[i]);
+
+        /* the reuse: two frames ride the same context back to back */
+
+        S3_ASSERT(s3_ssh3_compress_ctx_encode(enc, compressed, sizeof(compressed), &packed,
+                                              payload, payload_len) == S3_OK);
+        S3_ASSERT(s3_ssh3_compress_ctx_encode(enc, compressed, sizeof(compressed), &packed_two,
+                                              payload, payload_len) == S3_OK);
+        S3_ASSERT(packed == packed_two);
+
+        S3_ASSERT(s3_ssh3_compress_ctx_decode(dec, plain, sizeof(plain), &plain_len, compressed,
+                                              packed) == S3_OK);
+        S3_ASSERT(plain_len == payload_len);
+        S3_ASSERT(memcmp(plain, payload, payload_len) == 0);
+
+        /* the halves do not cross: the decode context cannot encode */
+
+        S3_ASSERT(s3_ssh3_compress_ctx_encode(dec, compressed, sizeof(compressed), &packed,
+                                              payload, payload_len) == S3_ERROR);
+
+        s3_ssh3_compress_ctx_destroy(enc);
+        s3_ssh3_compress_ctx_destroy(dec);
+    }
+
+    return s3_test_failures;
+}
+
+static int
+s3_test_compress_frame_gate(void)
+{
+    s3_ssh3_msg_compressed_data_t m;
+    u_char                        payload[512];
+    u_char                        frame[8192];
+    u_char                        scratch[8192];
+    size_t                        payload_len;
+    size_t                        frame_len = 0;
+    size_t                        wire_len = 0;
+    const u_char                 *pos;
+    s3_str_t                      out;
+    uint32_t                      available = s3_ssh3_compress_available();
+    s3_ssh3_compress_ctx_t       *enc;
+
+    payload_len = s3_compress_payload(payload, sizeof(payload), 64);
+
+    /* the NULL context builds the plain frame and refuses the
+     * compressed one (the fail-closed gate of the audit fix wave) */
+
+    /* the NULL context decodes the legal frame through the one-shot
+     * form; the refusal rides the mask, not the context */
+
+    S3_ASSERT(s3_ssh3_frame_data_build(frame, sizeof(frame), &frame_len, NULL, payload,
+                                       payload_len, &wire_len) == S3_OK);
+    S3_ASSERT(wire_len == payload_len);
+
+    s3_memzero(&m, sizeof(m));
+
+    m.algorithm = S3_SSH3_COMPRESS_ZSTD;
+    m.data.len = 5;
+    m.data.data = (u_char *)"hello";
+
+    {
+        u_char             msg[64];
+        u_char            *p;
+        size_t             len;
+        const u_char      *pt;
+        uint64_t           t;
+
+        len = (size_t)s3_ssh3_msg_encode_compressed_data(NULL, &m);
+        S3_ASSERT(len > 0 && len <= sizeof(msg));
+        s3_ssh3_msg_encode_compressed_data(msg, &m);
+
+        /* the type varint of the compressed frame rides first */
+
+        p = frame;
+        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED);
+        memcpy(p, msg, len);
+
+        /* the seam reads past the type varint, like the callers do */
+
+        pt = frame;
+
+        S3_ASSERT(s3_ssh3_parse_varint(&pt, frame + (size_t)(p - frame) + len, &t) == S3_OK);
+        S3_ASSERT(t == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED);
+
+        /* the mask of zero (the build without codecs, the peer that
+         * announced nothing) refuses the frame outright - the refusal
+         * rides before any decode, so the placeholder body is fine */
+
+        pt = frame;
+
+        S3_ASSERT(s3_ssh3_frame_data_parse(&pt, frame + (size_t)(p - frame) + len, t, 0, NULL,
+                                           scratch, sizeof(scratch), &out) == S3_DECLINED);
+
+        /* an id outside the announced mask is a protocol violation */
+
+        m.algorithm = 7;
+
+        len = (size_t)s3_ssh3_msg_encode_compressed_data(NULL, &m);
+        S3_ASSERT(len > 0 && len <= sizeof(msg));
+        s3_ssh3_msg_encode_compressed_data(msg, &m);
+
+        p = frame;
+        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED);
+        memcpy(p, msg, len);
+
+        pt = frame;
+
+        S3_ASSERT(s3_ssh3_parse_varint(&pt, frame + (size_t)(p - frame) + len, &t) == S3_OK);
+        S3_ASSERT(s3_ssh3_frame_data_parse(&pt, frame + (size_t)(p - frame) + len, t,
+                                           s3_ssh3_compress_available(), NULL, scratch,
+                                           sizeof(scratch), &out) == S3_DECLINED);
+    }
+
+    if (available == 0) {
+        /* a build without a codec has nothing else to probe */
+        return s3_test_failures;
+    }
+
+    /* the negotiated codec round-trips through the seam */
+
+    enc = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 0);
+
+    if (enc == NULL) {
+        /* the zstd is not in the build: the deflate and the lz4 ride
+         * the same gate, one codec of the build proves the shape */
+
+        enc = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_DEFLATE, 0);
+    }
+
+    if (enc == NULL) {
+        enc = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_LZ4, 0);
+    }
+
+    S3_ASSERT(enc != NULL);
+
+    S3_ASSERT(s3_ssh3_frame_data_build(frame, sizeof(frame), &frame_len, enc, payload, payload_len,
+                                       &wire_len) == S3_OK);
+    S3_ASSERT(wire_len < payload_len); /* the compressible payload rides the 192 */
+
+    {
+        s3_ssh3_compress_ctx_t *dec =
+            s3_ssh3_compress_ctx_create(s3_ssh3_compress_ctx_algorithm(enc), 1);
+        uint64_t                t;
+
+        pos = frame;
+
+        S3_ASSERT(dec != NULL);
+        S3_ASSERT(s3_ssh3_parse_varint(&pos, frame + frame_len, &t) == S3_OK);
+        S3_ASSERT(s3_ssh3_frame_data_parse(&pos, frame + frame_len, t, s3_ssh3_compress_available(),
+                                           dec, scratch, sizeof(scratch), &out) == S3_OK);
+        S3_ASSERT(out.len == payload_len);
+        S3_ASSERT(memcmp(out.data, payload, payload_len) == 0);
+
+        /* the NULL context decodes the same legal frame through the
+         * one-shot form: the refusal rides the mask, not the context */
+
+        pos = frame;
+
+        S3_ASSERT(s3_ssh3_parse_varint(&pos, frame + frame_len, &t) == S3_OK);
+
+        S3_ASSERT(s3_ssh3_frame_data_parse(&pos, frame + frame_len, t, s3_ssh3_compress_available(),
+                                           NULL, scratch, sizeof(scratch), &out) == S3_OK);
+        S3_ASSERT(out.len == payload_len);
+        S3_ASSERT(memcmp(out.data, payload, payload_len) == 0);
+
+        /* the id of the wire must sit in the announced mask: a frame
+         * on a side that announced nothing is a protocol violation
+         * even with a context */
+
+        {
+            uint64_t t2;
+
+            pos = frame;
+
+            S3_ASSERT(s3_ssh3_parse_varint(&pos, frame + frame_len, &t2) == S3_OK);
+            S3_ASSERT(s3_ssh3_frame_data_parse(&pos, frame + frame_len, t2, 0, dec, scratch,
+                                               sizeof(scratch), &out) == S3_DECLINED);
+        }
+
+        s3_ssh3_compress_ctx_destroy(dec);
+    }
+
+    /* the >32-bit id on the wire is refused before the truncation */
+
+    s3_memzero(&m, sizeof(m));
+
+    m.algorithm = 0x100000001ull + S3_SSH3_COMPRESS_ZSTD;
+    m.data.len = 5;
+    m.data.data = (u_char *)"hello";
+
+    {
+        u_char        msg[64];
+        u_char       *p;
+        size_t        len;
+        const u_char *pt;
+        uint64_t      t;
+        s3_ssh3_compress_ctx_t *dec;
+
+        len = (size_t)s3_ssh3_msg_encode_compressed_data(NULL, &m);
+        S3_ASSERT(len > 0 && len <= sizeof(msg));
+        s3_ssh3_msg_encode_compressed_data(msg, &m);
+
+        p = frame;
+        p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED);
+        memcpy(p, msg, len);
+
+        dec = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 1);
+
+        if (dec != NULL) {
+
+            pt = frame;
+
+            S3_ASSERT(s3_ssh3_parse_varint(&pt, frame + (size_t)(p - frame) + len, &t) == S3_OK);
+            S3_ASSERT(s3_ssh3_frame_data_parse(&pt, frame + (size_t)(p - frame) + len, t,
+                                               s3_ssh3_compress_available(), dec, scratch,
+                                               sizeof(scratch), &out) == S3_DECLINED);
+        }
+
+        s3_ssh3_compress_ctx_destroy(dec);
+    }
+
+    s3_ssh3_compress_ctx_destroy(enc);
+
+    return s3_test_failures;
+}
+
 int
 s3_test_ssh3_compress(void)
 {
@@ -455,7 +720,9 @@ s3_test_ssh3_compress(void)
     s3_test_compress_roundtrip();
     s3_test_compress_cutoff();
     s3_test_compress_bomb();
+    s3_test_compress_ctx();
     s3_test_compress_frame();
+    s3_test_compress_frame_gate();
     s3_test_compress_version();
 
     return s3_test_failures;

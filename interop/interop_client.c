@@ -169,6 +169,17 @@ static unsigned         s3_interop_h3_ch_confirmed;
 static unsigned         s3_interop_h3_ch_ok;
 
 /*
+ * the pre-auth channel probe (S3INTEROP_PREAUTH_CHANNEL, the audit
+ * fix wave): the CONNECT request never rides, so the conversation
+ * never reaches a verdict - the channel phase still opens, and the
+ * funnel gate of the server must refuse it.  the verdict rides the
+ * BAD-CHANNEL-VERDICT line of the channel reader (confirmed=0)
+ */
+
+static int              s3_interop_preauth_channel;
+static unsigned         s3_interop_preauth_checked;
+
+/*
  * the pass-2 e2e probe (S3INTEROP_BAD_CHANNEL=forwarded-tcp|
  * forwarded-udp|overgrow): the channel phase opens the bogus
  * server-to-client type (or trickles the garbage past the receive
@@ -8631,6 +8642,20 @@ main(int argc, char **argv)
                 s3_interop_bridge_flush();
             }
 
+            if (!s3_interop_preauth_checked) {
+
+                /* the knob rides once: the pre-auth probe holds the
+                 * CONNECT request back, the channel below opens into
+                 * the never-authenticated conversation */
+
+                s3_interop_preauth_checked = 1;
+                s3_interop_preauth_channel = (getenv("S3INTEROP_PREAUTH_CHANNEL") != NULL);
+            }
+
+            if (s3_interop_preauth_channel && !s3_interop_h3_req_sent) {
+                s3_interop_h3_req_sent = 1;
+            }
+
             if (hs_reported && !s3_interop_h3_req_sent) {
                 /* the section rides the auth value: the bearer JWT of the
                  * ed25519 keys is ~350 B, the RSA ones run longer -- the
@@ -8781,8 +8806,11 @@ main(int argc, char **argv)
                     break;
                 }
 
-            } else if (s3_interop_h3_status_seen && (s3_interop_h3_channel_mode ||
-                                                     s3_interop_fwd_mode || s3_interop_sftp_mode)) {
+            } else if ((s3_interop_h3_status_seen ||
+                        (s3_interop_preauth_channel &&
+                         s3_interop_h3_stream != NULL)) &&
+                       (s3_interop_h3_channel_mode || s3_interop_fwd_mode ||
+                        s3_interop_sftp_mode)) {
 
                 /*
                  * the channel comes up right after the 200: the next
