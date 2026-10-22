@@ -10,10 +10,20 @@
 #include <string.h>
 
 #include <s3_ssh3_compress.h>
+#include <s3_ssh3_frame.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_version.h>
+#include <s3_ssh3_wire.h>
 
 #include "s3_test.h"
+
+#if (S3_HAVE_LZ4)
+#include <lz4.h>
+#endif
+
+#if (S3_HAVE_ZSTD)
+#include <zstd.h>
+#endif
 
 /*
  * a payload with a compressible part and a noisy tail: the noisy part
@@ -46,6 +56,7 @@ static int
 s3_test_compress_capability(void)
 {
     u_char cap_buf[64];
+    char   cap_text[65];
     size_t cap_len;
     uint32_t available;
     uint32_t parsed;
@@ -67,6 +78,20 @@ s3_test_compress_capability(void)
 
     S3_ASSERT(parsed == available);
 
+    /* the list names the codecs of the build: the zstd and the lz4 ride
+     * the token when the codecs are compiled in */
+
+    s3_memcpy(cap_text, cap_buf, cap_len);
+    cap_text[cap_len] = '\0';
+
+#if (S3_HAVE_ZSTD)
+    S3_ASSERT(strstr(cap_text, "zstd") != NULL);
+#endif
+
+#if (S3_HAVE_LZ4)
+    S3_ASSERT(strstr(cap_text, "lz4") != NULL);
+#endif
+
     /* the unknown names are skipped, not fatal */
 
     {
@@ -81,6 +106,51 @@ s3_test_compress_capability(void)
     /* an empty value is the zero mask */
 
     S3_ASSERT(s3_ssh3_compress_parse((const u_char *)"", 0) == 0);
+
+    return s3_test_failures;
+}
+
+/*
+ * the names of the codecs: the word of the flag and the word of the
+ * capability list are the same
+ */
+
+static int
+s3_test_compress_names(void)
+{
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"zstd", 4) == S3_SSH3_COMPRESS_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"deflate", 7) == S3_SSH3_COMPRESS_DEFLATE);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"lz4", 3) == S3_SSH3_COMPRESS_LZ4);
+
+    /* the case does not matter */
+
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"ZSTD", 4) == S3_SSH3_COMPRESS_ZSTD);
+
+    /* the plain id of the wire rides the name too */
+
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"3", 1) == S3_SSH3_COMPRESS_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"1", 1) == S3_SSH3_COMPRESS_DEFLATE);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"2", 1) == S3_SSH3_COMPRESS_LZ4);
+
+    /* an unknown name is no codec at all */
+
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"nosuch", 5) == S3_SSH3_COMPRESS_NONE);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"", 0) == S3_SSH3_COMPRESS_NONE);
+    S3_ASSERT(s3_ssh3_compress_by_name((const u_char *)"4", 1) == S3_SSH3_COMPRESS_NONE);
+
+    /* the name back: the table of the capability list */
+
+    S3_ASSERT(strcmp(s3_ssh3_compress_name(S3_SSH3_COMPRESS_ZSTD), "zstd") == 0);
+    S3_ASSERT(strcmp(s3_ssh3_compress_name(S3_SSH3_COMPRESS_DEFLATE), "deflate") == 0);
+    S3_ASSERT(strcmp(s3_ssh3_compress_name(S3_SSH3_COMPRESS_LZ4), "lz4") == 0);
+    S3_ASSERT(s3_ssh3_compress_name(S3_SSH3_COMPRESS_NONE)[0] == '\0');
+
+    /* the bit of the capability: the bit of the name */
+
+    S3_ASSERT(s3_ssh3_compress_bit(S3_SSH3_COMPRESS_ZSTD) == S3_SSH3_COMPRESS_M_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_bit(S3_SSH3_COMPRESS_DEFLATE) == S3_SSH3_COMPRESS_M_DEFLATE);
+    S3_ASSERT(s3_ssh3_compress_bit(S3_SSH3_COMPRESS_LZ4) == S3_SSH3_COMPRESS_M_LZ4);
+    S3_ASSERT(s3_ssh3_compress_bit(S3_SSH3_COMPRESS_NONE) == 0);
 
     return s3_test_failures;
 }
@@ -104,6 +174,36 @@ s3_test_compress_choose(void)
         uint32_t chosen = s3_ssh3_compress_choose(available);
 
         S3_ASSERT(chosen != S3_SSH3_COMPRESS_NONE);
+    }
+
+    /*
+     * the preference order: zstd (the best ratio per cpu), deflate
+     * (the zlib of the ZFS gzip), lz4 (the fastest)
+     */
+
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_ZSTD) == S3_SSH3_COMPRESS_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_DEFLATE) == S3_SSH3_COMPRESS_DEFLATE);
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_LZ4) == S3_SSH3_COMPRESS_LZ4);
+
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_ZSTD | S3_SSH3_COMPRESS_M_DEFLATE
+                                       | S3_SSH3_COMPRESS_M_LZ4)
+           == S3_SSH3_COMPRESS_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_DEFLATE | S3_SSH3_COMPRESS_M_LZ4)
+           == S3_SSH3_COMPRESS_DEFLATE);
+    S3_ASSERT(s3_ssh3_compress_prefer(S3_SSH3_COMPRESS_M_ZSTD | S3_SSH3_COMPRESS_M_LZ4)
+           == S3_SSH3_COMPRESS_ZSTD);
+    S3_ASSERT(s3_ssh3_compress_prefer(0) == S3_SSH3_COMPRESS_NONE);
+
+    /* the negotiation takes the best of the peer mask and the build */
+
+    S3_ASSERT(s3_ssh3_compress_choose(0xffffffffu)
+               == s3_ssh3_compress_prefer(0xffffffffu & available));
+
+    /* the zstd wins the negotiation when the peer has it */
+
+    if ((available & S3_SSH3_COMPRESS_M_ZSTD) != 0) {
+        S3_ASSERT(s3_ssh3_compress_choose(S3_SSH3_COMPRESS_M_ZSTD | S3_SSH3_COMPRESS_M_LZ4)
+                   == S3_SSH3_COMPRESS_ZSTD);
     }
 
     return s3_test_failures;
@@ -350,6 +450,7 @@ int
 s3_test_ssh3_compress(void)
 {
     s3_test_compress_capability();
+    s3_test_compress_names();
     s3_test_compress_choose();
     s3_test_compress_roundtrip();
     s3_test_compress_cutoff();

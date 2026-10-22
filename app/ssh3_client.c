@@ -220,6 +220,36 @@ static unsigned s3_cli_compress_flag; /* the -C option */
 static uint32_t s3_cli_compress_mask;  /* the capability of the peer */
 static uint32_t s3_cli_compress_alg;  /* the negotiated algorithm */
 
+/* the pinned codec of the -C option (the automatic pick when the flag
+ * rides without a name; the benchmark of the codecs pins one) */
+
+static uint32_t s3_cli_compress_pin;
+
+/*
+ * the word after the -C flag: a host shape (the user@, the port, the
+ * path or the dot of a fqdn) is the destination of the run, not the
+ * name of a codec
+ */
+
+static int
+s3_cli_compress_word_is_host(const char *word)
+{
+    return strchr(word, '@') != NULL || strchr(word, ':') != NULL
+           || strchr(word, '/') != NULL || strchr(word, '.') != NULL;
+}
+
+/*
+ * the name of a codec ("zstd", "deflate", "lz4" or the plain id of
+ * the wire: "3", "1", "2"); S3_SSH3_COMPRESS_NONE when the name is
+ * unknown
+ */
+
+static uint32_t
+s3_cli_compress_name_parse(const char *name)
+{
+    return s3_ssh3_compress_by_name((const u_char *)name, s3_strlen(name));
+}
+
 /* the compression report: the compressed frames, the plain bytes they
  * carried and the bytes on the wire */
 
@@ -1184,7 +1214,8 @@ s3_cli_usage(const char *prog)
             "  --sftp put|get:local:remote  the transfer (get: local first)\n"
             "  --help      this help\n"
             "  -C          the compression of the channel body (the peer must announce\n"
-            "              the capability; the default is off)\n"
+            "              the capability; the default is off); -C zstd pins the\n"
+            "              codec (zstd, deflate, lz4), -C alone picks the best one\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
             " certificate pins into %s\n",
@@ -4076,13 +4107,34 @@ s3_cli_ctrl_read(s3_event_t *ev)
                         s3_cli_compress_mask = ver.compress_mask;
 
                         if (s3_cli_compress_flag) {
-                            s3_cli_compress_alg = s3_ssh3_compress_choose(s3_cli_compress_mask);
+
+                            if (s3_cli_compress_pin != S3_SSH3_COMPRESS_NONE) {
+
+                                /*
+                                 * the pinned codec: the peer must be
+                                 * able to decode it - no silent
+                                 * fallback to another codec
+                                 */
+
+                                if ((s3_cli_compress_mask & s3_ssh3_compress_bit(s3_cli_compress_pin)) == 0) {
+                                    fprintf(stderr, "ssh3: the peer does not support the %s compression\n",
+                                            s3_ssh3_compress_name(s3_cli_compress_pin));
+                                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                                    s3_quic_finalize_connection(pc, 0, "no common codec");
+                                    return;
+                                }
+
+                                s3_cli_compress_alg = s3_cli_compress_pin;
+
+                            } else {
+                                s3_cli_compress_alg = s3_ssh3_compress_choose(s3_cli_compress_mask);
+                            }
 
                             if (s3_cli_compress_alg != S3_SSH3_COMPRESS_NONE) {
                                 fprintf(stderr,
                                         "ssh3: the compression of the channel body is on "
-                                        "(algorithm %lu)\n",
-                                        (unsigned long)s3_cli_compress_alg);
+                                        "(%s)\n",
+                                        s3_ssh3_compress_name(s3_cli_compress_alg));
                             } else {
                                 fprintf(stderr, "ssh3: the peer does not support the compression of "
                                                 "the channel body\n");
@@ -12281,6 +12333,50 @@ main(int argc, char **argv)
                 }
 
                 value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "-C") == 0 && n + 1 < argc && argv[n + 1][0] != '-') {
+
+                /*
+                 * the pinned codec of the -C flag (the separated form:
+                 * "-C zstd"): the word names the codec, so it leaves
+                 * the command line - otherwise it would ride the
+                 * destination of the run.  a word that carries a host
+                 * shape (the user@, the port, the path or the dot of a
+                 * fqdn) is the destination, and the flag rides without
+                 * a name: the automatic pick
+                 */
+
+                const char *word = argv[n + 1];
+                uint32_t    alg = s3_cli_compress_name_parse(word);
+
+                if (alg == S3_SSH3_COMPRESS_NONE) {
+
+                    if (!s3_cli_compress_word_is_host(word)) {
+                        fprintf(stderr, "ssh3: unknown compression codec: %s "
+                                        "(the known ones: zstd, deflate, lz4)\n",
+                                word);
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    /* the destination of the run: the flag keeps the
+                     * automatic pick */
+
+                } else {
+
+                    if ((s3_ssh3_compress_available() & s3_ssh3_compress_bit(alg)) == 0) {
+                        fprintf(stderr, "ssh3: the %s codec is not in this build\n", word);
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    s3_cli_compress_flag = 1;
+                    s3_cli_compress_pin = alg;
+
+                    /* the flag and the name leave the command line */
+
+                    drop = 2;
+                }
             }
 
             if (value != NULL) {
@@ -12303,7 +12399,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "46ACD:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
+    while ((opt = getopt(argc, argv, "46AC::D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
@@ -12617,9 +12713,38 @@ main(int argc, char **argv)
         case 'C':
             /* the compression of the channel body (PLAN.md 9, B8): the
              * flag asks for it, the peer decides whether it happens
-             * (the capability of its version string) */
+             * (the capability of its version string).  the name of the
+             * codec rides the flag attached ("-Czstd", "-C=zstd") and
+             * pins the algorithm; the separated form ("-C zstd") is
+             * parsed by the pre-scan above */
 
             s3_cli_compress_flag = 1;
+
+            if (optarg != NULL) {
+
+                const char *name = optarg;
+
+                if (*name == '=') {
+                    name++;
+                }
+
+                s3_cli_compress_pin = s3_ssh3_compress_by_name((const u_char *)name, s3_strlen(name));
+
+                if (s3_cli_compress_pin == S3_SSH3_COMPRESS_NONE) {
+                    fprintf(stderr, "ssh3: unknown compression codec: %s "
+                                    "(the known ones: zstd, deflate, lz4)\n",
+                            name);
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                if ((s3_ssh3_compress_available() & s3_ssh3_compress_bit(s3_cli_compress_pin)) == 0) {
+                    fprintf(stderr, "ssh3: the %s codec is not in this build\n", name);
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+            }
+
             break;
 
         case 'V':

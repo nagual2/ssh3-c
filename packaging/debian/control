@@ -12,6 +12,9 @@ Build-Depends:
  ninja-build,
  gcc (>= 4:12),
  libssl-dev (>= 3.5),
+ zlib1g-dev,
+ libzstd-dev,
+ liblz4-dev,
  pkgconf
 Rules-Requires-Root: no
 

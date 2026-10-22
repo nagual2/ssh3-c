@@ -62,6 +62,104 @@ static const struct {
 
 #define S3_COMPRESS_ALGORITHMS (sizeof(s3_compress_algorithms) / sizeof(s3_compress_algorithms[0]))
 
+/*
+ * the case-insensitive comparison of the name with the table entry
+ */
+
+static int
+s3_compress_name_eq(const u_char *name, size_t len, const char *want, size_t want_len)
+{
+    size_t i;
+
+    if (len != want_len) {
+        return 0;
+    }
+
+    for (i = 0; i < len; i++) {
+
+        u_char c = name[i];
+
+        if (c >= 'A' && c <= 'Z') {
+            c = (u_char)(c - 'A' + 'a');
+        }
+
+        if (c != (u_char)want[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+uint32_t
+s3_ssh3_compress_by_name(const u_char *name, size_t len)
+{
+    size_t   i;
+    uint32_t value = 0;
+    size_t   digits = 0;
+
+    /* the plain id of the algorithm ("3", "1", "2") is accepted too:
+     * the ids of the wire are the numbers of the table below */
+
+    for (i = 0; i < len; i++) {
+
+        if (name[i] < '0' || name[i] > '9') {
+            break;
+        }
+
+        value = value * 10 + (uint32_t)(name[i] - '0');
+        digits++;
+    }
+
+    if (digits == len && digits > 0) {
+
+        for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
+            if (s3_compress_algorithms[i].algorithm == value) {
+                return value;
+            }
+        }
+
+        return S3_SSH3_COMPRESS_NONE;
+    }
+
+    for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
+        if (s3_compress_name_eq(name, len, s3_compress_algorithms[i].name,
+                                s3_compress_algorithms[i].len)) {
+            return s3_compress_algorithms[i].algorithm;
+        }
+    }
+
+    return S3_SSH3_COMPRESS_NONE;
+}
+
+const char *
+s3_ssh3_compress_name(uint32_t algorithm)
+{
+    size_t i;
+
+    for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
+        if (s3_compress_algorithms[i].algorithm == algorithm) {
+            return s3_compress_algorithms[i].name;
+        }
+    }
+
+    return "";
+}
+
+uint32_t
+s3_ssh3_compress_bit(uint32_t algorithm)
+{
+    size_t i;
+
+    for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
+        if (s3_compress_algorithms[i].algorithm == algorithm) {
+            return s3_compress_algorithms[i].bit;
+        }
+    }
+
+    return 0;
+}
+
 uint32_t
 s3_ssh3_compress_parse(const u_char *data, size_t len)
 {
@@ -142,18 +240,23 @@ s3_ssh3_compress_capability(u_char *buf, size_t cap)
 }
 
 uint32_t
-s3_ssh3_compress_choose(uint32_t peer_mask)
+s3_ssh3_compress_prefer(uint32_t mask)
 {
-    uint32_t common = peer_mask & s3_ssh3_compress_available();
-    size_t   i;
+    size_t i;
 
     for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
-        if ((common & s3_compress_algorithms[i].bit) != 0) {
+        if ((mask & s3_compress_algorithms[i].bit) != 0) {
             return s3_compress_algorithms[i].algorithm;
         }
     }
 
     return S3_SSH3_COMPRESS_NONE;
+}
+
+uint32_t
+s3_ssh3_compress_choose(uint32_t peer_mask)
+{
+    return s3_ssh3_compress_prefer(peer_mask & s3_ssh3_compress_available());
 }
 
 size_t
@@ -183,6 +286,24 @@ s3_ssh3_compress_bound(uint32_t algorithm, size_t in_len)
 
     default:
         break;
+    }
+
+    return bound;
+}
+
+size_t
+s3_ssh3_compress_bound_max(size_t in_len)
+{
+    size_t bound = 0;
+    size_t i;
+
+    for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
+
+        size_t b = s3_ssh3_compress_bound(s3_compress_algorithms[i].algorithm, in_len);
+
+        if (b > bound) {
+            bound = b;
+        }
     }
 
     return bound;

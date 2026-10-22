@@ -80,6 +80,27 @@ uint32_t s3_ssh3_compress_available(void);
 uint32_t s3_ssh3_compress_parse(const u_char *data, size_t len);
 
 /*
+ * the algorithm of the name ("zstd", "deflate", "lz4", the case does
+ * not matter); the plain id of the algorithm ("3", "1", "2") is
+ * accepted too.  S3_SSH3_COMPRESS_NONE when the name is unknown
+ */
+
+uint32_t s3_ssh3_compress_by_name(const u_char *name, size_t len);
+
+/*
+ * the name of the algorithm ("zstd", "deflate", "lz4"); the empty
+ * string for an unknown id
+ */
+
+const char *s3_ssh3_compress_name(uint32_t algorithm);
+
+/*
+ * the capability bit of the algorithm; zero for an unknown id
+ */
+
+uint32_t s3_ssh3_compress_bit(uint32_t algorithm);
+
+/*
  * writes the value of the capability token of the local build into
  * buf ("deflate,zstd"), returns the length; an empty string means the
  * build has no codec at all
@@ -95,6 +116,13 @@ size_t s3_ssh3_compress_capability(u_char *buf, size_t cap);
  */
 
 uint32_t s3_ssh3_compress_choose(uint32_t peer_mask);
+
+/*
+ * the preferred algorithm of the mask (the same order, no intersection
+ * with the local build): S3_SSH3_COMPRESS_NONE for an empty mask
+ */
+
+uint32_t s3_ssh3_compress_prefer(uint32_t mask);
 
 /*
  * compresses the frame payload; on S3_OK out_len carries the compressed
@@ -121,5 +149,13 @@ s3_int_t s3_ssh3_compress_decode(u_char *out, size_t cap, size_t *out_len, uint3
  */
 
 size_t s3_ssh3_compress_bound(uint32_t algorithm, size_t in_len);
+
+/*
+ * the worst case of the compressed size over the codecs of the build:
+ * the buffer of a frame must hold the form of the negotiated codec,
+ * and the bounds of the codecs differ (the zstd one is the largest)
+ */
+
+size_t s3_ssh3_compress_bound_max(size_t in_len);
 
 #endif /* _S3_SSH3_COMPRESS_H_INCLUDED_ */
