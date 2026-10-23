@@ -1,3 +1,20 @@
+ssh3-c (0.5.3-1) unstable; urgency=medium
+
+  * New upstream release 0.5.3: the wave B of the plan - the channel
+    body compression (the wire gain is 41x on zstd, the codecs
+    zlib+lz4+zstd, the negotiation and the frame format mirrored in
+    the go fork), the audit fix wave (the channel gate rides the
+    authenticated conversation, the identity and the codec state
+    live per channel, the frame 192 accepts fail-closed by the
+    announced mask) and the minors tail (the huffman width, the
+    lockout cap, the printable gate, the nightly fuzz CI).  The sftp
+    subsystem drains the half-closed peer now, the -J hop
+    certificate rides the known_hosts pin gate (the first hop was
+    accepted without a check - the MITM shape), and the QUIC path
+    MTU probes confirm again on the application ACK path.
+
+ -- Max <nahual15@gmail.com>  Fri, 23 Oct 2026 17:18:33 +0000
+
 ssh3-c (0.5.2-1) unstable; urgency=medium
 
   * New upstream release 0.5.2: the sftp jail of wave A - the jail
