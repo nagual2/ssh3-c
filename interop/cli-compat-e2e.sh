@@ -66,6 +66,11 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+# a hard-killed previous run (SIGKILL runs no EXIT trap) leaves its
+# setsid servers behind; sweep them by the tmp marker in their cmdline
+
+pkill -f 's3clie2e\.' 2>/dev/null
+
 WORK=$(mktemp -d /tmp/s3clie2e.XXXXXX)
 
 # the identity: the PKCS8 ed25519 of the C client, the authorized
