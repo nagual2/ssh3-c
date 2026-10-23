@@ -194,12 +194,4 @@ s3_int_t s3_ssh3_compress_decode(u_char *out, size_t cap, size_t *out_len, uint3
 
 size_t s3_ssh3_compress_bound(uint32_t algorithm, size_t in_len);
 
-/*
- * the worst case of the compressed size over the codecs of the build:
- * the buffer of a frame must hold the form of the negotiated codec,
- * and the bounds of the codecs differ (the zstd one is the largest)
- */
-
-size_t s3_ssh3_compress_bound_max(size_t in_len);
-
 #endif /* _S3_SSH3_COMPRESS_H_INCLUDED_ */

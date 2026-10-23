@@ -59,6 +59,7 @@
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_cmsg.h>
 #include <s3_ssh3_agent.h>
 #include <s3_ssh3_auth_jwt.h>
 #include <s3_ssh3_auth_srv.h>
@@ -3867,6 +3868,20 @@ main(int argc, char **argv)
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
         perror("bind");
+        return 1;
+    }
+
+    /*
+     * the local address ancillary data of the product daemon: the
+     * wildcard listener answers from the address the client dialed
+     * only when the kernel delivers the pktinfo - without it the
+     * local-address path of the interop legs stays inert and a
+     * regression there is invisible (the B15 audit tail); a no-op
+     * for a socket bound to a specific address
+     */
+
+    if (s3_enable_pktinfo(fd, (struct sockaddr *)&sa) != S3_OK) {
+        perror("s3_enable_pktinfo");
         return 1;
     }
 

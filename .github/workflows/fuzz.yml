@@ -1,0 +1,86 @@
+# The nightly libFuzzer run of the parser harnesses (the A3 wave, the
+# B15 audit tail: the fuzzers stayed outside the CI).
+#
+# Triggers:
+#   - schedule: nightly (the seed corpus rebuilds each run, the
+#     per-harness budget is time-boxed, the whole job fits the ~20
+#     minute mark)
+#   - workflow_dispatch: manual run, for testing the workflow itself
+#
+# The build rides the linux-fuzz preset (clang, libFuzzer, ASan +
+# UBSan, S3_BUILD_FUZZ=ON).  The QUIC TLS API needs OpenSSL 3.5+,
+# which the runners do not ship -- the job builds its own OpenSSL
+# into ~/opt, cached across runs (the same shape as build-release).
+#
+# A crash (or a leak, or an OOM) fails the job; the artifact carries
+# the reproducer file the harness wrote (crash-*, leak-*, timeout-*).
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: parsers (libFuzzer, asan+ubsan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18
+
+      - name: Cache OpenSSL 3.5.9 (native)
+        id: openssl
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/openssl-3.5
+          key: openssl-3.5.9-linux-x86_64
+
+      - name: Build OpenSSL 3.5.9 (native)
+        if: steps.openssl.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          tar -C /tmp -xzf /tmp/openssl.tar.gz
+          cd /tmp/openssl-3.5.9
+          ./Configure --prefix="$HOME/opt/openssl-3.5" --openssldir="$HOME/opt/openssl-3.5/ssl"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Configure and build (linux-fuzz)
+        run: |
+          cmake --preset linux-fuzz
+          cmake --build --preset linux-fuzz
+
+      - name: Generate the seed corpus
+        run: |
+          mkdir -p corpus
+          build/linux-fuzz/tests/fuzz/s3_fuzz_gen_seeds corpus
+
+      - name: Fuzz the parsers
+        run: |
+          ARTP=build/linux-fuzz/artifacts
+          mkdir -p "$ARTP"
+          FAIL=0
+          for H in fuzz_sftp_frame fuzz_cm_frame fuzz_forward_target fuzz_wire \
+                   fuzz_message fuzz_quic_state fuzz_h3_parse fuzz_h3_state fuzz_ssh3_state; do
+            echo "== $H"
+            build/linux-fuzz/tests/fuzz/$H corpus \
+              -max_total_time=60 -max_len=16384 -rss_limit_mb=2560 \
+              -artifact_prefix="$ARTP/" || FAIL=1
+          done
+          exit $FAIL
+
+      - name: Stage the reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build/linux-fuzz/artifacts/
+          if-no-files-found: ignore

@@ -18,16 +18,10 @@
 #include <s3_ssh3_compress.h>
 
 /*
- * the buffer size the frame of the payload needs: the plain frame
- * (the overhead of the type and of the string length) plus the room
- * for the compressed form of the worst case
- */
-
-size_t s3_ssh3_frame_data_bound(size_t payload_len);
-
-/*
- * builds the frame of the payload into buf (the size comes from
- * s3_ssh3_frame_data_bound):
+ * builds the frame of the payload into buf (the caller sizes the
+ * buffer on the channel invariants - the S3_*_FWD_FRAME constants and
+ * the peer max packet bound; the sizing helper of the earlier shape
+ * turned out dead and left with the B15 audit tail):
  *
  * - the compressed frame (192) when the codec context is set, the
  *   compressed form fits the buffer and is smaller than the payload

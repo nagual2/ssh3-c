@@ -6,7 +6,7 @@ Datum: 22.10.2026. Die Frage des Owners (F2 → B8): wie viel Verkehr spart die
 Kanalkompression wirklich. Beantwortet mit einer Live-Messung: `tcpdump` auf loopback,
 die Summe der UDP-Payload-Längen (die QUIC-Pakete — alles, was die Maschine verlässt),
 Runden in Rotationsfolge, die erste Runde ist Aufwärmung und fällt weg, der Median; eine
-Übertragung zählt nur bei byte-exakter Rückkehr der Datei (sha256-Gate außerhalb des
+Übertragung zählt nur bei byte-exakter Rückkehr der Datei (cmp-Gate außerhalb des
 Messfensters). Stand und Skript: `bench/p7-compress.sh`.
 
 ## Der Stand
@@ -17,11 +17,11 @@ Messfensters). Stand und Skript: `bench/p7-compress.sh`.
 | 2 | Payloads | `text` — 8,4 MiB wiederholter Zeilen (komprimierbar); `rand` — 8 MiB urandom (inkompressibel, Cutoff) |
 | 3 | Metrik | Summe der `UDP, length N` aus dem pcap des Bein-Fensters (der Put); der Pull läuft außerhalb und ist das Gate |
 | 4 | Beine | `c-plain` (ohne `-C`), `c-deflate`, `c-lz4`, `c-zstd` (erzwungener Codec), `go-auto` (Fork↔Fork, verhandelt) |
-| 5 | Runden | 5, davon 4 gemessen (Aufwärmung verworfen); der Median |
+| 5 | Runden | Skriptplan 7 (ROUNDS=7); tatsächlich Aufwärmung und 3 gemessene (WSL-Neustarts kürzten die Läufe, siehe Abweichungen); der Median |
 
 ## Ergebnisse (Mediane der LeitungBytes, ein Bein = ein Put)
 
-| Nr | Bein | text 8,4 MiB | Gewinn | rand 8 MiB |
+| Nr | Bein | text 8 MiB | Gewinn | rand 8 MiB |
 |----|------|-------------:|-------:|-----------:|
 | 1 | c-plain | 8 675 547 | 1× | 17 561 408 |
 | 2 | c-deflate | 224 553 | **38,6×** | 17 136 933 |

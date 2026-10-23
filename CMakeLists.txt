@@ -247,6 +247,14 @@ check_c_source_compiles(
 # check must complete them -- IP_PKTINFO and IPV6_RECVPKTINFO are plain
 # constants that survive on hosts where the structs are not declared.
 # struct in6_pktinfo is behind __USE_GNU, in_pktinfo behind __USE_MISC
+#
+# TRAP (the B15 audit tail): check_c_source_compiles caches its result
+# FOREVER -- a build directory configured before a fix of the check (or
+# of the feature macros around it) keeps the stale answer, and the
+# consumers of the gated declarations do not compile when the macro
+# stays off (implicit declaration on -Werror).  After changing a
+# feature check, its definitions or the toolchain, wipe the build
+# directory (rm -rf build/<preset>) instead of rebuilding in place.
 check_c_source_compiles(
     "
     #include <sys/socket.h>

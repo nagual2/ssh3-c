@@ -23,27 +23,6 @@
 
 #define S3_SSH3_FRAME_COMPRESSED_ROOM 16
 
-size_t
-s3_ssh3_frame_data_bound(size_t payload_len)
-{
-    size_t plain;
-    size_t compressed;
-
-    plain = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) + s3_ssh3_sshstring_size(payload_len);
-
-    /* the bound of the codec of the frame is not known here (the
-     * negotiation picks it later), so the largest bound of the build
-     * holds the compressed form of any of them */
-
-    compressed = s3_ssh3_compress_bound_max(payload_len);
-
-    if (compressed < payload_len) {
-        compressed = payload_len;
-    }
-
-    return plain + S3_SSH3_FRAME_COMPRESSED_ROOM + compressed;
-}
-
 s3_int_t
 s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, s3_ssh3_compress_ctx_t *ctx,
                          const u_char *payload, size_t payload_len, size_t *wire_len)

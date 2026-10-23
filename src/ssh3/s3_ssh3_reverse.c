@@ -125,12 +125,14 @@ s3_reverse_spec_unbracket(const char **f, size_t *len)
 }
 
 /*
- * the host text of the spec: the printable text only.  the bind
+ * the host text of the spec: the ASCII printable only.  the bind
  * address rides the wire verbatim and the server logs it as it
  * stands (the reason of a refusal rides the reply), so a control
  * character in the spec would reach the server log as a terminal
- * escape - the fail-closed rule refuses the spec before anything is
- * sent (the reference parser keeps the same plain-text shape)
+ * escape - and a raw 8-bit byte has no business in a bind address
+ * either (the B15 audit tail) - the fail-closed rule refuses the
+ * spec before anything is sent (the reference parser keeps the same
+ * plain-text shape)
  */
 
 static unsigned
@@ -142,7 +144,7 @@ s3_reverse_host_printable(const char *f, size_t len)
 
         u_char c = (u_char)f[i];
 
-        if (c < 0x20 || c == 0x7f) {
+        if (c < 0x20 || c > 0x7e) {
             return 0;
         }
     }

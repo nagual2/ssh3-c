@@ -6,7 +6,7 @@ Date: 2026-10-22. The owner's question (F2 → B8): how much traffic does the ch
 compression actually save. Answered with a live capture: `tcpdump` on loopback, the sum of
 the UDP payload lengths (the QUIC packets — everything that leaves the machine), rounds in
 a leg rotation, the first round is the warmup and is discarded, the median; a transfer
-counts only when the file comes back byte-exact (the sha256 gate outside the timed window).
+counts only when the file comes back byte-exact (the cmp gate outside the timed window).
 The stand and the script: `bench/p7-compress.sh`.
 
 ## The stand
@@ -14,14 +14,14 @@ The stand and the script: `bench/p7-compress.sh`.
 | № | Parameter | Value |
 |---|-----------|-------|
 | 1 | Implementations | ssh3-c `852ddfd` (zlib+lz4+zstd build), the go fork `ce072f4` (deflate+lz4+zstd) |
-| 2 | Payloads | `text` — 8.4 MiB of repeated lines (compressible); `rand` — 8 MiB of urandom (incompressible, the cutoff) |
+| 2 | Payloads | `text` — 8 MiB of repeated lines, 8 388 608 bytes (compressible); `rand` — 8 MiB of urandom (incompressible, the cutoff) |
 | 3 | Metric | the sum of `UDP, length N` from the pcap of the leg window (the put); the pull runs outside the window and is the gate |
 | 4 | Legs | `c-plain` (no `-C`), `c-deflate`, `c-lz4`, `c-zstd` (the forced codec), `go-auto` (fork↔fork, negotiated) |
-| 5 | Rounds | 5, of which 4 measured (the warmup discarded); the median |
+| 5 | Rounds | the script plan is 7 (ROUNDS=7); in fact the warmup and 3 measured rounds (the WSL restarts cut the runs, see the deviations); the median |
 
 ## Results (medians of the wire bytes, a leg = one put)
 
-| № | Leg | text 8.4 MiB | gain | rand 8 MiB |
+| № | Leg | text 8 MiB | gain | rand 8 MiB |
 |---|-----|-------------:|-----:|-----------:|
 | 1 | c-plain | 8 675 547 | 1× | 17 561 408 |
 | 2 | c-deflate | 224 553 | **38.6×** | 17 136 933 |

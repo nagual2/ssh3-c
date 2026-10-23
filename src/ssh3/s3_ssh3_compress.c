@@ -291,24 +291,6 @@ s3_ssh3_compress_bound(uint32_t algorithm, size_t in_len)
     return bound;
 }
 
-size_t
-s3_ssh3_compress_bound_max(size_t in_len)
-{
-    size_t bound = 0;
-    size_t i;
-
-    for (i = 0; i < S3_COMPRESS_ALGORITHMS; i++) {
-
-        size_t b = s3_ssh3_compress_bound(s3_compress_algorithms[i].algorithm, in_len);
-
-        if (b > bound) {
-            bound = b;
-        }
-    }
-
-    return bound;
-}
-
 /*
  * the channel codec context: the algorithm, the side and the resident
  * state of the codec (the zlib stream or the zstd context); the audit

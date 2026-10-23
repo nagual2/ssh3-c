@@ -120,6 +120,13 @@ s3_test_reverse_spec_printable(void)
     S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\x7f:80", &spec) == S3_ERROR);
     S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.1\x1b[31m:80", &spec) == S3_ERROR);
 
+    /* the raw 8-bit bytes refuse too: the ASCII printable is the
+     * whole alphabet of a bind host (the B15 audit tail) */
+
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:127.0.0.\x80:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("3000:h\xfcst.example:80", &spec) == S3_ERROR);
+    S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1\xff:3000:192.0.2.10:80", &spec) == S3_ERROR);
+
     /* the same rule on the bind host of the four-part form */
 
     S3_ASSERT(s3_ssh3_reverse_parse_spec("127.0.0.1\x02:3000:192.0.2.10:80", &spec) == S3_ERROR);

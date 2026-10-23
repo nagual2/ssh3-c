@@ -211,7 +211,16 @@ s3_h3_huff_encode(u_char *src, size_t len, u_char *dst, s3_uint_t lower)
 {
     u_char                    *end;
     size_t                     hlen;
-    s3_uint_t                  buf, pending, code;
+    /*
+     * the accumulator is uint64_t on purpose, not s3_uint_t: the
+     * encode macro writes eight bytes whatever the pointer width is,
+     * a 32-bit s3_uint_t here desynced the accounting from the writes
+     * (the B15 audit tail) - the shifts carry uint64_t casts, a plain
+     * s3_uint_t code shifted by 40 would be undefined on an ILP32
+     * build
+     */
+    uint64_t                   buf;
+    s3_uint_t                  pending, code;
     s3_h3_huff_encode_code_t  *table, *next;
 
     table = lower ? s3_h3_huff_encode_table_lc : s3_h3_huff_encode_table;
@@ -230,7 +239,7 @@ s3_h3_huff_encode(u_char *src, size_t len, u_char *dst, s3_uint_t lower)
         /* accumulate bits */
 
         if (pending < sizeof(buf) * 8) {
-            buf |= code << (sizeof(buf) * 8 - pending);
+            buf |= (uint64_t) code << (sizeof(buf) * 8 - pending);
             continue;
         }
 
@@ -246,14 +255,14 @@ s3_h3_huff_encode(u_char *src, size_t len, u_char *dst, s3_uint_t lower)
 
         hlen += sizeof(buf);
 
-        buf = pending ? code << (sizeof(buf) * 8 - pending) : 0;
+        buf = pending ? (uint64_t) code << (sizeof(buf) * 8 - pending) : 0;
     }
 
     if (pending == 0) {
         return hlen;
     }
 
-    buf |= (s3_uint_t)-1 >> pending;
+    buf |= (uint64_t) -1 >> pending;
 
     pending = (pending + 7) & ~(size_t)7;
 

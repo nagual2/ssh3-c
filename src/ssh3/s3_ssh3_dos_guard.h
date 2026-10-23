@@ -42,18 +42,21 @@
  * the bound of a tracked name: the lockout records store the name in
  * a fixed field, an over-bound name is never tracked (no booking, no
  * lockout) instead of being truncated - a truncated alias could let
- * one account's failures poison another's lockout.  The bound sits
- * under the CONNECT username cap of the daemon (128), so the tracked
- * names are the names the deployment can actually resolve
+ * one account's failures poison another's lockout.  The bound equals
+ * the CONNECT username cap of the daemon (128), so every name the
+ * deployment can resolve is trackable - a name between the old bound
+ * of 64 and the cap sat outside the brute-force protection silently
+ * (the B15 audit tail)
  */
 
-#define S3_DOS_USER_NAME_MAX 64
+#define S3_DOS_USER_NAME_MAX 128
 
 /*
  * the hard memory ceiling of the lockout bookkeeping: the keys are
  * attacker-controlled and the table - not a tree - is the bound, a
  * flood of invented usernames cannot grow the memory past this
- * shape (the record is ~88 bytes, so the ceiling is ~360 KiB)
+ * shape (the record is ~152 bytes with the 128-byte name field, so
+ * the ceiling is ~622 KiB)
  *
  * the table grows on demand: the daemon books the accounts the
  * password backends know, so the population is the real accounts and
