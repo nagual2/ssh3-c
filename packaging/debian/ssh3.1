@@ -102,7 +102,10 @@ everything); print the version.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.ssh3/known_hosts
-The TOFU pin store of the server certificates.
+The TOFU pin store of the server certificates: the destination
+host and every
+.Fl J
+hop.
 .It Pa ~/.ssh/config
 The OpenSSH configuration, consulted per
 .Fl F .

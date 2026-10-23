@@ -14,8 +14,8 @@
 #   9. -n smoke (the exec rides, the stdin unpumped)
 #  10. -A agent forwarding rides the throwaway agent (the small leg)
 #  11. -J put: deprecated works, --sftp put/get byte-exact
-#  12. -J jump vs the two-daemon stand (the positive and the wrong
-#      jump port refusal inside the deadline)
+#  12. -J jump vs the two-daemon stand (the positive, the wrong
+#      jump port refusal, the hop pin mismatch)
 #  13. -o Port=, -o User=, -o LocalForward= (the -L twin)
 #  14. -F config (HostName/Port/User/LocalForward from the file)
 #  15. -D socks5 (the curl through the proxy)
@@ -89,6 +89,7 @@ mkcert() {
 mkcert 1
 mkcert 2
 mkcert 3
+mkcert 4
 
 # the v4 loopback daemon: the extra args ride between -3 and the
 # cert pair (the -d 1352 of the jump daemon), the listen port scans
@@ -607,6 +608,13 @@ echo "== run 3: the jump stand (the -d 1352 jump daemon)"
 
 JPORT=$(start_srv 2 -d 1352) || die "the jump daemon did not start"
 
+# the hop pin rides the store before the jump legs: the -J client
+# checks the jump certificate against it (the pin gate of fix/j)
+
+printf '%s x509-certificate %s\n' "127.0.0.1:$JPORT/ssh3-term" \
+    "$(openssl x509 -in "$WORK/cert-2.pem" -outform DER | base64 -w0)" \
+    >> "$WORK/home/.ssh3/known_hosts"
+
 echo "== leg 16: -J jump (the exec through the tunnel)"
 
 if HOME="$WORK/home" timeout 40 "$BUILD/ssh3" -i "$WORK/priv.pem" \
@@ -634,6 +642,62 @@ else
         pass "the wrong jump port refused cleanly in $((NOW - START))s (rc 255)"
     else
         fail "the wrong jump leg: rc=$rc took $((NOW - START))s"
+    fi
+fi
+
+echo "== leg 18: the hop pin mismatch refuses (JUMP-PIN-MISMATCH-REJECT)"
+
+# a fresh jump daemon on the same port: the stand serves one jump
+# conversation (the direct-udp channel binds for the daemon
+# lifetime), the certificate stays the one the pin mismatch needs.
+# The start_srv pid dies with its $() substitution, so the jump
+# daemon dies by its listen shape instead
+
+pkill -9 -f "ssh3-server -3 -d 1352 -l 127.0.0.1:$JPORT" 2>/dev/null
+sleep 0.3
+
+setsid nohup env SSH3C_PROTO=1 "$BIN" -3 -d 1352 -l "127.0.0.1:$JPORT" \
+    -c "$WORK/cert-2.pem" -k "$WORK/key-2.pem" \
+    -K "$WORK/authorized_keys" > "$WORK/srv-2b.log" 2>&1 < /dev/null &
+J2PID=$!
+SRVPIDS="$SRVPIDS $J2PID"
+
+J2I=0
+
+while [ "$J2I" -lt 100 ]; do
+
+    if grep -q INTEROP-LISTEN "$WORK/srv-2b.log" 2>/dev/null; then
+        break
+    fi
+
+    sleep 0.1
+    J2I=$((J2I + 1))
+done
+
+grep -q INTEROP-LISTEN "$WORK/srv-2b.log" ||
+    die "the jump daemon restart failed: $(tail -3 "$WORK/srv-2b.log" 2>/dev/null)"
+
+# the fresh home pins the destination on the right certificate and
+# the hop on the foreign one (cert 4 against the daemon of the cert
+# 2): the MITM shape of the jump leg, refused before any credential
+
+pin_home home-jump-bad "127.0.0.1:$PORT/ssh3-term" 1
+
+printf '%s x509-certificate %s\n' "127.0.0.1:$JPORT/ssh3-term" \
+    "$(openssl x509 -in "$WORK/cert-4.pem" -outform DER | base64 -w0)" \
+    >> "$WORK/home-jump-bad/.ssh3/known_hosts"
+
+if HOME="$WORK/home-jump-bad" timeout 40 "$BUILD/ssh3" -i "$WORK/priv.pem" \
+    -J "127.0.0.1:$JPORT" "client@127.0.0.1:$PORT/ssh3-term" "echo no" \
+    > "$WORK/leg-jump-pin.out" 2>"$WORK/leg-jump-pin.err"; then
+    fail "-J accepted the hop certificate that misses the pin"
+else
+    rc=$?
+
+    if [ "$rc" -eq 255 ] && grep -q "does not match the pin in known_hosts" "$WORK/leg-jump-pin.err"; then
+        pass "-J refused the hop on the pin mismatch (rc 255)"
+    else
+        fail "-J hop pin leg: rc=$rc $(tail -1 "$WORK/leg-jump-pin.err")"
     fi
 fi
 

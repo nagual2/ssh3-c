@@ -454,6 +454,7 @@ static char        s3_cli_jump_user[128];
 static char        s3_cli_jump_host[256];
 static unsigned    s3_cli_jump_port; /* 0 asks the 443 default at the resolve */
 static char        s3_cli_jump_target[384];
+static char        s3_cli_jump_hostkey[768]; /* the known_hosts key of the hop */
 static char        s3_cli_jump_bearer[2048];
 static const char *s3_cli_jump_auth; /* the jump CONNECT auth value */
 
@@ -1028,6 +1029,7 @@ static uintptr_t s3_cli_h3_field_l(u_char *p, const char *name, const char *valu
 static size_t    s3_cli_h3_section(u_char *p);
 static s3_int_t  s3_cli_tofu_prepare(void);
 static s3_int_t  s3_cli_cert_check(void);
+static s3_int_t  s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey);
 static s3_int_t  s3_cli_opt_parse(const char *arg);
 static u_char   *s3_cli_session_request(u_char *p, s3_ssh3_request_kind_t kind, unsigned want_reply,
                                         const s3_ssh3_request_t *body);
@@ -3631,7 +3633,7 @@ s3_cli_tofu_prepare(void)
 }
 
 static s3_int_t
-s3_cli_cert_check(void)
+s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
 {
     char    line[17408], fp[64], pin[16384], kh_path[1024];
     u_char *der = NULL, dec[8192];
@@ -3650,7 +3652,7 @@ s3_cli_cert_check(void)
     /* the leaf of the handshake, the i2d form the pins store */
 
     {
-        X509 *cert = SSL_get1_peer_certificate(s3_cli_conn->ssl->connection);
+        X509 *cert = SSL_get1_peer_certificate(conn->ssl->connection);
 
         if (cert == NULL) {
             s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the server presented no certificate");
@@ -3715,7 +3717,7 @@ s3_cli_cert_check(void)
             *sp1 = '\0';
             *sp2 = '\0';
 
-            if (strcmp(line, s3_cli_hostkey) != 0 || strcmp(sp1 + 1, "x509-certificate") != 0) {
+            if (strcmp(line, hostkey) != 0 || strcmp(sp1 + 1, "x509-certificate") != 0) {
                 continue;
             }
 
@@ -3745,7 +3747,7 @@ s3_cli_cert_check(void)
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
                      "WARNING: the certificate of %s does not match the pin in known_hosts"
                      " (received %s): a machine-in-the-middle attack or a server change",
-                     s3_cli_hostkey, fp);
+                     hostkey, fp);
 
         OPENSSL_free(der);
         return S3_ERROR;
@@ -3761,7 +3763,7 @@ s3_cli_cert_check(void)
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
                      "the authenticity of %s cannot be established (certificate %s) and"
                      " strict-host-key-checking=yes refuses an unpinned host",
-                     s3_cli_hostkey, fp);
+                     hostkey, fp);
 
         OPENSSL_free(der);
         return S3_DECLINED;
@@ -3772,7 +3774,7 @@ s3_cli_cert_check(void)
         s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
                      "the certificate of %s is accepted without a pin"
                      " (strict-host-key-checking=no, certificate %s)",
-                     s3_cli_hostkey, fp);
+                     hostkey, fp);
 
         OPENSSL_free(der);
         return S3_OK;
@@ -3782,7 +3784,7 @@ s3_cli_cert_check(void)
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
                      "the authenticity of %s cannot be established (certificate %s) and the"
                      " session is not interactive, aborting",
-                     s3_cli_hostkey, fp);
+                     hostkey, fp);
 
         OPENSSL_free(der);
         return S3_DECLINED;
@@ -3792,7 +3794,7 @@ s3_cli_cert_check(void)
             "The authenticity of host %s cannot be established.\n"
             "Certificate fingerprint: %s\n"
             "Do you want to add this certificate to %s (yes/no)? ",
-            s3_cli_hostkey, fp, S3_CLI_KH_LABEL);
+            hostkey, fp, S3_CLI_KH_LABEL);
     fflush(stderr);
 
     {
@@ -3814,7 +3816,7 @@ s3_cli_cert_check(void)
     /* the pin appends (the line terminator rides the platform helper) */
 
     s3_cli_b64std(der, derlen, pin);
-    snprintf(line, sizeof(line), "%s x509-certificate %s", s3_cli_hostkey, pin);
+    snprintf(line, sizeof(line), "%s x509-certificate %s", hostkey, pin);
 
     if (s3_cli_kh_append(kh_path, line) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the known_hosts append failed");
@@ -3822,11 +3824,20 @@ s3_cli_cert_check(void)
         return S3_ERROR;
     }
 
-    fprintf(stderr, "Pinned %s (%s)\n", s3_cli_hostkey, fp);
+    fprintf(stderr, "Pinned %s (%s)\n", hostkey, fp);
 
     OPENSSL_free(der);
 
     return S3_OK;
+}
+
+/* the main connection check: the destination host key against the
+ * connection that carries the session */
+
+static s3_int_t
+s3_cli_cert_check(void)
+{
+    return s3_cli_cert_check_conn(s3_cli_conn, s3_cli_hostkey);
 }
 
 /*
@@ -9024,6 +9035,15 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
 
         if (!s3_cli_jump_hs && s3_cli_jump_cli->ssl != NULL && s3_cli_jump_cli->ssl->handshaked) {
 
+            /* the pin gate: the TLS layer rides SSL_VERIFY_NONE, the
+             * known_hosts hop pin is the only MITM barrier, and it
+             * closes before any credential goes out (the main conn
+             * checks at its own handshake the same way) */
+
+            if (s3_cli_cert_check_conn(s3_cli_jump_cli, s3_cli_jump_hostkey) != S3_OK) {
+                return S3_ERROR;
+            }
+
             s3_cli_jump_hs = 1;
 
             /* the h3 session first, the same the main run does */
@@ -13256,6 +13276,12 @@ main(int argc, char **argv)
         if (s3_cli_jump_port == 0) {
             s3_cli_jump_port = 443;
         }
+
+        /* the known_hosts key of the hop: the port default resolves
+         * first, the path mirrors the jump CONNECT target (/ssh3-term) */
+
+        snprintf(s3_cli_jump_hostkey, sizeof(s3_cli_jump_hostkey), "%s:%u%s", s3_cli_jump_host,
+                 s3_cli_jump_port, "/ssh3-term");
 
         memset(&jhints, 0, sizeof(jhints));
         jhints.ai_family = AF_INET;
