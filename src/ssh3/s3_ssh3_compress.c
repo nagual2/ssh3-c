@@ -264,6 +264,11 @@ s3_ssh3_compress_bound(uint32_t algorithm, size_t in_len)
 {
     size_t bound = 0;
 
+    /* a codec-less build (the windows-core cross) has no case below
+     * to consume in_len - the cast keeps the parameter named */
+
+    (void)in_len;
+
     switch (algorithm) {
 
 #if (S3_HAVE_ZLIB)
@@ -432,6 +437,14 @@ s3_int_t
 s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap, size_t *out_len,
                             const u_char *in, size_t in_len)
 {
+    /* a codec-less build has no case below to consume the buffer */
+
+    (void)out;
+    (void)cap;
+    (void)out_len;
+    (void)in;
+    (void)in_len;
+
     if (ctx == NULL || ctx->decode) {
         /* the resident state belongs to the decode side, the wrong
          * side would hand the decompressor to the compressor */
@@ -518,6 +531,14 @@ s3_int_t
 s3_ssh3_compress_ctx_decode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap, size_t *out_len,
                             const u_char *in, size_t in_len)
 {
+    /* a codec-less build has no case below to consume the buffer
+     * (cap rides the bomb limit below) */
+
+    (void)out;
+    (void)out_len;
+    (void)in;
+    (void)in_len;
+
     if (ctx == NULL || !ctx->decode) {
         /* the encode-side state never decodes */
 
@@ -616,6 +637,14 @@ s3_int_t
 s3_ssh3_compress_encode(u_char *out, size_t cap, size_t *out_len, uint32_t algorithm,
                         const u_char *in, size_t in_len)
 {
+    /* a codec-less build has no case below to consume the buffer */
+
+    (void)out;
+    (void)cap;
+    (void)out_len;
+    (void)in;
+    (void)in_len;
+
     switch (algorithm) {
 
 #if (S3_HAVE_ZLIB)
@@ -700,6 +729,14 @@ s3_int_t
 s3_ssh3_compress_decode(u_char *out, size_t cap, size_t *out_len, uint32_t algorithm,
                         const u_char *in, size_t in_len)
 {
+    /* a codec-less build has no case below to consume the buffer
+     * (cap rides the bomb limit below) */
+
+    (void)out;
+    (void)out_len;
+    (void)in;
+    (void)in_len;
+
     /* the bomb limit: the output buffer never exceeds the channel
      * packet limit, whatever the frame claims */
 
