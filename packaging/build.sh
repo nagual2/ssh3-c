@@ -221,7 +221,13 @@ version_of() {
     local bin="$1"
     local v
 
-    v=$("$bin" -V 2>/dev/null | awk '{print $3}')
+    # the daemon prints "ssh3-server version X.Y.Z" (the version is $3),
+    # the client prints "ssh3 version SSH 3.0 ssh3-c X.Y.Z ..." (the
+    # version rides after the implementation name)
+    v=$("$bin" -V 2>/dev/null | awk '{
+        if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+/) { print $3; exit }
+        for (i = 1; i < NF; i++) if ($i == "ssh3-c") { print $(i + 1); exit }
+    }')
 
     if [ -z "$v" ]; then
         v=$(awk '
