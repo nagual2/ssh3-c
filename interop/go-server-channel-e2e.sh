@@ -175,6 +175,67 @@ else
     pass "no lost-channel error in the fork log"
 fi
 
+echo "== leg 3: the valid user with a wrong key - the verdict rides before the flush (B11-3)"
+
+openssl genpkey -algorithm ed25519 -out "$W/wrong.pem" 2>/dev/null ||
+    die "openssl genpkey (wrong key) failed"
+
+T0=$(date +%s)
+HOME="$W/home" timeout -k 5 30 "$CCLI" -i "$W/wrong.pem" \
+    --sftp "put:$W/payload.bin:/go-srv-e2e-wrong.bin" "$URL_MAX" \
+    > "$W/wrong.out" 2>"$W/wrong.err"
+rc=$?
+T1=$(date +%s)
+
+if [ "$rc" -ne 0 ]; then
+    pass "the wrong key is refused (rc $rc)"
+else
+    fail "the wrong key was served"
+fi
+
+if [ $((T1 - T0)) -lt 10 ]; then
+    pass "the verdict came back at once ($((T1 - T0))s, no hang)"
+else
+    fail "the verdict hung for $((T1 - T0))s - the client saw the phantom 200"
+fi
+
+if grep -q "refused the session (HTTP 401)" "$W/wrong.err"; then
+    pass "the client saw the honest 401"
+else
+    fail "no 401 verdict on the client side: $(tail -1 "$W/wrong.err")"
+fi
+
+if grep -q "could not find SSH3 conversation" "$S_LOG"; then
+    fail "the wrong key lost the channel: $(grep -m1 "could not find SSH3" "$S_LOG")"
+else
+    pass "no lost-channel error on the wrong key"
+fi
+
+echo "== leg 4: the exec session and the exit status (the C client)"
+
+# the command args must not start with a dash: the client's getopt
+# permutes the whole argv and eats the tokens of `sh -c ...`
+
+HOME="$W/home" timeout -k 5 30 "$CCLI" -i "$W/key.pem" \
+    "$URL_MAX" printf go-server-channel-e2e-exec-ok > "$W/exec.out" 2>"$W/exec.err"
+rc=$?
+
+if [ "$rc" -eq 0 ] && grep -q go-server-channel-e2e-exec-ok "$W/exec.out"; then
+    pass "the exec rode (the marker came back)"
+else
+    fail "the exec leg: rc=$rc $(tail -1 "$W/exec.err")"
+fi
+
+HOME="$W/home" timeout -k 5 30 "$CCLI" -i "$W/key.pem" \
+    "$URL_MAX" false > "$W/false.out" 2>"$W/false.err"
+rc=$?
+
+if [ "$rc" -eq 1 ]; then
+    pass "the exit status propagated (rc 1)"
+else
+    fail "the exit-status leg: rc=$rc, want 1"
+fi
+
 if [ "$FAILURES" -eq 0 ]; then
     echo "GO-SERVER-CHANNEL-E2E OK"
     exit 0
