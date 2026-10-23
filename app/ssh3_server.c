@@ -1596,6 +1596,17 @@ struct s3_srv_h3_channel_s {
     pid_t    sftp_pid;      /* the child process, 0 once reaped */
     int      sftp_in;       /* the stdin pipe of the child, -1 when unused */
     int      sftp_out;      /* the stdout pipe of the child, -1 when unused */
+
+    /*
+     * the drain of the peer half-close (the B12 finding): the client
+     * shut its send side, the pending replies still ride back - the
+     * request side closes (the child stdin), the pumps carry the tail
+     * out and the flush completion ends the channel; the deadline
+     * bounds a child that never leaves
+     */
+
+    unsigned sftp_drain;
+    time_t   sftp_drain_deadline;
     unsigned sftp_budgeted; /* the per-user sftp budget slot is held (S2-02) */
 
     /*
@@ -3593,6 +3604,17 @@ s3_srv_fwd_flush(s3_srv_h3_channel_t *ch)
         if (ch->fwd_frame_sent == ch->fwd_frame_total) {
 
             if (ch->fwd_out_len == 0) {
+
+                /* the sftp drain (the B12 finding): the tail of the
+                 * subsystem is fully out, the fin rides back, the
+                 * channel ends */
+
+                if (ch->sftp_drain) {
+                    (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+                    s3_srv_report("SFTP-SRV-DONE\n");
+                    s3_srv_h3_channel_free(ch);
+                }
+
                 return;
             }
 
@@ -3772,6 +3794,15 @@ s3_srv_fwd_timer(s3_event_t *ev)
     s3_srv_h3_channel_t *ch = ev->data;
 
     ev->timedout = 0;
+
+    /* the sftp drain deadline (the B12 finding): a subsystem that
+     * never leaves does not hold the channel past the bound */
+
+    if (ch->sftp_drain && time(NULL) > ch->sftp_drain_deadline) {
+        fprintf(stderr, "ssh3-server: the sftp drain deadline\n");
+        s3_srv_h3_channel_free(ch);
+        return;
+    }
 
     if (getenv("S3AGENTDBG") != NULL && ch->fwd_kind == S3_SRV_FWD_AGENT) {
         fprintf(stderr, "agdbg fwd tick eof=%u\n", (unsigned)ch->fwd_eof);
@@ -6062,12 +6093,37 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
             if (ch->fwd_kind == S3_SRV_FWD_SFTP) {
 
-                /* the transfer peer closed: the subsystem goes with
-                 * it (the free kills and reaps the child) */
+                /*
+                 * the peer half-close (the B12 finding): EOF means "no
+                 * more requests", not "drop the answers" - the pending
+                 * replies of the child ride back before the channel
+                 * dies.  the child stdin closes here, the pump carries
+                 * the tail out (its eof end-shape ends the channel)
+                 * and the deadline bounds a child that never leaves
+                 */
 
-                s3_srv_report("SFTP-SRV-DONE\n");
+                ch->sftp_drain = 1;
+                ch->sftp_drain_deadline = time(NULL) + 30;
 
-                s3_srv_h3_channel_free(ch);
+                if (ch->sftp_in >= 0) {
+                    (void)close(ch->sftp_in);
+                    ch->sftp_in = -1;
+                }
+
+                s3_srv_report("SFTP-SRV-DRAIN\n");
+
+                s3_srv_fwd_arm(ch);
+
+                s3_srv_sftp_child_pump(ch);
+
+                if (ch->sc != NULL && ch->fwd_eof && ch->fwd_out_len == 0 &&
+                    ch->fwd_frame_sent == ch->fwd_frame_total) {
+
+                    (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+                    s3_srv_report("SFTP-SRV-DONE\n");
+                    s3_srv_h3_channel_free(ch);
+                }
+
                 return;
             }
 
@@ -6091,11 +6147,34 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
             if (ch->sftp != NULL) {
 
-                /* the transfer peer closed: the subsystem goes with it */
+                /*
+                 * the peer half-close of the lexical engine (the B12
+                 * finding): the engine answers synchronously, so the
+                 * tail is already in the out-buffer - the pump pushes
+                 * it out and the flush completion (or the timer, on a
+                 * send stall) ends the channel
+                 */
 
-                s3_srv_report("SFTP-SRV-DONE\n");
+                ch->sftp_drain = 1;
+                ch->sftp_drain_deadline = time(NULL) + 30;
 
-                s3_srv_h3_channel_free(ch);
+                s3_srv_report("SFTP-SRV-DRAIN\n");
+
+                s3_srv_fwd_arm(ch);
+
+                s3_srv_sftp_pump(ch);
+
+                if (ch->sc != NULL && ch->fwd_out_len == 0 &&
+                    ch->fwd_frame_sent == ch->fwd_frame_total) {
+
+                    /* the tail went out at once: the fin rides back,
+                     * the channel ends */
+
+                    (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+                    s3_srv_report("SFTP-SRV-DONE\n");
+                    s3_srv_h3_channel_free(ch);
+                }
+
                 return;
             }
 

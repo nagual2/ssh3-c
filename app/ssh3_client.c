@@ -13420,6 +13420,17 @@ main(int argc, char **argv)
 
         s3_process_events_and_timers(&s3_cli_ctx);
 
+        /* the signal stop of the dial and of the CONNECT wait (the
+         * B13 tail): a client stuck on an unreachable peer answers
+         * SIGTERM instead of holding the loop to its deadline - the
+         * session phases keep their own graceful shapes */
+
+        if (s3_cli_stop && s3_cli_phase != S3_CLI_PH_SESSION) {
+            fprintf(stderr, "ssh3: terminated\n");
+            s3_cli_rc = S3_CLI_EXIT_ERROR;
+            break;
+        }
+
         /* the jump tunnel: the parked frame retries, a dead jump
          * conversation strands the inner conn, the run ends */
 
