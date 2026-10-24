@@ -14051,7 +14051,14 @@ s3_cli_teardown(void)
     }
 
     if (s3_cli_conn != NULL) {
-        (void)s3_quic_close_connection(s3_cli_conn, S3_ABORT);
+        /* the graceful close: the CC frame (NO_ERROR) must reach the
+         * server, the silent abort of the first shape left the daemon
+         * holding the connection (its zstd contexts, its pools) until
+         * the idle timeout - a bench stand of ~60 sessions exhausted
+         * the daemon; S3_OK sends the CC and parks the finish on the
+         * close timer, the posted passes below complete it */
+
+        (void)s3_quic_close_connection(s3_cli_conn, S3_OK);
     }
 
     /* the close parked on the drain timer drops and completes inside

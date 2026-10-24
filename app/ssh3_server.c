@@ -649,6 +649,13 @@ s3_srv_conn_gone(void *data)
 {
     s3_connection_t **slot = data;
 
+    /* the runner marker of the teardown: the close legs of the e2e
+     * gate on it - the client CC must close the server side at once,
+     * not on the idle timeout (the zombie shape of the bench stands:
+     * the silent client abort left the connections riding) */
+
+    s3_srv_report("INTEROP-CONN-CLOSE");
+
     *slot = NULL;
 }
 

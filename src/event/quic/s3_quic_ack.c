@@ -1094,6 +1094,25 @@ s3_quic_pto_handler(s3_event_t *ev)
 
     qc->pto_count++;
 
+    /*
+     * the dead-path guard: the probes without a single ack in a row
+     * mean the peer is gone (a client that died before its CC, a cut
+     * path).  The sixth probe backs off 64x the base rto - a live
+     * path of any real rto answers long before the cap; the cap keeps
+     * the connection (its pools, its codec contexts) from riding the
+     * idle timeout the transport parameters agreed on - the zombie
+     * shape of the bench stands: the daemon kept such connections
+     * alive for the full idle window and the fresh sessions starved
+     */
+
+    if (qc->pto_count > 6) {
+        s3_log_error(S3_LOG_INFO, c->log, 0, "quic dead path: %ui probes without an ack, closing",
+                     qc->pto_count);
+
+        s3_quic_close_connection(c, S3_ERROR);
+        return;
+    }
+
     s3_quic_set_lost_timer(c);
 
     return;
