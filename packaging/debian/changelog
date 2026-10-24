@@ -1,3 +1,17 @@
+ssh3-c (0.5.4-1) unstable; urgency=medium
+
+  * New upstream release 0.5.4: the connection lifecycle fix (B18) -
+    the client teardown sent no QUIC CONNECTION_CLOSE (the silent
+    RFC 9000 10.1 shape), so the daemon held every finished session
+    until the idle timeout: ~3.9 MB per compressed connection, and a
+    bench stand of ~63 sessions starved the fresh ones (the "zombie"
+    daemon).  The teardown sends the CC now, the ack layer closes a
+    dead path after seven PTO probes without an ack, and the daemon
+    reports INTEROP-CONN-CLOSE for the stands; the p8 bench of the
+    default compression rides along.
+
+ -- Max <nahual15@gmail.com>  Sat, 24 Oct 2026 11:54:34 +0000
+
 ssh3-c (0.5.3-1) unstable; urgency=medium
 
   * New upstream release 0.5.3: the wave B of the plan - the channel
