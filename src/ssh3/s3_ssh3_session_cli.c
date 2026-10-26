@@ -203,7 +203,6 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
             }
 
             if (s->compress_dec == NULL) {
-                fprintf(stderr, "DIAG-CLI: the 192 without a dec context\n");
                 return S3_ERROR;
             }
 
@@ -235,9 +234,6 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
                 drc = s3_ssh3_compress_ctx_decode(s->compress_dec, s->dec_scratch, 1 << 20,
                                                   &out_len, p, packed_len);
 
-                fprintf(stderr, "DIAG-CLI: the 192 alg=%u packed=%zu rc=%d out=%zu\n",
-                        (unsigned)s3_ssh3_compress_ctx_algorithm(s->compress_dec),
-                        packed_len, (int)drc, out_len);
                 if (drc != S3_OK) {
                     return S3_ERROR;
                 }

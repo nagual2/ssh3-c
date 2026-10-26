@@ -239,6 +239,12 @@ sha-verified rounds, `bench/p8-server-default.sh`):
 | 1 | text 8 MiB (compressible) | 267.4 ms | **109.1 ms** | **2.4×** |
 | 2 | random 8 MiB (incompressible) | **247.1 ms** | 284.6 ms | — (1.2× slower) |
 
+The session channel rides the same codec (0.5.5-dev): the cat of the
+8 MiB compressible body through an exec session carries **28–31 KB**
+on the wire (~74×); the session stream output is still capped by the
+1 MiB initial window of the channel (the flow-control follow-up is
+tracked as B19b in [docs/PLAN.md](docs/PLAN.md)).
+
 With `-C` (both directions compressed) the compressible get is
 120.2 ms; the wire carries 17.8× fewer bytes. The console and the
 tiny exec sessions time identically in both modes.

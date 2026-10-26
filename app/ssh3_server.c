@@ -1549,7 +1549,6 @@ struct s3_srv_h3_channel_s {
 
     s3_ssh3_compress_ctx_t *compress_enc;
     s3_ssh3_compress_ctx_t *compress_dec;
-    unsigned           echo_none_warned;
 
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
@@ -3096,11 +3095,6 @@ s3_srv_h3_channel_echo(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
 
     if (ch->compress_enc == NULL && ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
         ch->compress_enc = s3_ssh3_compress_ctx_create(ch->compress_alg, 0);
-    }
-
-    if (ch->compress_enc == NULL && !ch->echo_none_warned) {
-        ch->echo_none_warned = 1;
-        fprintf(stderr, "DIAG: session echo compress_alg=%u enc=NULL (plain rides)\n", ch->compress_alg);
     }
 
     if (s3_ssh3_frame_data_build(s3_srv_h3_ch_out, sizeof(s3_srv_h3_ch_out), &total,
