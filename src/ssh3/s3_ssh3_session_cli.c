@@ -185,6 +185,74 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
 
             break;
 
+        case S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED:
+
+            /* the compressed body of the session channel (the server
+             * zstd of the exec and the pty output, B19): the decoded
+             * payload lands in the pool scratch of the session — the
+             * server compresses only the frames that shrank, so the
+             * 1 MiB scratch covers the shape of every session chunk.
+             * p lands past the packed tail of the consumed frame */
+
+            if (s3_ssh3_parse_varint(&p, end, &value) != S3_OK) {
+                goto partial;
+            }
+
+            if (s3_ssh3_parse_varint(&p, end, &value) != S3_OK) {
+                goto partial;
+            }
+
+            if (s->compress_dec == NULL) {
+                fprintf(stderr, "DIAG-CLI: the 192 without a dec context\n");
+                return S3_ERROR;
+            }
+
+            /* the scratch is allocated once and reused: a per-frame
+             * allocation would walk the pool with hundreds of 1 MiB
+             * chunks on a long output */
+
+            if (s->dec_scratch == NULL) {
+                s->dec_scratch = s3_palloc(s->pool, 1 << 20);
+
+                if (s->dec_scratch == NULL) {
+                    return S3_ERROR;
+                }
+            }
+
+            {
+                size_t   out_len = 0;
+                s3_int_t drc;
+                size_t   packed_len = (size_t)value;
+
+                if (packed_len > (size_t)(end - p)) {
+                    return S3_ERROR;
+                }
+
+                /* the exact packed length: the codecs are strict about
+                 * the input size, the tail of the next frame rides
+                 * behind in the same buffer */
+
+                drc = s3_ssh3_compress_ctx_decode(s->compress_dec, s->dec_scratch, 1 << 20,
+                                                  &out_len, p, packed_len);
+
+                fprintf(stderr, "DIAG-CLI: the 192 alg=%u packed=%zu rc=%d out=%zu\n",
+                        (unsigned)s3_ssh3_compress_ctx_algorithm(s->compress_dec),
+                        packed_len, (int)drc, out_len);
+                if (drc != S3_OK) {
+                    return S3_ERROR;
+                }
+
+                payload.data = s->dec_scratch;
+                payload.len = out_len;
+
+                if (s->out != NULL) {
+                    s->out(s->out_arg, &payload);
+                }
+            }
+
+            p = end;
+            break;
+
         case S3_SSH3_MSG_CHANNEL_EXTENDED_DATA:
 
             if (s3_ssh3_parse_varint(&p, end, &value) != S3_OK) {

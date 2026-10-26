@@ -13852,6 +13852,13 @@ main(int argc, char **argv)
                         break;
                     }
 
+                    /* the decode side of the 192 session frames (B19):
+                     * the server header has been parsed by now, the
+                     * context exists whenever the server announced the
+                     * codecs */
+
+                    s3_cli_sess.compress_dec = s3_cli_compress_dec;
+
                     if (s3_cli_console_init() != S3_OK) {
                         fprintf(stderr, "ssh3: the console init failed\n");
                         s3_cli_rc = S3_CLI_EXIT_ERROR;

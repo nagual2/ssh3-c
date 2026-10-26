@@ -226,6 +226,23 @@ The full tables and the environment notes —
 | 3 | ControlMaster warm exec, ms | **7.6** | 9.0 | 13.8 |
 | 4 | Server CPU / RSS peak, 512 MiB push | **75% / 81 MB** | 104% / 26 MB | 104% / 26 MB |
 | 5 | Many-file directory 4000×4 KiB push / pull, files/s | **4667 / 4624** | 4103 / 3518 | 1175 / 1284 |
+
+### Timings with and without compression (0.5.4)
+
+The daemon compresses the channel bodies towards the announcing peers
+by default; the client → server direction stays opt-in (`-C`). The
+timings of an 8 MiB sftp get over localhost (the medians of 4
+sha-verified rounds, `bench/p8-server-default.sh`):
+
+| № | Payload | Without compression | With compression | Faster by |
+|---|---------|--------------------:|-----------------:|----------:|
+| 1 | text 8 MiB (compressible) | 267.4 ms | **109.1 ms** | **2.4×** |
+| 2 | random 8 MiB (incompressible) | **247.1 ms** | 284.6 ms | — (1.2× slower) |
+
+With `-C` (both directions compressed) the compressible get is
+120.2 ms; the wire carries 17.8× fewer bytes. The console and the
+tiny exec sessions time identically in both modes.
+
 ## License
 
 The project's own code — BSD 2-clause (`LICENSE`). The code adapted

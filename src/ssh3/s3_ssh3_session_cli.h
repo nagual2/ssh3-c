@@ -6,6 +6,7 @@
 #define _S3_SSH3_SESSION_CLI_H_INCLUDED_
 
 #include <s3_base.h>
+#include <s3_ssh3_compress.h>
 
 #include <stdio.h>
 
@@ -49,6 +50,17 @@ struct s3_ssh3_session_cli_s {
 
     s3_ssh3_session_cli_exit_pt exit_cb;
     void                       *exit_arg;
+
+    /* the decode side of the 192 frames (the compression of the
+     * channel body, PLAN.md 9, B8): NULL rides plain, the compressed
+     * frame of a session without the context is a protocol error */
+
+    s3_ssh3_compress_ctx_t *compress_dec;
+
+    /* the decode scratch (1 MiB, the pool): allocated with the first
+     * compressed frame, reused by every next one */
+
+    u_char *dec_scratch;
 
     /* the partial tail of the last received chunk */
 

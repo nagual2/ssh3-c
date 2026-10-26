@@ -1549,6 +1549,7 @@ struct s3_srv_h3_channel_s {
 
     s3_ssh3_compress_ctx_t *compress_enc;
     s3_ssh3_compress_ctx_t *compress_dec;
+    unsigned           echo_none_warned;
 
     unsigned           fwd_eof;  /* the target socket saw the eof */
     int                fwd_fd;
@@ -1761,7 +1762,9 @@ s3_srv_h3_conv_id_of(s3_connection_t *pc)
 }
 
 /* one echo frame: varint 94 + SSHString, capped by the maxPacketSize */
-static u_char s3_srv_h3_ch_out[32768];
+static u_char s3_srv_h3_ch_out[131072]; /* the compressed form needs the
+                                         * room above the plain shape: the
+                                         * bound + the 16-byte header room */
 
 static void
 s3_srv_h3_store(u_char *dst, size_t size, size_t *len, s3_str_t *value)
@@ -3080,21 +3083,32 @@ s3_srv_h3_channel_cancel(s3_srv_h3_channel_t *ch, const char *why)
 }
 
 static s3_int_t
-s3_srv_h3_channel_echo(s3_connection_t *sc, const u_char *data, size_t len)
+s3_srv_h3_channel_echo(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
 {
-    u_char *p;
+    s3_connection_t *sc;
     size_t  total;
     ssize_t m;
 
-    total = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) + s3_ssh3_sshstring_size(len);
+    /* the session output rides the channel codec: the negotiated
+     * codec compresses the body, the cutoff keeps the small and the
+     * incompressible frames plain (the shape of the fwd relay); the
+     * enc grows with the first frame and dies with the channel */
 
-    if (total > sizeof(s3_srv_h3_ch_out)) {
+    if (ch->compress_enc == NULL && ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
+        ch->compress_enc = s3_ssh3_compress_ctx_create(ch->compress_alg, 0);
+    }
+
+    if (ch->compress_enc == NULL && !ch->echo_none_warned) {
+        ch->echo_none_warned = 1;
+        fprintf(stderr, "DIAG: session echo compress_alg=%u enc=NULL (plain rides)\n", ch->compress_alg);
+    }
+
+    if (s3_ssh3_frame_data_build(s3_srv_h3_ch_out, sizeof(s3_srv_h3_ch_out), &total,
+                                 ch->compress_enc, data, len, NULL) != S3_OK) {
         return S3_ERROR;
     }
 
-    p = s3_srv_h3_ch_out;
-    p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA);
-    p = (u_char *)s3_ssh3_encode_sshstring(p, data, len);
+    sc = ch->sc;
 
     m = s3_quic_stream_send(sc, s3_srv_h3_ch_out, total);
 
@@ -3420,7 +3434,7 @@ s3_srv_session_out_sink(void *ctx, const u_char *data, size_t len)
 {
     s3_srv_h3_channel_t *ch = ctx;
 
-    if (s3_srv_h3_channel_echo(ch->sc, data, len) != S3_OK) {
+    if (s3_srv_h3_channel_echo(ch, data, len) != S3_OK) {
         fprintf(stderr, "ssh3-server: session output send stalled\n");
         return S3_ERROR;
     }
@@ -6442,7 +6456,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                 /* the echo mode: the data goes back unchanged */
 
-                if (s3_srv_h3_channel_echo(sc, msg_data.data, msg_data.len) != S3_OK) {
+                if (s3_srv_h3_channel_echo(ch, msg_data.data, msg_data.len) != S3_OK) {
                     s3_srv_h3_channel_cancel(ch, "echo send stalled");
                     return;
                 }
