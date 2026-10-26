@@ -198,9 +198,10 @@ s3_int_t s3_ssh3_session_srv_reap(s3_ssh3_session_srv_t *s, uint64_t *exit_statu
 /*
  * the event-driven pump core (P7.2): the module owns the fd watches
  * and the drain, the wire framing stays with the caller through the
- * io sinks; a sink mirrors the channel echo contract - S3_OK or the
- * hard error, a stalled send loses the chunk exactly like the old
- * polling pump did
+ * io sinks; a sink answers S3_OK (sent), S3_BUSY (the peer window is
+ * full, the frame is queued in the sink - the pump stops reading the
+ * fds until the queue drains, the B19b backpressure) or S3_ERROR
+ * (the hard failure)
  */
 
 typedef s3_int_t (*s3_ssh3_session_sink_pt)(void *ctx, const u_char *data, size_t len);
@@ -216,7 +217,9 @@ typedef struct {
  * one pump pass: drains the readable output and the stderr pipe into
  * the sinks, reaps the verdict and reports it once through io->exit;
  * S3_AGAIN while the process runs, S3_OK once the verdict went out,
- * S3_ERROR when a sink failed (a retry answers with the cached code)
+ * S3_BUSY when a sink queued the chunk (the unread pipe bytes wait
+ * for the next pass), S3_ERROR when a sink failed (a retry answers
+ * with the cached code)
  */
 
 s3_int_t s3_ssh3_session_srv_pump(s3_ssh3_session_srv_t *s, const s3_ssh3_session_srv_io_t *io);

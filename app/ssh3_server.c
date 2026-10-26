@@ -1518,6 +1518,22 @@ struct s3_srv_h3_channel_s {
     unsigned               sess_peer_fin;
 
     /*
+     * the pending wire frames of the session output (B19b): the
+     * stream window closes under a bulk child and the S3_AGAIN is
+     * the normal QUIC backpressure - the built frames queue here,
+     * the 50 ms tick retries the send; the fds stop feeding the
+     * queue until it drains, the pipe carries the backpressure to
+     * the child.  the verdict rides the same queue, the fin waits
+     * for the drain (sess_fin_sent)
+     */
+
+    u_char    *sess_out;
+    size_t     sess_out_cap;
+    size_t     sess_out_len;
+    unsigned   sess_fin_sent;
+    s3_event_t sess_timer;
+
+    /*
      * the authenticated username of the conversation (P7.3), the
      * snapshot of the CONNECT verdict: the session spawns with it
      * under the per-session setuid mode, empty keeps the daemon
@@ -1649,6 +1665,15 @@ struct s3_srv_h3_channel_s {
 /* the teardown of the session side, the channel free calls it first */
 static void s3_srv_session_teardown(s3_srv_h3_channel_t *ch);
 
+static s3_int_t s3_srv_session_flush(s3_srv_h3_channel_t *ch);
+
+static void s3_srv_session_finish(s3_srv_h3_channel_t *ch);
+
+static void s3_srv_session_timer(s3_event_t *ev);
+
+static s3_int_t s3_srv_fwd_append(u_char **buf, size_t *cap, size_t *len, const u_char *data,
+                                  size_t n);
+
 /* the sftp and the agent wiring of the wave 2, defined below */
 
 static void s3_srv_sftp_pump(s3_srv_h3_channel_t *ch);
@@ -1711,7 +1736,8 @@ s3_srv_busy_channels(void)
             continue;
         }
 
-        if ((ch->sess != NULL && !ch->sess_exit_sent) || ch->sftp != NULL ||
+        if ((ch->sess != NULL && !ch->sess_exit_sent) || ch->sess_out_len > 0 ||
+            ch->sftp != NULL ||
             (ch->fwd_kind != S3_SRV_FWD_NONE && ch->fwd_kind != S3_SRV_FWD_RCTRL &&
              ch->fwd_kind != S3_SRV_FWD_RUDP && !ch->fwd_eof)) {
             n++;
@@ -2918,6 +2944,10 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
         s3_event_del_timer(&ch->agent_timer);
     }
 
+    if (ch->sess_timer.timer_set) {
+        s3_event_del_timer(&ch->sess_timer);
+    }
+
     s3_srv_session_teardown(ch);
 
     /* the agent listener dies with its pool: the cleanup unlinks the
@@ -2994,6 +3024,7 @@ s3_srv_h3_channel_free(s3_srv_h3_channel_t *ch)
     free(ch->fwd_in);
     free(ch->fwd_out);
     free(ch->fwd_plain);
+    free(ch->sess_out);
 
     /* the codec contexts of the channel body die with the channel
      * (the audit fix wave) */
@@ -3084,9 +3115,7 @@ s3_srv_h3_channel_cancel(s3_srv_h3_channel_t *ch, const char *why)
 static s3_int_t
 s3_srv_h3_channel_echo(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
 {
-    s3_connection_t *sc;
-    size_t  total;
-    ssize_t m;
+    size_t total;
 
     /* the session output rides the channel codec: the negotiated
      * codec compresses the body, the cutoff keeps the small and the
@@ -3102,31 +3131,27 @@ s3_srv_h3_channel_echo(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
         return S3_ERROR;
     }
 
-    sc = ch->sc;
+    /* the stream window closes under a bulk child: the frame queues
+     * and the 50 ms tick retries the send (B19b), the S3_AGAIN is
+     * not an error here any more; S3_BUSY tells the pump to stop
+     * feeding the queue */
 
-    m = s3_quic_stream_send(sc, s3_srv_h3_ch_out, total);
-
-    /*
-     * the scenario moves tens of bytes against a 16 KiB send window, a
-     * stall cannot happen; a partial send would desync the message
-     * stream, so any short write is a hard error here (the simpler
-     * choice over the write-event retry)
-     */
-    if (m != (ssize_t)total) {
+    if (s3_srv_fwd_append(&ch->sess_out, &ch->sess_out_cap, &ch->sess_out_len, s3_srv_h3_ch_out,
+                          total) != S3_OK) {
         return S3_ERROR;
     }
 
-    return S3_OK;
+    return s3_srv_session_flush(ch);
 }
 
-/* the 95 frame of the stderr pipe (docs/P4-WIRE.md 3.1, dataType 1) */
+/* the 95 frame of the stderr pipe (docs/P4-WIRE.md 3.1, dataType 1);
+ * the same queue shape as the 94 echo above (B19b) */
 
 static s3_int_t
-s3_srv_h3_channel_send_extended(s3_connection_t *sc, const u_char *data, size_t len)
+s3_srv_h3_channel_send_extended(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
 {
     u_char *p;
     size_t  total;
-    ssize_t m;
 
     total = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_EXTENDED_DATA) +
             s3_ssh3_varint_size(S3_SSH3_EXTENDED_DATA_STDERR) + s3_ssh3_sshstring_size(len);
@@ -3140,15 +3165,12 @@ s3_srv_h3_channel_send_extended(s3_connection_t *sc, const u_char *data, size_t 
     p = (u_char *)s3_ssh3_encode_varint(p, S3_SSH3_EXTENDED_DATA_STDERR);
     p = (u_char *)s3_ssh3_encode_sshstring(p, data, len);
 
-    m = s3_quic_stream_send(sc, s3_srv_h3_ch_out, total);
-
-    /* the same small-volume assumption as the 94 echo above */
-
-    if (m != (ssize_t)total) {
+    if (s3_srv_fwd_append(&ch->sess_out, &ch->sess_out_cap, &ch->sess_out_len, s3_srv_h3_ch_out,
+                          total) != S3_OK) {
         return S3_ERROR;
     }
 
-    return S3_OK;
+    return s3_srv_session_flush(ch);
 }
 
 /*
@@ -3375,8 +3397,54 @@ s3_srv_request_body_end(s3_ssh3_request_kind_t kind, const u_char *pos, const u_
 
 /* the 98 exit-status, the terminal message of the session flow */
 
+/*
+ * the pending wire frames ride the stream: the send drains as far as
+ * the peer window allows, the S3_AGAIN parks the tail and arms the
+ * 50 ms tick (B19b); S3_BUSY answers "the queue is not empty", the
+ * hard send failure is S3_ERROR
+ */
+
 static s3_int_t
-s3_srv_session_send_exit(s3_connection_t *sc, uint64_t code)
+s3_srv_session_flush(s3_srv_h3_channel_t *ch)
+{
+    if (ch->sc == NULL) {
+        return S3_ERROR;
+    }
+
+    while (ch->sess_out_len > 0) {
+
+        ssize_t m = s3_quic_stream_send(ch->sc, ch->sess_out, ch->sess_out_len);
+
+        if (m == (ssize_t)S3_AGAIN) {
+            break;
+        }
+
+        if (m <= 0) {
+            return S3_ERROR;
+        }
+
+        s3_memmove(ch->sess_out, ch->sess_out + m, ch->sess_out_len - (size_t)m);
+        ch->sess_out_len -= (size_t)m;
+    }
+
+    if (ch->sess_out_len > 0) {
+
+        if (!ch->sess_timer.timer_set) {
+            ch->sess_timer.data = ch;
+            ch->sess_timer.log = &s3_srv_log;
+            ch->sess_timer.handler = s3_srv_session_timer;
+        }
+
+        s3_event_add_timer(&ch->sess_timer, 50);
+
+        return S3_BUSY;
+    }
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_srv_session_send_exit(s3_srv_h3_channel_t *ch, uint64_t code)
 {
     u_char                frame[64];
     u_char                body[16];
@@ -3384,7 +3452,6 @@ s3_srv_session_send_exit(s3_connection_t *sc, uint64_t code)
     s3_ssh3_request_t     req;
     s3_ssh3_msg_request_t env;
     size_t                body_len, total;
-    ssize_t               m;
 
     s3_memzero(&req, sizeof(req));
 
@@ -3408,60 +3475,70 @@ s3_srv_session_send_exit(s3_connection_t *sc, uint64_t code)
 
     total = (size_t)(p - frame);
 
-    m = s3_quic_stream_send(sc, frame, total);
+    /* the verdict queues behind the output tail, the fin rides the
+     * flush completion (B19b) */
 
-    if (m != (ssize_t)total) {
+    if (s3_srv_fwd_append(&ch->sess_out, &ch->sess_out_cap, &ch->sess_out_len, frame, total) !=
+        S3_OK) {
         return S3_ERROR;
     }
 
-    return S3_OK;
+    return s3_srv_session_flush(ch);
 }
 
 /*
  * the io sinks of the event-driven pump: the wire framing stays here,
- * the module owns the fds and the drain; a stalled send loses the
- * chunk exactly like the polling pump did
+ * the module owns the fds and the drain; a window-blocked send queues
+ * the frame and answers S3_BUSY - the module pump stops reading the
+ * fds until the queue drains (B19b), a hard send failure stays
+ * S3_ERROR
  */
 
 static s3_int_t
 s3_srv_session_out_sink(void *ctx, const u_char *data, size_t len)
 {
     s3_srv_h3_channel_t *ch = ctx;
+    s3_int_t             rc;
 
-    if (s3_srv_h3_channel_echo(ch, data, len) != S3_OK) {
-        fprintf(stderr, "ssh3-server: session output send stalled\n");
-        return S3_ERROR;
+    rc = s3_srv_h3_channel_echo(ch, data, len);
+
+    if (rc != S3_OK && rc != S3_BUSY) {
+        fprintf(stderr, "ssh3-server: session output send failed\n");
     }
 
-    return S3_OK;
+    return rc;
 }
 
 static s3_int_t
 s3_srv_session_err_sink(void *ctx, const u_char *data, size_t len)
 {
     s3_srv_h3_channel_t *ch = ctx;
+    s3_int_t             rc;
 
-    if (s3_srv_h3_channel_send_extended(ch->sc, data, len) != S3_OK) {
-        fprintf(stderr, "ssh3-server: session stderr send stalled\n");
-        return S3_ERROR;
+    rc = s3_srv_h3_channel_send_extended(ch, data, len);
+
+    if (rc != S3_OK && rc != S3_BUSY) {
+        fprintf(stderr, "ssh3-server: session stderr send failed\n");
     }
 
-    return S3_OK;
+    return rc;
 }
 
 static s3_int_t
 s3_srv_session_exit_sink(void *ctx, uint64_t code)
 {
     s3_srv_h3_channel_t *ch = ctx;
+    s3_int_t             rc;
 
-    if (s3_srv_session_send_exit(ch->sc, code) != S3_OK) {
+    rc = s3_srv_session_send_exit(ch, code);
+
+    if (rc != S3_OK && rc != S3_BUSY) {
         fprintf(stderr, "ssh3-server: exit-status send failed\n");
         return S3_ERROR;
     }
 
-    /* the reference shuts the channel send side after the verdict */
-
-    (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+    /* the reference shuts the channel send side after the verdict:
+     * the fin waits for the queue drain (the flush completion) */
 
     ch->sess_exit_sent = 1;
 
@@ -3475,7 +3552,19 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
 {
     s3_ssh3_session_srv_io_t io;
 
-    if (ch->sess == NULL) {
+    if (ch->sc == NULL) {
+        return;
+    }
+
+    /* the window backpressure runs the drain first: the fds feed the
+     * queue only after it emptied (B19b), the unread bytes wait in
+     * the pipe and hold the child */
+
+    if (s3_srv_session_flush(ch) != S3_OK) {
+        return;
+    }
+
+    if (ch->sess == NULL || ch->sess_out_len > 0) {
         return;
     }
 
@@ -3486,20 +3575,54 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
 
     (void)s3_ssh3_session_srv_pump(ch->sess, &io);
 
-    if (ch->sess_exit_sent && ch->sess_peer_fin && ch->sc != NULL) {
+    /* the BUSY return means the queue holds the tail again */
 
-        /*
-         * the peer drained to fin before the verdict: the fin was the
-         * last byte this channel carries, the drop runs the quic
-         * stream cleanup (the retire queues MAX_STREAMS) and the slot
-         * frees for the next session; the free stays out of the sinks
-         * - the module pump still holds the session on its way back
-         */
+    (void)s3_srv_session_flush(ch);
+
+    s3_srv_session_finish(ch);
+}
+
+/*
+ * the queue drained and the verdict is out: the fin lands here, the
+ * peer fin before it ends the channel (the drop runs the quic stream
+ * cleanup, the retire queues MAX_STREAMS and the slot frees for the
+ * next session)
+ */
+
+static void
+s3_srv_session_finish(s3_srv_h3_channel_t *ch)
+{
+    if (ch->sc == NULL || ch->sess_out_len > 0) {
+        return;
+    }
+
+    if (ch->sess_exit_sent && !ch->sess_fin_sent) {
+        ch->sess_fin_sent = 1;
+
+        (void)s3_quic_shutdown_stream(ch->sc, S3_WRITE_SHUTDOWN);
+    }
+
+    if (ch->sess_exit_sent && ch->sess_peer_fin) {
         s3_close_connection(ch->sc);
         ch->sc = NULL;
 
         s3_srv_h3_channel_free(ch);
     }
+}
+
+/* the blocked queue drains by the tick: the window opens when the
+ * peer consumes and answers with its MAX_STREAM_DATA */
+
+static void
+s3_srv_session_timer(s3_event_t *ev)
+{
+    s3_srv_h3_channel_t *ch = ev->data;
+
+    if (ch->sc == NULL) {
+        return;
+    }
+
+    s3_srv_session_pump(ch);
 }
 
 /* the watch entry of the module, the readiness runs this pump */
@@ -6448,9 +6571,13 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     continue;
                 }
 
-                /* the echo mode: the data goes back unchanged */
+                /* the echo mode: the data goes back unchanged, the
+                 * queue shape of the session output (B19b): only the
+                 * hard failure cancels, the S3_BUSY rides the tick */
 
-                if (s3_srv_h3_channel_echo(ch, msg_data.data, msg_data.len) != S3_OK) {
+                rc = s3_srv_h3_channel_echo(ch, msg_data.data, msg_data.len);
+
+                if (rc != S3_OK && rc != S3_BUSY) {
                     s3_srv_h3_channel_cancel(ch, "echo send stalled");
                     return;
                 }

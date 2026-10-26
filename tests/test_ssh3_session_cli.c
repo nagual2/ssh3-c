@@ -14,6 +14,8 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <s3_ssh3_compress.h>
+#include <s3_ssh3_message.h>
 #include <s3_ssh3_session_cli.h>
 #include <s3_ssh3_wire.h>
 
@@ -93,6 +95,21 @@ s3_test_write_stderr(u_char *p, const void *data, size_t len)
     p = s3_ssh3_encode_varint(p, 1); /* the stderr dataType of the pin */
 
     return s3_ssh3_encode_sshstring(p, data, len);
+}
+
+/* the compressed data frame of B19: the 192, the algorithm, the
+ * packed length and the packed body of the codec */
+
+static u_char *
+s3_test_write_compressed(u_char *p, uint32_t alg, const void *packed, size_t packed_len)
+{
+    p = s3_ssh3_encode_varint(p, S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED);
+    p = s3_ssh3_encode_varint(p, alg);
+    p = s3_ssh3_encode_varint(p, packed_len);
+
+    s3_memcpy(p, packed, packed_len);
+
+    return p + packed_len;
 }
 
 /* the server exit-status of docs/P4-WIRE.md 6 step 12: the request
@@ -588,6 +605,191 @@ s3_test_session_cli_null_sinks(void)
  * does, the test pins that symmetry
  */
 
+/* the compressed frame of the B19 session output: the 192 carries the
+ * zstd body, the decode lands in the sink; the exit-status rides
+ * behind to pin the ordering */
+
+static const char s3_test_192_text[] = "compressed hello";
+
+static size_t
+s3_test_192_stream(u_char *buf, size_t cap, uint64_t code)
+{
+    s3_ssh3_compress_ctx_t *enc;
+    u_char                  packed[256];
+    size_t                  packed_len;
+    u_char                 *p = buf;
+
+    enc = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 0);
+    S3_ASSERT(enc != NULL);
+    S3_ASSERT(s3_ssh3_compress_ctx_encode(enc, packed, sizeof(packed), &packed_len,
+                                          (const u_char *)s3_test_192_text,
+                                          sizeof(s3_test_192_text) - 1) == S3_OK);
+    s3_ssh3_compress_ctx_destroy(enc);
+
+    p = s3_test_write_confirm(p, 30000);
+    p = s3_test_write_compressed(p, S3_SSH3_COMPRESS_ZSTD, packed, packed_len);
+
+    if (code != (uint64_t)-1) {
+        p = s3_test_write_exit_status(p, code);
+    }
+
+    S3_ASSERT((size_t)(p - buf) <= cap);
+
+    return (size_t)(p - buf);
+}
+
+/* the one-chunk 192: the decode lands in the sink, the verdict behind
+ * it rides untouched */
+
+static int
+s3_test_session_cli_192_happy(void)
+{
+    s3_log_t                log;
+    s3_pool_t              *pool;
+    s3_ssh3_session_cli_t   s;
+    s3_test_sink_t          out, err;
+    s3_test_exit_t          verdict;
+    s3_ssh3_compress_ctx_t *dec;
+    u_char                  buf[512];
+    size_t                  len;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&out, sizeof(out));
+    s3_memzero(&err, sizeof(err));
+    s3_memzero(&verdict, sizeof(verdict));
+
+    s3_test_session_open(&s, pool, &out, &err, &verdict);
+
+    dec = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 1);
+    S3_ASSERT(dec != NULL);
+    s.compress_dec = dec;
+
+    len = s3_test_192_stream(buf, sizeof(buf), 3);
+
+    S3_ASSERT(s3_ssh3_session_cli_input(&s, buf, len) == S3_OK);
+
+    S3_ASSERT(out.len == sizeof(s3_test_192_text) - 1);
+    S3_ASSERT(s3_memcmp(out.buf, s3_test_192_text, out.len) == 0);
+    S3_ASSERT(verdict.calls == 1 && verdict.code == 3);
+    S3_ASSERT(s.pend_len == 0);
+
+    s3_ssh3_compress_ctx_destroy(dec);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
+/* the same stream in 1..5-byte chunks: the 192 body straddles the
+ * chunk boundaries, the parser waits whole instead of dying (B19b) */
+
+static int
+s3_test_session_cli_192_split(void)
+{
+    s3_log_t                log;
+    s3_pool_t              *pool;
+    s3_ssh3_session_cli_t   s;
+    s3_test_sink_t          out, err;
+    s3_test_exit_t          verdict;
+    s3_ssh3_compress_ctx_t *dec;
+    u_char                  buf[512];
+    size_t                  len, chunk, off, n;
+
+    len = s3_test_192_stream(buf, sizeof(buf), 3);
+
+    for (chunk = 1; chunk <= 5; chunk++) {
+
+        pool = s3_test_make_pool(&log);
+        S3_ASSERT(pool != NULL);
+
+        s3_memzero(&out, sizeof(out));
+        s3_memzero(&err, sizeof(err));
+        s3_memzero(&verdict, sizeof(verdict));
+
+        s3_test_session_open(&s, pool, &out, &err, &verdict);
+
+        dec = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 1);
+        S3_ASSERT(dec != NULL);
+        s.compress_dec = dec;
+
+        for (off = 0; off < len; off += chunk) {
+            n = len - off < chunk ? len - off : chunk;
+
+            S3_ASSERT(s3_ssh3_session_cli_input(&s, buf + off, n) == S3_OK);
+        }
+
+        S3_ASSERT(out.len == sizeof(s3_test_192_text) - 1);
+        S3_ASSERT(s3_memcmp(out.buf, s3_test_192_text, out.len) == 0);
+        S3_ASSERT(verdict.calls == 1 && verdict.code == 3);
+        S3_ASSERT(s.pend_len == 0);
+
+        s3_ssh3_compress_ctx_destroy(dec);
+        s3_destroy_pool(pool);
+    }
+
+    return s3_test_failures;
+}
+
+/* the chunk holds the 192 and the frames behind it: nothing after
+ * the compressed frame may drop (B19b: p = end swallowed the tail,
+ * the live run died on the half-eaten header of the next chunk) */
+
+static int
+s3_test_session_cli_192_multi(void)
+{
+    s3_log_t                log;
+    s3_pool_t              *pool;
+    s3_ssh3_session_cli_t   s;
+    s3_test_sink_t          out, err;
+    s3_test_exit_t          verdict;
+    s3_ssh3_compress_ctx_t *dec;
+    u_char                  buf[512];
+    size_t                  len, text_len = sizeof(s3_test_192_text) - 1;
+
+    pool = s3_test_make_pool(&log);
+    S3_ASSERT(pool != NULL);
+
+    s3_memzero(&out, sizeof(out));
+    s3_memzero(&err, sizeof(err));
+    s3_memzero(&verdict, sizeof(verdict));
+
+    s3_test_session_open(&s, pool, &out, &err, &verdict);
+
+    dec = s3_ssh3_compress_ctx_create(S3_SSH3_COMPRESS_ZSTD, 1);
+    S3_ASSERT(dec != NULL);
+    s.compress_dec = dec;
+
+    /* the 192 with no verdict behind it, the 94 and the 98 follow in
+     * the same chunk */
+
+    len = s3_test_192_stream(buf, sizeof(buf), (uint64_t)-1);
+
+    S3_ASSERT((size_t)(buf + len - buf) <= sizeof(buf));
+
+    {
+        u_char *p = buf + len;
+
+        p = s3_test_write_data(p, "hi", 2);
+        p = s3_test_write_exit_status(p, 5);
+
+        len = (size_t)(p - buf);
+    }
+
+    S3_ASSERT(s3_ssh3_session_cli_input(&s, buf, len) == S3_OK);
+
+    S3_ASSERT(out.len == text_len + 2);
+    S3_ASSERT(s3_memcmp(out.buf, s3_test_192_text, text_len) == 0);
+    S3_ASSERT(s3_memcmp(out.buf + text_len, "hi", 2) == 0);
+    S3_ASSERT(verdict.calls == 1 && verdict.code == 5);
+    S3_ASSERT(s.pend_len == 0);
+
+    s3_ssh3_compress_ctx_destroy(dec);
+    s3_destroy_pool(pool);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_session_cli_tty(void)
 {
@@ -632,6 +834,9 @@ s3_test_ssh3_session_cli(void)
     (void)s3_test_session_cli_repeat_exit();
     (void)s3_test_session_cli_errors();
     (void)s3_test_session_cli_null_sinks();
+    (void)s3_test_session_cli_192_happy();
+    (void)s3_test_session_cli_192_split();
+    (void)s3_test_session_cli_192_multi();
     (void)s3_test_session_cli_tty();
 
     return s3_test_failures;

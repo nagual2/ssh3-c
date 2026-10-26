@@ -1491,6 +1491,18 @@ s3_quic_handle_max_stream_data_frame(s3_connection_t *c, s3_quic_header_t *pkt,
      * wakes the application writer here as well.
      */
 
+    if (qs->connection == NULL) {
+
+        /*
+         * the app side is gone (the stream waits for the ack of its
+         * final size in the tree): the wake and the flush have no
+         * writer to serve, the close re-runs its terminal check (the
+         * handle_stream shape)
+         */
+
+        return s3_quic_close_stream(qs);
+    }
+
     s3_quic_set_event(qc, qs->connection->write);
 
     return s3_quic_stream_flush(qs);

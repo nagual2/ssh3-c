@@ -1395,7 +1395,20 @@ s3_ssh3_session_srv_pump(s3_ssh3_session_srv_t *s, const s3_ssh3_session_srv_io_
 
         if (n > 0) {
 
-            if (io->output(io->ctx, s->drain, (size_t)n) != S3_OK) {
+            s3_int_t src = io->output(io->ctx, s->drain, (size_t)n);
+
+            if (src == S3_BUSY) {
+
+                /*
+                 * the peer window is full: the chunk is queued in the
+                 * sink, the unread pipe bytes wait for the next pump
+                 * pass and hold the child (the B19b backpressure)
+                 */
+
+                return S3_BUSY;
+            }
+
+            if (src != S3_OK) {
                 s3_ssh3_session_watchdog_arm(s);
                 return S3_ERROR;
             }
@@ -1421,9 +1434,18 @@ s3_ssh3_session_srv_pump(s3_ssh3_session_srv_t *s, const s3_ssh3_session_srv_io_
 
         if (n > 0) {
 
-            if (io->err != NULL && io->err(io->ctx, s->drain, (size_t)n) != S3_OK) {
-                s3_ssh3_session_watchdog_arm(s);
-                return S3_ERROR;
+            if (io->err != NULL) {
+
+                s3_int_t src = io->err(io->ctx, s->drain, (size_t)n);
+
+                if (src == S3_BUSY) {
+                    return S3_BUSY;
+                }
+
+                if (src != S3_OK) {
+                    s3_ssh3_session_watchdog_arm(s);
+                    return S3_ERROR;
+                }
             }
 
             continue;

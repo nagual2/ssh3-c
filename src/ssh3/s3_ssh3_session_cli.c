@@ -192,7 +192,10 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
              * payload lands in the pool scratch of the session — the
              * server compresses only the frames that shrank, so the
              * 1 MiB scratch covers the shape of every session chunk.
-             * p lands past the packed tail of the consumed frame */
+             * the QUIC stream preserves no send boundaries, the
+             * packed body may end behind the chunk: the whole frame
+             * waits in the pending buffer, the decode is atomic over
+             * the complete body */
 
             if (s3_ssh3_parse_varint(&p, end, &value) != S3_OK) {
                 goto partial;
@@ -224,7 +227,7 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
                 size_t   packed_len = (size_t)value;
 
                 if (packed_len > (size_t)(end - p)) {
-                    return S3_ERROR;
+                    goto partial;
                 }
 
                 /* the exact packed length: the codecs are strict about
@@ -244,9 +247,14 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
                 if (s->out != NULL) {
                     s->out(s->out_arg, &payload);
                 }
+
+                /* the next frame rides behind the packed body in the
+                 * same chunk: the cursor lands on it, the tail is not
+                 * ours to drop */
+
+                p += packed_len;
             }
 
-            p = end;
             break;
 
         case S3_SSH3_MSG_CHANNEL_EXTENDED_DATA:
