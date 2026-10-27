@@ -166,7 +166,8 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
         return S3_ERROR;
     }
 
-    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_REUSEADDR, s3_oidc_sockopt_val(&yes), sizeof(yes));
+    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_REUSEADDR, s3_oidc_sockopt_val(&yes),
+                     sizeof(yes));
 
     s3_memzero(&sa, sizeof(sa));
 
