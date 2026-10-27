@@ -120,6 +120,9 @@ if(WIN32)
         src/ssh3/s3_ssh3_sftp_cli.c
         src/ssh3/s3_ssh3_cm.c
         src/ssh3/s3_ssh3_session_cli.c
+        src/ssh3/s3_ssh3_oidc.c
+        src/ssh3/s3_ssh3_oidc_client.c
+        src/os/unix/s3_https_fetch.c
     )
 
     target_include_directories(s3core
@@ -212,7 +215,8 @@ if(WIN32)
     # the branch below, docs/PLAN.md 8.1)
     add_executable(ssh3 app/ssh3_client.c)
     target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
-    target_link_libraries(ssh3 PRIVATE s3core)
+    # shell32: the ShellExecuteA of the oidc provider tab (the --oidc-*)
+    target_link_libraries(ssh3 PRIVATE s3core shell32)
 
     # the icon + VERSIONINFO object (go-winres, app/winres/): linked
     # as an external COFF object, regenerate on a version bump

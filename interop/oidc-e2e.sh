@@ -261,6 +261,101 @@ neg_case expired " expiry" somenonce -120
 echo "== oidc 4: the wrong nonce -> expect the nonce reject"
 neg_case nonce " nonce" the-wrong-nonce 600
 
+# the prod client (ssh3) legs: the full flow and the raw-token
+# negative against the real daemon (the runner markers ride the
+# daemon natively); the known_hosts pins the TOFU line the
+# non-interactive run demands
+
+echo "== oidc 5: the prod client full flow -> the daemon, exec session"
+
+PROD=$BUILD/ssh3
+PROD_HOME=$WORK/prod-home
+mkdir -p "$PROD_HOME/.ssh3"
+
+setsid nohup "$BUILD/ssh3-server" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+    -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/prod-srv.log" 2>&1 < /dev/null &
+
+if ! wait_listen "$WORK/prod-srv.log"; then
+    echo "   FAIL: the daemon did not start"
+    tail -5 "$WORK/prod-srv.log" | sed 's/^/   /'
+    FAILURES=$((FAILURES + 1))
+fi
+
+PORT=$(port_of "$WORK/prod-srv.log")
+printf '127.0.0.1:%s/ssh3-term x509-certificate %s\n' "$PORT" \
+    "$(openssl x509 -in "$CERT" -outform DER | base64 -w0)" \
+    >> "$PROD_HOME/.ssh3/known_hosts"
+
+S3_OIDC_NO_BROWSER=1 HOME="$PROD_HOME" setsid nohup "$PROD" -n --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+    -T "client@127.0.0.1:$PORT/ssh3-term" "echo oidc-prod-ok" \
+    > "$WORK/prod-cli.out" 2> "$WORK/prod-cli.log" &
+
+URL=$(wait_oidc_url "$WORK/prod-cli.log" 15)
+
+if [ -z "$URL" ]; then
+    echo "   FAIL: the prod client never printed the authorize url"
+    tail -5 "$WORK/prod-cli.log" | sed 's/^/   /'
+    FAILURES=$((FAILURES + 1))
+else
+    if ! drive_redirect "$URL"; then
+        echo "   FAIL: the redirect drive failed"
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    if wait_marker "$WORK/prod-cli.out" "oidc-prod-ok" 30 \
+        && grep -qa "INTEROP-AUTH-OK user=oidc" "$WORK/prod-srv.log"; then
+        echo "   PASS (the prod flow accepted, the exec ran)"
+    else
+        echo "   FAIL"
+        tail -5 "$WORK/prod-cli.log" | sed 's/^/   /'
+        tail -5 "$WORK/prod-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    fi
+fi
+
+pkill -f "ssh3-server.*--oidc-issuer" 2>/dev/null
+sleep 0.3
+
+echo "== oidc 6: the prod client raw token -> expect the 401 reject"
+
+tok=$(python3 "$MOCK" mint --keys "$WORK/keys" --issuer "$ISSUER" \
+    --audience ssh3-c-cli --nonce offline-nonce --ttl 600)
+
+setsid nohup "$BUILD/ssh3-server" -3 --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+    -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/prod2-srv.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/prod2-srv.log"; then
+    PORT=$(port_of "$WORK/prod2-srv.log")
+    printf '127.0.0.1:%s/ssh3-term x509-certificate %s\n' "$PORT" \
+        "$(openssl x509 -in "$CERT" -outform DER | base64 -w0)" \
+        >> "$PROD_HOME/.ssh3/known_hosts"
+
+    HOME="$PROD_HOME" timeout 30 "$PROD" --oidc-token "$tok" \
+        -T "client@127.0.0.1:$PORT/ssh3-term" "echo no" \
+        > "$WORK/prod2-cli.out" 2> "$WORK/prod2-cli.log"
+
+    if grep -qa "INTEROP-AUTH-OK" "$WORK/prod2-srv.log"; then
+        echo "   FAIL: the daemon accepted the raw token"
+        FAILURES=$((FAILURES + 1))
+    elif ! grep -qa "rejected:" "$WORK/prod2-srv.log"; then
+        echo "   FAIL: the reject reason is missing"
+        tail -5 "$WORK/prod2-srv.log" | sed 's/^/   /'
+        FAILURES=$((FAILURES + 1))
+    elif grep -qa "oidc-prod-ok" "$WORK/prod2-cli.out"; then
+        echo "   FAIL: the session ran over the rejection"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "   PASS (the raw token rejected, 401)"
+    fi
+else
+    echo "   FAIL: the daemon did not start"
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "ssh3-server.*--oidc-issuer" 2>/dev/null
+
 if [ "$FAILURES" -eq 0 ]; then
     echo "OIDC-E2E PASS"
     rm -rf "$WORK"

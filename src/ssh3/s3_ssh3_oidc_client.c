@@ -7,18 +7,37 @@
  * auth/oidc/openid_connect.go Connect() shape, one blocking pass)
  */
 
+/* the loopback sockets: the winsock twins ride the S3_WIN32 define
+ * (the LEAN build pulls no net headers on its own) */
+
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
+
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #include <stdio.h>
 #include <string.h>
 
 #include <s3_https_fetch.h>
 #include <s3_ssh3_oidc_client.h>
+
+/* the fd closer and the setsockopt optval of the loopback sockets */
+
+#if (S3_WIN32)
+#define s3_oidc_close(fd)      closesocket(fd)
+#define s3_oidc_sockopt_val(p) ((const char *)(p))
+#else
+#define s3_oidc_close(fd)      close(fd)
+#define s3_oidc_sockopt_val(p) (p)
+#endif
 
 /* the redirect answer of the reference callback */
 
@@ -133,7 +152,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
      * alphabet carries + and =), the endpoint decodes it back */
 
     if (s3_cli_url_encode(f->nonce, nonce_enc, sizeof(nonce_enc)) == 0) {
-        close(f->listen_fd);
+        s3_oidc_close(f->listen_fd);
         f->listen_fd = -1;
         return S3_ERROR;
     }
@@ -147,7 +166,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
         return S3_ERROR;
     }
 
-    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_REUSEADDR, s3_oidc_sockopt_val(&yes), sizeof(yes));
 
     s3_memzero(&sa, sizeof(sa));
 
@@ -157,7 +176,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
 
     if (bind(f->listen_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
         listen(f->listen_fd, 1) != 0) {
-        close(f->listen_fd);
+        s3_oidc_close(f->listen_fd);
         f->listen_fd = -1;
         return S3_ERROR;
     }
@@ -167,7 +186,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
         socklen_t          blen = sizeof(bound);
 
         if (getsockname(f->listen_fd, (struct sockaddr *)&bound, &blen) != 0) {
-            close(f->listen_fd);
+            s3_oidc_close(f->listen_fd);
             f->listen_fd = -1;
             return S3_ERROR;
         }
@@ -178,7 +197,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
     n = snprintf(f->redirect_uri, sizeof(f->redirect_uri), "http://127.0.0.1:%d/ssh", f->port);
 
     if (n >= sizeof(f->redirect_uri)) {
-        close(f->listen_fd);
+        s3_oidc_close(f->listen_fd);
         f->listen_fd = -1;
         return S3_ERROR;
     }
@@ -193,7 +212,7 @@ s3_ssh3_oidc_flow_init(s3_ssh3_oidc_flow_t *f, const char *authorization_endpoin
                  client_id, f->redirect_uri, f->state, nonce_enc, challenge_b64);
 
     if (url_n <= 0 || (size_t)url_n >= sizeof(f->authorize_url)) {
-        close(f->listen_fd);
+        s3_oidc_close(f->listen_fd);
         f->listen_fd = -1;
         return S3_ERROR;
     }
@@ -269,18 +288,18 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
     tv.tv_sec = S3_SSH3_OIDC_CLI_TIMEOUT_SEC;
     tv.tv_usec = 0;
 
-    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(f->listen_fd, SOL_SOCKET, SO_RCVTIMEO, s3_oidc_sockopt_val(&tv), sizeof(tv));
 
     conn = accept(f->listen_fd, NULL, NULL);
 
-    close(f->listen_fd);
+    s3_oidc_close(f->listen_fd);
     f->listen_fd = -1;
 
     if (conn < 0) {
         return S3_ERROR;
     }
 
-    (void)setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, s3_oidc_sockopt_val(&tv), sizeof(tv));
 
     /* one request line carries the redirect, the rest is drained by
      * the close (the browsers pipeline nothing before the response) */
@@ -292,7 +311,7 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
         got = recv(conn, req + n, 1, 0);
 
         if (got <= 0) {
-            close(conn);
+            s3_oidc_close(conn);
             return S3_ERROR;
         }
 
@@ -328,7 +347,7 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
     }
 
     if (!ok) {
-        close(conn);
+        s3_oidc_close(conn);
         return S3_ERROR;
     }
 
@@ -339,7 +358,7 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
         /* the state mismatch answers the 400 like the reference */
 
         (void)send(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 47, 0);
-        close(conn);
+        s3_oidc_close(conn);
 
         return S3_DECLINED;
     }
@@ -347,7 +366,7 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
     rc = s3_cli_query_param(target, "code", code, code_max);
 
     if (rc != S3_OK) {
-        close(conn);
+        s3_oidc_close(conn);
         return S3_ERROR;
     }
 
@@ -367,7 +386,7 @@ s3_ssh3_oidc_flow_wait_code(s3_ssh3_oidc_flow_t *f, char *code, size_t code_max)
         (void)send(conn, resp, n, 0);
     }
 
-    close(conn);
+    s3_oidc_close(conn);
 
     return S3_OK;
 }

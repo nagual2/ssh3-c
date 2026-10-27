@@ -12,9 +12,25 @@
 
 #include <stdio.h>
 #include <string.h>
+
+/* the socket timeout options of the blocking fetch: the winsock twins
+ * ride the S3_WIN32 define (the file serves both builds, the BIO
+ * carries the connect and the TLS itself) */
+
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+/* the winsock setsockopt takes the const char * optval */
+
+#define s3_https_sockopt_val(p) ((const char *)(p))
+#else
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#define s3_https_sockopt_val(p) (p)
+#endif
 
 #include <s3_https_fetch.h>
 
@@ -92,8 +108,8 @@ s3_https_socket_timeout(int fd)
     tv.tv_sec = S3_HTTPS_TIMEOUT_SEC;
     tv.tv_usec = 0;
 
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
 }
 
 /* the connected (and handshaked for https) BIO; the ctx out lives

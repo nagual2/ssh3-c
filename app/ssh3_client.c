@@ -129,6 +129,8 @@ typedef unsigned short u_short;
 #include <s3_ssh3_dgram.h>
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
+#include <s3_ssh3_oidc.h>
+#include <s3_ssh3_oidc_client.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_reverse.h>
 #include <s3_ssh3_session_cli.h>
@@ -136,6 +138,16 @@ typedef unsigned short u_short;
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
 #include <s3_ssl.h>
+
+#if (S3_WIN32)
+
+/* shellapi rides after the s3 headers: the windows.h came in through
+ * them, the LEAN_AND_MEAN build does not pull it on its own (the
+ * ShellExecuteA of the oidc provider tab) */
+
+#include <shellapi.h>
+
+#endif
 
 /*
  * the platform shims of the shared body: the known_hosts label, the
@@ -308,7 +320,12 @@ struct termios {
 
 #endif
 
-enum { S3_CLI_AUTH_NONE = 0, S3_CLI_AUTH_BASIC, S3_CLI_AUTH_PUBKEY };
+enum {
+    S3_CLI_AUTH_NONE = 0,
+    S3_CLI_AUTH_BASIC,
+    S3_CLI_AUTH_PUBKEY,
+    S3_CLI_AUTH_OIDC
+};
 
 /* the session state machine of the main loop */
 
@@ -365,6 +382,17 @@ static char        s3_cli_keyfile[1024];
 static char        s3_cli_basic[512];
 static char        s3_cli_bearer[2048];
 static const char *s3_cli_auth_value;
+
+/* the --oidc-* mode: the issuer and the audience (the client id of
+ * the token) ride the long flags, --oidc-token feeds the raw
+ * id_token (the CI/headless bypass, S3_OIDC_NO_BROWSER keeps the
+ * tab closed for the full flow) */
+
+static const char *s3_cli_oidc_issuer;
+static const char *s3_cli_oidc_aud;
+static const char *s3_cli_oidc_raw;
+static char        s3_cli_oidc_bearer[S3_SSH3_OIDC_CLI_TOKEN_MAX + 8];
+
 static char       *s3_cli_cmd; /* the joined exec text, NULL = shell */
 
 /*
@@ -1025,6 +1053,7 @@ static EVP_PKEY *s3_cli_ossh_ec256(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_ossh_rsa(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_openssh_key(const char *buf);
 static s3_int_t  s3_cli_jwt_build(SSL *ssl);
+static s3_int_t  s3_cli_oidc_acquire(SSL *ssl);
 static uintptr_t s3_cli_h3_field_l(u_char *p, const char *name, const char *value);
 static size_t    s3_cli_h3_section(u_char *p);
 static s3_int_t  s3_cli_tofu_prepare(void);
@@ -1225,6 +1254,10 @@ s3_cli_usage(const char *prog)
             "  -r          with the transfers: the recursive tree\n"
             "  --log-level 0..9|all  the s3 log level\n"
             "  --sftp put|get:local:remote  the transfer (get: local first)\n"
+            "  --oidc-issuer url --oidc-audience id: the OIDC login (the\n"
+            "              provider tab opens, the id_token rides the CONNECT\n"
+            "              Bearer; S3_OIDC_NO_BROWSER keeps the tab closed,\n"
+            "              --oidc-token feeds the raw id_token)\n"
             "  --help      this help\n"
             "  -C          the compression of the channel body (the peer must announce\n"
             "              the capability; the default is off); -C zstd pins the\n"
@@ -2301,6 +2334,116 @@ s3_cli_jwt_build(SSL *ssl)
     }
 
     s3_cli_auth_value = s3_cli_bearer;
+
+    return S3_OK;
+}
+
+/*
+ * the OIDC acquire of the --oidc-* mode, the shape of the reference
+ * auth/oidc Connect(): the conversation nonce derives from the live
+ * TLS session (the base64 of the EXPORTER-SSH3 32-byte exporter, the
+ * same bytes the C and the Go servers verify against), the loopback
+ * listener takes the provider redirect, the code exchanges under
+ * PKCE and the id_token verifies locally before it rides the
+ * CONNECT.  --oidc-token feeds the raw id_token instead (the CI and
+ * the headless runs); S3_OIDC_NO_BROWSER keeps the tab closed, the
+ * url always prints on the stderr
+ */
+
+static s3_int_t
+s3_cli_oidc_acquire(SSL *ssl)
+{
+    char                    nonce[64], code[S3_SSH3_OIDC_CLI_CODE_MAX];
+    char                    token[S3_SSH3_OIDC_CLI_TOKEN_MAX];
+    const char             *ca_file, *no_browser;
+    s3_ssh3_oidc_provider_t prov;
+    s3_ssh3_oidc_flow_t     flow;
+
+    if (s3_cli_oidc_raw != NULL) {
+
+        /* the raw id_token rides as-is (the CI and the negatives) */
+
+        snprintf(s3_cli_oidc_bearer, sizeof(s3_cli_oidc_bearer), "Bearer %s", s3_cli_oidc_raw);
+        s3_cli_auth_value = s3_cli_oidc_bearer;
+
+        return S3_OK;
+    }
+
+    if (ssl == NULL) {
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_oidc_conversation_nonce(ssl, nonce) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: the conversation nonce failed");
+        return S3_ERROR;
+    }
+
+    ca_file = getenv("S3_OIDC_CA_FILE");
+
+    if (s3_ssh3_oidc_discover(s3_cli_oidc_issuer, ca_file, &prov) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: the provider discovery failed");
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_oidc_flow_init(&flow, prov.authorization_endpoint, s3_cli_oidc_aud, nonce) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: the flow init failed");
+        return S3_ERROR;
+    }
+
+    /* the harness marker the oidc-e2e redirect driver greps; the
+     * stderr keeps the human copy readable */
+
+    fprintf(stderr, "OIDC-AUTHORIZE-URL: %s\n", flow.authorize_url);
+
+    no_browser = getenv("S3_OIDC_NO_BROWSER");
+
+    if (no_browser == NULL) {
+
+#if (S3_WIN32)
+
+        /* the shell association opens the provider tab; the failure
+         * is non-fatal: the url prints above, the manual tab works
+         * the same */
+
+        {
+            HINSTANCE inst = ShellExecuteA(NULL, "open", flow.authorize_url, NULL, NULL, SW_SHOWNORMAL);
+
+            if ((uintptr_t)inst <= 32) {
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "oidc: the browser open failed");
+            }
+        }
+
+#else
+
+        {
+            pid_t pid = fork();
+
+            if (pid == 0) {
+                execlp("xdg-open", "xdg-open", flow.authorize_url, (char *)NULL);
+                _exit(127);
+            }
+
+            if (pid < 0) {
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "oidc: the browser spawn failed");
+            }
+        }
+
+#endif
+    }
+
+    if (s3_ssh3_oidc_flow_wait_code(&flow, code, sizeof(code)) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: no redirect code");
+        return S3_ERROR;
+    }
+
+    if (s3_ssh3_oidc_client_token(s3_cli_oidc_issuer, s3_cli_oidc_aud, ca_file, &flow, code, token,
+                                  sizeof(token)) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: the token exchange failed");
+        return S3_ERROR;
+    }
+
+    snprintf(s3_cli_oidc_bearer, sizeof(s3_cli_oidc_bearer), "Bearer %s", token);
+    s3_cli_auth_value = s3_cli_oidc_bearer;
 
     return S3_OK;
 }
@@ -12401,6 +12544,46 @@ main(int argc, char **argv)
 
                 value = argv[n + 1];
 
+            } else if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
+
+                /* the OIDC login flow of the --oidc-* mode (the long
+                 * keys: no ssh2 twin to mirror): the issuer feeds the
+                 * discovery, the audience is the client id of the
+                 * token, --oidc-token feeds the raw id_token for the
+                 * headless runs (S3_OIDC_NO_BROWSER keeps the tab
+                 * closed for the full flow) */
+
+                if (s3_cli_oidc_issuer != NULL) {
+                    fprintf(stderr, "ssh3: --oidc-issuer is set twice\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                s3_cli_oidc_issuer = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--oidc-audience") == 0 && n + 1 < argc) {
+
+                if (s3_cli_oidc_aud != NULL) {
+                    fprintf(stderr, "ssh3: --oidc-audience is set twice\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                s3_cli_oidc_aud = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--oidc-token") == 0 && n + 1 < argc) {
+
+                if (s3_cli_oidc_raw != NULL) {
+                    fprintf(stderr, "ssh3: --oidc-token is set twice\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                s3_cli_oidc_raw = argv[n + 1];
+                value = argv[n + 1];
+
             } else if (strcmp(argv[n], "-C") == 0 && n + 1 < argc && argv[n + 1][0] != '-') {
 
                 /*
@@ -13036,6 +13219,25 @@ main(int argc, char **argv)
 
     s3_cli_console = _isatty(0) ? 1u : 0u;
 
+    /* the credential kind the command line chose: the snapshot rides
+     * the oidc conflict check before the config defaults land (the
+     * config IdentityFile yields to the explicit --oidc-*, the flag
+     * -i/-U refuses the mix) */
+
+    {
+        static unsigned s3_cli_auth_flag_kind;
+
+        s3_cli_auth_flag_kind = s3_cli_auth;
+
+        if (s3_cli_oidc_issuer != NULL || s3_cli_oidc_raw != NULL) {
+
+            if (s3_cli_auth_flag_kind != S3_CLI_AUTH_NONE) {
+                fprintf(stderr, "ssh3: --oidc-* excludes -i and -U\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+        }
+    }
+
     /* the -t force without a local tty is the ssh2 refusal */
 
     if (s3_cli_pty_mode == S3_CLI_PTY_FORCE && !s3_cli_console) {
@@ -13179,7 +13381,40 @@ main(int argc, char **argv)
 
     /* the auth consistency: the pubkey wants the bare username, the
      * Basic one carried its own; the JWT username validates like the
-     * harness (the claim set embeds it verbatim) */
+     * harness (the claim set embeds it verbatim); the oidc mode
+     * excludes the other credentials and wants both its flags (the
+     * raw --oidc-token rides without the issuer/audience pair) */
+
+    /* the oidc mode overrides the config defaults (the config
+     * IdentityFile is a default, the explicit --oidc-* wins); the
+     * flag-vs-flag conflict (-i/-U together with --oidc-*) died
+     * before the config read */
+
+    if (s3_cli_oidc_issuer != NULL || s3_cli_oidc_raw != NULL) {
+
+        if (s3_cli_oidc_issuer != NULL && s3_cli_oidc_aud == NULL) {
+            fprintf(stderr, "ssh3: --oidc-issuer wants --oidc-audience (the client id of the token)\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_auth = S3_CLI_AUTH_OIDC;
+    }
+
+    if (s3_cli_auth == S3_CLI_AUTH_OIDC) {
+
+        if (s3_cli_oidc_issuer == NULL && s3_cli_oidc_raw == NULL) {
+            fprintf(stderr, "ssh3: --oidc-audience without --oidc-issuer\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        if (s3_cli_jump_on) {
+            /* the jump leg carries its own exporter and its own
+             * nonce: the oidc flow toward the hop is a later wave */
+
+            fprintf(stderr, "ssh3: --oidc-* rides no -J in this wave\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
 
     if (s3_cli_auth == S3_CLI_AUTH_PUBKEY) {
 
@@ -13502,6 +13737,12 @@ main(int argc, char **argv)
 
             if (s3_cli_auth == S3_CLI_AUTH_PUBKEY &&
                 s3_cli_jwt_build(cli->ssl->connection) != S3_OK) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+
+            if (s3_cli_auth == S3_CLI_AUTH_OIDC &&
+                s3_cli_oidc_acquire(cli->ssl->connection) != S3_OK) {
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 break;
             }
