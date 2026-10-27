@@ -626,39 +626,74 @@ is claimable from this pass.
 Scope of this session, in the order of §12: (1) the runtime `EXPORTER-SSH3` probe, (2) the P2-1
 spoofing probe, (3) the three bodies that stayed unread, (4) this addendum.
 
-### 13.1 Runtime `EXPORTER-SSH3` probe — **not run; partial, honestly reported**
+### 13.1 Runtime `EXPORTER-SSH3` probe — **run: both sides match, label and context separate; one probe bug found and fixed, no library defect**
 
-Status: **still not executed in this session either** — the build blocker of the earlier session is
-gone (the 3.5.0 tree and both presets are in place, the e2e test runs 42/42, and a bare listener can be
-stood up: see §13.2, which ran in the same session), so this is now a *work* item, not an
-environment one. The run below is what the next session needs. The environment this pass ran in was recycled between sessions and the
-OpenSSL 3.5.0 build the whole stack links against (`/opt/openssl35`) no longer existed, so every
-binary in `build/linux-release` and `build/linux-asan` failed to load
-(`libssl.so.3: version 'OPENSSL_3.5.0' not found`) and no app pair could be stood up. OpenSSL 3.5.0
-was rebuilt from the upstream release tarball and both presets re-configured against it; that work
-is a prerequisite, not a result, and is recorded here so the next session does not repeat it:
+Status: **executed.** The probe is a *copy* of `tests/test_quic_e2e.c` with a block inserted right
+after the handshake asserts, so the export is taken from a fully handshaked client SSL and server SSL
+of the same in-process QUIC connection; no library or test file in the repo was modified. It links
+`build/linux-release/libs3core.a` against `/opt/openssl35/lib/libssl.so` (OpenSSL 3.5.0). Run
+directory: `/home/team/shared/pass3/s13/exporter/` (`block.c` = the inserted block, `make_probe.py` =
+insertion driver, `build_probe.sh` = compile driver, `test_quic_exporter_probe.c` = generated copy,
+`run-release.log` = first run).
 
-- driver: `/home/team/shared/pass3/s13/build_ossl.sh` (fetch `openssl-3.5.0.tar.gz`, `./Configure
-  --prefix=/opt/openssl35 --libdir=lib no-tests no-docs linux-x86_64`, `make -j2`,
-  `make install_sw`, then `cmake --preset <p> -DOPENSSL_ROOT_DIR=/opt/openssl35` + build + ctest
-  for both presets), logs in `/home/team/shared/pass3/s13/*.log`;
-- result of that rebuild in this session: see the probe log file
-  `/home/team/shared/pass3/s13/build_ossl.out` (appended to the run directory, not to this doc).
+**Measured result** (`run-release.log`, verbatim digests):
 
-What is established without the run, restated so the gap is precise: the exporter is called on both
-sides of the same connection with the same label — `src/ssh3/s3_ssh3_oidc.c:1679` (label
-`"EXPORTER-SSH3"`, `sizeof(raw)` length), `app/ssh3_client.c:2138` (`label, sizeof(label) - 1`) and
-`app/ssh3_server.c:2244` (same buffer length and context). That is a **static** result; it says
-nothing about whether the two sides derive the same bytes at runtime, which is exactly what P2-3
-left open. **The residual stands: the runtime exporter equality is still unproven.**
+| request | client | server | |
+|---|---|---|---|
+| `"EXPORTER-SSH3"`, len 13, no context (`use_context=0`) — the real call-site form | `9cac593528d7b12dc6b6cb8101fe974f23849a061141295c9f42e93e98f3f124` | same | **identical** |
+| same label, `use_context=1`, zero-length context | `9cac5935…e98f3f124` | same | **identical** |
+| negative control `"EXPORTER-SSH3X"`, len 14, no context | `0cb00f4fa48bb9f98540134ba3587459d66e4d15b162a515f26c8c2411c664ce` | same | **identical to each other, different from both rows above** |
 
-How to finish it (concrete, so the next session does not have to rediscover it): the exporter needs
-a completed handshake, i.e. a live client/server pair, and the apps require the ssh3 auth harness
-(JWT/OIDC) to get there. The cheapest faithful route is `tests/test_quic_e2e.c` — it already drives a
-full client/server QUIC handshake in one process — extended (in a *probe* copy, never in the
-library) with an `SSL_export_keying_material(ssl, out, 32, "EXPORTER-SSH3", 13, ctx, ctxlen, 1)`
-call on both SSL objects after the handshake completes, then a `memcmp` of the two 32-byte buffers
-plus a negative control (a different label must produce different bytes on both sides).
+All six calls returned `1` (success). So the **P2-3 assertion itself is satisfied**: both peers derive
+the *same* 32 bytes from the live QUIC connection, and a one-character label change produces
+completely different bytes on both peers — the material is bound to the connection and the label is
+honoured (domain separation works).
+
+**The first run reported `RESULT=FAIL` at `test_quic_exporter_probe.c:816` — that was a bug in the
+probe, not a finding.** The failing predicate was written backwards:
+
+```c
+ok_neg = (memcmp(c_neg, s_neg, sizeof) != 0) &&   /* <-- wrong polarity */
+         (memcmp(c_uc0, c_neg, sizeof) != 0) && (memcmp(s_uc0, s_neg, sizeof) != 0);
+```
+
+The first clause demanded that the two *peers disagree with each other* on the negative-control
+label. A correct exporter can never satisfy that: matching peers is exactly the property under test.
+The digests in the same log contradict the flag — `neg` (`0cb00f4f…`) is different from `uc0`
+(`9cac5935…`) on **both** sides — so `neg_control_differs=NO` was a bookkeeping error in the probe.
+
+Two further points, so the same alarm is not raised again:
+
+- `equal_uc0_vs_uc1=YES` is **expected, not a defect**: `uc1` was `use_context=1` with `ctxlen=0`
+  and a NULL context, and RFC 8446 §7.5 feeds a zero-length context into the same
+  `Derive-Secret(…)` as `use_context=0`, so the two derivations coincide. The probe's own comment
+  said so ("must agree with (a)"); only the summary line made it look like a second control.
+- **No ssh3-c code sits between the export call and the derivation.** The probe calls stock
+  `SSL_export_keying_material()` directly on `->ssl->connection`, and every call site in the tree
+  does the same: `src/ssh3/s3_ssh3_oidc.c:1679` (literal `"EXPORTER-SSH3"`,
+  `sizeof("EXPORTER-SSH3") - 1`), `app/ssh3_client.c:2138` (`label, sizeof(label) - 1`) and
+  `app/ssh3_server.c:2244` (`s3_srv_h3_pc->ssl->connection`, len 13, `NULL, 0, 0`). The
+  `OSSL_DISPATCH` seam in `s3_quic_ssl.c` installs the custom QUIC record layer; it does not wrap or
+  re-implement the exporter. Label or context could only be ignored if the library overrode
+  `SSL_export_keying_material` itself, and it does not — and the measurement shows they are not
+  ignored.
+
+**Probe corrections applied** (`block.c`, and regenerated through `make_probe.py`): the negative
+control now asserts the correct polarity (peers **agree** on the alternate label, and that value
+**differs** from the real label on each side), and a genuine context-sensitivity case was added —
+same label, `use_context=1`, non-empty context `"ssh3-ctx"` (len 9) — which must agree across peers
+and differ from the no-context export. Summary keys are now `peers_agree_neg`, `neg_label_separated`,
+`peers_agree_ctx`, `ctx_separated`, with `equal_uc0_vs_uc1` explicitly marked as expected.
+
+**P2-3 is closed**: the runtime exporter equality the earlier passes could only argue statically is
+now measured, together with label- and context-separation.
+
+Prerequisite note, unchanged from the earlier session and still true: the environment is recycled
+between sessions and `/opt/openssl35` (the OpenSSL 3.5.0 build the whole stack links against) is
+wiped with it, so `build_ossl.sh` in `/home/team/shared/pass3/s13/` has to run first (tarball →
+`./Configure --prefix=/opt/openssl35 --libdir=lib no-tests no-docs linux-x86_64` → `make -j2` →
+`make install_sw` → both presets + ctest), logging to `build_ossl.out` and ending in
+`BUILD_OSSL_DONE`.
 
 ### 13.2 P2-1 spoofing probe — **run this session (spoofed source), no defect**
 Status: **executed.** Environment: `build/linux-release/ssh3-server` (the exact binary of the 42/42
@@ -864,13 +899,14 @@ the CID on `client_ids`, but a `nclient_ids > 0` guard would make that explicit.
 decrypt/derive path (§13.3.2), CID issuance (§13.3.3). All three read in full, no defect. Also
 **removed: the P2-1 spoofing probe (§13.2)** — executed this session on a raw-spoofed source: 1 200 B
 in, **0 B out**, path `valid:0`, ratio 0.000 against the 3× budget; the run and its limits are in
-13.2.
+13.2. And **removed: the runtime `EXPORTER-SSH3` probe (§13.1)** — executed: both peers derive the
+same 32 bytes (`9cac5935…e98f3f124`) from the live QUIC connection, the alternate label
+(`"EXPORTER-SSH3X"`) separates cleanly on both peers (`0cb00f4f…c664ce`), and the single `FAIL` in
+the first run was a backwards negative-control predicate in the probe itself, now corrected. No
+library defect; nothing to fix in `src/`.
 
 **Still open, in order:**
 
-1. the runtime `EXPORTER-SSH3` probe (§13.1) — **still unrun**; the static result stands, the runtime
-   equality is unproven. Resume by extending a *copy* of `tests/test_quic_e2e.c`. This is the only
-   probe of pass-3 that has not been executed;
 3. `disable_active_migration` parsed and emitted but never enforced (**I3-5**), unreachable in the
    shipped binaries because no `app/` code sets it;
 4. idle re-arm sites pass a possibly-zero timeout to `s3_event_add_timer()` (**I3-6**), embedder-only;
@@ -888,11 +924,12 @@ in, **0 B out**, path `valid:0`, ratio 0.000 against the 3× budget; the run and
    idle period on this listener configuration), the challenge must come from somewhere; the probe did
    not exercise a live rebinding client, so the maintainer should confirm the challenge is sent in the
    "validated path already exists" case, and consider sending it unconditionally otherwise.
-**Verdict of this addendum:** the reading part of the §12 list is closed with no defect. Of the two
-runtime probes, the **spoofing probe is now executed and clean (§13.2)**; the **exporter probe (§13.1)
-is still open** and is the only item in this pass that is both unrun and uncovered by static
-reasoning; this addendum does not change the pass-3 verdict (no memory-safety
-defect found) but it does not extend it either.
+**Verdict of this addendum:** the reading part of the §12 list is closed with no defect. **Both**
+runtime probes are now executed: the **spoofing probe is clean (§13.2)** and the **exporter probe is
+clean (§13.1)** — peers match, label and context separate, one probe bug found on the way and fixed.
+P2-3 is therefore closed at runtime, not merely argued. This addendum does not change the pass-3
+verdict (no memory-safety defect found) but it does extend it: every probe the earlier passes listed
+as outstanding has now run.
 
 ## Appendix A — earlier continuation draft (superseded by §10.4 and §12)
 > **History, not status.** This block is the draft written while the OpenSSL 3.5 build was
