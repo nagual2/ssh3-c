@@ -502,14 +502,14 @@ typedef struct {
 } s3_cli_jump_bridge_t;
 
 struct s3_cli_jump_hop_s {
-    char                    user[128];
-    char                    host[256];
-    unsigned                port;         /* 0 asks the 443 default at the resolve */
-    char                    target[384];  /* the CONNECT ?user= path */
-    char                    hostkey[768]; /* the known_hosts key of the hop */
-    char                    bearer[2048];
-    const char             *auth; /* the jump CONNECT auth value */
-    struct sockaddr_storage sa;   /* the resolved hop */
+    char        user[128];
+    char        host[256];
+    unsigned    port;                                   /* 0 asks the 443 default at the resolve */
+    char        target[384];                            /* the CONNECT ?user= path */
+    char        hostkey[768];                           /* the known_hosts key of the hop */
+    char        bearer[S3_SSH3_OIDC_CLI_TOKEN_MAX + 8]; /* the jwt or the oidc id_token */
+    const char *auth;                                   /* the jump CONNECT auth value */
+    struct sockaddr_storage sa;                         /* the resolved hop */
     socklen_t               sa_len;
     struct sockaddr_storage
                      tgt; /* the channel target: the next hop, the last one rides the destination */
@@ -1086,7 +1086,7 @@ static EVP_PKEY *s3_cli_ossh_ec256(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_ossh_rsa(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_openssh_key(const char *buf);
 static s3_int_t  s3_cli_jwt_build(SSL *ssl);
-static s3_int_t  s3_cli_oidc_acquire(SSL *ssl);
+static s3_int_t  s3_cli_oidc_acquire(SSL *ssl, char *bearer, size_t cap);
 static uintptr_t s3_cli_h3_field_l(u_char *p, const char *name, const char *value);
 static size_t    s3_cli_h3_section(u_char *p);
 static s3_int_t  s3_cli_tofu_prepare(void);
@@ -2384,11 +2384,14 @@ s3_cli_jwt_build(SSL *ssl)
  * PKCE and the id_token verifies locally before it rides the
  * CONNECT.  --oidc-token feeds the raw id_token instead (the CI and
  * the headless runs); S3_OIDC_NO_BROWSER keeps the tab closed, the
- * url always prints on the stderr
+ * url always prints on the stderr.  The bearer lands in the
+ * caller's buffer: the main conn points s3_cli_auth_value at its
+ * own, every jump hop rides its own (each hop conversation carries
+ * its own exporter, the token of one hop never serves another)
  */
 
 static s3_int_t
-s3_cli_oidc_acquire(SSL *ssl)
+s3_cli_oidc_acquire(SSL *ssl, char *bearer, size_t cap)
 {
     char                    nonce[64], code[S3_SSH3_OIDC_CLI_CODE_MAX];
     char                    token[S3_SSH3_OIDC_CLI_TOKEN_MAX];
@@ -2396,12 +2399,15 @@ s3_cli_oidc_acquire(SSL *ssl)
     s3_ssh3_oidc_provider_t prov;
     s3_ssh3_oidc_flow_t     flow;
 
+    if (bearer == NULL || cap == 0) {
+        return S3_ERROR;
+    }
+
     if (s3_cli_oidc_raw != NULL) {
 
         /* the raw id_token rides as-is (the CI and the negatives) */
 
-        snprintf(s3_cli_oidc_bearer, sizeof(s3_cli_oidc_bearer), "Bearer %s", s3_cli_oidc_raw);
-        s3_cli_auth_value = s3_cli_oidc_bearer;
+        snprintf(bearer, cap, "Bearer %s", s3_cli_oidc_raw);
 
         return S3_OK;
     }
@@ -2481,8 +2487,7 @@ s3_cli_oidc_acquire(SSL *ssl)
         return S3_ERROR;
     }
 
-    snprintf(s3_cli_oidc_bearer, sizeof(s3_cli_oidc_bearer), "Bearer %s", token);
-    s3_cli_auth_value = s3_cli_oidc_bearer;
+    snprintf(bearer, cap, "Bearer %s", token);
 
     return S3_OK;
 }
@@ -9521,9 +9526,12 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
                 return S3_ERROR;
             }
 
-            /* the jump auth rides the same scheme: the JWT of the
+            /* the hop auth rides the same scheme: the JWT of the
              * hop exporter for the -i mode, the Basic string for
-             * the -U mode */
+             * the -U mode, the per-hop oidc flow for the --oidc-*
+             * (each hop conversation carries its own exporter and
+             * its own nonce, the token of one hop never serves
+             * another) */
 
             if (s3_cli_auth == S3_CLI_AUTH_PUBKEY) {
 
@@ -9536,6 +9544,15 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
 
             } else if (s3_cli_auth == S3_CLI_AUTH_BASIC) {
                 hop->auth = s3_cli_basic;
+
+            } else if (s3_cli_auth == S3_CLI_AUTH_OIDC) {
+
+                if (s3_cli_oidc_acquire(hop->cli->ssl->connection, hop->bearer,
+                                        sizeof(hop->bearer)) != S3_OK) {
+                    return S3_ERROR;
+                }
+
+                hop->auth = hop->bearer;
             }
         }
 
@@ -13722,13 +13739,10 @@ main(int argc, char **argv)
             return S3_CLI_EXIT_ERROR;
         }
 
-        if (s3_cli_jump_on) {
-            /* the jump leg carries its own exporter and its own
-             * nonce: the oidc flow toward the hop is a later wave */
-
-            fprintf(stderr, "ssh3: --oidc-* rides no -J in this wave\n");
-            return S3_CLI_EXIT_ERROR;
-        }
+        /* the jump chain rides the per-hop flows: every hop
+         * conversation carries its own exporter and its own nonce,
+         * the dial runs the acquire once per hop (the url prints
+         * per hop, the browser opens per hop) */
     }
 
     if (s3_cli_auth == S3_CLI_AUTH_PUBKEY) {
@@ -14157,10 +14171,15 @@ main(int argc, char **argv)
                 break;
             }
 
-            if (s3_cli_auth == S3_CLI_AUTH_OIDC &&
-                s3_cli_oidc_acquire(cli->ssl->connection) != S3_OK) {
-                s3_cli_rc = S3_CLI_EXIT_ERROR;
-                break;
+            if (s3_cli_auth == S3_CLI_AUTH_OIDC) {
+
+                if (s3_cli_oidc_acquire(cli->ssl->connection, s3_cli_oidc_bearer,
+                                        sizeof(s3_cli_oidc_bearer)) != S3_OK) {
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                    break;
+                }
+
+                s3_cli_auth_value = s3_cli_oidc_bearer;
             }
 
             if (s3_h3_get_session(cli) == NULL && s3_h3_init_session(cli) != S3_OK) {

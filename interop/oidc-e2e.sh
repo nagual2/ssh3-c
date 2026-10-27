@@ -9,6 +9,10 @@
 #      the server names the signature
 #   3. the expired token: rejected on the exp gate
 #   4. the wrong nonce: rejected on the conversation binding
+#   5. the prod client full flow -> the daemon, exec session
+#   6. the prod client raw token: rejected, 401
+#   7. the prod client rides the jump chain: the flow runs per hop,
+#      both daemons accept their own exporter's token
 #
 # everything rides the loopback; BUILD overrides the build dir
 
@@ -355,6 +359,104 @@ else
 fi
 
 pkill -f "ssh3-server.*--oidc-issuer" 2>/dev/null
+sleep 0.3
+
+echo "== oidc 7: the prod client rides the jump chain, the flow runs per hop"
+
+# the chain stand: the jump daemon and the destination daemon both
+# verify the oidc bearer (every hop conversation carries its own
+# exporter and its own nonce, the flow runs once per hop); the
+# driver follows the two authorize urls as they appear
+
+setsid nohup "$BUILD/ssh3-server" -3 -d 1352 --oidc-issuer "$ISSUER" \
+    --oidc-audience ssh3-c-cli -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/chain-jump.log" 2>&1 < /dev/null &
+
+setsid nohup "$BUILD/ssh3-server" -3 --oidc-issuer "$ISSUER" \
+    --oidc-audience ssh3-c-cli -l 127.0.0.1:0 -c "$CERT" -k "$KEY" \
+    > "$WORK/chain-dest.log" 2>&1 < /dev/null &
+
+if wait_listen "$WORK/chain-jump.log" && wait_listen "$WORK/chain-dest.log"; then
+
+    JPORT=$(port_of "$WORK/chain-jump.log")
+    DPORT=$(port_of "$WORK/chain-dest.log")
+
+    printf '127.0.0.1:%s/ssh3-term x509-certificate %s\n' "$JPORT" \
+        "$(openssl x509 -in "$CERT" -outform DER | base64 -w0)" \
+        >> "$PROD_HOME/.ssh3/known_hosts"
+    printf '127.0.0.1:%s/ssh3-term x509-certificate %s\n' "$DPORT" \
+        "$(openssl x509 -in "$CERT" -outform DER | base64 -w0)" \
+        >> "$PROD_HOME/.ssh3/known_hosts"
+
+    S3_OIDC_NO_BROWSER=1 HOME="$PROD_HOME" setsid nohup "$PROD" -n \
+        -J "127.0.0.1:$JPORT" \
+        --oidc-issuer "$ISSUER" --oidc-audience ssh3-c-cli \
+        -T "client@127.0.0.1:$DPORT/ssh3-term" "echo oidc-chain-ok" \
+        > "$WORK/chain-cli.out" 2> "$WORK/chain-cli.log" &
+
+    URL1=$(wait_oidc_url "$WORK/chain-cli.log" 15)
+
+    CHAIN_OK=1
+
+    if [ -z "$URL1" ]; then
+        echo "   FAIL: the first hop never printed the authorize url"
+        tail -5 "$WORK/chain-cli.log" | sed 's/^/   /'
+        CHAIN_OK=0
+    else
+        if ! drive_redirect "$URL1"; then
+            echo "   FAIL: the first hop redirect drive failed"
+            CHAIN_OK=0
+        fi
+
+        # the second url appears once the destination conn handshake
+        # completed (the second flow rides the second exporter)
+
+        URL2=""
+        i=0
+
+        while [ "$i" -lt 150 ]; do
+            URL2=$(grep "OIDC-AUTHORIZE-URL:" "$WORK/chain-cli.log" 2>/dev/null | sed -n 2p |
+                sed 's/^OIDC-AUTHORIZE-URL: //')
+            [ -n "$URL2" ] && break
+            sleep 0.1
+            i=$((i + 1))
+        done
+
+        if [ -z "$URL2" ]; then
+            echo "   FAIL: the destination never printed its authorize url"
+            tail -5 "$WORK/chain-cli.log" | sed 's/^/   /'
+            CHAIN_OK=0
+        else
+            if ! drive_redirect "$URL2"; then
+                echo "   FAIL: the destination redirect drive failed"
+                CHAIN_OK=0
+            fi
+
+            if wait_marker "$WORK/chain-cli.out" "oidc-chain-ok" 30 \
+                && grep -qa "INTEROP-AUTH-OK user=oidc" "$WORK/chain-jump.log" \
+                && grep -qa "INTEROP-AUTH-OK user=oidc" "$WORK/chain-dest.log"; then
+                echo "   PASS (the chain accepted both flows, the exec ran)"
+            else
+                echo "   FAIL"
+                tail -5 "$WORK/chain-cli.log" | sed 's/^/   /'
+                tail -3 "$WORK/chain-jump.log" | sed 's/^/   J: /'
+                tail -3 "$WORK/chain-dest.log" | sed 's/^/   D: /'
+                CHAIN_OK=0
+            fi
+        fi
+    fi
+
+    [ "$CHAIN_OK" -eq 0 ] && FAILURES=$((FAILURES + 1))
+
+else
+    echo "   FAIL: the chain daemons did not start"
+    tail -3 "$WORK/chain-jump.log" | sed 's/^/   J: /'
+    tail -3 "$WORK/chain-dest.log" | sed 's/^/   D: /'
+    FAILURES=$((FAILURES + 1))
+fi
+
+pkill -f "ssh3-server.*--oidc-issuer" 2>/dev/null
+sleep 0.3
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "OIDC-E2E PASS"
