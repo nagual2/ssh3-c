@@ -1487,25 +1487,22 @@ s3_quic_handle_max_stream_data_frame(s3_connection_t *c, s3_quic_header_t *pkt,
      * so qs->send can be non-empty while qs->send_offset has stopped.
      * Flushing unconditionally hands those bytes to a STREAM frame;
      * s3_quic_stream_flush() is a no-op when qs->send is empty, and it
-     * stops at the connection and stream limits on its own.  The reference
-     * wakes the application writer here as well.
+     * stops at the connection and stream limits on its own.  The flush
+     * runs before the close check: an app-gone stream with an unsent
+     * backlog (the session output past the verdict, B19b) must still
+     * take the newly granted window, the close drops the backlog only
+     * when the send side is terminal.
      */
 
+    (void)s3_quic_stream_flush(qs);
+
     if (qs->connection == NULL) {
-
-        /*
-         * the app side is gone (the stream waits for the ack of its
-         * final size in the tree): the wake and the flush have no
-         * writer to serve, the close re-runs its terminal check (the
-         * handle_stream shape)
-         */
-
         return s3_quic_close_stream(qs);
     }
 
     s3_quic_set_event(qc, qs->connection->write);
 
-    return s3_quic_stream_flush(qs);
+    return S3_OK;
 }
 
 s3_int_t

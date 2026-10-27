@@ -3586,13 +3586,25 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
  * the queue drained and the verdict is out: the fin lands here, the
  * peer fin before it ends the channel (the drop runs the quic stream
  * cleanup, the retire queues MAX_STREAMS and the slot frees for the
- * next session)
+ * next session).  a stream backlog behind the peer window (the child
+ * output outgrew the window before the verdict, B19b) holds the
+ * channel open: the flush of handle_max_stream_data_frame drains it
+ * when the client consumes and extends, the close would drop the
+ * tail and deadlock the peer
  */
 
 static void
 s3_srv_session_finish(s3_srv_h3_channel_t *ch)
 {
+    s3_quic_stream_t *qs;
+
     if (ch->sc == NULL || ch->sess_out_len > 0) {
+        return;
+    }
+
+    qs = ch->sc->data;
+
+    if (qs->send.size > qs->send.offset) {
         return;
     }
 

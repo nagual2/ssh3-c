@@ -243,9 +243,7 @@ The session channel rides the same codec (0.5.5-dev): the cat of the
 8 MiB compressible body through an exec session carries **28–31 KB**
 on the wire (~74×); the session output path queues the wire frames
 against the peer window and paces them with a 50 ms tick, so outputs
-larger than the 1 MiB initial window flow to completion (the residual
-loss-recovery corner of the plain path is tracked as B19b in
-[docs/PLAN.md](docs/PLAN.md)).
+larger than the 1 MiB initial window flow to completion (B19b).
 
 With `-C` (both directions compressed) the compressible get is
 120.2 ms; the wire carries 17.8× fewer bytes. The console and the
