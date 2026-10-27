@@ -1,3 +1,22 @@
+ssh3-c (0.5.5-1) unstable; urgency=medium
+
+  * New upstream release 0.5.5: the session flow-control wave (B19b) -
+    the session output no longer dies at the 1 MiB initial stream
+    window.  The server session sinks queue the wire frames and ride
+    the peer window (S3_BUSY backpressure, the 50 ms tick retry, the
+    fds hold until the queue drains, the verdict fin waits for the
+    flush); the client 192-frame parser heals the recv-chunk splits
+    (the packed body waits whole, the cursor walks past the decoded
+    frame); the max_stream_data handler flushes the parked backlog
+    before the close check (the late peer window drains the tail, the
+    channel holds until it does - the exec of an 8 MiB output
+    completes byte-exact); the segfault guard for the stream parked
+    in the tree for its final-size ack.  The outputs larger than the
+    initial window flow to completion in the plain and the compressed
+    shapes alike.
+
+ -- Max <nahual15@gmail.com>  Tue, 27 Oct 2026 10:20:00 +0000
+
 ssh3-c (0.5.4-1) unstable; urgency=medium
 
   * New upstream release 0.5.4: the connection lifecycle fix (B18) -
