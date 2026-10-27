@@ -459,55 +459,89 @@ static unsigned s3_cli_sftp_spec_mode;
 static char    *s3_cli_notes[S3_CLI_NOTES_MAX];
 static unsigned s3_cli_notes_n;
 
-/* the -J jump spec ([user@]host[:port], one hop) and the tunnel state
- * (the interop shape: the direct-udp channel of the jump conversation
- * bridges the inner datagrams through a loopback socket pair) */
+/* the -J jump chain (the [user@]host[:port] segments of the comma
+ * spec, the ssh2 ProxyJump shape) and the tunnel state (the interop
+ * shape: every hop conversation bridges the next leg's datagrams
+ * through a loopback socket pair, the last bridge carries the
+ * destination conn; the reference walks the same loop hop by hop,
+ * each hop dialed through the local udp relay of the previous one) */
 
 #define S3_CLI_JUMP_INNER_MTU  1200
 #define S3_CLI_JUMP_DGRAM_SIZE 1352
 #define S3_CLI_JUMP_DGRAM_MIN  1202
+#define S3_CLI_JUMP_MAX_HOPS   8
+
+/*
+ * the per-level cost of the datagram budget (the reference
+ * tunnelDatagramOverhead): the QUIC packet overhead plus the SSH3
+ * datagram framing of the level above, so hop k pins at the inner
+ * floor plus (n - k) levels of headroom and the chain that does not
+ * fit the standard path refuses instead of silently breaking
+ */
+
+#define S3_CLI_JUMP_LEVEL_OVERHEAD 48
+#define S3_CLI_JUMP_OUTER_MTU      1452
 
 /* the phase 1 deadline (the tunnel bring-up), the wrong jump host
  * refuses inside it */
 
 #define S3_CLI_JUMP_TIMEOUT 10000
 
-static unsigned    s3_cli_jump_on;
-static char        s3_cli_jump_user[128];
-static char        s3_cli_jump_host[256];
-static unsigned    s3_cli_jump_port; /* 0 asks the 443 default at the resolve */
-static char        s3_cli_jump_target[384];
-static char        s3_cli_jump_hostkey[768]; /* the known_hosts key of the hop */
-static char        s3_cli_jump_bearer[2048];
-static const char *s3_cli_jump_auth; /* the jump CONNECT auth value */
+typedef struct s3_cli_jump_hop_s s3_cli_jump_hop_t;
 
-static struct sockaddr_in s3_cli_jump_sa;
+/* the bridge toward the next leg: the loopback socket pair, the a
+ * side is the quic fd of the next conversation (the next hop or the
+ * destination), the b side is the tunnel side the hop channel feeds */
 
-static s3_connection_t *s3_cli_jump_cli; /* the jump udp connection */
-static s3_quic_conf_t   s3_cli_jump_conf;
-static s3_connection_t *s3_cli_jump_stream; /* the CONNECT stream */
-static s3_connection_t *s3_cli_jump_channel;
-static uint64_t         s3_cli_jump_conv_id;
-static uint64_t         s3_cli_jump_ch_id;
-static unsigned         s3_cli_jump_hs;
-static unsigned         s3_cli_jump_req_sent;
-static unsigned         s3_cli_jump_ch_sent;
-static unsigned         s3_cli_jump_ch_confirmed;
+typedef struct {
+    SOCKET             a, b;
+    struct sockaddr_in sa; /* the b address (the next conn dials it) */
+    s3_connection_t   *bc; /* the b event connection */
+    u_char             frame[S3_CLI_JUMP_OUTER_MTU + 16];
+    size_t             parked;
+} s3_cli_jump_bridge_t;
 
-/* the receive accumulator of the jump channel (the 91 confirmation) */
+struct s3_cli_jump_hop_s {
+    char                    user[128];
+    char                    host[256];
+    unsigned                port;         /* 0 asks the 443 default at the resolve */
+    char                    target[384];  /* the CONNECT ?user= path */
+    char                    hostkey[768]; /* the known_hosts key of the hop */
+    char                    bearer[2048];
+    const char             *auth; /* the jump CONNECT auth value */
+    struct sockaddr_storage sa;   /* the resolved hop */
+    socklen_t               sa_len;
+    struct sockaddr_storage
+                     tgt; /* the channel target: the next hop, the last one rides the destination */
+    socklen_t        tgt_len;
+    s3_connection_t *cli; /* the hop udp connection */
+    s3_quic_conf_t   conf;
+    s3_connection_t *stream; /* the CONNECT stream */
+    s3_connection_t *channel;
+    uint64_t         conv_id;
+    uint64_t         ch_id;
+    unsigned         hs;
+    unsigned         req_sent;
+    unsigned         ch_sent;
+    unsigned         ch_confirmed;
+    unsigned         mtu_pin;    /* the path mtu cap of this level (0 rides the discovery) */
+    unsigned         dgram_need; /* the peer datagram acceptance this level's channel wants */
+    unsigned         bridge_cap; /* the packet cap of the next level this hop carries */
+    u_char           ch_buf[64]; /* the receive accumulator (the 91 confirmation) */
+    size_t           ch_len;
+    s3_cli_jump_bridge_t *bridge; /* toward the next leg */
+};
 
-static u_char s3_cli_jump_ch_buf[64];
-static size_t s3_cli_jump_ch_len;
+static unsigned             s3_cli_jump_on;
+static s3_cli_jump_hop_t    s3_cli_jump_hops[S3_CLI_JUMP_MAX_HOPS];
+static unsigned             s3_cli_jump_n; /* the chain length */
+static s3_cli_jump_bridge_t s3_cli_jump_bridges[S3_CLI_JUMP_MAX_HOPS];
 
-/* the loopback socket pair: a is the inner quic fd, b is the tunnel
- * side the bridge reads */
+/* the destination bridge handoff: the a side becomes the inner quic
+ * fd in the main flow, the b address is the peer the inner conn dials */
 
 static SOCKET             s3_cli_bridge_a = INVALID_SOCKET;
-static SOCKET             s3_cli_bridge_b = INVALID_SOCKET;
-static s3_connection_t   *s3_cli_bridge_bc;
 static struct sockaddr_in s3_cli_bridge_sa;
-static u_char             s3_cli_bridge_frame[2048];
-static size_t             s3_cli_bridge_parked;
 
 /*
  * the -o options (the backlog 7, the fork keys, case-insensitive):
@@ -1126,12 +1160,15 @@ static void     s3_cli_agent_teardown(const char *why);
 static void     s3_cli_agent_pump(void);
 static void     s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data);
 static void     s3_cli_jump_bridge_read(s3_event_t *ev);
-static void     s3_cli_jump_bridge_flush(void);
-static s3_int_t s3_cli_jump_bridge_create(s3_event_ctx_t *ctx);
+static void     s3_cli_jump_bridge_flush(s3_cli_jump_hop_t *hop);
+static s3_int_t s3_cli_jump_bridge_create(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop);
 static void     s3_cli_jump_ch_read(s3_event_t *ev);
-static size_t   s3_cli_jump_h3_section(u_char *p);
+static size_t   s3_cli_jump_h3_section(s3_cli_jump_hop_t *hop, u_char *p);
+static unsigned s3_cli_jump_chain_gone(void);
 static s3_int_t s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap);
-static s3_int_t s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout);
+static s3_int_t s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
+                                 const struct sockaddr *peer, socklen_t peer_len, s3_msec_t start,
+                                 s3_msec_t timeout);
 #if (S3_WIN32)
 static void s3_cli_cm_acc_push(HANDLE h);
 static unsigned __stdcall s3_cli_cm_accept_thread(void *arg);
@@ -1199,8 +1236,8 @@ s3_cli_usage(const char *prog)
             "              ControlPersist)\n"
             "  -i keyfile  pubkey auth: sign the Bearer JWT with the PEM private\n"
             "              key (ed25519, P-256 or RSA)\n"
-            "  -J [user@]host[:port]  the proxy jump (one hop, the comma chain\n"
-            "              refuses)\n"
+            "  -J [user@]host[:port]  the proxy jump (the comma chain of\n"
+            "              hops rides, every hop carries its own user@)\n"
             "  -l login    the login name (the operand user wins on a conflict)\n"
             "  -L [bind:]port:host:hostport  the local tcp forward: every\n"
             "              accepted connection rides a direct-tcp channel of\n"
@@ -2489,6 +2526,47 @@ s3_cli_version_string(void)
 }
 
 /*
+ * the hop defaults: the port asks the 443 default, a spec without a
+ * user@ borrows the main login (the ssh2 shape), the CONNECT target
+ * rides the default path with the hop login, the known_hosts key
+ * mirrors the jump CONNECT target (/ssh3-term)
+ */
+
+static void
+s3_cli_jump_hop_defaults(s3_cli_jump_hop_t *hop)
+{
+    char user[sizeof(hop->user)];
+    char host[sizeof(hop->host)];
+
+    if (hop->user[0] == '\0') {
+        snprintf(hop->user, sizeof(hop->user), "%s", s3_cli_user);
+    }
+
+    /* the compose rides the known-size locals: the analyzer cannot
+     * size the chain-array members through the inlined hop pointer,
+     * the bounded copies close its false truncation positives */
+
+    memcpy(user, hop->user, sizeof(user));
+    user[sizeof(user) - 1] = '\0';
+
+    memcpy(host, hop->host, sizeof(host));
+    host[sizeof(host) - 1] = '\0';
+
+    if (user[0] != '\0') {
+        snprintf(hop->target, sizeof(hop->target), "/ssh3-term?user=%s", user);
+
+    } else {
+        snprintf(hop->target, sizeof(hop->target), "%s", "/ssh3-term");
+    }
+
+    if (hop->port == 0) {
+        hop->port = 443;
+    }
+
+    snprintf(hop->hostkey, sizeof(hop->hostkey), "%s:%u%s", host, hop->port, "/ssh3-term");
+}
+
+/*
  * the extended CONNECT request section: a zero prefix plus the
  * literal field lines, it decodes against any peer QPACK state (the
  * harness shape); the :authority carries the real host:port, the
@@ -2544,17 +2622,17 @@ s3_cli_h3_section(u_char *p)
     return s3_cli_h3_section_ex(p, authority, s3_cli_target, s3_cli_auth_value);
 }
 
-/* the jump CONNECT section: the jump host authority, the jump target
- * (?user= of the jump login) and the jump auth value */
+/* the jump CONNECT section: the hop authority, the hop target
+ * (?user= of the hop login) and the hop auth value */
 
 static size_t
-s3_cli_jump_h3_section(u_char *p)
+s3_cli_jump_h3_section(s3_cli_jump_hop_t *hop, u_char *p)
 {
     char authority[320];
 
-    snprintf(authority, sizeof(authority), "%s:%u", s3_cli_jump_host, s3_cli_jump_port);
+    snprintf(authority, sizeof(authority), "%s:%u", hop->host, hop->port);
 
-    return s3_cli_h3_section_ex(p, authority, s3_cli_jump_target, s3_cli_jump_auth);
+    return s3_cli_h3_section_ex(p, authority, hop->target, hop->auth);
 }
 
 /*
@@ -2790,6 +2868,7 @@ s3_cli_cfg_apply(const char *key, const char *val)
 
         if (s3_cli_streq_ci(val, "none") == 0) {
             s3_cli_jump_on = 0;
+            s3_cli_jump_n = 0;
             s3_cli_have_jump = 1;
             return S3_OK;
         }
@@ -3224,36 +3303,29 @@ s3_cli_sftp_spec_parse(const char *rest)
 }
 
 /*
- * the jump spec [user@]host[:port] (the ssh2 ProxyJump shape): one
- * hop, the comma chain refuses cleanly, the port defaults to 443 at
- * the resolve
+ * the jump spec (the ssh2 ProxyJump shape): the comma chain of
+ * [user@]host[:port] segments, every segment rides its own hop, the
+ * port defaults to 443 at the resolve.  A fresh parse rebuilds the
+ * chain (the last -J / ProxyJump wins, the ssh_config shape)
  */
 
 static s3_int_t
-s3_cli_jump_parse(const char *spec)
+s3_cli_jump_hop_parse_one(s3_cli_jump_hop_t *hop, const char *spec)
 {
     const char *s = spec, *at, *colon;
     size_t      len;
-
-    /* the transfer spec of the legacy -J never lands here (the
-     * caller forked it off), the comma chain is the rejected shape */
-
-    if (strchr(spec, ',') != NULL) {
-        fprintf(stderr, "ssh3: proxy chains are not supported (one jump hop rides)\n");
-        return S3_ERROR;
-    }
 
     at = strchr(s, '@');
 
     if (at != NULL) {
 
-        if ((size_t)(at - s) >= sizeof(s3_cli_jump_user)) {
+        if ((size_t)(at - s) >= sizeof(hop->user)) {
             fprintf(stderr, "ssh3: the jump user name is too long\n");
             return S3_ERROR;
         }
 
-        memcpy(s3_cli_jump_user, s, (size_t)(at - s));
-        s3_cli_jump_user[at - s] = '\0';
+        memcpy(hop->user, s, (size_t)(at - s));
+        hop->user[at - s] = '\0';
         s = at + 1;
     }
 
@@ -3261,9 +3333,9 @@ s3_cli_jump_parse(const char *spec)
 
     if (colon != NULL) {
 
-        s3_cli_jump_port = (unsigned)atoi(colon + 1);
+        hop->port = (unsigned)atoi(colon + 1);
 
-        if (s3_cli_jump_port == 0 || s3_cli_jump_port > 65535) {
+        if (hop->port == 0 || hop->port > 65535) {
             fprintf(stderr, "ssh3: bad jump port in %s\n", spec);
             return S3_ERROR;
         }
@@ -3274,13 +3346,62 @@ s3_cli_jump_parse(const char *spec)
         len = strlen(s);
     }
 
-    if (len == 0 || len >= sizeof(s3_cli_jump_host)) {
+    if (len == 0 || len >= sizeof(hop->host)) {
         fprintf(stderr, "ssh3: bad jump host in %s\n", spec);
         return S3_ERROR;
     }
 
-    memcpy(s3_cli_jump_host, s, len);
-    s3_cli_jump_host[len] = '\0';
+    memcpy(hop->host, s, len);
+    hop->host[len] = '\0';
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_cli_jump_parse(const char *spec)
+{
+    const char *s = spec;
+
+    /* the transfer spec of the legacy -J never lands here (the
+     * caller forked it off), the chain rebuilds from scratch (the
+     * last spec wins) */
+
+    s3_cli_jump_n = 0;
+
+    for (;;) {
+
+        const char        *comma = strchr(s, ',');
+        size_t             len = comma != NULL ? (size_t)(comma - s) : strlen(s);
+        char               seg[512];
+        s3_cli_jump_hop_t *hop;
+
+        if (s3_cli_jump_n >= S3_CLI_JUMP_MAX_HOPS) {
+            fprintf(stderr, "ssh3: the jump chain rides at most %u hops\n", S3_CLI_JUMP_MAX_HOPS);
+            return S3_ERROR;
+        }
+
+        if (len == 0 || len >= sizeof(seg)) {
+            fprintf(stderr, "ssh3: bad jump host in %s\n", spec);
+            return S3_ERROR;
+        }
+
+        memcpy(seg, s, len);
+        seg[len] = '\0';
+
+        hop = &s3_cli_jump_hops[s3_cli_jump_n++];
+        s3_memzero(hop, sizeof(*hop));
+
+        if (s3_cli_jump_hop_parse_one(hop, seg) != S3_OK) {
+            s3_cli_jump_n = 0;
+            return S3_ERROR;
+        }
+
+        if (comma == NULL) {
+            break;
+        }
+
+        s = comma + 1;
+    }
 
     s3_cli_jump_on = 1;
     s3_cli_have_jump = 1;
@@ -3683,6 +3804,7 @@ s3_cli_opt_parse(const char *arg)
 
         if (s3_cli_streq_ci(val, "none") == 0) {
             s3_cli_jump_on = 0;
+            s3_cli_jump_n = 0;
             s3_cli_have_jump = 1;
             return S3_OK;
         }
@@ -8830,28 +8952,84 @@ s3_cli_agent_pump(void)
  * side with the path mtu pinned to the 1200 floor === */
 
 /*
- * the datagram handler of the jump conversation: the tunnel frames
- * carry the prefix of the direct-udp channel, the payloads are the
- * raw quic packets of the inner connection, one send() into the
- * bridge socket b delivers them; a dropped datagram stays a loss the
- * inner connection recovers from (RFC 768, RFC 9002)
+ * the hop lookup for the shared handlers: the datagram handler rides
+ * the connection pointer, the channel reader rides the channel
+ * pointer (the machine carries per-level state, the pointers key it)
+ */
+
+static s3_cli_jump_hop_t *
+s3_cli_jump_hop_by_conn(s3_connection_t *c)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_jump_n; i++) {
+
+        if (s3_cli_jump_hops[i].cli == c) {
+            return &s3_cli_jump_hops[i];
+        }
+    }
+
+    return NULL;
+}
+
+static s3_cli_jump_hop_t *
+s3_cli_jump_hop_by_channel(s3_connection_t *c)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_jump_n; i++) {
+
+        if (s3_cli_jump_hops[i].channel == c) {
+            return &s3_cli_jump_hops[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* the bridge read handler rides the b-side connection pointer (the
+ * event layer owns ev->data, the hop lookup goes through the bridge
+ * map) */
+
+static s3_cli_jump_hop_t *
+s3_cli_jump_hop_by_bridge(s3_connection_t *c)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_jump_n; i++) {
+
+        if (s3_cli_jump_hops[i].bridge != NULL && s3_cli_jump_hops[i].bridge->bc == c) {
+            return &s3_cli_jump_hops[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * the datagram handler of a hop conversation: the tunnel frames
+ * carry the prefix of the hop channel, the payloads are the raw quic
+ * packets of the next leg, one send() into the bridge socket b
+ * delivers them; a dropped datagram stays a loss the next leg
+ * recovers from (RFC 768, RFC 9002)
  */
 
 static void
 s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
 {
-    u_char        flat[S3_CLI_JUMP_INNER_MTU + 16];
-    u_char       *p;
-    size_t        len = 0;
-    s3_chain_t   *cl;
-    const u_char *pos, *end;
-    uint64_t      csid, chid;
-    s3_str_t      payload;
-    ssize_t       n;
+    s3_cli_jump_hop_t *hop;
+    u_char             flat[S3_CLI_JUMP_OUTER_MTU + 16];
+    u_char            *p;
+    size_t             len = 0;
+    s3_chain_t        *cl;
+    const u_char      *pos, *end;
+    uint64_t           csid, chid;
+    s3_str_t           payload;
+    ssize_t            n;
 
-    (void)c;
+    hop = s3_cli_jump_hop_by_conn(c);
 
-    if (s3_cli_bridge_b == INVALID_SOCKET) {
+    if (hop == NULL || hop->bridge == NULL || hop->bridge->b == INVALID_SOCKET) {
         return;
     }
 
@@ -8876,38 +9054,50 @@ s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
         return;
     }
 
-    if (csid != s3_cli_jump_conv_id || chid != s3_cli_jump_ch_id) {
+    if (csid != hop->conv_id || chid != hop->ch_id) {
         return;
     }
 
-    n = send(s3_cli_bridge_b, (const char *)payload.data, payload.len, 0);
+    if (payload.len > hop->bridge_cap) {
+        /* the next level pins below the cap, the rest drops */
+        return;
+    }
 
-    (void)n; /* a short send is a loss the inner conn recovers from */
+    n = send(hop->bridge->b, (const char *)payload.data, payload.len, 0);
+
+    (void)n; /* a short send is a loss the next leg recovers from */
 }
 
 /*
- * the tunnel side of the bridge: the quic packets of the inner
- * connection recv straight behind the prefix (the payload bytes never
- * move), one datagram per send; the congested channel parks the
- * frame and puts the read event to sleep until the flush drains it
+ * the tunnel side of a bridge: the quic packets of the next leg recv
+ * straight behind the prefix (the payload bytes never move), one
+ * datagram per send; the congested channel parks the frame and puts
+ * the read event to sleep until the flush drains it
  */
 
 static void
 s3_cli_jump_bridge_read(s3_event_t *ev)
 {
-    size_t  pre;
-    ssize_t n;
+    s3_cli_jump_hop_t    *hop = s3_cli_jump_hop_by_bridge(ev->data);
+    s3_cli_jump_bridge_t *br;
+    size_t                pre;
+    ssize_t               n;
 
-    if (s3_cli_bridge_parked > 0) {
+    if (hop == NULL || hop->bridge == NULL) {
         return;
     }
 
-    pre = s3_ssh3_dgram_prefix_size(s3_cli_jump_conv_id, s3_cli_jump_ch_id);
+    br = hop->bridge;
+
+    if (br->parked > 0) {
+        return;
+    }
+
+    pre = s3_ssh3_dgram_prefix_size(hop->conv_id, hop->ch_id);
 
     for (;;) {
 
-        n = recv(s3_cli_bridge_b, (char *)s3_cli_bridge_frame + pre,
-                 sizeof(s3_cli_bridge_frame) - pre, 0);
+        n = recv(br->b, (char *)br->frame + pre, sizeof(br->frame) - pre, 0);
 
         if (n < 0) {
 
@@ -8915,7 +9105,7 @@ s3_cli_jump_bridge_read(s3_event_t *ev)
                 return;
             }
 
-            /* the bridge socket died: the inner conn has no transport
+            /* the bridge socket died: the next leg has no transport
              * left, the verdict ends the run */
 
             s3_cli_verdict = 1;
@@ -8929,28 +9119,28 @@ s3_cli_jump_bridge_read(s3_event_t *ev)
             continue;
         }
 
-        if ((size_t)n > S3_CLI_JUMP_INNER_MTU) {
-            /* the inner packets are pinned to the cap, the rest drops */
+        if ((size_t)n > hop->bridge_cap) {
+            /* the next level pins below the cap, the rest drops */
             continue;
         }
 
         {
-            u_char *p = s3_cli_bridge_frame;
+            u_char *p = br->frame;
             size_t  len;
 
-            p = (u_char *)s3_ssh3_encode_varint(p, s3_cli_jump_conv_id);
-            p = (u_char *)s3_ssh3_encode_varint(p, s3_cli_jump_ch_id);
+            p = (u_char *)s3_ssh3_encode_varint(p, hop->conv_id);
+            p = (u_char *)s3_ssh3_encode_varint(p, hop->ch_id);
 
-            len = (size_t)(p - s3_cli_bridge_frame) + (size_t)n;
+            len = (size_t)(p - br->frame) + (size_t)n;
 
-            if (s3_quic_send_datagram(s3_cli_jump_cli, s3_cli_bridge_frame, len) != S3_OK) {
+            if (s3_quic_send_datagram(hop->cli, br->frame, len) != S3_OK) {
 
                 /* the channel is full: park the frame, the read
                  * event sleeps until the flush drains the queue */
 
-                s3_cli_bridge_parked = len;
+                br->parked = len;
 
-                (void)s3_event_actions.del_event(ev, S3_READ_EVENT, 0);
+                (void)s3_event_actions.del_event(br->bc->read, S3_READ_EVENT, 0);
 
                 return;
             }
@@ -8961,34 +9151,63 @@ s3_cli_jump_bridge_read(s3_event_t *ev)
 /* the parked frame retries each pass, the read event wakes on success */
 
 static void
-s3_cli_jump_bridge_flush(void)
+s3_cli_jump_bridge_flush(s3_cli_jump_hop_t *hop)
 {
-    if (s3_cli_bridge_parked == 0) {
+    s3_cli_jump_bridge_t *br;
+
+    if (hop == NULL || hop->bridge == NULL) {
         return;
     }
 
-    if (s3_quic_send_datagram(s3_cli_jump_cli, s3_cli_bridge_frame, s3_cli_bridge_parked) !=
-        S3_OK) {
+    br = hop->bridge;
+
+    if (br->parked == 0) {
+        return;
+    }
+
+    if (s3_quic_send_datagram(hop->cli, br->frame, br->parked) != S3_OK) {
         /* still congested, the next pass retries */
         return;
     }
 
-    s3_cli_bridge_parked = 0;
+    br->parked = 0;
 
-    (void)s3_event_actions.add_event(s3_cli_bridge_bc->read, S3_READ_EVENT, 0);
+    (void)s3_event_actions.add_event(br->bc->read, S3_READ_EVENT, 0);
+}
+
+/* any hop conversation gone strands the chain, the run ends */
+
+static unsigned
+s3_cli_jump_chain_gone(void)
+{
+    unsigned i;
+
+    for (i = 0; i < s3_cli_jump_n; i++) {
+
+        if (s3_cli_jump_hops[i].cli != NULL &&
+            s3_quic_get_connection(s3_cli_jump_hops[i].cli) == NULL) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 /*
- * the loopback socket pair: two udp sockets bound to 127.0.0.1:0 and
- * connected to each other, a becomes the fd of the inner quic
- * connection, b is the tunnel side the bridge reads
+ * the loopback socket pair of a hop: two udp sockets bound to
+ * 127.0.0.1:0 and connected to each other, a becomes the fd of the
+ * next conversation, b is the tunnel side the bridge reads
  */
 
 static s3_int_t
-s3_cli_jump_bridge_create(s3_event_ctx_t *ctx)
+s3_cli_jump_bridge_create(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop)
 {
-    struct sockaddr_in a, b;
-    socklen_t          len;
+    struct sockaddr_in    a, b;
+    socklen_t             len;
+    s3_cli_jump_bridge_t *br;
+
+    br = &s3_cli_jump_bridges[hop - s3_cli_jump_hops];
+    hop->bridge = br;
 
     s3_memzero(&a, sizeof(a));
     s3_memzero(&b, sizeof(b));
@@ -8996,79 +9215,80 @@ s3_cli_jump_bridge_create(s3_event_ctx_t *ctx)
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    s3_cli_bridge_a = socket(AF_INET, SOCK_DGRAM, 0);
-    s3_cli_bridge_b = socket(AF_INET, SOCK_DGRAM, 0);
+    br->a = socket(AF_INET, SOCK_DGRAM, 0);
+    br->b = socket(AF_INET, SOCK_DGRAM, 0);
 
-    if (s3_cli_bridge_a == INVALID_SOCKET || s3_cli_bridge_b == INVALID_SOCKET) {
+    if (br->a == INVALID_SOCKET || br->b == INVALID_SOCKET) {
         return S3_ERROR;
     }
 
-    if (s3_nonblocking((s3_fd_t)s3_cli_bridge_a) != S3_OK ||
-        s3_nonblocking((s3_fd_t)s3_cli_bridge_b) != S3_OK) {
+    if (s3_nonblocking((s3_fd_t)br->a) != S3_OK || s3_nonblocking((s3_fd_t)br->b) != S3_OK) {
         return S3_ERROR;
     }
 
-    if (bind(s3_cli_bridge_a, (struct sockaddr *)&a, sizeof(a)) != 0) {
+    if (bind(br->a, (struct sockaddr *)&a, sizeof(a)) != 0) {
         return S3_ERROR;
     }
 
     len = sizeof(a);
 
-    if (getsockname(s3_cli_bridge_a, (struct sockaddr *)&a, &len) != 0) {
+    if (getsockname(br->a, (struct sockaddr *)&a, &len) != 0) {
         return S3_ERROR;
     }
 
     b = a;
     b.sin_port = 0;
 
-    if (bind(s3_cli_bridge_b, (struct sockaddr *)&b, sizeof(b)) != 0) {
+    if (bind(br->b, (struct sockaddr *)&b, sizeof(b)) != 0) {
         return S3_ERROR;
     }
 
     len = sizeof(b);
 
-    if (getsockname(s3_cli_bridge_b, (struct sockaddr *)&b, &len) != 0) {
+    if (getsockname(br->b, (struct sockaddr *)&b, &len) != 0) {
         return S3_ERROR;
     }
 
-    s3_cli_bridge_sa = b;
+    br->sa = b;
 
-    if (connect(s3_cli_bridge_a, (struct sockaddr *)&b, sizeof(b)) != 0 ||
-        connect(s3_cli_bridge_b, (struct sockaddr *)&a, sizeof(a)) != 0) {
+    if (connect(br->a, (struct sockaddr *)&b, sizeof(b)) != 0 ||
+        connect(br->b, (struct sockaddr *)&a, sizeof(a)) != 0) {
         return S3_ERROR;
     }
 
-    s3_cli_bridge_bc = s3_get_connection(ctx, (s3_fd_t)s3_cli_bridge_b);
+    br->bc = s3_get_connection(ctx, (s3_fd_t)br->b);
 
-    if (s3_cli_bridge_bc == NULL) {
+    if (br->bc == NULL) {
         return S3_ERROR;
     }
 
-    s3_cli_bridge_bc->read->handler = s3_cli_jump_bridge_read;
+    br->bc->read->handler = s3_cli_jump_bridge_read;
 
-    return s3_event_actions.add_event(s3_cli_bridge_bc->read, S3_READ_EVENT, 0);
+    return s3_event_actions.add_event(br->bc->read, S3_READ_EVENT, 0);
 }
 
 /*
- * the jump channel reader: the direct-udp channel carries no stream
+ * the hop channel reader: the direct-udp channel carries no stream
  * data, the tunnel lives once the 91 confirmation came back
  */
 
 static void
 s3_cli_jump_ch_read(s3_event_t *ev)
 {
-    s3_connection_t *sc;
-    const u_char    *pos, *end;
-    ssize_t          n;
+    s3_cli_jump_hop_t *hop;
+    s3_connection_t   *sc;
+    const u_char      *pos, *end;
+    ssize_t            n;
 
-    if (s3_cli_jump_ch_confirmed) {
+    hop = s3_cli_jump_hop_by_channel(ev->data);
+
+    if (hop == NULL || hop->ch_confirmed) {
         return;
     }
 
     sc = ev->data;
 
-    n = sc->recv(sc, s3_cli_jump_ch_buf + s3_cli_jump_ch_len,
-                 sizeof(s3_cli_jump_ch_buf) - s3_cli_jump_ch_len);
+    n = sc->recv(sc, hop->ch_buf + hop->ch_len, sizeof(hop->ch_buf) - hop->ch_len);
 
     if (n == (ssize_t)S3_AGAIN) {
         return;
@@ -9081,10 +9301,10 @@ s3_cli_jump_ch_read(s3_event_t *ev)
         return;
     }
 
-    s3_cli_jump_ch_len += (size_t)n;
+    hop->ch_len += (size_t)n;
 
-    pos = s3_cli_jump_ch_buf;
-    end = s3_cli_jump_ch_buf + s3_cli_jump_ch_len;
+    pos = hop->ch_buf;
+    end = hop->ch_buf + hop->ch_len;
 
     while (pos < end) {
 
@@ -9106,7 +9326,7 @@ s3_cli_jump_ch_read(s3_event_t *ev)
                 break;
             }
 
-            s3_cli_jump_ch_confirmed = 1;
+            hop->ch_confirmed = 1;
             continue;
         }
 
@@ -9118,64 +9338,63 @@ s3_cli_jump_ch_read(s3_event_t *ev)
 
     /* the consumed bytes compact to the front of the accumulator */
 
-    s3_cli_jump_ch_len = (size_t)(end - pos);
-    s3_memmove(s3_cli_jump_ch_buf, pos, s3_cli_jump_ch_len);
+    hop->ch_len = (size_t)(end - pos);
+    s3_memmove(hop->ch_buf, pos, hop->ch_len);
 }
 
 /*
- * phase 1 of the proxy jump: the connection to the jump host runs the
- * normal h3 bring-up, the CONNECT answers 200 and the direct-udp
- * channel to the inner server address confirms; the jump connection
- * stays open for the whole run, its events ride the same loop the
- * inner connection uses below.  The -i mode builds the JWT of the
- * jump exporter (the bearer binds the live TLS session), the -U mode
+ * one hop of the jump chain: the connection runs the normal h3
+ * bring-up, the CONNECT answers 200 and the direct-udp channel to
+ * the next leg confirms; the hop conversation stays open for the
+ * whole run, its events ride the same loop the destination conn uses
+ * below.  The first hop rides its own socket (the caller dials the
+ * resolved hop address), the deeper hops dial through the previous
+ * hop's bridge socket pair.  The -i mode builds the JWT of the hop
+ * exporter (the bearer binds the live TLS session), the -U mode
  * rides the Basic string unchanged
  */
 
 static s3_int_t
-s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
+s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
+                 const struct sockaddr *peer, socklen_t peer_len, s3_msec_t start,
+                 s3_msec_t timeout)
 {
     u_char                alpn_wire[8];
     s3_str_t              alpn;
-    s3_quic_conf_t       *conf = &s3_cli_jump_conf;
-    s3_fd_t               fd;
+    s3_quic_conf_t       *conf = &hop->conf;
     s3_quic_connection_t *qc;
     s3_uint_t             i;
+    unsigned              outermost = (hop == &s3_cli_jump_hops[0]);
 
-    fd = (s3_fd_t)socket(AF_INET, SOCK_DGRAM, 0);
+    /* the shared h3 response state resets per hop: the CONNECT and
+     * the :status of the previous leg replay clean */
 
-    if (fd == (s3_fd_t)INVALID_SOCKET) {
-        fprintf(stderr, "ssh3: the jump socket failed\n");
-        return S3_ERROR;
-    }
+    s3_cli_status_seen = 0;
+    s3_cli_status = 0;
+    s3_cli_resp_len = 0;
+    s3_memzero(&s3_cli_h3parse, sizeof(s3_cli_h3parse));
 
-    if (s3_nonblocking(fd) != S3_OK) {
-        fprintf(stderr, "ssh3: the jump nonblocking mode failed\n");
-        return S3_ERROR;
-    }
+    hop->cli = s3_get_connection(ctx, fd);
 
-    s3_cli_jump_cli = s3_get_connection(ctx, fd);
-
-    if (s3_cli_jump_cli == NULL) {
+    if (hop->cli == NULL) {
         fprintf(stderr, "ssh3: the jump connection alloc failed\n");
         return S3_ERROR;
     }
 
-    s3_cli_jump_cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    hop->cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_cli_log);
 
-    if (s3_cli_jump_cli->pool == NULL) {
+    if (hop->cli->pool == NULL) {
         return S3_ERROR;
     }
 
-    s3_cli_jump_cli->sockaddr =
-        (struct sockaddr *)s3_palloc(s3_cli_jump_cli->pool, sizeof(s3_cli_jump_sa));
+    hop->cli->sockaddr = (struct sockaddr *)s3_palloc(hop->cli->pool, peer_len);
 
-    if (s3_cli_jump_cli->sockaddr == NULL) {
+    if (hop->cli->sockaddr == NULL) {
         return S3_ERROR;
     }
 
-    s3_memcpy(s3_cli_jump_cli->sockaddr, &s3_cli_jump_sa, sizeof(s3_cli_jump_sa));
-    s3_cli_jump_cli->socklen = sizeof(s3_cli_jump_sa);
+    s3_memcpy(hop->cli->sockaddr, peer, peer_len);
+    hop->cli->socklen = peer_len;
 
     alpn_wire[0] = (u_char)2;
     alpn_wire[1] = 'h';
@@ -9221,11 +9440,11 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
         conf->sr_token_key[i] = (u_char)(0xb0 + i);
     }
 
-    if (s3_event_actions.add_event(s3_cli_jump_cli->read, S3_READ_EVENT, 0) != S3_OK) {
+    if (s3_event_actions.add_event(hop->cli->read, S3_READ_EVENT, 0) != S3_OK) {
         return S3_ERROR;
     }
 
-    if (s3_quic_connect(s3_cli_jump_cli, conf) != S3_OK) {
+    if (s3_quic_connect(hop->cli, conf) != S3_OK) {
         fprintf(stderr, "ssh3: the jump connect failed\n");
         return S3_ERROR;
     }
@@ -9236,96 +9455,106 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
 
         s3_process_events_and_timers(ctx);
 
-        qc = s3_quic_get_connection(s3_cli_jump_cli);
+        qc = s3_quic_get_connection(hop->cli);
 
         if (qc == NULL) {
             fprintf(stderr, "ssh3: the jump connection is gone\n");
             return S3_ERROR;
         }
 
-        if (!s3_cli_jump_hs && s3_cli_jump_cli->ssl != NULL && s3_cli_jump_cli->ssl->handshaked) {
+        /* the deeper hops live inside the previous hop's datagrams:
+         * the level budget pins BOTH ends of the discovery (mtu and
+         * max_mtu), the binary search below the cap would never
+         * reach the budget (the midpoint probe) and the dgram frame
+         * of the next level would park forever */
+
+        if (!outermost && qc->path != NULL && hop->mtu_pin != 0) {
+            qc->path->max_mtu = hop->mtu_pin;
+            qc->path->mtu = hop->mtu_pin;
+        }
+
+        if (!hop->hs && hop->cli->ssl != NULL && hop->cli->ssl->handshaked) {
 
             /* the pin gate: the TLS layer rides SSL_VERIFY_NONE, the
              * known_hosts hop pin is the only MITM barrier, and it
              * closes before any credential goes out (the main conn
              * checks at its own handshake the same way) */
 
-            if (s3_cli_cert_check_conn(s3_cli_jump_cli, s3_cli_jump_hostkey) != S3_OK) {
+            if (s3_cli_cert_check_conn(hop->cli, hop->hostkey) != S3_OK) {
                 return S3_ERROR;
             }
 
-            s3_cli_jump_hs = 1;
+            hop->hs = 1;
 
             /* the h3 session first, the same the main run does */
 
-            if (s3_h3_get_session(s3_cli_jump_cli) == NULL &&
-                s3_h3_init_session(s3_cli_jump_cli) != S3_OK) {
+            if (s3_h3_get_session(hop->cli) == NULL && s3_h3_init_session(hop->cli) != S3_OK) {
                 fprintf(stderr, "ssh3: the jump h3 session init failed\n");
                 return S3_ERROR;
             }
 
-            s3_cli_jump_stream = s3_quic_open_stream(s3_cli_jump_cli, 1);
+            hop->stream = s3_quic_open_stream(hop->cli, 1);
 
-            if (s3_cli_jump_stream == NULL) {
+            if (hop->stream == NULL) {
                 fprintf(stderr, "ssh3: the jump stream open failed\n");
                 return S3_ERROR;
             }
 
-            s3_cli_jump_conv_id = ((s3_quic_stream_t *)s3_cli_jump_stream->data)->id;
+            hop->conv_id = ((s3_quic_stream_t *)hop->stream->data)->id;
 
-            s3_cli_jump_stream->read->handler = s3_cli_ctrl_read;
-            s3_cli_jump_stream->read->data = s3_cli_jump_stream;
-            s3_cli_jump_stream->read->active = 1;
+            hop->stream->read->handler = s3_cli_ctrl_read;
+            hop->stream->read->data = hop->stream;
+            hop->stream->read->active = 1;
 
             /*
              * the transport parameters are final at the handshake: a
-             * jump peer that cannot take the 1202-byte tunnel frames
+             * jump peer that cannot take this level's tunnel frames
              * is a configuration error, fail at once
              */
 
-            if (qc->ctp.max_datagram_frame_size < S3_CLI_JUMP_DGRAM_MIN) {
+            if (qc->ctp.max_datagram_frame_size < hop->dgram_need) {
                 fprintf(stderr,
                         "ssh3: the jump peer max_datagram_frame_size %u is below the tunnel "
-                        "need %u (the jump server wants -d 1352)\n",
-                        (unsigned)qc->ctp.max_datagram_frame_size, (unsigned)S3_CLI_JUMP_DGRAM_MIN);
+                        "need %u (the jump server wants -d %u)\n",
+                        (unsigned)qc->ctp.max_datagram_frame_size, hop->dgram_need,
+                        S3_CLI_JUMP_DGRAM_SIZE);
                 return S3_ERROR;
             }
 
             /* the jump auth rides the same scheme: the JWT of the
-             * jump exporter for the -i mode, the Basic string for
+             * hop exporter for the -i mode, the Basic string for
              * the -U mode */
 
             if (s3_cli_auth == S3_CLI_AUTH_PUBKEY) {
 
-                if (s3_cli_jwt_build_user(s3_cli_jump_cli->ssl->connection, s3_cli_jump_user,
-                                          s3_cli_jump_bearer,
-                                          sizeof(s3_cli_jump_bearer)) != S3_OK) {
+                if (s3_cli_jwt_build_user(hop->cli->ssl->connection, hop->user, hop->bearer,
+                                          sizeof(hop->bearer)) != S3_OK) {
                     return S3_ERROR;
                 }
 
-                s3_cli_jump_auth = s3_cli_jump_bearer;
+                hop->auth = hop->bearer;
 
             } else if (s3_cli_auth == S3_CLI_AUTH_BASIC) {
-                s3_cli_jump_auth = s3_cli_basic;
+                hop->auth = s3_cli_basic;
             }
         }
 
-        if (s3_cli_jump_hs && !s3_cli_jump_req_sent) {
+        if (hop->hs && !hop->req_sent) {
 
             u_char  frame[1024];
             u_char *p;
             size_t  sec_len, total;
             ssize_t m;
 
-            sec_len = s3_cli_jump_h3_section(NULL);
+            sec_len = s3_cli_jump_h3_section(hop, NULL);
 
             p = frame;
             p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
             p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
-            sec_len = s3_cli_jump_h3_section(p);
+            sec_len = s3_cli_jump_h3_section(hop, p);
             total = (size_t)(p - frame) + sec_len;
 
-            m = s3_quic_stream_send(s3_cli_jump_stream, frame, total);
+            m = s3_quic_stream_send(hop->stream, frame, total);
 
             if (m == (ssize_t)S3_AGAIN) {
                 /* the window opens on the write event, retried next pass */
@@ -9334,31 +9563,32 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
                 return S3_ERROR;
 
             } else {
-                s3_cli_jump_req_sent = 1;
+                hop->req_sent = 1;
             }
         }
 
-        if (s3_cli_status_seen && s3_cli_jump_channel == NULL) {
+        if (s3_cli_status_seen && hop->channel == NULL) {
 
             /* the direct-udp channel comes up right after the 200:
-             * the target extension carries the inner server address,
-             * the 91 confirmation completes the tunnel */
+             * the target extension carries the next leg address (the
+             * next hop, the last hop rides the destination), the 91
+             * confirmation completes the tunnel */
 
-            s3_cli_jump_channel = s3_quic_open_stream(s3_cli_jump_cli, 1);
+            hop->channel = s3_quic_open_stream(hop->cli, 1);
 
-            if (s3_cli_jump_channel == NULL) {
+            if (hop->channel == NULL) {
                 fprintf(stderr, "ssh3: the jump channel open failed\n");
                 return S3_ERROR;
             }
 
-            s3_cli_jump_ch_id = ((s3_quic_stream_t *)s3_cli_jump_channel->data)->id;
+            hop->ch_id = ((s3_quic_stream_t *)hop->channel->data)->id;
 
-            s3_cli_jump_channel->read->handler = s3_cli_jump_ch_read;
-            s3_cli_jump_channel->read->data = s3_cli_jump_channel;
-            s3_cli_jump_channel->read->active = 1;
+            hop->channel->read->handler = s3_cli_jump_ch_read;
+            hop->channel->read->data = hop->channel;
+            hop->channel->read->active = 1;
         }
 
-        if (s3_cli_status_seen && !s3_cli_jump_ch_sent) {
+        if (s3_cli_status_seen && !hop->ch_sent) {
 
             u_char                   frame[1024];
             u_char                  *p;
@@ -9369,7 +9599,7 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
 
             s3_memzero(&hdr, sizeof(hdr));
 
-            hdr.conversation_stream_id = s3_cli_jump_conv_id;
+            hdr.conversation_stream_id = hop->conv_id;
             hdr.max_packet_size = S3_CLI_CHANNEL_MAX_PACKET;
             hdr.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
             hdr.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
@@ -9377,22 +9607,34 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
             p = frame;
             p = (u_char *)s3_ssh3_channel_build_header(p, &hdr);
 
-            target.family = 4;
-            target.ip_len = 4;
+            /* the family-tagged target extension (the wire shape of
+             * the v6 wave): the resolved family of the next leg
+             * rides, the 4- or the 16-byte form follows */
 
-            {
-                struct sockaddr_in in;
+            if (hop->tgt.ss_family == AF_INET6) {
 
-                memcpy(&in, &s3_cli_sa, sizeof(in));
-                memcpy(target.ip, &in.sin_addr, 4);
-                target.port = ntohs(in.sin_port);
+                struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&hop->tgt;
+
+                target.family = 6;
+                target.ip_len = 16;
+                memcpy(target.ip, &in6->sin6_addr, 16);
+                target.port = ntohs(in6->sin6_port);
+
+            } else {
+
+                struct sockaddr_in *in = (struct sockaddr_in *)&hop->tgt;
+
+                target.family = 4;
+                target.ip_len = 4;
+                memcpy(target.ip, &in->sin_addr, 4);
+                target.port = ntohs(in->sin_port);
             }
 
             p = s3_ssh3_forward_build_target(p, &target);
 
             total = (size_t)(p - frame);
 
-            m = s3_quic_stream_send(s3_cli_jump_channel, frame, total);
+            m = s3_quic_stream_send(hop->channel, frame, total);
 
             if (m == (ssize_t)S3_AGAIN) {
                 /* the window opens on the write event, retried next pass */
@@ -9401,17 +9643,17 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_msec_t start, s3_msec_t timeout)
                 return S3_ERROR;
 
             } else {
-                s3_cli_jump_ch_sent = 1;
+                hop->ch_sent = 1;
             }
         }
 
-        if (s3_cli_jump_ch_confirmed) {
+        if (hop->ch_confirmed) {
             return S3_OK;
         }
 
         if (s3_current_msec - start > timeout) {
             fprintf(stderr, "ssh3: the jump tunnel timed out (hs=%u req=%u status=%u ch=%u)\n",
-                    s3_cli_jump_hs, s3_cli_jump_req_sent, s3_cli_status_seen, s3_cli_jump_ch_sent);
+                    hop->hs, hop->req_sent, s3_cli_status_seen, hop->ch_sent);
             return S3_ERROR;
         }
     }
@@ -13515,25 +13757,14 @@ main(int argc, char **argv)
         snprintf(s3_cli_target, sizeof(s3_cli_target), "%s", s3_cli_path);
     }
 
-    /* the jump target rides the default path with the jump login; a
-     * jump spec without a user@ borrows the main login (the ssh2
-     * shape) */
+    /* the hop defaults: the port asks the 443 default, a spec
+     * without a user@ borrows the main login (the ssh2 shape), the
+     * CONNECT target rides the default path with the hop login */
 
     if (s3_cli_jump_on) {
 
-        if (s3_cli_jump_user[0] == '\0') {
-
-            /* the jump spec without a user@ borrows the main login */
-
-            snprintf(s3_cli_jump_user, sizeof(s3_cli_jump_user), "%s", s3_cli_user);
-        }
-
-        if (s3_cli_jump_user[0] != '\0') {
-            snprintf(s3_cli_jump_target, sizeof(s3_cli_jump_target), "%s?user=%s", "/ssh3-term",
-                     s3_cli_jump_user);
-
-        } else {
-            snprintf(s3_cli_jump_target, sizeof(s3_cli_jump_target), "%s", "/ssh3-term");
+        for (i = 0; i < s3_cli_jump_n && i < S3_CLI_JUMP_MAX_HOPS; i++) {
+            s3_cli_jump_hop_defaults(&s3_cli_jump_hops[i]);
         }
     }
 
@@ -13580,50 +13811,160 @@ main(int argc, char **argv)
     if (s3_cli_jump_on) {
 
         struct addrinfo jhints, *jres = NULL;
+        unsigned        k;
 
-        if (s3_cli_jump_port == 0) {
-            s3_cli_jump_port = 443;
-        }
-
-        /* the known_hosts key of the hop: the port default resolves
-         * first, the path mirrors the jump CONNECT target (/ssh3-term) */
-
-        snprintf(s3_cli_jump_hostkey, sizeof(s3_cli_jump_hostkey), "%s:%u%s", s3_cli_jump_host,
-                 s3_cli_jump_port, "/ssh3-term");
+        /* the hop resolution first (the v4 shape of this port, the
+         * -6 dial refuses above) */
 
         memset(&jhints, 0, sizeof(jhints));
         jhints.ai_family = AF_INET;
         jhints.ai_socktype = SOCK_DGRAM;
 
-        if (getaddrinfo(s3_cli_jump_host, NULL, &jhints, &jres) != 0 || jres == NULL) {
-            fprintf(stderr, "ssh3: cannot resolve the jump host %s\n", s3_cli_jump_host);
+        for (k = 0; k < s3_cli_jump_n; k++) {
+
+            s3_cli_jump_hop_t *hop = &s3_cli_jump_hops[k];
+
+            if (getaddrinfo(hop->host, NULL, &jhints, &jres) != 0 || jres == NULL) {
+                fprintf(stderr, "ssh3: cannot resolve the jump host %s\n", hop->host);
+                s3_cli_net_cleanup();
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            memcpy(&hop->sa, jres->ai_addr, jres->ai_addrlen);
+            hop->sa_len = jres->ai_addrlen;
+
+            ((struct sockaddr_in *)&hop->sa)->sin_family = AF_INET;
+            ((struct sockaddr_in *)&hop->sa)->sin_port = htons((u_short)hop->port);
+
+            freeaddrinfo(jres);
+            jres = NULL;
+        }
+
+        /* the channel targets: hop k tunnels hop k+1, the last one
+         * tunnels the destination (s3_cli_sa, resolved above) */
+
+        for (k = 0; k < s3_cli_jump_n; k++) {
+
+            s3_cli_jump_hop_t *hop = &s3_cli_jump_hops[k];
+
+            if (k + 1 < s3_cli_jump_n) {
+                memcpy(&hop->tgt, &s3_cli_jump_hops[k + 1].sa, s3_cli_jump_hops[k + 1].sa_len);
+                hop->tgt_len = s3_cli_jump_hops[k + 1].sa_len;
+
+            } else {
+                memcpy(&hop->tgt, &s3_cli_sa, s3_cli_sa_len);
+                hop->tgt_len = s3_cli_sa_len;
+            }
+        }
+
+        /* the packet budgets of the chain (the reference shape):
+         * every level eats the datagram overhead of the level above
+         * it, the innermost stays at the QUIC floor, the chain that
+         * does not fit the standard path refuses cleanly */
+
+        if (S3_CLI_JUMP_INNER_MTU + s3_cli_jump_n * S3_CLI_JUMP_LEVEL_OVERHEAD >
+            S3_CLI_JUMP_OUTER_MTU) {
+            fprintf(stderr, "ssh3: the jump chain is too long for the QUIC datagram budget\n");
             s3_cli_net_cleanup();
             return S3_CLI_EXIT_ERROR;
         }
 
-        memcpy(&s3_cli_jump_sa, jres->ai_addr, sizeof(struct sockaddr_in));
-        s3_cli_jump_sa.sin_family = AF_INET;
-        s3_cli_jump_sa.sin_port = htons((u_short)s3_cli_jump_port);
+        for (k = 0; k < s3_cli_jump_n; k++) {
 
-        freeaddrinfo(jres);
+            s3_cli_jump_hop_t *hop = &s3_cli_jump_hops[k];
 
-        /* the jump dial rides its own 10s bound: the wrong jump host
-         * refuses cleanly well inside the session shape */
+            /* hop k pins at the floor plus the levels it carries
+             * (the outermost rides the discovery instead) */
 
-        if (s3_cli_jump_dial(&s3_cli_ctx, s3_current_msec, S3_CLI_JUMP_TIMEOUT) != S3_OK) {
-            s3_cli_net_cleanup();
-            return S3_CLI_EXIT_ERROR;
+            if (k > 0) {
+                hop->mtu_pin =
+                    S3_CLI_JUMP_INNER_MTU + (s3_cli_jump_n - k) * S3_CLI_JUMP_LEVEL_OVERHEAD;
+            }
+
+            /* the channel of hop k carries the packets of the level
+             * k+1, the peer acceptance must cover them with the
+             * framing margin; the bridge and the datagram handler
+             * drop above the same cap (the fixed 1200 floor would
+             * cut the deeper levels' packets) */
+
+            hop->bridge_cap =
+                S3_CLI_JUMP_INNER_MTU + (s3_cli_jump_n - 1 - k) * S3_CLI_JUMP_LEVEL_OVERHEAD;
+
+            hop->dgram_need = hop->bridge_cap + S3_CLI_JUMP_LEVEL_OVERHEAD;
         }
 
-        /* the loopback bridge, a becomes the inner quic fd below; the
-         * h3 globals the tunnel run touched reset for the inner phase
-         * (the CONNECT and the :status replay clean) */
+        /* the dial chain: the first hop rides its own socket, every
+         * deeper hop dials through the previous hop's bridge; each
+         * dial runs its own 10s bound (the wrong hop host refuses
+         * cleanly well inside the session shape) */
 
-        if (s3_cli_jump_bridge_create(&s3_cli_ctx) != S3_OK) {
+        for (k = 0; k < s3_cli_jump_n; k++) {
+
+            s3_cli_jump_hop_t *hop = &s3_cli_jump_hops[k];
+            s3_fd_t            fd;
+            s3_msec_t          jstart = s3_current_msec;
+
+            if (k == 0) {
+
+                fd = (s3_fd_t)socket(AF_INET, SOCK_DGRAM, 0);
+
+                if (fd == (s3_fd_t)INVALID_SOCKET) {
+                    fprintf(stderr, "ssh3: the jump socket failed\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                if (s3_nonblocking(fd) != S3_OK) {
+                    fprintf(stderr, "ssh3: the jump nonblocking mode failed\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                if (s3_cli_jump_dial(&s3_cli_ctx, hop, fd, (struct sockaddr *)&hop->sa, hop->sa_len,
+                                     jstart, S3_CLI_JUMP_TIMEOUT) != S3_OK) {
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+            } else {
+
+                /* the bridge of the previous hop tunnels this one:
+                 * its a side becomes the hop's quic fd, the b
+                 * address the peer */
+
+                if (s3_cli_jump_bridge_create(&s3_cli_ctx, &s3_cli_jump_hops[k - 1]) != S3_OK) {
+                    fprintf(stderr, "ssh3: the jump bridge create failed\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                fd = (s3_fd_t)s3_cli_jump_hops[k - 1].bridge->a;
+                s3_cli_jump_hops[k - 1].bridge->a = INVALID_SOCKET;
+
+                if (s3_cli_jump_dial(&s3_cli_ctx, hop, fd,
+                                     (struct sockaddr *)&s3_cli_jump_hops[k - 1].bridge->sa,
+                                     sizeof(struct sockaddr_in), jstart,
+                                     S3_CLI_JUMP_TIMEOUT) != S3_OK) {
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+            }
+        }
+
+        /* the destination bridge: the a side becomes the inner quic
+         * fd below, the b address the peer; the h3 globals the
+         * tunnel runs touched reset for the inner phase (the
+         * CONNECT and the :status replay clean) */
+
+        if (s3_cli_jump_bridge_create(&s3_cli_ctx, &s3_cli_jump_hops[s3_cli_jump_n - 1]) != S3_OK) {
             fprintf(stderr, "ssh3: the jump bridge create failed\n");
             s3_cli_net_cleanup();
             return S3_CLI_EXIT_ERROR;
         }
+
+        s3_cli_bridge_a = s3_cli_jump_hops[s3_cli_jump_n - 1].bridge->a;
+        s3_cli_jump_hops[s3_cli_jump_n - 1].bridge->a = INVALID_SOCKET;
+        s3_cli_bridge_sa = s3_cli_jump_hops[s3_cli_jump_n - 1].bridge->sa;
 
         s3_cli_hs_done = 0;
         s3_cli_req_sent = 0;
@@ -13765,18 +14106,20 @@ main(int argc, char **argv)
             break;
         }
 
-        /* the jump tunnel: the parked frame retries, a dead jump
-         * conversation strands the inner conn, the run ends */
+        /* the jump chain: a dead hop conversation strands the
+         * destination conn, the run ends; the parked frames retry */
 
         if (s3_cli_jump_on) {
 
-            if (s3_quic_get_connection(s3_cli_jump_cli) == NULL) {
+            if (s3_cli_jump_chain_gone()) {
                 fprintf(stderr, "ssh3: the jump connection is gone\n");
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 break;
             }
 
-            s3_cli_jump_bridge_flush();
+            for (i = 0; i < s3_cli_jump_n; i++) {
+                s3_cli_jump_bridge_flush(&s3_cli_jump_hops[i]);
+            }
         }
 
         qc = s3_quic_get_connection(cli);
@@ -14415,28 +14758,44 @@ s3_cli_teardown(void)
         s3_cli_conn = NULL;
     }
 
-    /* the jump tunnel: the jump conn and the bridge sockets close
+    /* the jump chain: the hop conns and the bridge sockets close
      * with the wire (the pools ride the conn close) */
 
-    if (s3_cli_jump_cli != NULL) {
+    for (i = 0; i < s3_cli_jump_n; i++) {
 
-        if (s3_cli_jump_conf.ssl != NULL) {
-            s3_ssl_free(s3_cli_jump_conf.ssl);
-            s3_cli_jump_conf.ssl = NULL;
+        s3_cli_jump_hop_t    *hop = &s3_cli_jump_hops[i];
+        s3_cli_jump_bridge_t *br = hop->bridge;
+        unsigned              j;
+
+        if (hop->cli != NULL) {
+
+            if (hop->conf.ssl != NULL) {
+                s3_ssl_free(hop->conf.ssl);
+                hop->conf.ssl = NULL;
+            }
+
+            closesocket((SOCKET)hop->cli->fd);
+            hop->cli = NULL;
         }
 
-        closesocket((SOCKET)s3_cli_jump_cli->fd);
-        s3_cli_jump_cli = NULL;
+        if (br == NULL) {
+            continue;
+        }
+
+        for (j = 0; j < 2; j++) {
+
+            SOCKET *s = j == 0 ? &br->a : &br->b;
+
+            if (*s != INVALID_SOCKET) {
+                closesocket(*s);
+                *s = INVALID_SOCKET;
+            }
+        }
     }
 
     if (s3_cli_bridge_a != INVALID_SOCKET) {
         closesocket(s3_cli_bridge_a);
         s3_cli_bridge_a = INVALID_SOCKET;
-    }
-
-    if (s3_cli_bridge_b != INVALID_SOCKET) {
-        closesocket(s3_cli_bridge_b);
-        s3_cli_bridge_b = INVALID_SOCKET;
     }
 
     s3_event_ctx_shutdown(&s3_cli_ctx);
