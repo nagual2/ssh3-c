@@ -1339,14 +1339,14 @@ s3_srv_datagram_echo(s3_connection_t *c, s3_chain_t *data)
 typedef struct {
     s3_h3_parse_headers_t parse;
 
-    u_char   *buf; /* the request bytes of the CONNECT */
-    size_t    cap;
-    size_t    len;
+    u_char *buf; /* the request bytes of the CONNECT */
+    size_t  cap;
+    size_t  len;
 
     s3_connection_t *sc; /* the CONNECT stream */
     s3_connection_t *pc; /* the quic conn of the CONNECT */
-    uint64_t  conv_id;
-    unsigned  responded;
+    uint64_t         conv_id;
+    unsigned         responded;
 
     /*
      * the compression of the channel body (PLAN.md 9, B8): the
@@ -1354,7 +1354,7 @@ typedef struct {
      * codecs it can decode in the version string of its CONNECT
      */
 
-    uint32_t  compress_alg;
+    uint32_t compress_alg;
 
     /*
      * the authenticated username of THIS connection (the audit fix
@@ -1364,36 +1364,36 @@ typedef struct {
      * verdict of one connection and the channels of another
      */
 
-    char      user[128];
+    char user[128];
 
     /* the verdict of the CONNECT (200 = the conversation is
      * authenticated, the reverse forward may bind) */
 
-    unsigned  code;
+    unsigned code;
 
-    u_char    method[32];
-    size_t    method_len;
-    u_char    protocol[32];
-    size_t    protocol_len;
-    u_char    path[256];
-    size_t    path_len;
+    u_char method[32];
+    size_t method_len;
+    u_char protocol[32];
+    size_t protocol_len;
+    u_char path[256];
+    size_t path_len;
     /*
      * the Authorization snapshot: the biggest Bearer the CONNECT carries
      * (an Ed25519 pubkey JWT is ~340 bytes, an RS256 one goes past 600,
      * an RS256 OIDC id_token rides ~1.2 KB), the 256-byte capture of the
      * Basic wave truncated it and the verdict failed on the tail
      */
-    u_char    auth[4096];
-    size_t    auth_len;
-    u_char    ua[128];
-    size_t    ua_len;
-    u_char    authority[256];
-    size_t    authority_len;
-    u_char    scheme[16];
-    size_t    scheme_len;
+    u_char auth[4096];
+    size_t auth_len;
+    u_char ua[128];
+    size_t ua_len;
+    u_char authority[256];
+    size_t authority_len;
+    u_char scheme[16];
+    size_t scheme_len;
 
-    u_char    out[512]; /* the response tail pending on the send window */
-    size_t    out_len;
+    u_char out[512]; /* the response tail pending on the send window */
+    size_t out_len;
 } s3_srv_preauth_t;
 
 /*
@@ -1552,8 +1552,8 @@ struct s3_srv_h3_channel_s {
      * (-R) channels ride the same shapes (the RCTRL control channel,
      * the RUDP per-peer datagram channel)
      */
-    unsigned           fwd_kind; /* S3_SRV_FWD_NONE/TCP/UDP/AGENT/RCTRL/RUDP */
-    uint32_t           compress_alg; /* the negotiated codec of the channel body */
+    unsigned fwd_kind;     /* S3_SRV_FWD_NONE/TCP/UDP/AGENT/RCTRL/RUDP */
+    uint32_t compress_alg; /* the negotiated codec of the channel body */
 
     /*
      * the codec contexts of the channel body (the audit fix wave): the
@@ -1566,18 +1566,19 @@ struct s3_srv_h3_channel_s {
     s3_ssh3_compress_ctx_t *compress_enc;
     s3_ssh3_compress_ctx_t *compress_dec;
 
-    unsigned           fwd_eof;  /* the target socket saw the eof */
-    int                fwd_fd;
-    struct sockaddr_in fwd_sa;
-    u_char            *fwd_in; /* the 94 payloads awaiting the socket send */
-    size_t             fwd_in_cap;
-    size_t             fwd_in_len;
-    u_char            *fwd_out; /* the socket bytes awaiting the 94 send */
-    size_t             fwd_out_cap;
-    size_t             fwd_out_len;
-    size_t             fwd_frame_sent; /* the partial 94 frame in flight */
-    size_t             fwd_frame_total;
-    s3_event_t         fwd_timer;
+    unsigned                fwd_eof; /* the target socket saw the eof */
+    int                     fwd_fd;
+    struct sockaddr_storage fwd_sa; /* the family storage of the target */
+    socklen_t               fwd_sa_len;
+    u_char                 *fwd_in; /* the 94 payloads awaiting the socket send */
+    size_t                  fwd_in_cap;
+    size_t                  fwd_in_len;
+    u_char                 *fwd_out; /* the socket bytes awaiting the 94 send */
+    size_t                  fwd_out_cap;
+    size_t                  fwd_out_len;
+    size_t                  fwd_frame_sent; /* the partial 94 frame in flight */
+    size_t                  fwd_frame_total;
+    s3_event_t              fwd_timer;
 
     /*
      * the scratch of the decoded payload: the compressed frames of the
@@ -1585,8 +1586,8 @@ struct s3_srv_h3_channel_s {
      * not touch it; it grows with the first compressed frame
      */
 
-    u_char            *fwd_plain;
-    size_t             fwd_plain_cap;
+    u_char *fwd_plain;
+    size_t  fwd_plain_cap;
 
     /*
      * the server-initiated channels (the agent bridge, the reverse
@@ -1616,9 +1617,9 @@ struct s3_srv_h3_channel_s {
      * child serves the engine behind chroot+drop, the parent pumps
      * the two pipes; the death of the child ends the channel
      */
-    pid_t    sftp_pid;      /* the child process, 0 once reaped */
-    int      sftp_in;       /* the stdin pipe of the child, -1 when unused */
-    int      sftp_out;      /* the stdout pipe of the child, -1 when unused */
+    pid_t sftp_pid; /* the child process, 0 once reaped */
+    int   sftp_in;  /* the stdin pipe of the child, -1 when unused */
+    int   sftp_out; /* the stdout pipe of the child, -1 when unused */
 
     /*
      * the drain of the peer half-close (the B12 finding): the client
@@ -1736,8 +1737,7 @@ s3_srv_busy_channels(void)
             continue;
         }
 
-        if ((ch->sess != NULL && !ch->sess_exit_sent) || ch->sess_out_len > 0 ||
-            ch->sftp != NULL ||
+        if ((ch->sess != NULL && !ch->sess_exit_sent) || ch->sess_out_len > 0 || ch->sftp != NULL ||
             (ch->fwd_kind != S3_SRV_FWD_NONE && ch->fwd_kind != S3_SRV_FWD_RCTRL &&
              ch->fwd_kind != S3_SRV_FWD_RUDP && !ch->fwd_eof)) {
             n++;
@@ -1819,13 +1819,11 @@ s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
     static s3_str_t scheme = s3_string(":scheme");
 
     if (f->name.len == method.len && s3_memcmp(f->name.data, method.data, method.len) == 0) {
-        s3_srv_h3_store(pa->method, sizeof(pa->method), &pa->method_len,
-                        &f->value);
+        s3_srv_h3_store(pa->method, sizeof(pa->method), &pa->method_len, &f->value);
 
     } else if (f->name.len == protocol.len &&
                s3_memcmp(f->name.data, protocol.data, protocol.len) == 0) {
-        s3_srv_h3_store(pa->protocol, sizeof(pa->protocol), &pa->protocol_len,
-                        &f->value);
+        s3_srv_h3_store(pa->protocol, sizeof(pa->protocol), &pa->protocol_len, &f->value);
 
     } else if (f->name.len == path.len && s3_memcmp(f->name.data, path.data, path.len) == 0) {
         s3_srv_h3_store(pa->path, sizeof(pa->path), &pa->path_len, &f->value);
@@ -1838,12 +1836,10 @@ s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
 
     } else if (f->name.len == authority.len &&
                s3_memcmp(f->name.data, authority.data, authority.len) == 0) {
-        s3_srv_h3_store(pa->authority, sizeof(pa->authority), &pa->authority_len,
-                        &f->value);
+        s3_srv_h3_store(pa->authority, sizeof(pa->authority), &pa->authority_len, &f->value);
 
     } else if (f->name.len == scheme.len && s3_memcmp(f->name.data, scheme.data, scheme.len) == 0) {
-        s3_srv_h3_store(pa->scheme, sizeof(pa->scheme), &pa->scheme_len,
-                        &f->value);
+        s3_srv_h3_store(pa->scheme, sizeof(pa->scheme), &pa->scheme_len, &f->value);
     }
 
     /* the other field lines are irrelevant to the verdict */
@@ -1992,8 +1988,7 @@ s3_srv_auth_user_gate(s3_srv_preauth_t *pa, const s3_str_t *user)
 {
     pa->user[0] = '\0';
 
-    if (user == NULL || user->data == NULL || user->len == 0 ||
-        user->len >= sizeof(pa->user)) {
+    if (user == NULL || user->data == NULL || user->len == 0 || user->len >= sizeof(pa->user)) {
         return S3_DECLINED;
     }
 
@@ -2426,10 +2421,9 @@ s3_srv_h3_jwt_verdict(s3_srv_preauth_t *pa)
         }
     }
 
-    if (pa->pc == NULL || pa->pc->ssl == NULL ||
-        pa->pc->ssl->connection == NULL ||
-        SSL_export_keying_material(pa->pc->ssl->connection, conv, sizeof(conv),
-                                   "EXPORTER-SSH3", 13, NULL, 0, 0) != 1) {
+    if (pa->pc == NULL || pa->pc->ssl == NULL || pa->pc->ssl->connection == NULL ||
+        SSL_export_keying_material(pa->pc->ssl->connection, conv, sizeof(conv), "EXPORTER-SSH3", 13,
+                                   NULL, 0, 0) != 1) {
         fprintf(stderr, "ssh3-server: pubkey auth: exporter failed\n");
         return 401;
     }
@@ -2623,9 +2617,8 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
      * query part carries the auth username (docs/P4-WIRE.md 7 step 3)
      * and does not affect the route */
 
-    if (pa->method_len == 7 && s3_memcmp(pa->method, "CONNECT", 7) == 0 &&
-        pa->protocol_len == 4 && s3_memcmp(pa->protocol, "ssh3", 4) == 0 &&
-        pa->path_len >= s3_srv_url_path_len &&
+    if (pa->method_len == 7 && s3_memcmp(pa->method, "CONNECT", 7) == 0 && pa->protocol_len == 4 &&
+        s3_memcmp(pa->protocol, "ssh3", 4) == 0 && pa->path_len >= s3_srv_url_path_len &&
         s3_memcmp(pa->path, s3_srv_url_path, s3_srv_url_path_len) == 0 &&
         (pa->path_len == s3_srv_url_path_len || pa->path[s3_srv_url_path_len] == '?')) {
 
@@ -2635,8 +2628,7 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
         if (pa->scheme_len == 0 || pa->authority_len == 0) {
             code = 400;
 
-        } else if (pa->ua_len == 0 ||
-                   s3_ssh3_version_parse(pa->ua, pa->ua_len, &ver) != S3_OK ||
+        } else if (pa->ua_len == 0 || s3_ssh3_version_parse(pa->ua, pa->ua_len, &ver) != S3_OK ||
                    s3_ssh3_version_supported(&ver) != S3_OK) {
 
             /* the reference rejects a bad user-agent before anything
@@ -3715,8 +3707,12 @@ s3_srv_fwd_socket_flush(s3_srv_h3_channel_t *ch)
             m = send(ch->fwd_fd, ch->fwd_in, ch->fwd_in_len, 0);
 
         } else {
+            socklen_t slen = (ch->fwd_sa.ss_family == AF_INET6)
+                                 ? (socklen_t)sizeof(struct sockaddr_in6)
+                                 : (socklen_t)sizeof(struct sockaddr_in);
+
             m = sendto(ch->fwd_fd, ch->fwd_in, ch->fwd_in_len, 0,
-                       (const struct sockaddr *)&ch->fwd_sa, sizeof(ch->fwd_sa));
+                       (const struct sockaddr *)&ch->fwd_sa, slen);
         }
 
         if (m > 0) {
@@ -5829,31 +5825,49 @@ s3_srv_fwd_policy_gate(const s3_ssh3_forward_target_t *t, const char *kind)
 static s3_int_t
 s3_srv_fwd_tcp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 {
-    struct sockaddr_in sa;
-    int                fd;
+    struct sockaddr_storage ss;
+    socklen_t               slen;
+    int                     fd, af;
 
     if (s3_srv_fwd_policy_gate(t, "TCP") != S3_OK) {
         return S3_ERROR;
     }
 
-    if (t->family != 4) {
-        fprintf(stderr, "ssh3-server: direct-tcp: only the ipv4 targets are supported\n");
-        return S3_ERROR;
+    /* the family dial: the v6 targets dial the same service, the
+     * policy gate above already saw the family-shaped address text */
+
+    if (t->family == 6) {
+        struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ss;
+
+        s3_memzero(&ss, sizeof(ss));
+
+        sa6->sin6_family = AF_INET6;
+        s3_memcpy(&sa6->sin6_addr, t->ip, 16);
+        sa6->sin6_port = htons(t->port);
+
+        af = AF_INET6;
+        slen = (socklen_t)sizeof(*sa6);
+
+    } else {
+        struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
+
+        s3_memzero(&ss, sizeof(ss));
+
+        sa->sin_family = AF_INET;
+        s3_memcpy(&sa->sin_addr, t->ip, 4);
+        sa->sin_port = htons(t->port);
+
+        af = AF_INET;
+        slen = (socklen_t)sizeof(*sa);
     }
 
-    s3_memzero(&sa, sizeof(sa));
-
-    sa.sin_family = AF_INET;
-    s3_memcpy(&sa.sin_addr, t->ip, 4);
-    sa.sin_port = htons(t->port);
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
+    fd = socket(af, SOCK_STREAM, 0);
 
     if (fd == -1) {
         return S3_ERROR;
     }
 
-    if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (connect(fd, (const struct sockaddr *)&ss, slen) != 0) {
         (void)close(fd);
         return S3_ERROR;
     }
@@ -5865,7 +5879,8 @@ s3_srv_fwd_tcp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 
     ch->fwd_fd = fd;
     ch->fwd_kind = S3_SRV_FWD_TCP;
-    ch->fwd_sa = sa;
+    s3_memcpy(&ch->fwd_sa, &ss, sizeof(ss));
+    ch->fwd_sa_len = slen;
 
     s3_srv_fwd_report(t, "TCP");
 
@@ -5880,15 +5895,11 @@ s3_srv_fwd_tcp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 static s3_int_t
 s3_srv_fwd_udp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 {
-    struct sockaddr_in sa;
-    int                fd;
+    struct sockaddr_storage ss;
+    socklen_t               slen;
+    int                     fd, af;
 
     if (s3_srv_fwd_policy_gate(t, "UDP") != S3_OK) {
-        return S3_ERROR;
-    }
-
-    if (t->family != 4) {
-        fprintf(stderr, "ssh3-server: direct-udp: only the ipv4 targets are supported\n");
         return S3_ERROR;
     }
 
@@ -5897,13 +5908,35 @@ s3_srv_fwd_udp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
         return S3_ERROR;
     }
 
-    s3_memzero(&sa, sizeof(sa));
+    /* the family dial: the v6 targets dial the same shape (the jump
+     * chain rides this path toward the v6 next-hop) */
 
-    sa.sin_family = AF_INET;
-    s3_memcpy(&sa.sin_addr, t->ip, 4);
-    sa.sin_port = htons(t->port);
+    if (t->family == 6) {
+        struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ss;
 
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
+        s3_memzero(&ss, sizeof(ss));
+
+        sa6->sin6_family = AF_INET6;
+        s3_memcpy(&sa6->sin6_addr, t->ip, 16);
+        sa6->sin6_port = htons(t->port);
+
+        af = AF_INET6;
+        slen = (socklen_t)sizeof(*sa6);
+
+    } else {
+        struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
+
+        s3_memzero(&ss, sizeof(ss));
+
+        sa->sin_family = AF_INET;
+        s3_memcpy(&sa->sin_addr, t->ip, 4);
+        sa->sin_port = htons(t->port);
+
+        af = AF_INET;
+        slen = (socklen_t)sizeof(*sa);
+    }
+
+    fd = socket(af, SOCK_DGRAM, 0);
 
     if (fd == -1) {
         return S3_ERROR;
@@ -5916,7 +5949,8 @@ s3_srv_fwd_udp_open(s3_srv_h3_channel_t *ch, const s3_ssh3_forward_target_t *t)
 
     ch->fwd_fd = fd;
     ch->fwd_kind = S3_SRV_FWD_UDP;
-    ch->fwd_sa = sa;
+    s3_memcpy(&ch->fwd_sa, &ss, sizeof(ss));
+    ch->fwd_sa_len = slen;
 
     s3_srv_h3_udp_fwd = ch;
 
@@ -5952,9 +5986,12 @@ s3_srv_udp_fwd_datagram(s3_connection_t *c, const u_char *buf, size_t len)
     }
 
     if (payload.len > 0) {
+        socklen_t slen = (s3_srv_h3_udp_fwd->fwd_sa.ss_family == AF_INET6)
+                             ? (socklen_t)sizeof(struct sockaddr_in6)
+                             : (socklen_t)sizeof(struct sockaddr_in);
+
         (void)sendto(s3_srv_h3_udp_fwd->fwd_fd, payload.data, payload.len, 0,
-                     (const struct sockaddr *)&s3_srv_h3_udp_fwd->fwd_sa,
-                     sizeof(s3_srv_h3_udp_fwd->fwd_sa));
+                     (const struct sockaddr *)&s3_srv_h3_udp_fwd->fwd_sa, slen);
     }
 }
 
@@ -6147,8 +6184,8 @@ s3_srv_h3_channel_confirm(s3_srv_h3_channel_t *ch)
     /* the user rides last: the e2e greps assert the id and the type
      * prefix of the line (the shape of the pre-fix-wave markers) */
 
-    s3_srv_report("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s user=%s\n",
-                  (unsigned long long)qs->id, (int)hdr.type.len, (const char *)hdr.type.data,
+    s3_srv_report("INTEROP-CHANNEL-ACCEPT id=%llu type=%.*s user=%s\n", (unsigned long long)qs->id,
+                  (int)hdr.type.len, (const char *)hdr.type.data,
                   (ch->sess_user[0] != '\0') ? ch->sess_user : "-");
 
     /* the header bytes are consumed, the type view dies here */
@@ -6401,8 +6438,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                 break;
             }
 
-            if (type == S3_SSH3_MSG_CHANNEL_DATA ||
-                type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
+            if (type == S3_SSH3_MSG_CHANNEL_DATA || type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
                 s3_str_t msg_data;
                 s3_int_t rc;
 
@@ -6417,8 +6453,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                 if (type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
 
-                    if (ch->compress_dec == NULL &&
-                        ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
+                    if (ch->compress_dec == NULL && ch->compress_alg != S3_SSH3_COMPRESS_NONE) {
                         ch->compress_dec = s3_ssh3_compress_ctx_create(ch->compress_alg, 1);
                     }
 
@@ -6532,8 +6567,7 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                         fprintf(stderr, "\n");
                     }
 
-                    if (s3_ssh3_sftp_srv_input(ch->sftp, msg_data.data, msg_data.len) !=
-                        S3_OK) {
+                    if (s3_ssh3_sftp_srv_input(ch->sftp, msg_data.data, msg_data.len) != S3_OK) {
                         fprintf(stderr, "ssh3-server: sftp input failed\n");
                     }
 
@@ -6889,9 +6923,9 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
 static void
 s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 {
-    s3_connection_t   *sc, *pc;
-    s3_event_t        *rev, *wev;
-    s3_srv_preauth_t  *pa;
+    s3_connection_t  *sc, *pc;
+    s3_event_t       *rev, *wev;
+    s3_srv_preauth_t *pa;
 
     /*
      * ssh3-c: the stream_handler receives the stream connection (its
@@ -8638,7 +8672,6 @@ main(int argc, char **argv)
      */
 
     s3_ssl_free(s3_srv_conf.ssl);
-
 
     s3_event_ctx_shutdown(&ctx);
 

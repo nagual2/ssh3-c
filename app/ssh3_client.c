@@ -229,7 +229,7 @@ typedef int s3_cli_cm_h_t;
  */
 
 static unsigned s3_cli_compress_flag; /* the -C option */
-static uint32_t s3_cli_compress_mask;  /* the capability of the peer */
+static uint32_t s3_cli_compress_mask; /* the capability of the peer */
 static uint32_t s3_cli_compress_alg;  /* the negotiated algorithm */
 
 /*
@@ -257,8 +257,8 @@ static uint32_t s3_cli_compress_pin;
 static int
 s3_cli_compress_word_is_host(const char *word)
 {
-    return strchr(word, '@') != NULL || strchr(word, ':') != NULL
-           || strchr(word, '/') != NULL || strchr(word, '.') != NULL;
+    return strchr(word, '@') != NULL || strchr(word, ':') != NULL || strchr(word, '/') != NULL ||
+           strchr(word, '.') != NULL;
 }
 
 /*
@@ -320,12 +320,7 @@ struct termios {
 
 #endif
 
-enum {
-    S3_CLI_AUTH_NONE = 0,
-    S3_CLI_AUTH_BASIC,
-    S3_CLI_AUTH_PUBKEY,
-    S3_CLI_AUTH_OIDC
-};
+enum { S3_CLI_AUTH_NONE = 0, S3_CLI_AUTH_BASIC, S3_CLI_AUTH_PUBKEY, S3_CLI_AUTH_OIDC };
 
 /* the session state machine of the main loop */
 
@@ -346,9 +341,9 @@ static s3_connection_t *s3_cli_chan; /* the session channel */
  * confirmation parse keeps it, the send path chunks by it instead of
  * the local constant - the reference WriteData() honors the peer bound
  */
-static uint64_t s3_cli_ch_peer_mps = S3_CLI_CHANNEL_MAX_PACKET;
-static s3_quic_conf_t   s3_cli_conf;
-static uint64_t         s3_cli_conv_id;
+static uint64_t       s3_cli_ch_peer_mps = S3_CLI_CHANNEL_MAX_PACKET;
+static s3_quic_conf_t s3_cli_conf;
+static uint64_t       s3_cli_conv_id;
 /* the dial peer, the family rides -4/-6 (the storage carries the v6
  * form, the socklen follows the family) */
 static struct sockaddr_storage s3_cli_sa;
@@ -393,7 +388,7 @@ static const char *s3_cli_oidc_aud;
 static const char *s3_cli_oidc_raw;
 static char        s3_cli_oidc_bearer[S3_SSH3_OIDC_CLI_TOKEN_MAX + 8];
 
-static char       *s3_cli_cmd; /* the joined exec text, NULL = shell */
+static char *s3_cli_cmd; /* the joined exec text, NULL = shell */
 
 /*
  * the ssh(1)-canon option states (P8 wave 1): the "have" flags track
@@ -613,7 +608,9 @@ typedef struct {
     unsigned bind_addr;   /* the network order ipv4 (AF_INET binds) */
     u_char   bind_v6[16];
     unsigned bind_port;
-    unsigned target_addr; /* the network order ipv4 of the target */
+    unsigned target_addr;   /* the network order ipv4 of the target */
+    unsigned target_family; /* 4 or 6, the wire target family */
+    u_char   target_ip[16]; /* the wire ip bytes of the target */
     unsigned target_port;
     char     text[128]; /* the spec shape of the logs */
 } s3_cli_fwd_spec_t;
@@ -664,6 +661,8 @@ typedef struct {
     unsigned socks;
     unsigned socks_step;
     unsigned t_addr;
+    unsigned t_family; /* 4 or 6, the wire target family */
+    u_char   t_ip[16];
     unsigned t_port;
     u_char   socks_buf[320];
     size_t   socks_len;
@@ -829,7 +828,7 @@ static int s3_cli_agent_fd = -1;
 static s3_pool_t       *s3_cli_agent_pool; /* the dial state of the agent module */
 static unsigned         s3_cli_agent_bridged;
 static s3_connection_t *s3_cli_agent_sc; /* the agent-connection channel */
-static uint64_t s3_cli_agent_peer_mps = S3_CLI_CHANNEL_MAX_PACKET; /* P2-1 */
+static uint64_t         s3_cli_agent_peer_mps = S3_CLI_CHANNEL_MAX_PACKET; /* P2-1 */
 static u_char           s3_cli_agent_hdr[64];
 static size_t           s3_cli_agent_hdr_len;
 static u_char          *s3_cli_agent_in; /* the channel bytes to the pipe */
@@ -888,8 +887,8 @@ struct s3_cli_cm_run_s {
     unsigned          exit_queued : 1;
     uint64_t          exit_code;
     uint64_t          peer_mps; /* the peer-advertised maxPacketSize (P2-1) */
-    s3_connection_t  *chan;   /* the ssh3 session channel */
-    u_char           *ch_buf; /* the channel parse accumulator */
+    s3_connection_t  *chan;     /* the ssh3 session channel */
+    u_char           *ch_buf;   /* the channel parse accumulator */
     size_t            ch_len;
     size_t            ch_cap;
     u_char           *stdin_buf; /* the io bytes awaiting the 94 frames */
@@ -1100,7 +1099,8 @@ static s3_int_t s3_cli_fwd_listeners_start(void);
 static void     s3_cli_fwd_tcp_accept(s3_event_t *ev);
 static void     s3_cli_fwd_socks_accept(s3_event_t *ev);
 static void     s3_cli_fwd_socks_local_read(s3_event_t *ev);
-static s3_int_t s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_addr, unsigned t_port);
+static s3_int_t s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_family,
+                                     const u_char *t_ip, unsigned t_port);
 static void     s3_cli_fwd_tcp_local_read(s3_event_t *ev);
 static void     s3_cli_fwd_tcp_chan_read(s3_event_t *ev);
 static void     s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc);
@@ -2265,7 +2265,7 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
      * and the audit asks for the escape regardless of the server's
      * exact-match refusal */
 
-    elen = s3_json_escape((const u_char *) user, strlen(user), (u_char *) user_esc, sizeof(user_esc));
+    elen = s3_json_escape((const u_char *)user, strlen(user), (u_char *)user_esc, sizeof(user_esc));
 
     if (elen < 0) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the login does not escape into the claims");
@@ -2385,7 +2385,8 @@ s3_cli_oidc_acquire(SSL *ssl)
         return S3_ERROR;
     }
 
-    if (s3_ssh3_oidc_flow_init(&flow, prov.authorization_endpoint, s3_cli_oidc_aud, nonce) != S3_OK) {
+    if (s3_ssh3_oidc_flow_init(&flow, prov.authorization_endpoint, s3_cli_oidc_aud, nonce) !=
+        S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "oidc: the flow init failed");
         return S3_ERROR;
     }
@@ -2406,7 +2407,8 @@ s3_cli_oidc_acquire(SSL *ssl)
          * the same */
 
         {
-            HINSTANCE inst = ShellExecuteA(NULL, "open", flow.authorize_url, NULL, NULL, SW_SHOWNORMAL);
+            HINSTANCE inst =
+                ShellExecuteA(NULL, "open", flow.authorize_url, NULL, NULL, SW_SHOWNORMAL);
 
             if ((uintptr_t)inst <= 32) {
                 s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "oidc: the browser open failed");
@@ -4298,8 +4300,10 @@ s3_cli_ctrl_read(s3_event_t *ev)
                                  * fallback to another codec
                                  */
 
-                                if ((s3_cli_compress_mask & s3_ssh3_compress_bit(s3_cli_compress_pin)) == 0) {
-                                    fprintf(stderr, "ssh3: the peer does not support the %s compression\n",
+                                if ((s3_cli_compress_mask &
+                                     s3_ssh3_compress_bit(s3_cli_compress_pin)) == 0) {
+                                    fprintf(stderr,
+                                            "ssh3: the peer does not support the %s compression\n",
                                             s3_ssh3_compress_name(s3_cli_compress_pin));
                                     s3_cli_rc = S3_CLI_EXIT_ERROR;
                                     s3_quic_finalize_connection(pc, 0, "no common codec");
@@ -4335,8 +4339,9 @@ s3_cli_ctrl_read(s3_event_t *ev)
                                 }
 
                             } else {
-                                fprintf(stderr, "ssh3: the peer does not support the compression of "
-                                                "the channel body\n");
+                                fprintf(stderr,
+                                        "ssh3: the peer does not support the compression of "
+                                        "the channel body\n");
                             }
                         }
                     }
@@ -4501,7 +4506,8 @@ s3_cli_sftp_finish(void)
      * plain bytes they carried and the bytes on the wire */
 
     if (s3_cli_compress_frames > 0) {
-        fprintf(stderr, "ssh3: the compression of the channel body: %lu frames, %lu bytes -> %lu bytes\n",
+        fprintf(stderr,
+                "ssh3: the compression of the channel body: %lu frames, %lu bytes -> %lu bytes\n",
                 (unsigned long)s3_cli_compress_frames, (unsigned long)s3_cli_compress_plain,
                 (unsigned long)s3_cli_compress_packed);
     }
@@ -4789,8 +4795,7 @@ s3_cli_sftp_read(s3_event_t *ev)
                 continue;
             }
 
-            if (type == S3_SSH3_MSG_CHANNEL_DATA ||
-                type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
+            if (type == S3_SSH3_MSG_CHANNEL_DATA || type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
 
                 s3_str_t payload;
                 s3_int_t rc;
@@ -5031,13 +5036,36 @@ s3_cli_fwd_parse(const char *arg)
 
         {
             struct in_addr a;
+            const char    *h6 = host;
+            char           nobr[64];
+            size_t         hl6 = strlen(host);
+            unsigned       family = 0;
 
-            if (inet_pton(AF_INET, host, &a) != 1) {
-                fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4 socket\n", host, slash2 + 1);
+            /* the v6 literal rides raw or bracketed (the URI host may
+             * keep the ssh2 brackets) */
+
+            if (host[0] == '[' && hl6 >= 3 && host[hl6 - 1] == ']' && hl6 < sizeof(nobr)) {
+                memcpy(nobr, host + 1, hl6 - 2);
+                nobr[hl6 - 2] = '\0';
+                h6 = nobr;
+            }
+
+            if (inet_pton(AF_INET, host, &a) == 1) {
+                family = 4;
+                spec->target_addr = (unsigned)a.s_addr;
+                memcpy(spec->target_ip, &a, 4);
+
+            } else if (inet_pton(AF_INET6, h6, spec->target_ip) == 1) {
+                family = 6;
+            }
+
+            if (family == 0) {
+                fprintf(stderr, "ssh3: -L target %s:%s is not an ipv4/ipv6 socket\n", host,
+                        slash2 + 1);
                 return S3_ERROR;
             }
 
-            spec->target_addr = (unsigned)a.s_addr;
+            spec->target_family = family;
         }
 
         tport = (unsigned)atoi(slash2 + 1);
@@ -5189,13 +5217,14 @@ s3_cli_fwd_parse(const char *arg)
 
         spec->bind_port = port;
 
-        /* the target host: a v4 literal or a name resolved AF_INET */
+        /* the target host: a v4/v6 literal or a name resolved
+         * AF_UNSPEC (the family rides the wire target, the v6 hop
+         * chains dial the same shape) */
 
         {
 
-            struct sockaddr_in sa;
-            struct addrinfo    hints, *res = NULL;
-            char               thtext[128];
+            struct addrinfo hints, *res = NULL;
+            char            thtext[128];
 
             if (host_len == 0 || host_len >= sizeof(thtext)) {
                 fprintf(stderr, "ssh3: -L bad target host in %s\n", arg);
@@ -5205,17 +5234,44 @@ s3_cli_fwd_parse(const char *arg)
             memcpy(thtext, host_f, host_len);
             thtext[host_len] = '\0';
 
+            /* the ssh2 bracket canon: the target host may arrive as
+             * [::1], the resolvers want the bare address */
+
+            if (thtext[0] == '[') {
+                size_t tl = strlen(thtext);
+
+                if (tl >= 2 && thtext[tl - 1] == ']') {
+                    memmove(thtext, thtext + 1, tl - 2);
+                    thtext[tl - 2] = '\0';
+                }
+            }
+
             memset(&hints, 0, sizeof(hints));
-            hints.ai_family = AF_INET;
+            hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_DGRAM;
 
-            if (inet_pton(AF_INET, thtext, &sa.sin_addr) == 1) {
-                spec->target_addr = (unsigned)sa.sin_addr.s_addr;
+            if (inet_pton(AF_INET, thtext, &spec->target_addr) == 1) {
+                spec->target_family = 4;
+                memcpy(spec->target_ip, &spec->target_addr, 4);
+
+            } else if (inet_pton(AF_INET6, thtext, spec->target_ip) == 1) {
+                spec->target_family = 6;
 
             } else if (getaddrinfo(thtext, NULL, &hints, &res) == 0 && res != NULL) {
 
-                memcpy(&sa, res->ai_addr, sizeof(sa));
-                spec->target_addr = (unsigned)sa.sin_addr.s_addr;
+                if (res->ai_family == AF_INET6) {
+                    struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)res->ai_addr;
+
+                    spec->target_family = 6;
+                    memcpy(spec->target_ip, &sa6->sin6_addr, 16);
+
+                } else {
+                    struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+
+                    spec->target_family = 4;
+                    spec->target_addr = sa->sin_addr.s_addr;
+                    memcpy(spec->target_ip, &sa->sin_addr, 4);
+                }
 
                 freeaddrinfo(res);
 
@@ -5530,8 +5586,8 @@ s3_cli_fwd_tcp_flush(s3_cli_fwd_tcp_conn_t *fc)
 
         if (fc->frame_sent == fc->frame_total) {
 
-            size_t  chunk =
-                s3_ssh3_channel_chunk_size(fc->peer_mps ? fc->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
+            size_t chunk = s3_ssh3_channel_chunk_size(
+                fc->peer_mps ? fc->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
             if (chunk > fc->to_chan_len) {
                 chunk = fc->to_chan_len;
@@ -5730,8 +5786,8 @@ s3_cli_fwd_tcp_chan_read(s3_event_t *ev)
                     }
 
                     rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_ssh3_compress_available(),
-                                                 s3_cli_compress_dec, s3_cli_fwd_plain,
-                                                 sizeof(s3_cli_fwd_plain), &data);
+                                                  s3_cli_compress_dec, s3_cli_fwd_plain,
+                                                  sizeof(s3_cli_fwd_plain), &data);
 
                     if (rc == S3_ERROR) {
                         pos = msg;
@@ -5882,7 +5938,8 @@ s3_cli_fwd_tcp_local_read(s3_event_t *ev)
  */
 
 static s3_int_t
-s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_addr, unsigned t_port)
+s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_family, const u_char *t_ip,
+                     unsigned t_port)
 {
     s3_ssh3_channel_t        h;
     s3_ssh3_forward_target_t t;
@@ -5908,9 +5965,9 @@ s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_addr, unsigned t_port
     h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_TCP;
     h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_TCP);
 
-    t.family = 4;
-    t.ip_len = 4;
-    memcpy(t.ip, &t_addr, 4);
+    t.family = t_family;
+    t.ip_len = (t_family == 6) ? 16 : 4;
+    memcpy(t.ip, t_ip, t.ip_len);
     t.port = (uint16_t)t_port;
 
     p = fc->hdr;
@@ -5994,7 +6051,8 @@ s3_cli_fwd_tcp_accept(s3_event_t *ev)
         fc->fd = fd;
         fc->evc = c;
 
-        if (s3_cli_fwd_conn_open(fc, s3_cli_fwd_specs[spec].target_addr,
+        if (s3_cli_fwd_conn_open(fc, s3_cli_fwd_specs[spec].target_family,
+                                 s3_cli_fwd_specs[spec].target_ip,
                                  s3_cli_fwd_specs[spec].target_port) != S3_OK) {
             s3_cli_fwd_tcp_drop(fc);
             continue;
@@ -6100,7 +6158,7 @@ s3_cli_fwd_socks_fail(s3_cli_fwd_tcp_conn_t *fc, u_char code)
 
     reply[1] = code;
 
-    (void)send(fc->fd, (const char *) reply, sizeof(reply), 0);
+    (void)send(fc->fd, (const char *)reply, sizeof(reply), 0);
     fc->dead = 1;
 }
 
@@ -6123,7 +6181,7 @@ s3_cli_fwd_socks_ok(s3_cli_fwd_tcp_conn_t *fc, unsigned v4)
     reply[6] = (u_char)((v4 >> 16) & 0xff);
     reply[7] = (u_char)((v4 >> 24) & 0xff);
 
-    (void)send(fc->fd, (const char *) reply, 8, 0);
+    (void)send(fc->fd, (const char *)reply, 8, 0);
 }
 
 /* the client-side resolve of the socks target (the wire rides the
@@ -6141,6 +6199,8 @@ s3_cli_fwd_socks_resolve(s3_cli_fwd_tcp_conn_t *fc, const char *host)
 
     if (inet_pton(AF_INET, host, &sa.sin_addr) == 1) {
         fc->t_addr = (unsigned)sa.sin_addr.s_addr;
+        fc->t_family = 4;
+        memcpy(fc->t_ip, &sa.sin_addr, 4);
         return S3_OK;
     }
 
@@ -6150,6 +6210,8 @@ s3_cli_fwd_socks_resolve(s3_cli_fwd_tcp_conn_t *fc, const char *host)
 
     memcpy(&sa, res->ai_addr, sizeof(sa));
     fc->t_addr = (unsigned)sa.sin_addr.s_addr;
+    fc->t_family = 4;
+    memcpy(fc->t_ip, &sa.sin_addr, 4);
 
     freeaddrinfo(res);
 
@@ -6172,7 +6234,8 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
 
         ssize_t n;
 
-        n = recv(fc->fd, (char *) fc->socks_buf + fc->socks_len, sizeof(fc->socks_buf) - fc->socks_len, 0);
+        n = recv(fc->fd, (char *)fc->socks_buf + fc->socks_len,
+                 sizeof(fc->socks_buf) - fc->socks_len, 0);
 
         if (n < 0) {
 
@@ -6219,7 +6282,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
             {
                 u_char reply[2] = {5, 0};
 
-                (void)send(fc->fd, (const char *) reply, sizeof(reply), 0);
+                (void)send(fc->fd, (const char *)reply, sizeof(reply), 0);
             }
 
             fc->socks_len = 0;
@@ -6324,7 +6387,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
             fc->socks_len = 0;
             fc->socks_step = 3; /* the bridged shape, no parse left */
 
-            if (s3_cli_fwd_conn_open(fc, fc->t_addr, fc->t_port) != S3_OK) {
+            if (s3_cli_fwd_conn_open(fc, fc->t_family, fc->t_ip, fc->t_port) != S3_OK) {
                 s3_cli_fwd_tcp_drop(fc);
                 return;
             }
@@ -6385,6 +6448,8 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
                 }
 
                 fc->t_addr = (unsigned)a.s_addr;
+                fc->t_family = 4;
+                memcpy(fc->t_ip, &a, 4);
                 fc->t_port = port;
 
                 s3_cli_fwd_socks_ok(fc, a.s_addr);
@@ -6392,7 +6457,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
                 fc->socks_len = 0;
                 fc->socks_step = 3;
 
-                if (s3_cli_fwd_conn_open(fc, fc->t_addr, fc->t_port) != S3_OK) {
+                if (s3_cli_fwd_conn_open(fc, fc->t_family, fc->t_ip, fc->t_port) != S3_OK) {
                     s3_cli_fwd_tcp_drop(fc);
                     return;
                 }
@@ -6525,9 +6590,9 @@ s3_cli_fwd_udp_local_read(s3_event_t *ev)
                 h.type.data = (u_char *)S3_SSH3_CHANNEL_TYPE_DIRECT_UDP;
                 h.type.len = strlen(S3_SSH3_CHANNEL_TYPE_DIRECT_UDP);
 
-                t.family = 4;
-                t.ip_len = 4;
-                memcpy(t.ip, &sp->target_addr, 4);
+                t.family = sp->target_family;
+                t.ip_len = (sp->target_family == 6) ? 16 : 4;
+                memcpy(t.ip, sp->target_ip, t.ip_len);
                 t.port = (uint16_t)sp->target_port;
 
                 p = src->hdr_park;
@@ -7747,7 +7812,8 @@ s3_cli_rev_pump(void)
                 u_char *p;
                 size_t  chunk;
 
-                chunk = s3_ssh3_channel_chunk_size(b->peer_mps ? b->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
+                chunk = s3_ssh3_channel_chunk_size(
+                    b->peer_mps ? b->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
                 if (chunk > b->to_chan_len) {
                     chunk = b->to_chan_len;
@@ -8814,7 +8880,7 @@ s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
         return;
     }
 
-    n = send(s3_cli_bridge_b, (const char *) payload.data, payload.len, 0);
+    n = send(s3_cli_bridge_b, (const char *)payload.data, payload.len, 0);
 
     (void)n; /* a short send is a loss the inner conn recovers from */
 }
@@ -8840,7 +8906,8 @@ s3_cli_jump_bridge_read(s3_event_t *ev)
 
     for (;;) {
 
-        n = recv(s3_cli_bridge_b, (char *) s3_cli_bridge_frame + pre, sizeof(s3_cli_bridge_frame) - pre, 0);
+        n = recv(s3_cli_bridge_b, (char *)s3_cli_bridge_frame + pre,
+                 sizeof(s3_cli_bridge_frame) - pre, 0);
 
         if (n < 0) {
 
@@ -10130,7 +10197,8 @@ s3_cli_cm_run_stdin_pump(s3_cli_cm_run_t *run)
 
         if (run->frame_sent == run->frame_total) {
 
-            chunk = s3_ssh3_channel_chunk_size(run->peer_mps ? run->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
+            chunk = s3_ssh3_channel_chunk_size(
+                run->peer_mps ? run->peer_mps : S3_CLI_CHANNEL_MAX_PACKET, 0);
 
             if (chunk > run->stdin_len) {
                 chunk = run->stdin_len;
@@ -12602,8 +12670,9 @@ main(int argc, char **argv)
                 if (alg == S3_SSH3_COMPRESS_NONE) {
 
                     if (!s3_cli_compress_word_is_host(word)) {
-                        fprintf(stderr, "ssh3: unknown compression codec: %s "
-                                        "(the known ones: zstd, deflate, lz4)\n",
+                        fprintf(stderr,
+                                "ssh3: unknown compression codec: %s "
+                                "(the known ones: zstd, deflate, lz4)\n",
                                 word);
                         s3_cli_net_cleanup();
                         return S3_CLI_EXIT_ERROR;
@@ -12978,17 +13047,20 @@ main(int argc, char **argv)
                     name++;
                 }
 
-                s3_cli_compress_pin = s3_ssh3_compress_by_name((const u_char *)name, s3_strlen(name));
+                s3_cli_compress_pin =
+                    s3_ssh3_compress_by_name((const u_char *)name, s3_strlen(name));
 
                 if (s3_cli_compress_pin == S3_SSH3_COMPRESS_NONE) {
-                    fprintf(stderr, "ssh3: unknown compression codec: %s "
-                                    "(the known ones: zstd, deflate, lz4)\n",
+                    fprintf(stderr,
+                            "ssh3: unknown compression codec: %s "
+                            "(the known ones: zstd, deflate, lz4)\n",
                             name);
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
 
-                if ((s3_ssh3_compress_available() & s3_ssh3_compress_bit(s3_cli_compress_pin)) == 0) {
+                if ((s3_ssh3_compress_available() & s3_ssh3_compress_bit(s3_cli_compress_pin)) ==
+                    0) {
                     fprintf(stderr, "ssh3: the %s codec is not in this build\n", name);
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
@@ -13393,7 +13465,8 @@ main(int argc, char **argv)
     if (s3_cli_oidc_issuer != NULL || s3_cli_oidc_raw != NULL) {
 
         if (s3_cli_oidc_issuer != NULL && s3_cli_oidc_aud == NULL) {
-            fprintf(stderr, "ssh3: --oidc-issuer wants --oidc-audience (the client id of the token)\n");
+            fprintf(stderr,
+                    "ssh3: --oidc-issuer wants --oidc-audience (the client id of the token)\n");
             return S3_CLI_EXIT_ERROR;
         }
 
