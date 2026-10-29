@@ -181,7 +181,7 @@ else
     fail "no compression report in the client output"
 fi
 
-echo "== leg 3: without -C the channel stays plain"
+echo "== leg 3: without -C the channel compresses by default (the both-directions canon)"
 
 HOME="$WORK/home" timeout 60 "$CLI" -i "$WORK/priv.pem" \
     --sftp "put:$WORK/payload.txt:/tmp/s3compress2.txt" \
@@ -190,15 +190,36 @@ HOME="$WORK/home" timeout 60 "$CLI" -i "$WORK/priv.pem" \
 rc=$?
 
 if [ "$rc" -eq 0 ]; then
-    pass "the plain put rode (rc 0)"
+    pass "the default put rode (rc 0)"
 else
-    fail "the plain put leg: rc=$rc $(tail -1 "$WORK/plain.err")"
+    fail "the default put leg: rc=$rc $(tail -1 "$WORK/plain.err")"
 fi
 
-if grep -q "the compression of the channel body" "$WORK/plain.err"; then
-    fail "the plain leg noted a compression"
+if grep -q "the compression of the channel body: " "$WORK/plain.err"; then
+    grep "the compression of the channel body: " "$WORK/plain.err" | head -1 | sed 's/^/   /'
+    pass "the default run compressed the channel body"
 else
-    pass "the plain leg carried no compression"
+    fail "the default run carried no compression"
+fi
+
+echo "== leg 3b: -Cnone keeps the channel plain (the explicit off)"
+
+HOME="$WORK/home" timeout 60 "$CLI" -i "$WORK/priv.pem" -Cnone \
+    --sftp "put:$WORK/payload.txt:/tmp/s3compress3.txt" \
+    "client@127.0.0.1:$PORT/ssh3-term" \
+    > "$WORK/none.out" 2>"$WORK/none.err"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+    pass "the -Cnone put rode (rc 0)"
+else
+    fail "the -Cnone put leg: rc=$rc $(tail -1 "$WORK/none.err")"
+fi
+
+if grep -q "the compression of the channel body" "$WORK/none.err"; then
+    fail "the -Cnone leg noted a compression"
+else
+    pass "the -Cnone leg carried no compression"
 fi
 
 echo "== leg 4: the daemon survives the compressed channel"

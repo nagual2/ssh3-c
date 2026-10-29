@@ -95,6 +95,7 @@ mkcert 1
 mkcert 2
 mkcert 3
 mkcert 4
+mkcert 5
 
 # the v4 loopback daemon: the extra args ride between -3 and the
 # cert pair (the -d 1352 of the jump daemon), the listen port scans
@@ -510,6 +511,73 @@ if [ "$rc" -eq 0 ]; then
     pass "--sftp put rode"
 else
     fail "--sftp put leg: rc=$rc $(tail -1 "$WORK/leg-s2.err")"
+fi
+
+echo "== leg 11b: the positional --sftp derives the direction (the scp canon)"
+
+HOME="$WORK/home" timeout 30 "$BUILD/ssh3" --sftp "$WORK/xfer.txt" :/tmp/s3cli-pos.txt \
+    -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term" \
+    > "$WORK/leg-pos.out" 2>"$WORK/leg-pos.err"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+    pass "the positional put rode (the leading colon names the remote)"
+else
+    fail "the positional put leg: rc=$rc $(tail -1 "$WORK/leg-pos.err")"
+fi
+
+HOME="$WORK/home" timeout 30 "$BUILD/ssh3" --sftp :/tmp/s3cli-pos.txt "$WORK/xfer-pos.txt" \
+    -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term" \
+    > "$WORK/leg-pos2.out" 2>"$WORK/leg-pos2.err"
+rc=$?
+
+if [ "$rc" -eq 0 ] && cmp -s "$WORK/xfer.txt" "$WORK/xfer-pos.txt"; then
+    pass "the positional get returned the file byte-exact"
+else
+    fail "the positional get leg: rc=$rc $(tail -1 "$WORK/leg-pos2.err")"
+fi
+
+HOME="$WORK/home" timeout 20 "$BUILD/ssh3" --sftp "$WORK/xfer.txt" "$WORK/xfer-noop.txt" \
+    -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term" \
+    > /dev/null 2>"$WORK/leg-pos3.err"
+rc=$?
+
+if [ "$rc" -eq 255 ] && grep -q "exactly one remote operand" "$WORK/leg-pos3.err"; then
+    pass "the ambiguous positional refused cleanly (rc 255)"
+else
+    fail "the ambiguous positional leg: rc=$rc $(tail -1 "$WORK/leg-pos3.err")"
+fi
+
+echo "== leg 11c: --password rides the Basic auth (the -U canon split)"
+
+printf 'tester:secret\n' > "$WORK/passfile"
+
+PWPORT=$(start_srv 5 -P "$WORK/passfile" --enable-password-login) ||
+    die "the password daemon did not start"
+
+pin_home home-pw "127.0.0.1:$PWPORT/ssh3-term" 5
+
+if HOME="$WORK/home-pw" timeout 20 "$BUILD/ssh3" --password "tester:secret" \
+    "tester@127.0.0.1:$PWPORT/ssh3-term" "printf S3-PW-OK" \
+    > "$WORK/leg-pw.out" 2>"$WORK/leg-pw.err" &&
+    grep -q "S3-PW-OK" "$WORK/leg-pw.out"; then
+    pass "--password carried the Basic auth"
+else
+    fail "--password leg: rc=$? $(tail -1 "$WORK/leg-pw.err")"
+fi
+
+if HOME="$WORK/home-pw" timeout 20 "$BUILD/ssh3" --password "tester:wrong" \
+    "tester@127.0.0.1:$PWPORT/ssh3-term" "echo no" \
+    > /dev/null 2>"$WORK/leg-pw2.err"; then
+    fail "--password accepted the wrong pass"
+else
+    rc=$?
+
+    if [ "$rc" -eq 255 ]; then
+        pass "--password wrong pass refused cleanly (rc 255)"
+    else
+        fail "--password wrong pass leg: rc=$rc"
+    fi
 fi
 
 echo "== leg 12: -o Port=, -o User=, -o LocalForward="

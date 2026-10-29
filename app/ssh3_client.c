@@ -228,9 +228,10 @@ typedef int s3_cli_cm_h_t;
  * channel max packet size)
  */
 
-static unsigned s3_cli_compress_flag; /* the -C option */
-static uint32_t s3_cli_compress_mask; /* the capability of the peer */
-static uint32_t s3_cli_compress_alg;  /* the negotiated algorithm */
+static unsigned s3_cli_compress_flag;     /* the -C option */
+static unsigned s3_cli_compress_disabled; /* the -Cnone marker: the explicit off */
+static uint32_t s3_cli_compress_mask;     /* the capability of the peer */
+static uint32_t s3_cli_compress_alg;      /* the negotiated algorithm */
 
 /*
  * the codec contexts of the negotiated algorithm (the audit fix wave):
@@ -1055,6 +1056,8 @@ static void      s3_cli_note(const char *fmt, ...);
 static void      s3_cli_notes_flush(void);
 static char     *s3_cli_join_words(char **argv, size_t first, size_t argc);
 static s3_int_t  s3_cli_sftp_spec_parse(const char *rest);
+static s3_int_t  s3_cli_sftp_positional_parse(const char *src, const char *dst);
+static s3_int_t  s3_cli_basic_parse(const char *userpass);
 static s3_int_t  s3_cli_jump_parse(const char *spec);
 static s3_int_t  s3_cli_escape_parse(const char *arg);
 static size_t    s3_cli_escape_feed(const u_char *src, size_t n, u_char *dst);
@@ -1286,19 +1289,25 @@ s3_cli_usage(const char *prog)
             "  -L udp://[bind:]port/host/port  the local udp forward over the\n"
             "              datagrams\n"
             "  -R ...[/tcp|/udp]  the reverse protocol infix (the tcp default)\n"
-            "  -U user:pass  the Basic auth (RFC 7617), the ?user= of the\n"
-            "              target (the HTTP spec keeps its own head)\n"
+            "  -U user:pass  the Basic auth (deprecated, use --password),\n"
+            "              the ?user= of the target\n"
             "  -r          with the transfers: the recursive tree\n"
             "  --log-level 0..9|all  the s3 log level\n"
-            "  --sftp put|get:local:remote  the transfer (get: local first)\n"
+            "  --password user:pass  the Basic auth (RFC 7617), the ?user=\n"
+            "              of the target\n"
+            "  --sftp put|get:local:remote | SRC DST  the transfer: the\n"
+            "              positional form derives the direction from the\n"
+            "              leading colon of the remote operand (the session\n"
+            "              host implied), get: carries local first\n"
             "  --oidc-issuer url --oidc-audience id: the OIDC login (the\n"
             "              provider tab opens, the id_token rides the CONNECT\n"
             "              Bearer; S3_OIDC_NO_BROWSER keeps the tab closed,\n"
             "              --oidc-token feeds the raw id_token)\n"
             "  --help      this help\n"
-            "  -C          the compression of the channel body (the peer must announce\n"
-            "              the capability; the default is off); -C zstd pins the\n"
-            "              codec (zstd, deflate, lz4), -C alone picks the best one\n"
+            "  -C [none|zstd|deflate|lz4]  the compression of the channel\n"
+            "              body rides by default (the both-directions canon,\n"
+            "              the peer must announce the capability); -Cnone is\n"
+            "              the explicit off, a codec name pins it\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
             " certificate pins into %s\n",
@@ -3308,6 +3317,97 @@ s3_cli_sftp_spec_parse(const char *rest)
 }
 
 /*
+ * the Basic auth spec user:pass: the header builds in s3_cli_basic,
+ * the username before the colon feeds the ?user= target (the
+ * --password canon, the -U spelling rides it deprecated)
+ */
+
+static s3_int_t
+s3_cli_basic_parse(const char *userpass)
+{
+    const char *sep = strchr(userpass, ':');
+    size_t      ulen = strlen(userpass);
+
+    if (sep == NULL || ulen > 300) {
+        fprintf(stderr, "ssh3: --password wants user:pass\n");
+        return S3_ERROR;
+    }
+
+    memcpy(s3_cli_basic, "Basic ", sizeof("Basic ") - 1);
+    s3_cli_b64std((const u_char *)userpass, ulen, s3_cli_basic + sizeof("Basic ") - 1);
+
+    if ((size_t)(sep - userpass) >= sizeof(s3_cli_user)) {
+        fprintf(stderr, "ssh3: the user name is too long\n");
+        return S3_ERROR;
+    }
+
+    memcpy(s3_cli_user, userpass, (size_t)(sep - userpass));
+    s3_cli_user[sep - userpass] = '\0';
+
+    s3_cli_auth = S3_CLI_AUTH_BASIC;
+    s3_cli_auth_value = s3_cli_basic;
+
+    return S3_OK;
+}
+
+/*
+ * the positional transfer spec (the scp canon): the remote operand
+ * rides the leading colon (the session host implied), the direction
+ * derives from which side carries it; the put|get: forms stay the
+ * explicit aliases
+ */
+
+static s3_int_t
+s3_cli_sftp_positional_parse(const char *src, const char *dst)
+{
+    unsigned    src_remote = (src[0] == ':');
+    unsigned    dst_remote = (dst[0] == ':');
+    const char *local, *remote;
+
+    if (src_remote == dst_remote) {
+        fprintf(stderr, "ssh3: --sftp wants exactly one remote operand with the leading colon "
+                        "(--sftp ./file :/remote/path or --sftp :/remote/path ./file)\n");
+        return S3_ERROR;
+    }
+
+    if (dst_remote) {
+        s3_cli_sftp_mode = S3_CLI_SFTP_PUT;
+        local = src;
+        remote = dst + 1;
+
+    } else {
+        s3_cli_sftp_mode = S3_CLI_SFTP_GET;
+        local = dst;
+        remote = src + 1;
+    }
+
+    if (*local == '\0' || *remote == '\0') {
+        fprintf(stderr, "ssh3: --sftp wants both paths non-empty\n");
+        return S3_ERROR;
+    }
+
+    s3_cli_sftp_local = malloc(strlen(local) + 1);
+
+    if (s3_cli_sftp_local == NULL) {
+        fprintf(stderr, "ssh3: out of memory\n");
+        return S3_ERROR;
+    }
+
+    strcpy(s3_cli_sftp_local, local);
+
+    s3_cli_sftp_remote = malloc(strlen(remote) + 1);
+
+    if (s3_cli_sftp_remote == NULL) {
+        fprintf(stderr, "ssh3: out of memory\n");
+        return S3_ERROR;
+    }
+
+    strcpy(s3_cli_sftp_remote, remote);
+
+    return S3_OK;
+}
+
+/*
  * the jump spec (the ssh2 ProxyJump shape): the comma chain of
  * [user@]host[:port] segments, every segment rides its own hop, the
  * port defaults to 443 at the resolve.  A fresh parse rebuilds the
@@ -4417,7 +4517,14 @@ s3_cli_ctrl_read(s3_event_t *ev)
                                 1);
                         }
 
-                        if (s3_cli_compress_flag) {
+                        /* the both-directions canon (the parity
+                         * backlog 8): the build's codecs ride by
+                         * default, -C pins, -Cnone is the explicit
+                         * off; the notes stay on the explicit -C (the
+                         * default rides silent) */
+
+                        if (s3_cli_compress_flag ||
+                            (s3_ssh3_compress_available() != 0 && !s3_cli_compress_disabled)) {
 
                             if (s3_cli_compress_pin != S3_SSH3_COMPRESS_NONE) {
 
@@ -4458,14 +4565,14 @@ s3_cli_ctrl_read(s3_event_t *ev)
                                     fprintf(stderr,
                                             "ssh3: the compression of the channel body stays "
                                             "off (the codec context failed)\n");
-                                } else {
+                                } else if (s3_cli_compress_flag) {
                                     fprintf(stderr,
                                             "ssh3: the compression of the channel body is on "
                                             "(%s)\n",
                                             s3_ssh3_compress_name(s3_cli_compress_alg));
                                 }
 
-                            } else {
+                            } else if (s3_cli_compress_flag) {
                                 fprintf(stderr,
                                         "ssh3: the peer does not support the compression of "
                                         "the channel body\n");
@@ -12862,14 +12969,54 @@ main(int argc, char **argv)
                 s3_cli_net_cleanup();
                 return 0;
 
-            } else if (strcmp(argv[n], "--sftp") == 0 && n + 1 < argc) {
+            } else if (strcmp(argv[n], "--password") == 0 && n + 1 < argc) {
 
-                if (s3_cli_sftp_spec_parse(argv[n + 1]) != S3_OK) {
+                /* the Basic auth of the cli canon (the long key: the
+                 * ssh2 has no twin, the -U spelling rides it
+                 * deprecated) */
+
+                if (s3_cli_basic_parse(argv[n + 1]) != S3_OK) {
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
 
                 value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--sftp") == 0 && n + 1 < argc) {
+
+                if (strncmp(argv[n + 1], "put:", 4) == 0 || strncmp(argv[n + 1], "get:", 4) == 0) {
+
+                    /* the explicit put|get: alias form */
+
+                    if (s3_cli_sftp_spec_parse(argv[n + 1]) != S3_OK) {
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    value = argv[n + 1];
+
+                } else {
+
+                    /* the positional scp canon: two operands, the
+                     * leading colon names the remote side */
+
+                    if (n + 2 >= argc) {
+                        fprintf(stderr, "ssh3: --sftp wants SRC DST (the remote side carries the "
+                                        "leading colon)\n");
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    if (s3_cli_sftp_positional_parse(argv[n + 1], argv[n + 2]) != S3_OK) {
+                        s3_cli_net_cleanup();
+                        return S3_CLI_EXIT_ERROR;
+                    }
+
+                    /* the --sftp word and both operands leave */
+
+                    drop = 3;
+                    keep = 0;
+                }
 
             } else if (strcmp(argv[n], "--oidc-issuer") == 0 && n + 1 < argc) {
 
@@ -12926,7 +13073,16 @@ main(int argc, char **argv)
                 const char *word = argv[n + 1];
                 uint32_t    alg = s3_cli_compress_name_parse(word);
 
-                if (alg == S3_SSH3_COMPRESS_NONE) {
+                if (strcmp(word, "none") == 0) {
+
+                    /* the explicit off wins over the default */
+
+                    s3_cli_compress_disabled = 1;
+                    s3_cli_compress_flag = 0;
+
+                    drop = 2;
+
+                } else if (alg == S3_SSH3_COMPRESS_NONE) {
 
                     if (!s3_cli_compress_word_is_host(word)) {
                         fprintf(stderr,
@@ -13019,29 +13175,16 @@ main(int argc, char **argv)
 
             {
 
-                const char *sep = strchr(optarg, ':');
-                size_t      ulen = strlen(optarg);
+                /* the Basic user:pass of the -U spelling: the canon
+                 * rides --password, the -U key stays the deprecated
+                 * alias (the fork's -U is the transfer, the collision
+                 * the cli canon decision splits) */
 
-                if (sep == NULL || ulen > 300) {
-                    fprintf(stderr, "ssh3: -U wants user:pass\n");
+                s3_cli_note("ssh3: -U user:pass is deprecated, use --password");
+
+                if (s3_cli_basic_parse(optarg) != S3_OK) {
                     return S3_CLI_EXIT_ERROR;
                 }
-
-                memcpy(s3_cli_basic, "Basic ", sizeof("Basic ") - 1);
-                s3_cli_b64std((const u_char *)optarg, ulen, s3_cli_basic + sizeof("Basic ") - 1);
-
-                /* the username before the colon feeds the ?user= target */
-
-                if ((size_t)(sep - optarg) >= sizeof(s3_cli_user)) {
-                    fprintf(stderr, "ssh3: -U user is too long\n");
-                    return S3_CLI_EXIT_ERROR;
-                }
-
-                memcpy(s3_cli_user, optarg, (size_t)(sep - optarg));
-                s3_cli_user[sep - optarg] = '\0';
-
-                s3_cli_auth = S3_CLI_AUTH_BASIC;
-                s3_cli_auth_value = s3_cli_basic;
             }
 
             break;
@@ -13290,11 +13433,12 @@ main(int argc, char **argv)
 
         case 'C':
             /* the compression of the channel body (PLAN.md 9, B8): the
-             * flag asks for it, the peer decides whether it happens
-             * (the capability of its version string).  the name of the
-             * codec rides the flag attached ("-Czstd", "-C=zstd") and
-             * pins the algorithm; the separated form ("-C zstd") is
-             * parsed by the pre-scan above */
+             * both-directions canon - the build's codecs ride by
+             * default (the peer mask decides whether it happens),
+             * "-Cnone" is the explicit off; the codec name rides the
+             * flag attached ("-Czstd", "-C=zstd") and pins the
+             * algorithm; the separated form ("-C zstd") is parsed by
+             * the pre-scan above */
 
             s3_cli_compress_flag = 1;
 
@@ -13304,6 +13448,17 @@ main(int argc, char **argv)
 
                 if (*name == '=') {
                     name++;
+                }
+
+                if (strcmp(name, "none") == 0) {
+
+                    /* the explicit off wins over the default */
+
+                    s3_cli_compress_disabled = 1;
+                    s3_cli_compress_flag = 0;
+                    s3_cli_compress_pin = S3_SSH3_COMPRESS_NONE;
+
+                    break;
                 }
 
                 s3_cli_compress_pin =
