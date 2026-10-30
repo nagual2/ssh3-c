@@ -403,7 +403,8 @@ build_rpm() {
             --define "_arch $RPM_ARCH"
             --define "_target_cpu $RPM_ARCH"
             --define "_build_arch $RPM_ARCH"
-            --define "_host_cpu $RPM_ARCH")
+            --define "_host_cpu $RPM_ARCH"
+            --define "debug_package %{nil}")
 
         if command -v "${MULTIARCH}-strip" >/dev/null 2>&1; then
             target_args+=(--define "__strip ${MULTIARCH}-strip")
