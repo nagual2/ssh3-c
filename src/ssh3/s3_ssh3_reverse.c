@@ -356,12 +356,15 @@ s3_ssh3_reverse_resolve_target(const s3_ssh3_reverse_spec_t *spec, s3_ssh3_forwa
     s3_memzero(&hints, sizeof(hints));
 
     /*
-     * the names resolve over AF_UNSPEC (the -L canon): the bridge
-     * dials the resolved family, the wire form of the channel target
-     * carries both (the first result wins, the resolver order rule)
+     * the names resolve over AF_INET (the canon of the reverse target,
+     * the pinned invariant of test_ssh3_reverse: musl orders ::1 of
+     * localhost first under AF_UNSPEC): the v6 targets ride the
+     * literal fast path above (inet_pton), an AAAA-only name refuses
+     * instead of resolving into an address family the caller did not
+     * pin
      */
 
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;
     hints.ai_socktype = (spec->proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM;
 
     if (snprintf(port_text, sizeof(port_text), "%u", (unsigned)spec->target_port) <= 0) {

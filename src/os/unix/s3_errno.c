@@ -12,7 +12,20 @@ s3_strerror(s3_err_t err, u_char *errbuf, size_t len)
     const char *msg;
     size_t      n;
 
-#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 32)
+/*
+ * glibc's strerrordesc_np() arrived at 2.32.  The version probe rides
+ * its own guarded define: on the libcs without __GLIBC_PREREQ the
+ * function-call form must never tokenize inside #if - the parser dies
+ * on the undefined function-like invocation even behind a false &&.
+ */
+
+#if defined(__GLIBC_PREREQ)
+#define S3_GLIBC_PREREQ_2_32 __GLIBC_PREREQ(2, 32)
+#else
+#define S3_GLIBC_PREREQ_2_32 0
+#endif
+
+#if defined(__GLIBC__) && S3_GLIBC_PREREQ_2_32
 
     /*
      * strerrordesc_np() is a table lookup: it is async-signal-safe and
