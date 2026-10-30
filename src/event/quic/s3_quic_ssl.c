@@ -697,6 +697,20 @@ s3_quic_client_init_connection(s3_connection_t *c)
         return S3_ERROR;
     }
 
+    /*
+     * the session resumption of the 0-RTT stage 1: the stored ticket
+     * rides the ClientHello, the early-data enable arms the early
+     * keys (the early CONNECT flight is the stage 2 - the 425 gate
+     * keeps the auth out of the replay window meanwhile)
+     */
+
+    SSL_set_app_data(ssl_conn->connection, qc->conf->ssl);
+
+    if (qc->conf->ssl->stored_session != NULL) {
+        SSL_set_session(ssl_conn->connection, qc->conf->ssl->stored_session);
+        SSL_set_quic_tls_early_data_enabled(ssl_conn->connection, 1);
+    }
+
     SSL_set_connect_state(ssl_conn->connection);
 
     if (qc->conf->ssl->alpn.len > 0 &&

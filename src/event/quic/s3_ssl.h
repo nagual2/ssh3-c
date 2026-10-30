@@ -46,6 +46,15 @@ struct s3_ssl_s {
      * closed by s3_ssl_free()
      */
     FILE *keylog_file;
+
+    /*
+     * the newest session ticket of the client (the 0-RTT stage 1):
+     * the new-session callback stores it per process (the Control
+     * Master connections reuse it), SSL_set_session rides it on the
+     * next dial; the persistence across the runs lands with the
+     * stage 2 (the CONNECT-in-0-RTT flight)
+     */
+    SSL_SESSION *stored_session;
 };
 
 /*

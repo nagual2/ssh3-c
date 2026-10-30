@@ -16,7 +16,7 @@
 # usage: early-data-e2e.sh [worktree]
 set -u
 
-ROOT=${1:-/mnt/c/Git/project/ssh3-c}
+ROOT=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 BUILD=$ROOT/build/linux-release
 SERVER=$BUILD/s3interop_server
 FAILURES=0

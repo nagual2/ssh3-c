@@ -148,6 +148,18 @@ s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key,
         SSL_CTX_set_alpn_select_cb(ssl->ctx, s3_ssl_alpn_select_cb, ssl);
     }
 
+    /*
+     * the session resumption groundwork of the 0-RTT stage 1: the
+     * tickets ride the internal server cache, the early-data
+     * advertisement arms the per-SSL enable hook of
+     * s3_quic_init_connection - the client attempts the early flight,
+     * the 425 gate of the CONNECT keeps the auth out of the replay
+     * window (RFC 8470)
+     */
+
+    SSL_CTX_set_session_cache_mode(ssl->ctx, SSL_SESS_CACHE_SERVER);
+    SSL_CTX_set_max_early_data(ssl->ctx, 16384);
+
     return ssl;
 
 failed:
@@ -177,6 +189,31 @@ s3_ssl_free(s3_ssl_t *ssl)
     }
 
     s3_free(ssl);
+}
+
+static int
+s3_ssl_client_new_session_cb(SSL *ssl, SSL_SESSION *session)
+{
+    s3_ssl_t *ssl_conf;
+
+    /* the newest ticket wins: the per-process store of the single
+     * host the CLI dials (the Control Master connections reuse it),
+     * the persistence across the runs lands with the 0-RTT stage 2 */
+
+    ssl_conf = SSL_get_app_data(ssl);
+
+    if (ssl_conf == NULL) {
+        SSL_SESSION_free(session);
+        return 0;
+    }
+
+    if (ssl_conf->stored_session != NULL) {
+        SSL_SESSION_free(ssl_conf->stored_session);
+    }
+
+    ssl_conf->stored_session = session;
+
+    return 1;
 }
 
 s3_ssl_t *
@@ -218,6 +255,13 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
     SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_NONE, NULL);
 
     SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
+
+    /* the client keeps no internal session cache: the tickets land in
+     * the new-session callback (the store of s3_ssl_t) */
+
+    SSL_CTX_set_session_cache_mode(ssl->ctx,
+                                   SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(ssl->ctx, s3_ssl_client_new_session_cb);
 
     return ssl;
 }
