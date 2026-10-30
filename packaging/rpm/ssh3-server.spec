@@ -16,6 +16,11 @@
 Name:           ssh3-server
 Version:        @VERSION@
 Release:        1%{?dist}
+
+# the payload is the prebuilt binaries: the debug extraction has no
+# sources on the packaging host (the build tree paths do not exist
+# there) and the empty debugsourcefiles.list kills the run
+%define debug_package %{nil}
 Summary:        SSH3 server - SSH over QUIC/HTTP3 transport
 License:        BSD-2-Clause
 BuildArch:      @RPMARCH@
