@@ -85,6 +85,150 @@ jobs:
           name: linux-dist
           path: dist/
 
+  linux-arm64-release:
+    name: linux-arm64 (server, deb/rpm/apk)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf rpm
+
+      - name: Cache OpenSSL 3.5.9 (native arm64)
+        id: openssl
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/openssl-3.5
+          key: openssl-3.5.9-linux-aarch64
+
+      - name: Build OpenSSL 3.5.9 (native arm64)
+        if: steps.openssl.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          tar -C /tmp -xzf /tmp/openssl.tar.gz
+          cd /tmp/openssl-3.5.9
+          ./Configure --prefix="$HOME/opt/openssl-3.5" --openssldir="$HOME/opt/openssl-3.5/ssl"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Build and test (linux-release, arm64)
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release
+          ctest --preset linux-release
+
+      - name: Check the tag matches the binary version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER=$(build/linux-release/ssh3-server -V | awk '{print $3}')
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::tag v$TAG does not match the binary version $VER"
+            exit 1
+          fi
+
+      - name: Package (deb/rpm/apk, arm64)
+        run: ARCH=arm64 bash packaging/build.sh all
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp packaging/_build/*arm64.deb packaging/_build/*aarch64.rpm packaging/_build/*aarch64.apk dist/
+          cp build/linux-release/ssh3-server dist/ssh3-server_linux_arm64
+          cp build/linux-release/ssh3 dist/ssh3_linux_arm64
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-dist
+          path: dist/
+
+  alpine-apk:
+    name: alpine (musl apk)
+    runs-on: ubuntu-24.04
+    container:
+      image: alpine:3.22
+    steps:
+      - name: Install the runner and build dependencies
+        run: |
+          apk add --no-cache nodejs git build-base cmake ninja musl-dev \
+            linux-headers zlib-dev zstd-dev lz4-dev openssl-dev perl pkgconf
+
+      - uses: actions/checkout@v4
+
+      - name: Build and test (musl)
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release
+          ctest --preset linux-release
+
+      - name: Package (apk, musl)
+        run: |
+          # the build.sh apk channel assembles the APKv2 streams around
+          # the build-tree binaries - here they are the musl ones, so
+          # the so: depends of .PKGINFO resolve in a plain container
+          bash packaging/build.sh apk
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp packaging/_build/*.apk dist/
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpine-dist
+          path: dist/
+
+  openwrt-ipk:
+    name: openwrt (ipk, SDK 25.12.6)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file curl zstd
+
+      - name: Cache the SDK
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/openwrt-sdk
+          key: openwrt-sdk-25.12.6-mediatek-filogic
+
+      - name: Download the SDK
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/sdk.tar.zst \
+            https://downloads.openwrt.org/releases/25.12.6/targets/mediatek/filogic/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+          mkdir -p ~/openwrt-sdk/sdk
+          tar --zstd -xf /tmp/sdk.tar.zst -C ~/openwrt-sdk/sdk --strip-components=1
+
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Stage the package feed and build the ipk
+        run: |
+          cp -r src/packaging/openwrt ~/openwrt-sdk/sdk/package/ssh3-server
+          cd ~/openwrt-sdk/sdk
+          make defconfig >/dev/null 2>&1
+          make package/ssh3-server/compile V=s
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          find ~/openwrt-sdk/sdk/bin/packages -name 'ssh3-server*.ipk' -exec cp -v {} dist/ \;
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-dist
+          path: dist/
+
   windows-client:
     name: windows (client exe, mingw cross)
     runs-on: ubuntu-24.04
@@ -143,7 +287,7 @@ jobs:
 
   release:
     name: publish GitHub Release
-    needs: [linux-release, windows-client]
+    needs: [linux-release, linux-arm64-release, alpine-apk, windows-client]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -168,6 +312,8 @@ jobs:
             dist/*.apk
             dist/ssh3-server_linux_amd64
             dist/ssh3_linux_amd64
+            dist/ssh3-server_linux_arm64
+            dist/ssh3_linux_arm64
             dist/ssh3_windows_amd64.exe
             dist/libssl-3-x64.dll
             dist/libcrypto-3-x64.dll
@@ -175,10 +321,12 @@ jobs:
           body: |
             ssh3-c ${{ github.ref_name }}
 
-            - `ssh3-server`: deb / rpm / apk packages (amd64); the deb bundles
-              OpenSSL 3.5 for OpenSSL 3.0.x targets (mint 22.x, ubuntu 24.04)
-            - `ssh3-server_linux_amd64`: raw server binary
-            - `ssh3_linux_amd64`: raw client binary
+            - `ssh3-server`: deb / rpm / apk packages (amd64 + arm64); the deb
+              bundles OpenSSL 3.5 for OpenSSL 3.0.x targets (mint 22.x,
+              ubuntu 24.04); the apk is the musl build (alpine 3.22)
+            - `ssh3-server_linux_amd64` / `ssh3-server_linux_arm64`: raw
+              server binaries
+            - `ssh3_linux_amd64` / `ssh3_linux_arm64`: raw client binaries
             - `checksums.txt`: the sha256 of every asset of the release
             - `ssh3_windows_amd64.exe`: the Windows client, icon and version
               resources embedded; needs `libssl-3-x64.dll` / `libcrypto-3-x64.dll`

@@ -462,7 +462,7 @@ build_apk_server() {
     tar --format=ustar --owner=0 --group=0 --numeric-owner \
         -czf "$stage/data.tar.gz" -C "$stage/data" usr
     cat "$stage/control.tar.gz" "$stage/data.tar.gz" \
-        > "$OUT_DIR/ssh3-server_${VERSION}-r0.apk"
+        > "$OUT_DIR/ssh3-server_${VERSION}-r0_${APK_ARCH}.apk"
 }
 
 # the client apk: the CLI, the man page, the same control layout
@@ -481,7 +481,7 @@ build_apk_client() {
     tar --format=ustar --owner=0 --group=0 --numeric-owner \
         -czf "$stage/data.tar.gz" -C "$stage/data" usr
     cat "$stage/control.tar.gz" "$stage/data.tar.gz" \
-        > "$OUT_DIR/ssh3-client_${VERSION}-r0.apk"
+        > "$OUT_DIR/ssh3-client_${VERSION}-r0_${APK_ARCH}.apk"
 }
 
 build_apk() {
