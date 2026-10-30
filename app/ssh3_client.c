@@ -1308,6 +1308,13 @@ s3_cli_usage(const char *prog)
             "              body rides by default (the both-directions canon,\n"
             "              the peer must announce the capability); -Cnone is\n"
             "              the explicit off, a codec name pins it\n"
+            "  -insecure   the test-mode TLS: any peer certificate is\n"
+            "              accepted (the pin check skips; the -o insecure\n"
+            "              twin)\n"
+            "  -strict-host-key-checking yes|no|accept-new  the\n"
+            "              unknown-host policy of the TOFU as a flag (the\n"
+            "              bare form refuses: the value would eat the\n"
+            "              destination)\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
             " certificate pins into %s\n",
@@ -13111,6 +13118,50 @@ main(int argc, char **argv)
 
                     drop = 2;
                 }
+
+            } else if (strcmp(argv[n], "-insecure") == 0) {
+
+                /* the test-mode TLS as a flag: the pin check skips
+                 * entirely - the -o insecure twin rides the same
+                 * variable (s3_cli_cert_check_conn short-circuits) */
+
+                s3_cli_opt_insecure = 1;
+
+                /* the flag word alone leaves the command line */
+
+                drop = 1;
+
+            } else if (strcmp(argv[n], "-strict-host-key-checking") == 0) {
+
+                /*
+                 * the unknown-host policy of the TOFU as a flag: the
+                 * value rides the next word (yes|no|accept-new, the
+                 * case rides the -o machinery). the bare form refuses:
+                 * an optional value would eat the destination of the
+                 * run
+                 */
+
+                if (n + 1 >= argc || (s3_cli_streq_ci(argv[n + 1], "yes") != 0 &&
+                                      s3_cli_streq_ci(argv[n + 1], "no") != 0 &&
+                                      s3_cli_streq_ci(argv[n + 1], "accept-new") != 0)) {
+                    fprintf(stderr, "ssh3: -strict-host-key-checking wants yes|no|accept-new\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                char buf[64];
+
+                snprintf(buf, sizeof(buf), "strict-host-key-checking=%s", argv[n + 1]);
+
+                /* the -o machinery applies it: the same precedence,
+                 * the CLI beats the config -F spelling */
+
+                if (s3_cli_opt_parse(buf) != S3_OK) {
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                value = argv[n + 1];
             }
 
             if (value != NULL) {

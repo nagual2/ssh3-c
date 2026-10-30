@@ -15,6 +15,13 @@
 #      the mismatch (the PIN-MISMATCH-REJECT marker, the MITM shape)
 #   6. the -o insecure accepts the rotated certificate (the
 #      INSECURE-OK marker), the pin store stays untouched
+#   8. the -insecure flag form crosses the rotated certificate (the
+#      FLAG-INSECURE-OK marker)
+#   9. the -strict-host-key-checking yes flag refuses the unpinned
+#      host (the FLAG-STRICT-REJECT marker)
+#  10. the bare -strict-host-key-checking refuses with the value
+#      hint (the FLAG-ARG-REJECT-255 marker), the destination is
+#      not eaten
 #
 # the verdicts: CLIENT-OPT-E2E OK / FAILED, the leg markers on the
 # way
@@ -295,6 +302,50 @@ if run_cli home-insec "insecure" "printf S3-INSECURE-FRESH-OK" &&
 
 else
     fail "the fresh insecure leg: rc=$? $(tail -1 "$WORK/home-insec.err")"
+fi
+
+echo "== leg 8: the -insecure flag crosses the rotated certificate (FLAG-INSECURE-OK)"
+
+if HOME="$WORK/home-flag-insec" timeout 30 "$BUILD/ssh3" -insecure -i "$WORK/priv.pem" \
+    "client@127.0.0.1:$(srv_port)/ssh3-term" "printf S3-FLAG-INSECURE-OK" \
+    > "$WORK/home-flag-insec.out" 2> "$WORK/home-flag-insec.err" &&
+    grep -q "S3-FLAG-INSECURE-OK" "$WORK/home-flag-insec.out"; then
+    pass "the -insecure flag crossed the pin mismatch"
+else
+    fail "the -insecure flag leg: rc=$? $(tail -1 "$WORK/home-flag-insec.err")"
+fi
+
+echo "== leg 9: the -strict-host-key-checking yes flag refuses the unpinned host (FLAG-STRICT-REJECT)"
+
+if HOME="$WORK/home-flag-strict" timeout 30 "$BUILD/ssh3" -strict-host-key-checking yes \
+    -i "$WORK/priv.pem" "client@127.0.0.1:$(srv_port)/ssh3-term" "printf no" \
+    > "$WORK/home-flag-strict.out" 2> "$WORK/home-flag-strict.err"; then
+    fail "the strict flag leg: the run exited 0"
+else
+    RC=$?
+
+    if [ "$RC" -eq 255 ] &&
+        grep -q "refuses an unpinned host" "$WORK/home-flag-strict.err"; then
+        pass "the strict flag refused the unpinned host (rc $RC)"
+    else
+        fail "the strict flag leg: rc=$RC $(tail -1 "$WORK/home-flag-strict.err")"
+    fi
+fi
+
+echo "== leg 10: the bare -strict-host-key-checking refuses, the destination survives (FLAG-ARG-REJECT-255)"
+
+if timeout 10 "$BUILD/ssh3" -strict-host-key-checking bob@127.0.0.1:1/ssh3-term \
+    > "$WORK/leg10.out" 2> "$WORK/leg10.err"; then
+    fail "the bare flag leg: the run exited 0"
+else
+    RC=$?
+
+    if [ "$RC" -eq 255 ] &&
+        grep -q "strict-host-key-checking wants yes|no|accept-new" "$WORK/leg10.err"; then
+        pass "the bare flag refused 255 with the value hint"
+    else
+        fail "the bare flag leg: rc=$RC $(tail -1 "$WORK/leg10.err")"
+    fi
 fi
 
 stop_srv

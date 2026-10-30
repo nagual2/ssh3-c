@@ -85,6 +85,16 @@ ProxyJump, EscapeChar, StrictHostKeyChecking, ControlMaster,
 ControlPath, ControlPersist.
 .It Fl o Ar Key=Value
 A client option override, repeatable, case-insensitive.
+.It Fl insecure
+The test-mode TLS: any peer certificate is accepted (the pin check
+skips; the
+.Fl o Cm insecure
+twin).
+.It Fl strict-host-key-checking Ar yes|no|accept-new
+The unknown-host policy of the TOFU as a flag (the
+.Fl o
+spelling); the bare form refuses, the value would eat the
+destination.
 .It Fl M , Fl S Ar path , Fl O Ar op
 The control master, its socket path and the control ops (check,
 stop, exit) against a running master.
