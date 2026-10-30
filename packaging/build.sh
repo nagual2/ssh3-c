@@ -377,11 +377,37 @@ build_rpm() {
     sed -e "s/@VERSION@/$VERSION/" -e "s/@RPMARCH@/$RPM_ARCH/" \
         "$SCRIPT_DIR/rpm/ssh3-server.spec" > "$top/SPECS/ssh3-server.spec"
     # the foreign architecture needs the target hint: rpmbuild refuses
-    # to build a package of an arch the host does not run
+    # to build a package of an arch the host does not run.  the
+    # debian/ubuntu rpm ignores --target entirely (the vendor patch
+    # keeps the host triple), so the target rides the --define form
+    # next to it, and the host compat chain gains the foreign arch
+    # through a generated rpmrc: the spec BuildArch check is the
+    # BUILDARCH chain of the host arch, and the rpmrc tables take the
+    # first match - the line is extended in place, an appended line
+    # loses to the stock one.  __strip pins the cross strip when the
+    # toolchain is around (the install post would otherwise feed the
+    # foreign payload to the host strip)
     local target_args=()
+    local host_arch rcfile
 
     if [ "$RPM_ARCH" != "$(uname -m)" ]; then
-        target_args=(--target "$RPM_ARCH")
+        host_arch=$(uname -m)
+        rcfile="$top/rpmrc"
+
+        if [ -f /usr/lib/rpm/rpmrc ] && grep -q "^arch_compat: $host_arch:" /usr/lib/rpm/rpmrc; then
+            sed "s/^arch_compat: $host_arch:.*/& $RPM_ARCH/" /usr/lib/rpm/rpmrc > "$rcfile"
+            target_args+=(--rcfile "$rcfile")
+        fi
+
+        target_args+=(--target "$RPM_ARCH"
+            --define "_arch $RPM_ARCH"
+            --define "_target_cpu $RPM_ARCH"
+            --define "_build_arch $RPM_ARCH"
+            --define "_host_cpu $RPM_ARCH")
+
+        if command -v "${MULTIARCH}-strip" >/dev/null 2>&1; then
+            target_args+=(--define "__strip ${MULTIARCH}-strip")
+        fi
     fi
 
     rpmbuild -bb "${target_args[@]}" --define "_topdir $top" \
