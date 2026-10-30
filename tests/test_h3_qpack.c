@@ -27,6 +27,7 @@
 
 #include <s3_core.h>
 #include <s3_h3.h>
+#include <s3_quic_connection.h>
 
 #include "s3_test.h"
 
@@ -262,26 +263,34 @@ s3_test_encoders(void)
     s3_str_t  name, value;
     uintptr_t n;
 
-    /* field section prefix: insert_count 3, sign 0, delta_base 5 */
+    /* field section prefix: insert_count 3 (the RFC 9204 4.5.1.1
+     * wire form: the raw count + 1 modulo 2N), sign 0, delta_base 5 */
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_section_prefix(buf, 3, 0, 5);
     S3_ASSERT((uintptr_t)(end - buf) == 2);
-    S3_ASSERT(buf[0] == 0x03 && buf[1] == 0x05);
+    S3_ASSERT(buf[0] == 0x04 && buf[1] == 0x05);
 
     /* the sign bit goes into the delta_base prefix byte */
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_section_prefix(buf, 3, 1, 5);
     S3_ASSERT((uintptr_t)(end - buf) == 2);
-    S3_ASSERT(buf[0] == 0x03 && buf[1] == 0x85);
+    S3_ASSERT(buf[0] == 0x04 && buf[1] == 0x85);
 
-    /* insert_count 300 overflows the 8-bit prefix: ff 2d, delta 00 */
+    /* the zero count rides the zero special case */
+    s3_memzero(buf, sizeof(buf));
+    end = (u_char *)s3_h3_encode_field_section_prefix(buf, 0, 0, 0);
+    S3_ASSERT((uintptr_t)(end - buf) == 2);
+    S3_ASSERT(buf[0] == 0x00 && buf[1] == 0x00);
+
+    /* insert_count 300 wraps to the ric 45 (300 mod 256 + 1), the
+     * 8-bit prefix rides one byte, delta 00 */
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_section_prefix(buf, 300, 0, 0);
-    S3_ASSERT((uintptr_t)(end - buf) == 3);
-    S3_ASSERT(s3_memcmp(buf, "\xff\x2d\x00", 3) == 0);
+    S3_ASSERT((uintptr_t)(end - buf) == 2);
+    S3_ASSERT(s3_memcmp(buf, "\x2d\x00", 2) == 0);
 
     n = s3_h3_encode_field_section_prefix(NULL, 300, 1, 0);
-    S3_ASSERT(n == 3);
+    S3_ASSERT(n == 2);
 
     /* indexed field line, static index 5: c0 | 5 */
     s3_memzero(buf, sizeof(buf));
@@ -375,9 +384,7 @@ s3_test_encoders(void)
     s3_memzero(buf, sizeof(buf));
     end = (u_char *)s3_h3_encode_field_lpbi(buf, 3, (u_char *)"abc", 3);
     S3_ASSERT((uintptr_t)(end - buf) == 4);
-    S3_ASSERT(s3_memcmp(buf,
-                        "\x03\x82\x1c\x64",
-                        4) == 0);
+    S3_ASSERT(s3_memcmp(buf, "\x03\x82\x1c\x64", 4) == 0);
 
     n = s3_h3_encode_field_lpbi(NULL, 3, (u_char *)"abc", 3);
     S3_ASSERT(n == 4);
@@ -539,8 +546,10 @@ s3_test_dynamic_table(s3_test_env_t *e)
 
     S3_ASSERT(s3_h3_insert(e->c, &name, &value) == S3_H3_ERR_ENCODER_STREAM_ERROR);
 
-    /* the decoder stream feedback is not used */
-    S3_ASSERT(s3_h3_ack_section(e->c, 0) == S3_H3_ERR_DECODER_STREAM_ERROR);
+    /* the decoder stream feedback: the section ack is a tracked
+     * no-op (the entry gate rides the Insert Count Increment), the
+     * increment of unknown inserts refuses (the F2 contract) */
+    S3_ASSERT(s3_h3_ack_section(e->c, 0) == S3_OK);
     S3_ASSERT(s3_h3_inc_insert_count(e->c, 1) == S3_H3_ERR_DECODER_STREAM_ERROR);
 
     /* QPACK 4.5.1.1 required insert count decoding */
@@ -635,6 +644,273 @@ s3_test_empty_value(s3_test_env_t *e)
     S3_ASSERT(value.len == 0);
 }
 
+/*
+ * the F2 encoder instructions: the byte-exact capacity form, the
+ * structural masks of the insert/duplicate forms (the huffman body
+ * rides the round-trip through the real parser below)
+ */
+
+static void
+s3_test_enc_instructions(void)
+{
+    s3_str_t  name = s3_string("server");
+    s3_str_t  value = s3_string("ssh3-c 0.5.5");
+    u_char    buf[256];
+    u_char   *p;
+    uintptr_t n;
+
+    /* Set Dynamic Table Capacity 4096: the first byte 0x20 | 31 =
+     * 0x3f, the continuation varint of 4096 - 31 = 4065 = e1 1f; the
+     * write form returns the past-the-end pointer like the field
+     * lines, the measure the byte count */
+
+    n = s3_h3_encode_insert_capacity(NULL, 4096);
+    S3_ASSERT(n == 3);
+
+    s3_memzero(buf, sizeof(buf));
+    p = (u_char *)s3_h3_encode_insert_capacity(buf, 4096);
+    S3_ASSERT((uintptr_t)(p - buf) == 3);
+    S3_ASSERT(buf[0] == 0x3f && buf[1] == 0xe1 && buf[2] == 0x1f);
+
+    /* the thresh value rides the continuation form (RFC 7541 5.1):
+     * 0x3f then the zero tail; the sub-thresh values ride one byte
+     * (0x20 | value) */
+
+    buf[0] = 0;
+    p = (u_char *)s3_h3_encode_insert_capacity(buf, 31);
+    S3_ASSERT((uintptr_t)(p - buf) == 2 && buf[0] == 0x3f && buf[1] == 0x00);
+
+    buf[0] = 0;
+    p = (u_char *)s3_h3_encode_insert_capacity(buf, 10);
+    S3_ASSERT((uintptr_t)(p - buf) == 1 && buf[0] == 0x2a);
+
+    /* Insert With Literal Name: the 01 prefix, the measure matches
+     * the written bytes */
+
+    s3_memzero(buf, sizeof(buf));
+    p = (u_char *)s3_h3_encode_insert_literal(buf, &name, &value);
+    S3_ASSERT((uintptr_t)(p - buf) > 1);
+    S3_ASSERT((buf[0] & 0xc0) == 0x40);
+    S3_ASSERT((uintptr_t)(p - buf) == s3_h3_encode_insert_literal(NULL, &name, &value));
+
+    /* Duplicate: the 000 prefix, the 5-bit index under 31 rides one
+     * byte */
+
+    n = s3_h3_encode_duplicate(NULL, 7);
+    S3_ASSERT(n == 1);
+
+    s3_memzero(buf, sizeof(buf));
+    p = (u_char *)s3_h3_encode_duplicate(buf, 7);
+    S3_ASSERT((uintptr_t)(p - buf) == 1 && buf[0] == 0x07);
+
+    /* Insert With Name Reference: the static form carries 0xc0, the
+     * dynamic 0x80, the index rides the 6-bit prefix; the string body
+     * rides raw under the accumulator floor (len < 17) */
+
+    s3_memzero(buf, sizeof(buf));
+    n = s3_h3_encode_insert_name_ref(NULL, 0, 40, (u_char *)"one", 3);
+    p = (u_char *)s3_h3_encode_insert_name_ref(buf, 0, 40, (u_char *)"one", 3);
+    S3_ASSERT((uintptr_t)(p - buf) == n);
+    S3_ASSERT((buf[0] & 0xc0) == 0xc0);
+
+    s3_memzero(buf, sizeof(buf));
+    p = (u_char *)s3_h3_encode_insert_name_ref(buf, 1, 40, (u_char *)"one", 3);
+    S3_ASSERT((buf[0] & 0xc0) == 0x80);
+}
+
+/*
+ * the F2 round-trip: the encoder inserts ride the encoder uni stream
+ * into the receiving table through the real instruction parser, the
+ * peer ack unlocks the references, the literal fallback covers the
+ * unacked entry and the capacity-less peer
+ */
+
+static void
+s3_test_enc_roundtrip(void)
+{
+    /* the fresh env: the shared table of the main env carries the
+     * other tests' entries, the roundtrip pins the exact counts */
+
+    static s3_test_env_t e;
+
+    u_char                sec[256], *p;
+    s3_str_t              name = s3_string("server");
+    s3_str_t              value = s3_string("ssh3-c 0.5.5");
+    s3_h3_parse_uni_t     ust;
+    s3_h3_parse_headers_t hst;
+    s3_quic_stream_t     *qs;
+    s3_connection_t      *sc, *enc;
+    s3_buf_t              b;
+    s3_str_t              fname, fvalue;
+    u_char                full[512];
+    u_char                uni[512];
+    u_char               *q;
+    size_t                in_len_0, prev;
+
+    if (s3_test_env_init(&e) != S3_OK) {
+        printf("FAIL env init (roundtrip)\n");
+        s3_test_failures++;
+        return;
+    }
+
+    s3_test_dec_sink_len = 0;
+
+    /* the request stream shape: c->data carries the quic stream, the
+     * parent resolution of s3_h3_enc_field walks it */
+
+    qs = s3_pcalloc(e.ctx.pool, sizeof(s3_quic_stream_t));
+    S3_ASSERT(qs != NULL);
+    qs->parent = e.c;
+
+    sc = s3_test_new_stream(&e);
+    S3_ASSERT(sc != NULL);
+    sc->data = qs;
+
+    /* the encoder uni stream with the fake send collects the
+     * instructions */
+
+    enc = s3_test_new_stream(&e);
+    S3_ASSERT(enc != NULL);
+
+    e.h3c->known_streams[S3_H3_STREAM_ENCODER] = enc;
+    enc->send_chain = s3_test_send_chain;
+
+    /* the peer capacity arms the encoder table */
+
+    S3_ASSERT(s3_h3_enc_capacity(e.c, 4096) == S3_OK);
+    S3_ASSERT(e.h3c->peer_capacity == 4096);
+    S3_ASSERT(e.h3c->encoder.capacity == 4096);
+    S3_ASSERT(e.h3c->encoder.elts != NULL);
+
+    /* the first field line: the fresh insert rides the literal, the
+     * capacity + literal-insert instructions went to the encoder
+     * stream */
+
+    p = sec;
+    p = s3_h3_enc_field(sc, p, &name, &value);
+
+    S3_ASSERT(p > sec);
+    S3_ASSERT(e.h3c->encoder.insert_count == 1);
+    S3_ASSERT(s3_test_dec_sink_len > 2);
+    S3_ASSERT(s3_test_dec_sink[0] == 0x3f); /* the capacity instruction first */
+
+    in_len_0 = s3_test_dec_sink_len;
+
+    /* the entry sits in the encoder table unacked: the second field
+     * line rides the literal again (no one-byte ri, no duplicate
+     * insert, no duplicate instruction) */
+
+    p = sec;
+    p = s3_h3_enc_field(sc, p, &name, &value);
+
+    S3_ASSERT((uintptr_t)(p - sec) > 1);
+    S3_ASSERT((sec[0] & 0xc0) != 0x80);
+    S3_ASSERT(e.h3c->encoder.insert_count == 1);
+    S3_ASSERT(s3_test_dec_sink_len == in_len_0);
+
+    /* the peer decoder ingests the instructions through the real uni
+     * parser (the qpack encoder stream type 0x02 leads, the
+     * instructions follow): the entry lands in the receiving table */
+
+    s3_memzero(&ust, sizeof(ust));
+
+    uni[0] = S3_H3_STREAM_ENCODER; /* the stream type varint */
+    s3_memcpy(uni + 1, s3_test_dec_sink, s3_test_dec_sink_len);
+
+    b.memory = 1;
+    b.pos = uni;
+    b.last = uni + 1 + s3_test_dec_sink_len;
+
+    while (b.pos < b.last) {
+
+        s3_int_t rc;
+
+        prev = (size_t)(b.pos - uni);
+
+        rc = s3_h3_parse_uni(e.c, &ust, &b);
+        S3_ASSERT(rc == S3_OK || rc == S3_AGAIN);
+        S3_ASSERT((size_t)(b.pos - uni) > prev);
+    }
+
+    S3_ASSERT(e.h3c->table.insert_count == 1);
+
+    S3_ASSERT(s3_h3_lookup(e.c, 0, &fname, &fvalue) == S3_OK);
+    S3_ASSERT(fname.len == 6 && s3_memcmp(fname.data, "server", 6) == 0);
+    S3_ASSERT(fvalue.len == 12 && s3_memcmp(fvalue.data, "ssh3-c 0.5.5", 12) == 0);
+
+    /* the peer acks the insert: the reference unlocks, the field line
+     * rides the one-byte dynamic ri of the relative index 0 */
+
+    S3_ASSERT(s3_h3_inc_insert_count(e.c, 1) == S3_OK);
+    S3_ASSERT(e.h3c->encoder.ack_insert_count == 1);
+
+    p = sec;
+    p = s3_h3_enc_field(sc, p, &name, &value);
+
+    S3_ASSERT((uintptr_t)(p - sec) == 1);
+    S3_ASSERT(sec[0] == 0x80);
+
+    /* the section decodes through the real headers parser (the
+     * HEADERS frame header + the required insert count of the acked
+     * entry + the field line): the dynamic reference resolves into
+     * the receiving table entry; the section is built first, the
+     * frame length rides the exact section size */
+
+    q = full + 2;
+    q = (u_char *)s3_h3_encode_field_section_prefix(q, 1, 0, 0);
+    s3_memcpy(q, sec, (size_t)(p - sec));
+    q += (size_t)(p - sec);
+
+    full[0] = S3_H3_FRAME_HEADERS;
+    full[1] = (u_char)(q - full - 2);
+
+    s3_memzero(&hst, sizeof(hst));
+
+    b.memory = 1;
+    b.pos = full;
+    b.last = q;
+
+    for (;;) {
+
+        s3_int_t rc = s3_h3_parse_headers(e.c, &hst, &b);
+
+        if (rc == S3_OK) {
+            fname = hst.field_rep.field.name;
+            fvalue = hst.field_rep.field.value;
+            continue;
+        }
+
+        if (rc == S3_DONE) {
+            fname = hst.field_rep.field.name;
+            fvalue = hst.field_rep.field.value;
+            break;
+        }
+
+        fprintf(stderr, "DBG hdr rc=%d consumed=%zu of %zu\n", (int)rc, (size_t)(b.pos - full),
+                (size_t)(q - full));
+
+        S3_ASSERT(rc == S3_AGAIN || rc == S3_BUSY);
+        break;
+    }
+
+    S3_ASSERT(fname.len == 6 && s3_memcmp(fname.data, "server", 6) == 0);
+    S3_ASSERT(fvalue.len == 12 && s3_memcmp(fvalue.data, "ssh3-c 0.5.5", 12) == 0);
+
+    /* the capacity-less peer: everything rides the literals */
+
+    e.h3c->peer_capacity = 0;
+
+    p = sec;
+    p = s3_h3_enc_field(sc, p, &name, &value);
+    S3_ASSERT((uintptr_t)(p - sec) > 1);
+
+    while (e.npools > 0) {
+        s3_destroy_pool(e.pools[--e.npools]);
+    }
+
+    s3_test_close(e.fd);
+}
+
 static int
 s3_test_h3_qpack(void)
 {
@@ -644,6 +920,7 @@ s3_test_h3_qpack(void)
     s3_test_varlen();
     s3_test_prefix();
     s3_test_encoders();
+    s3_test_enc_instructions();
 
     if (s3_test_env_init(&e) != S3_OK) {
         printf("FAIL env init\n");
@@ -653,6 +930,14 @@ s3_test_h3_qpack(void)
     s3_test_static_table(&e);
     s3_test_dynamic_table(&e);
     s3_test_empty_value(&e);
+
+    s3_test_close(e.fd);
+
+    while (e.npools > 0) {
+        s3_destroy_pool(e.pools[--e.npools]);
+    }
+
+    s3_test_enc_roundtrip();
 
     s3_test_close(e.fd);
 

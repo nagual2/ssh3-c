@@ -419,8 +419,9 @@ s3_test_encoder_decoder(s3_connection_t *c)
     buf[3] = 0x01;
     b = s3_test_buf(buf, 4);
     rc = s3_h3_parse_uni(c, &st, &b);
-    /* the server decoder does not track dynamic sections */
-    S3_ASSERT(rc == S3_H3_ERR_DECODER_STREAM_ERROR);
+    /* the ack is a tracked no-op (the F2 entry gate rides the Insert
+     * Count Increment, the section ack alone cannot advance it) */
+    S3_ASSERT(rc == S3_AGAIN);
 
     /* Insert Count Increment, 6-bit: 5 */
     s3_memzero(&st, sizeof(s3_h3_parse_uni_t));
@@ -695,7 +696,7 @@ s3_test_field_lifetime(s3_connection_t *c)
     p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
     sec_len = (size_t)(p - sec);
 
-    buf[0] = 0x01; /* the HEADERS frame */
+    buf[0] = 0x01;            /* the HEADERS frame */
     buf[1] = (u_char)sec_len; /* the frame length (the one-byte varint) */
 
     s3_memzero(&st, sizeof(st));

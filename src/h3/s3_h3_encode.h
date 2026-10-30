@@ -22,4 +22,12 @@ uintptr_t s3_h3_encode_field_l(u_char *p, s3_str_t *name, s3_str_t *value);
 uintptr_t s3_h3_encode_field_pbi(u_char *p, s3_uint_t index);
 uintptr_t s3_h3_encode_field_lpbi(u_char *p, s3_uint_t index, u_char *data, size_t len);
 
+/* the QPACK encoder instructions (RFC 9204 4.3, the F2 item) */
+
+uintptr_t s3_h3_encode_insert_capacity(u_char *p, s3_uint_t capacity);
+uintptr_t s3_h3_encode_insert_name_ref(u_char *p, s3_uint_t dynamic, s3_uint_t index, u_char *data,
+                                       size_t len);
+uintptr_t s3_h3_encode_insert_literal(u_char *p, s3_str_t *name, s3_str_t *value);
+uintptr_t s3_h3_encode_duplicate(u_char *p, s3_uint_t index);
+
 #endif /* _S3_H3_ENCODE_H_INCLUDED_ */

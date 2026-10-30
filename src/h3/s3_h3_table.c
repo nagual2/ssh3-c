@@ -6,6 +6,8 @@
  */
 
 #include <s3_h3.h>
+#include <s3_h3_encode.h>
+#include <s3_quic_connection.h>
 
 #define s3_h3_table_entry_size(n, v) ((n)->len + (v)->len + 32)
 
@@ -406,19 +408,49 @@ s3_h3_ack_section(s3_connection_t *c, s3_uint_t stream_id)
 {
     s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 ack section %ui", stream_id);
 
-    /* we do not use dynamic tables */
+    /*
+     * ssh3-c (F2): the peer acknowledged a decoded section on this
+     * stream.  the section cannot advance the encoder ack count on
+     * its own (the Section Acknowledgment carries the stream id, not
+     * the required insert count this side tracked) - the entry gate
+     * rides the Insert Count Increment below, the only sound signal
+     * of "the peer table holds our inserts"
+     */
 
-    return S3_H3_ERR_DECODER_STREAM_ERROR;
+    return S3_OK;
 }
 
 s3_int_t
 s3_h3_inc_insert_count(s3_connection_t *c, s3_uint_t inc)
 {
+    s3_h3_session_t       *h3c;
+    s3_h3_dynamic_table_t *et;
+
     s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 increment insert count %ui", inc);
 
-    /* we do not use dynamic tables */
+    /*
+     * ssh3-c (F2): the peer Insert Count Increment - its decoder
+     * consumed our new entries, they are referenceable now.  the
+     * decoder-side struct keeps its own count for the (dormant,
+     * capacity 0) receiving table
+     */
 
-    return S3_H3_ERR_DECODER_STREAM_ERROR;
+    h3c = s3_h3_get_session(c);
+
+    if (h3c == NULL) {
+        return S3_H3_ERR_DECODER_STREAM_ERROR;
+    }
+
+    et = &h3c->encoder;
+    et->ack_insert_count += inc;
+
+    if (et->ack_insert_count > et->insert_count) {
+        s3_log_error(S3_LOG_ERR, c->log, 0, "http3 peer acknowledged unknown inserts");
+        et->ack_insert_count = et->insert_count;
+        return S3_H3_ERR_DECODER_STREAM_ERROR;
+    }
+
+    return S3_OK;
 }
 
 s3_int_t
@@ -678,6 +710,11 @@ s3_h3_send_inc_insert_count(s3_connection_t *c, s3_uint_t inc)
 
     h3c = s3_h3_get_session(c);
 
+    /* the server decoder stream slot: the client side sends no Insert
+     * Count Increment today (its receiving table is dormant at the
+     * capacity 0 of our SETTINGS), the role-correct slot comes with
+     * the client decoder wake-up */
+
     dc = h3c->known_streams[S3_H3_STREAM_SERVER_DECODER];
 
     if (dc == NULL || dc->send_chain == NULL) {
@@ -719,6 +756,14 @@ s3_h3_set_param(s3_connection_t *c, uint64_t id, uint64_t value)
     case S3_H3_PARAM_MAX_TABLE_CAPACITY:
         s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 param QPACK_MAX_TABLE_CAPACITY:%uL",
                       value);
+
+        /*
+         * ssh3-c (F2): the peer capacity arms the encoder table - the
+         * references stay gated on the acks, so an announced capacity
+         * alone changes nothing until the peer acks
+         */
+
+        (void)s3_h3_enc_capacity(c, (s3_uint_t)value);
         break;
 
     case S3_H3_PARAM_MAX_FIELD_SECTION_SIZE:
@@ -737,4 +782,258 @@ s3_h3_set_param(s3_connection_t *c, uint64_t id, uint64_t value)
     }
 
     return S3_OK;
+}
+
+/*
+ * the encoder side of the dynamic table (F2).  the capacity arrives
+ * with the peer SETTINGS (QPACK_MAX_TABLE_CAPACITY), the inserts ride
+ * the encoder uni stream, the references carry only the entries the
+ * peer acknowledged through the Insert Count Increment.  the table
+ * never evicts - the relative indexes of the live entries stay stable
+ * for the session life, the inserts stop at the capacity instead.
+ * the lifetime follows the s3_h3_insert pattern: the entries copy
+ * into the connection pool inside the handler, nothing references the
+ * caller buffers after the return (the B1 agreement)
+ */
+
+static s3_connection_t *
+s3_h3_enc_parent(s3_connection_t *c)
+{
+    s3_quic_stream_t *qs;
+
+    if (s3_quic_get_connection(c) != NULL) {
+        return c;
+    }
+
+    qs = c->data;
+
+    return (qs != NULL) ? qs->parent : NULL;
+}
+
+static s3_int_t
+s3_h3_enc_send_instruction(s3_connection_t *pc, u_char *buf, size_t n)
+{
+    s3_buf_t              b;
+    s3_chain_t            cl;
+    s3_connection_t      *ec;
+    s3_h3_session_t      *h3c;
+    s3_quic_connection_t *qc;
+    unsigned              slot;
+
+    h3c = s3_h3_get_session(pc);
+
+    /* the role slot of the outgoing encoder stream (the uni_index
+     * mapping): the client conn rides its own encoder, the server
+     * conn its own; the qc-less connections (the test stands) ride
+     * the client slot */
+
+    qc = s3_quic_get_connection(pc);
+
+    slot = (qc == NULL || qc->client) ? S3_H3_STREAM_CLIENT_ENCODER : S3_H3_STREAM_SERVER_ENCODER;
+
+    ec = h3c->known_streams[slot];
+
+    if (ec == NULL || ec->send_chain == NULL) {
+        return S3_DECLINED;
+    }
+
+    s3_memzero(&b, sizeof(s3_buf_t));
+
+    b.memory = 1;
+    b.pos = buf;
+    b.last = buf + n;
+
+    cl.buf = &b;
+    cl.next = NULL;
+
+    if (ec->send_chain(ec, &cl, 0) == S3_CHAIN_ERROR || b.pos != b.last) {
+        /* the window or the stream is gone: no state bump, the field
+         * line rides the literal and the next response retries */
+
+        return S3_DECLINED;
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_h3_enc_capacity(s3_connection_t *c, s3_uint_t capacity)
+{
+    s3_uint_t              max;
+    s3_h3_field_t        **elts;
+    s3_h3_session_t       *h3c;
+    s3_h3_dynamic_table_t *et;
+
+    /*
+     * the session conn (the parent) rides in: the capacity arrives
+     * with the peer SETTINGS, and the settings parse always walks the
+     * parent (uni.c resolves it before the control parse)
+     */
+
+    h3c = s3_h3_get_session(c);
+
+    if (h3c == NULL) {
+        return S3_DECLINED;
+    }
+
+    if (capacity > S3_H3_MAX_TABLE_CAPACITY) {
+        capacity = S3_H3_MAX_TABLE_CAPACITY;
+    }
+
+    h3c->peer_capacity = capacity;
+    et = &h3c->encoder;
+
+    if (capacity == 0 || capacity <= et->capacity) {
+        return S3_OK;
+    }
+
+    max = capacity / 32;
+
+    elts = s3_palloc(c->pool, (max + 1) * sizeof(void *));
+    if (elts == NULL) {
+        return S3_ERROR;
+    }
+
+    if (et->elts) {
+        s3_memcpy(elts, et->elts, et->nelts * sizeof(void *));
+    }
+
+    et->elts = elts;
+    et->capacity = capacity;
+
+    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 encoder table capacity %ui", capacity);
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_h3_enc_insert(s3_connection_t *pc, s3_str_t *name, s3_str_t *value)
+{
+    u_char                 buf[1024], *p;
+    size_t                 size, n;
+    s3_h3_field_t         *field;
+    s3_h3_session_t       *h3c;
+    s3_h3_dynamic_table_t *et;
+
+    h3c = s3_h3_get_session(pc);
+    et = &h3c->encoder;
+
+    size = s3_h3_table_entry_size(name, value);
+
+    if (et->capacity == 0 || size > et->capacity || et->capacity - et->size < size) {
+        return S3_DECLINED;
+    }
+
+    p = buf;
+
+    /* the capacity instruction rides the first insert (RFC 9204
+     * 4.3.1): the peer decoder applies it before the entries */
+
+    if (et->insert_count == 0) {
+        p = (u_char *)s3_h3_encode_insert_capacity(p, et->capacity);
+    }
+
+    p = (u_char *)s3_h3_encode_insert_literal(p, name, value);
+    n = (size_t)(p - buf);
+
+    if (n > sizeof(buf) || s3_h3_enc_send_instruction(pc, buf, n) != S3_OK) {
+        return S3_DECLINED;
+    }
+
+    field = s3_palloc(pc->pool, sizeof(s3_h3_field_t) + name->len + value->len);
+    if (field == NULL) {
+        return S3_DECLINED;
+    }
+
+    field->name.data = (u_char *)field + sizeof(s3_h3_field_t);
+    field->name.len = name->len;
+    field->value.data = field->name.data + name->len;
+    field->value.len = value->len;
+    s3_memcpy(field->name.data, name->data, name->len);
+    s3_memcpy(field->value.data, value->data, value->len);
+
+    et->elts[et->nelts++] = field;
+    et->size += size;
+    et->insert_count++;
+
+    s3_log_debug4(S3_LOG_DEBUG_EVENT, pc->log, 0,
+                  "http3 encoder insert [%uL] \"%V\":\"%V\", size:%uz", et->insert_count, name,
+                  value, size);
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_h3_enc_lookup(s3_connection_t *pc, s3_str_t *name, s3_str_t *value, s3_uint_t acked_only,
+                 s3_uint_t *index)
+{
+    s3_uint_t              k;
+    s3_h3_session_t       *h3c;
+    s3_h3_dynamic_table_t *et;
+
+    h3c = s3_h3_get_session(pc);
+    et = &h3c->encoder;
+
+    for (k = 0; k < et->nelts; k++) {
+
+        s3_h3_field_t *field = et->elts[k];
+
+        /* the reference gate: the acked entries only, the peer Insert
+         * Count Increment is the signal (an unacked reference would
+         * block the peer decoder, no BLOCKED_STREAMS is announced) */
+
+        if (acked_only && (uint64_t)(k + 1) > et->ack_insert_count) {
+            continue;
+        }
+
+        if (field->name.len == name->len && field->value.len == value->len &&
+            s3_memcmp(field->name.data, name->data, name->len) == 0 &&
+            s3_memcmp(field->value.data, value->data, value->len) == 0) {
+
+            /*
+             * the QPACK relative index: the distance from the top the
+             * DECODER sees - the ack count (the entries the peer
+             * consumed), not our total: the section prefix declares
+             * the required insert count = the ack count, so the
+             * decoder resolves abs = RIC - 1 - rel = k (the absolute
+             * of elts[k], the 0-based insert order, the table never
+             * evicts).  the unacked tail of our table stays invisible
+             * to the reference math
+             */
+
+            *index = (s3_uint_t)(et->ack_insert_count - 1 - k);
+
+            return S3_OK;
+        }
+    }
+
+    return S3_DECLINED;
+}
+
+u_char *
+s3_h3_enc_field(s3_connection_t *c, u_char *p, s3_str_t *name, s3_str_t *value)
+{
+    s3_connection_t *pc;
+    s3_h3_session_t *h3c;
+    s3_uint_t        index;
+
+    pc = s3_h3_enc_parent(c);
+
+    if (pc == NULL || (h3c = s3_h3_get_session(pc)) == NULL || h3c->peer_capacity == 0) {
+        return (u_char *)s3_h3_encode_field_l(p, name, value);
+    }
+
+    if (s3_h3_enc_lookup(pc, name, value, 1, &index) == S3_OK) {
+        return (u_char *)s3_h3_encode_field_ri(p, 1, index);
+    }
+
+    /* the fresh insert is unacked: this section carries the literal,
+     * the next response references the entry; an entry that already
+     * sits in the table unacked does not insert again */
+
+    if (s3_h3_enc_lookup(pc, name, value, 0, &index) != S3_OK) {
+        (void)s3_h3_enc_insert(pc, name, value);
+    }
+
+    return (u_char *)s3_h3_encode_field_l(p, name, value);
 }

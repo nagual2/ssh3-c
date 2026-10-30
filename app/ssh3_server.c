@@ -1846,17 +1846,20 @@ s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
 }
 
 static u_char *
-s3_srv_h3_put_status(u_char *p, unsigned code)
+s3_srv_h3_put_status(u_char *p, unsigned code, s3_uint_t ric)
 {
     s3_str_t name, value;
     u_char   digits[8];
     int      n;
 
     /*
-     * the zero prefix: the static-table reference or a literal below,
-     * the dynamic table is never referenced either way
+     * the required insert count of the section = the ack count of our
+     * encoder table (the F2 references ride the acked entries only,
+     * so the peer never blocks on the section: the BLOCKED_STREAMS
+     * budget we announce is zero); the zero ric of the static-only
+     * sections keeps the old wire shape
      */
-    p = (u_char *)s3_h3_encode_field_section_prefix(p, 0, 0, 0);
+    p = (u_char *)s3_h3_encode_field_section_prefix(p, ric, 0, 0);
 
     if (code == 200) {
         /* RFC 9204 static table: 25 = ":status: 200" */
@@ -1902,10 +1905,21 @@ s3_srv_h3_flush(s3_srv_preauth_t *pa)
 static void
 s3_srv_h3_send_status(s3_srv_preauth_t *pa, unsigned code)
 {
-    u_char  sec[512];
-    u_char *p;
-    size_t  sec_len, total;
-    ssize_t m;
+    u_char           sec[512];
+    u_char          *p;
+    size_t           sec_len, total;
+    ssize_t          m;
+    s3_h3_session_t *h3c;
+    s3_uint_t        ric;
+
+    /*
+     * the required insert count of the section: the ack count of the
+     * encoder table of this connection (the F2 side; the peer has
+     * consumed those inserts, the section never blocks it)
+     */
+
+    h3c = (pa->pc != NULL) ? s3_h3_get_session(pa->pc) : NULL;
+    ric = (h3c != NULL) ? (s3_uint_t)h3c->encoder.ack_insert_count : 0;
 
     /*
      * the section is built into the scratch buffer first: the HEADERS
@@ -1915,7 +1929,7 @@ s3_srv_h3_send_status(s3_srv_preauth_t *pa, unsigned code)
      * and the section follows it
      */
     p = sec;
-    p = s3_srv_h3_put_status(p, code);
+    p = s3_srv_h3_put_status(p, code, ric);
 
     /*
      * the Server field of the reference rides EVERY response: the
@@ -1940,7 +1954,12 @@ s3_srv_h3_send_status(s3_srv_preauth_t *pa, unsigned code)
         value.data = version;
         value.len = version_len;
 
-        p = (u_char *)s3_h3_encode_field_l(p, &name, &value);
+        /* the F2 encoder: the field rides the acked dynamic entry of
+         * the peer table when the peer announced the capacity, the
+         * literals stay the fallback (the unacked fresh insert rides
+         * the literal too) */
+
+        p = s3_h3_enc_field(pa->sc, p, &name, &value);
     }
 
     sec_len = (size_t)(p - sec);

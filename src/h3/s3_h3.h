@@ -80,6 +80,20 @@ struct s3_h3_session_s {
     s3_h3_dynamic_table_t table;
 
     /*
+     * ssh3-c (F2): the encoder side of QPACK - the table we insert
+     * into and reference the acked entries from (the struct above is
+     * the decoder side, what the peer inserts into).  the references
+     * ride only the entries the peer acknowledged through the Insert
+     * Count Increment, so no blocked streams and no BLOCKED_STREAMS
+     * accounting; the peer capacity 0 (our own SETTINGS announce
+     * zero) keeps the side dormant.  the table never evicts: the
+     * relative indexes of the live entries stay stable for the
+     * session life, the inserts stop at the capacity instead
+     */
+    s3_h3_dynamic_table_t encoder;
+    uint64_t              peer_capacity;
+
+    /*
      * ssh3-c: the event context of the parent connection; nginx posts
      * to the global ngx_posted_events queue, the kernel uses
      * per-context queues, so the table layer needs the ctx reference
