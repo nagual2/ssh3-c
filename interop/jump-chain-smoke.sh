@@ -6,7 +6,7 @@
 # the deadline
 set -u
 
-ROOT=/mnt/c/Git/project/ssh3-c
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/build/linux-release}
 WORK=$(mktemp -d /tmp/s3jc.XXXXXX)
 FAILURES=0
@@ -86,13 +86,35 @@ start_srv() {
     fi
 }
 
+# the v6 form of the same stand: the bracketed listen of the daemon
+
+start_srv6() {
+    TAG=$1
+    shift
+
+    setsid nohup env SSH3C_PROTO=1 "$BUILD/ssh3-server" -3 "$@" \
+        -l "[::1]:0" -c "$WORK/cert-$TAG.pem" -k "$WORK/key-$TAG.pem" \
+        -K "$WORK/authorized_keys" > "$WORK/srv-$TAG.log" 2>&1 < /dev/null &
+
+    if ! wait_listen "$WORK/srv-$TAG.log"; then
+        die "the server $TAG did not start"
+    fi
+}
+
+mkcert 4
+mkcert 5
+
 start_srv 1 -d 1352
 start_srv 2 -d 1352
 start_srv 3
+start_srv6 4 -d 1352
+start_srv6 5
 
 J1PORT=$(port_of "$WORK/srv-1.log")
 J2PORT=$(port_of "$WORK/srv-2.log")
 IPORT=$(port_of "$WORK/srv-3.log")
+J6PORT=$(port_of "$WORK/srv-4.log")
+I6PORT=$(port_of "$WORK/srv-5.log")
 
 # the pin store: both hops and the destination pin before the run
 
@@ -141,6 +163,20 @@ else
     else
         echo "   PASS (clean refusal in $((NOW - START))s)"
     fi
+fi
+
+echo "== v6: the -6 chain rides the bracketed hop and destination (JUMP-V6-OK)"
+
+if HOME="$WORK/home6" timeout 40 "$BUILD/ssh3" -6 -insecure -i "$WORK/priv.pem" \
+    -J "[::1]:$J6PORT" \
+    "client@[::1]:$I6PORT/ssh3-term" "printf S3-JUMP-V6-OK" \
+    > "$WORK/v6.out" 2>"$WORK/v6.err" &&
+    grep -q "S3-JUMP-V6-OK" "$WORK/v6.out"; then
+    echo "   PASS: the -6 chain rode the v6 hop and destination"
+else
+    echo "   FAIL: rc=$?"
+    tail -8 "$WORK/v6.err" | sed 's/^/   /'
+    FAILURES=$((FAILURES + 1))
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

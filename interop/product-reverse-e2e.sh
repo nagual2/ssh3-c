@@ -147,7 +147,29 @@ def udp_srv():
         s.sendto(d, a)
 
 
-{"tcp": tcp_srv, "udp": udp_srv}[sys.argv[1]]()
+def tcp6_srv():
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("::1", 19123))
+    s.listen(8)
+    print("ECHO-READY tcp6", flush=True)
+
+    def handle(c):
+        try:
+            while 1:
+                d = c.recv(65536)
+                if not d:
+                    break
+                c.sendall(d)
+        finally:
+            c.close()
+
+    while 1:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+{"tcp": tcp_srv, "udp": udp_srv, "tcp6": tcp6_srv}[sys.argv[1]]()
 PYEOF
 
 start_echo() {
@@ -157,7 +179,7 @@ start_echo() {
 
 stop_echo() {
 
-    for k in tcp udp; do
+    for k in tcp udp tcp6; do
 
         if [ -f "$WORK/echo-$k.pid" ]; then
             kill "$(cat "$WORK/echo-$k.pid")" 2>/dev/null
@@ -470,20 +492,30 @@ fi
 
 stop_srv
 
-echo "== leg 5: the ipv6 target refuses at the parse (the ipv4-only bridge)"
+echo "== leg 5: the ipv6 target relay carries 64 KiB byte-exact (PRODUCT-REVERSE-V6TARGET-OK)"
 
-if timeout 10 "$BUILD/ssh3" -R "0:[::1]:19121" bob@127.0.0.1:1/ssh3-term \
-    > "$WORK/leg5.out" 2> "$WORK/leg5.err"; then
-    fail "the ipv6 target leg: the run exited 0"
-else
-    RC=$?
+start_srv --run-as-user off || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
 
-    if [ "$RC" -eq 255 ] && grep -q "is not an ipv4 socket" "$WORK/leg5.err"; then
-        pass "the ipv6 target refused at the parse (rc $RC)"
+start_echo tcp6
+wait_echo tcp6 || die "the tcp6 echo did not start"
+
+S3CLILOG="$WORK/cli-v6tgt.log"
+start_cli -R "0:[::1]:19123"
+
+if wait_bind; then
+    if timeout 30 python3 "$WORK/tcp_probe.py" "$RPORT" > "$WORK/tcp6.log" 2>&1 &&
+        grep -q "TCP-PROBE-OK" "$WORK/tcp6.log"; then
+        pass "the v6 target relay carried 64 KiB byte-exact"
     else
-        fail "the ipv6 target leg: rc=$RC $(tail -1 "$WORK/leg5.err")"
+        fail "the v6 target relay leg: $(tail -2 "$WORK/tcp6.log")"
     fi
+
+else
+    fail "the v6 target relay leg: no bind $(tail -2 "$S3CLILOG")"
 fi
+
+stop_cli
+stop_srv
 
 echo "== leg 6: the ipv6 bind is refused by the server (fail-closed)"
 

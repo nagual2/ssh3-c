@@ -4,7 +4,7 @@
 # daemon; the client rides the -L forwards
 set -u
 
-BUILD=/mnt/c/Git/project/ssh3-c/build/linux-release
+BUILD=${BUILD:-$(cd "$(dirname "$0")/../build/linux-release" && pwd)}
 WORK=/tmp/s3v6-$$
 mkdir -p "$WORK/home/.ssh3"
 CERT=$WORK/cert.pem

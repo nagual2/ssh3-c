@@ -3441,9 +3441,34 @@ s3_cli_jump_hop_parse_one(s3_cli_jump_hop_t *hop, const char *spec)
         s = at + 1;
     }
 
-    colon = strchr(s, ':');
+    /* the bracketed ipv6 hop ([::1] or [::1]:port, the ssh2 Host
+     * entry shape): the literal colons stay inside the fences, the
+     * port splits behind the closing one; the bare form keeps the
+     * host:port split */
 
-    if (colon != NULL) {
+    if (*s == '[') {
+
+        const char *end = strchr(s + 1, ']');
+
+        if (end == NULL) {
+            fprintf(stderr, "ssh3: bad jump host in %s (the unclosed bracket)\n", spec);
+            return S3_ERROR;
+        }
+
+        len = (size_t)(end - s - 1);
+        s++;
+
+        if (end[1] == ':') {
+
+            hop->port = (unsigned)atoi(end + 2);
+
+            if (hop->port == 0 || hop->port > 65535) {
+                fprintf(stderr, "ssh3: bad jump port in %s\n", spec);
+                return S3_ERROR;
+            }
+        }
+
+    } else if ((colon = strchr(s, ':')) != NULL) {
 
         hop->port = (unsigned)atoi(colon + 1);
 
@@ -7156,19 +7181,11 @@ s3_cli_rev_parse_spec(const char *arg)
         return S3_ERROR;
     }
 
-    /*
-     * the family policy of the bridge (the -L canon): the local half
-     * of the reverse bridge dials the ipv4 targets only, so a v6
-     * target would bind the port on the server and never carry a
-     * byte - the refusal rides the parse, before the request is sent
-     * (the fail-closed shape of the direct forward)
-     */
-
-    if (s3_cli_rtarget[s3_cli_rspec_count].family != 4) {
-        fprintf(stderr, "ssh3: the -R target %s:%u is not an ipv4 socket\n", spec->target_host,
-                (unsigned)spec->target_port);
-        return S3_ERROR;
-    }
+    /* the target dials in its resolved family (the v4 literal, the
+     * v6 literal or the name over AF_UNSPEC): the wire form of the
+     * channel target carries both, the refusal of a v6 target would
+     * strand a port the server already bound - the unreachable
+     * target fails the bridge dial at the accept instead */
 
     if (s3_ssh3_reverse_target_ntop(&s3_cli_rtarget[s3_cli_rspec_count], text, sizeof(text)) !=
         S3_OK) {
@@ -7402,27 +7419,37 @@ s3_cli_rev_bridge_start(s3_connection_t *sc, unsigned spec_ix, unsigned proto, c
         }
     }
 
-    /* the local half: the dial of the spec target (the ipv4 literal
-     * or the v4-mapped form), the nonblocking socket */
-
-    if (s3_cli_rtarget[spec_ix].family != 4) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the -R bridge bridges the ipv4 targets only");
-        (void)s3_quic_cancelable_stream(sc);
-        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
-        s3_close_connection(sc);
-        return;
-    }
+    /* the local half: the dial of the spec target in its resolved
+     * family (the v4 literal, the v6 literal or the AAAA name), the
+     * nonblocking socket */
 
     {
-        struct sockaddr_in sa;
+        struct sockaddr_storage sa;
+        socklen_t               sa_len;
 
         s3_memzero(&sa, sizeof(sa));
 
-        sa.sin_family = AF_INET;
-        s3_memcpy(&sa.sin_addr, s3_cli_rtarget[spec_ix].ip, 4);
-        sa.sin_port = htons(s3_cli_rtarget[spec_ix].port);
+        if (s3_cli_rtarget[spec_ix].family == 6) {
 
-        b->fd = socket(AF_INET, (proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&sa;
+
+            sa6->sin6_family = AF_INET6;
+            s3_memcpy(&sa6->sin6_addr, s3_cli_rtarget[spec_ix].ip, 16);
+            sa6->sin6_port = htons(s3_cli_rtarget[spec_ix].port);
+            sa_len = sizeof(*sa6);
+
+        } else {
+
+            struct sockaddr_in *sa4 = (struct sockaddr_in *)&sa;
+
+            sa4->sin_family = AF_INET;
+            s3_memcpy(&sa4->sin_addr, s3_cli_rtarget[spec_ix].ip, 4);
+            sa4->sin_port = htons(s3_cli_rtarget[spec_ix].port);
+            sa_len = sizeof(*sa4);
+        }
+
+        b->fd = socket(sa.ss_family,
+                       (proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
 
         if (b->fd == INVALID_SOCKET) {
             s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the reverse bridge socket failed");
@@ -7432,7 +7459,7 @@ s3_cli_rev_bridge_start(s3_connection_t *sc, unsigned spec_ix, unsigned proto, c
             return;
         }
 
-        if (connect(b->fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+        if (connect(b->fd, (const struct sockaddr *)&sa, sa_len) != 0 ||
             s3_nonblocking(b->fd) != S3_OK) {
             s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the local -R target is unreachable");
             (void)closesocket(b->fd);
@@ -13853,14 +13880,6 @@ main(int argc, char **argv)
 
     s3_cli_notes_flush();
 
-    /* the jump rides the v4 inner target of this wave: the direct-udp
-     * extension carries the ipv4 form, the -6 dial refuses cleanly */
-
-    if (s3_cli_jump_on && s3_cli_family != AF_INET) {
-        fprintf(stderr, "ssh3: the proxy jump rides ipv4 in this wave, drop -6\n");
-        return S3_CLI_EXIT_ERROR;
-    }
-
     /* the mode interlocks of the stage B shapes */
 
     if (s3_cli_cm_master &&
@@ -13991,11 +14010,11 @@ main(int argc, char **argv)
     (void)s3_cli_tofu_prepare();
 
     /* the resolution first: the literal or the name; the family is
-     * the v4 default of this port, -6 rides the v6 dial; the jump
-     * run resolves the inner host v4 (the tunnel target extension) */
+     * the -4/-6 pick of the run (the v4 default), the chain targets
+     * carry it family-tagged on the wire */
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = s3_cli_jump_on ? AF_INET : s3_cli_family;
+    hints.ai_family = s3_cli_family;
     hints.ai_socktype = SOCK_DGRAM;
 
     if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
@@ -14033,11 +14052,12 @@ main(int argc, char **argv)
         struct addrinfo jhints, *jres = NULL;
         unsigned        k;
 
-        /* the hop resolution first (the v4 shape of this port, the
-         * -6 dial refuses above) */
+        /* the hop resolution: the family rides the -4/-6 pick like
+         * the destination (the v6 hop dials v6, the v4-mapped
+         * literals stay the v4 form) */
 
         memset(&jhints, 0, sizeof(jhints));
-        jhints.ai_family = AF_INET;
+        jhints.ai_family = s3_cli_family;
         jhints.ai_socktype = SOCK_DGRAM;
 
         for (k = 0; k < s3_cli_jump_n; k++) {
@@ -14053,8 +14073,12 @@ main(int argc, char **argv)
             memcpy(&hop->sa, jres->ai_addr, jres->ai_addrlen);
             hop->sa_len = jres->ai_addrlen;
 
-            ((struct sockaddr_in *)&hop->sa)->sin_family = AF_INET;
-            ((struct sockaddr_in *)&hop->sa)->sin_port = htons((u_short)hop->port);
+            if (hop->sa.ss_family == AF_INET6) {
+                ((struct sockaddr_in6 *)&hop->sa)->sin6_port = htons((u_short)hop->port);
+
+            } else {
+                ((struct sockaddr_in *)&hop->sa)->sin_port = htons((u_short)hop->port);
+            }
 
             freeaddrinfo(jres);
             jres = NULL;
@@ -14126,7 +14150,7 @@ main(int argc, char **argv)
 
             if (k == 0) {
 
-                fd = (s3_fd_t)socket(AF_INET, SOCK_DGRAM, 0);
+                fd = (s3_fd_t)socket(hop->sa.ss_family, SOCK_DGRAM, 0);
 
                 if (fd == (s3_fd_t)INVALID_SOCKET) {
                     fprintf(stderr, "ssh3: the jump socket failed\n");
