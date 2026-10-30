@@ -24,6 +24,7 @@ Russian; EN/DE are faithful translations.
 | 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | third-party copyright and license notices (legal text, not translated) | EN |
 | 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | illumos porting assessment: platform facts, the traffic-archiving pipeline, distributed ZFS (frozen plan item F6b) | RU |
 | 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | the operational plan slice: from the last done item to the first not-done one (waves A/B, distro leftovers, frozen list) | RU |
+| 15 | [docs/COEXISTENCE.md](docs/COEXISTENCE.md) | the package co-installation control matrix (OpenSSH, the go fork, the two deb channels) + the acceptance procedure | RU · [EN](docs/COEXISTENCE.en.md) · [DE](docs/COEXISTENCE.de.md) |
 
 A pure-C17 SSH3 implementation in the nginx style: memory pools, buffer
 views, a chain interface for all I/O, a zero-copy data path. The target
@@ -42,7 +43,8 @@ and a peer of OpenSSH (ssh2): the binaries carry the same names
 is the same; the packages declare `Provides`/`Conflicts`/`Replaces`
 against ssh3-go, so one package replaces another (e.g. when closing a
 vulnerability) without reconfiguring third-party programs that work
-over ssh3.
+over ssh3. The full co-installation matrix and its acceptance
+procedure — [docs/COEXISTENCE.md](docs/COEXISTENCE.md).
 
 ## Layout
 

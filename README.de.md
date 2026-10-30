@@ -24,6 +24,7 @@ jeder Datei verweist auf die Versionen). Der kanonische Text der
 | 12 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Copyright- und Lizenzhinweise Dritter (juristischer Text, nicht übersetzt) | EN |
 | 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | Bewertung des illumos-Ports: Plattformfakten, Archivierungs-Pipeline, verteiltes ZFS (eingefrorener Punkt F6b) | RU |
 | 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | operativer Plan-Ausschnitt: vom letzten erledigten Punkt zum ersten offenen (Wellen A/B, Distro-Reste, eingefrorene Punkte) | RU |
+| 15 | [docs/COEXISTENCE.md](docs/COEXISTENCE.md) | Kontrollmatrix der gemeinsamen Paketinstallation (OpenSSH, die go-Gabel, zwei deb-Kanäle) + die Abnahmeprozedur | RU · [EN](docs/COEXISTENCE.en.md) · [DE](docs/COEXISTENCE.de.md) |
 
 Eine SSH3-Implementierung in reinem C17 im nginx-Stil: Speicherpools,
 Buffer-Sichten, ein Chain-Interface für sämtliche I/O, ein Zero-Copy-
@@ -43,7 +44,9 @@ und Nachbar OpenSSH (ssh2): die Binärdateien tragen identische Namen
 der Funktionsumfang gleich ist; die Pakete erklären
 `Provides`/`Conflicts`/`Replaces` gegen ssh3-go, sodass ein Paket ein
 anderes ersetzt (etwa beim Schließen einer Schwachstelle) ohne
-Neukonfiguration fremder Programme, die über ssh3 arbeiten.
+Neukonfiguration fremder Programme, die über ssh3 arbeiten. Die volle
+Installationsmatrix samt Abnahmeprozedur —
+[docs/COEXISTENCE.md](docs/COEXISTENCE.md).
 
 ## Aufbau
 
