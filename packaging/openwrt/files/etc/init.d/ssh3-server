@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+# ssh3-server procd init (the P8(2) package): the uci core section maps
+# onto the daemon flags, the log knobs ride the env the daemon reads.
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/sbin/ssh3-server
+
+start_service() {
+	local listen cert key authorized_keys url_path
+	local log_level log_file shutdown_drain
+
+	config_load ssh3
+	config_get listen core listen "0.0.0.0:443"
+	config_get cert core cert "/etc/ssh3/cert.pem"
+	config_get key core key "/etc/ssh3/key.pem"
+	config_get authorized_keys core authorized_keys "/etc/ssh3/authorized_keys"
+	config_get url_path core url_path ""
+	config_get log_level core log_level ""
+	config_get log_file core log_file ""
+	config_get shutdown_drain core shutdown_drain ""
+
+	procd_open_instance
+	procd_set_param command "$PROG" -3 -l "$listen" -c "$cert" -k "$key" -K "$authorized_keys"
+	[ -n "$url_path" ] && procd_append_param command --url-path "$url_path"
+	[ -n "$log_level" ] && procd_set_param env SSH3_LOG_LEVEL="$log_level"
+	[ -n "$log_file" ] && procd_set_param env SSH3_LOG_FILE="$log_file"
+	[ -n "$shutdown_drain" ] && procd_set_param env SSH3_SHUTDOWN_DRAIN="$shutdown_drain"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

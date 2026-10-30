@@ -1,0 +1,17 @@
+#!/bin/sh
+# the self-signed certificate of the daemon on the first boot (the
+# admin replaces it with the real one under /etc/ssh3/); openssl-util
+# rides the package Depends
+
+CERT=/etc/ssh3/cert.pem
+KEY=/etc/ssh3/key.pem
+
+if { [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; } && command -v openssl >/dev/null 2>&1; then
+	mkdir -p /etc/ssh3
+	openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+		-keyout "$KEY" -out "$CERT" \
+		-subj "/CN=ssh3-server" >/dev/null 2>&1 \
+		&& chmod 0640 "$KEY"
+fi
+
+exit 0

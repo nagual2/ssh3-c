@@ -1,0 +1,7 @@
+# the ssh3-server openrc knobs (the daemon flags; see ssh3-server(8))
+
+listen="0.0.0.0:443"
+cert="/etc/ssh3/cert.pem"
+key="/etc/ssh3/key.pem"
+authorized_keys="/etc/ssh3/authorized_keys"
+log_file="/var/log/ssh3-server.log"

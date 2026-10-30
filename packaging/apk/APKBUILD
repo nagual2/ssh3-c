@@ -1,0 +1,62 @@
+# Contributor: ssh3-c maintainers <maintainers@example.com>
+# Maintainer: ssh3-c maintainers <maintainers@example.com>
+#
+# the aports MR material (the P8(2) plan item): this file drops into
+# community/testing/ssh3-server/ of the aports tree. the musl build
+# surface is verified by the alpine:3.22 container run of the release
+# CI recipe (the full ctest suite) - see packaging/README.md, the apk
+# section.
+#
+# the daemon needs the OpenSSL 3.5 QUIC TLS API: alpine 3.22 carries
+# openssl 3.5.x, older releases refuse at the cmake configure.
+
+pkgname=ssh3-server
+pkgver=0.5.5
+pkgrel=0
+pkgdesc="SSH3 server: the SSH3 protocol over the HTTP/3 (QUIC) transport"
+url="https://github.com/nagual2/ssh3-c"
+arch="all"
+license="BSD-2-Clause"
+pkgusers="ssh3"
+pkggroups="ssh3"
+makedepends="
+	cmake
+	samurai
+	linux-headers
+	openssl-dev>=3.5
+	zlib-dev
+	zstd-dev
+	lz4-dev
+	"
+subpackages="$pkgname-openrc"
+source="$pkgname-$pkgver.tar.gz::https://github.com/nagual2/ssh3-c/archive/refs/tags/v$pkgver.tar.gz"
+builddir="$srcdir/ssh3-c-$pkgver"
+
+build() {
+	if [ "$CBUILD" != "$CHOST" ]; then
+		CMAKE_CROSSOPTS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_HOST_SYSTEM_NAME=Linux"
+	fi
+	# the QUIC TLS API of OpenSSL 3.5 is the hard floor: the configure
+	# refuses the older system OpenSSL (find_package(OpenSSL 3.5 REQUIRED))
+	cmake -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		$CMAKE_CROSSOPTS
+	cmake --build build --target ssh3-server
+}
+
+check() {
+	ctest --test-dir build --output-on-failure
+}
+
+package() {
+	install -Dm0755 build/ssh3-server "$pkgdir"/usr/sbin/ssh3-server
+
+	# the openrc half (the subpackage), the conf.d rides the defaults
+	install -Dm0755 "$srcdir"/ssh3-server.initd "$pkgdir"/etc/init.d/ssh3-server 2>/dev/null \
+		|| install -Dm0755 "$startdir"/ssh3-server.initd "$pkgdir"/etc/init.d/ssh3-server
+	install -Dm0644 "$startdir"/ssh3-server.confd "$pkgdir"/etc/conf.d/ssh3-server
+
+	install -d "$pkgdir"/etc/ssh3
+	install -m0644 /dev/null "$pkgdir"/etc/ssh3/authorized_keys
+}
