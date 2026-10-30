@@ -50,8 +50,8 @@
 | № | Дистрибутив | Состояние | Осталось | Приёмка |
 |---|-------------|-----------|----------|---------|
 | 1 | Debian | source-пакет собран, CI зелёный, тест-циклы пройдены | A5 (загрузка) | принят в RFS |
-| 2 | Fedora | rpm-спека есть | в целевом стеке Fedora нет OpenSSL 3.5 → на момент подачи: subpackage OpenSSL или ждать репозиторный 3.5; review-заявка | пакет в ревью |
-| 3 | Alpine | APKv2 структура валидна | aports MR; musl-сборка: проверить ветки getpwnam/shadow и `crypt_r` | aports MR |
+| 2 | Fedora | rpm-спека есть — **материалы ревью готовы 2026-10-30** (`9f47b1a`): `packaging/rpm/REVIEW.md` (чек-лист + черновик review-request) и `ssh3-server.fedora.spec` — сборка из исходников (пребилды ревью не пройдут), go-конфликты сняты по review-гайдам; вопрос OpenSSL решён — Fedora 43 несёт 3.5, subpackage не нужен; подача — владелец (FAS-аккаунт, koji scratch, Bugzilla) | пакет в ревью (владелец) |
+| 3 | Alpine | APKv2 структура валидна — **материалы aports готовы 2026-10-30** (`9f47b1a`): `packaging/apk/APKBUILD` (сборка из исходников, ctest в check, openrc-сабпакет) + initd/confd; **musl-сборка проверена контейнером alpine:3.22 — ctest 46/46** (гвард `__GLIBC_PREREQ`, crypt_r в libc); aports MR — владелец (GitLab-аккаунт) | aports MR (владелец) |
 | 4 | OpenWrt | Makefile-заготовка | довести до install-able через SDK (целевой стек владельца); тесты — на openwrt dev, на роутеры ничего не ставится (решение владельца 2026-10-29) | сборка и install/purge в openwrt dev |
 
 ---
