@@ -139,10 +139,10 @@
 
 | № | Пункт | Карта сайтов (аудит 2026-10-31, c-nginx-zero-copy) | Объём |
 |---|-------|----------------------------------------------------|-------|
-| 1 | `app/ssh3_client.c`: ~12 malloc-сайтов процесс/conn-lifetime буферов — на пул+cleanup (конвенция №6/№7): cmd (3250), sftp argv local/remote (3309/3320/3402/3411), forward-мосты `fc->frame`, `b->acc`, `b->to_chan` (6237/7565/8087/8150), CM pend-copy (11879), notes strdup (3219), keyfile-буфер (2208) | буферы не в hot-path (free на смерть конна корректен) — полироль, не дефект; free-пары уже парные | 2–4 ч |
-| 2 | Контракт-комментарии к оправданным free-сайтам внешних API: compress-контексты (s3_ssh3_compress.c:344), DIR* (s3_ssh3_sftp_cli.c:378), realpath (s3_ssh3_sftp_jail.c:153) | при следующем касании файлов | S |
+| 1 | `app/ssh3_client.c` — **ВЫПОЛНЕНО 2026-10-31** (`fdf6d53`, `8aed303` частично): фикс-буферы conn/bridge (`fc->frame`, `b->frame`) → per-object пул (destroy на drop/kill); процесс-lifetime строки (cmd, sftp argv ×4, notes) → ленивый `s3_cli_pool` (free-пары сняты, cleanup destroys); **растущие аккумуляторы** (`b->acc`, `b->to_chan`, `fc->chan_acc` — realloc-рост) в пул не переносятся принципиально — контракт-комментарии на kill-сайтах; keyfile-буфер и CM-pend оставлены malloc/free (временные локальные, владение точечное). Ловля волны: `net_cleanup` делал free над переведёнными на пул указателями → double free (rc=134) — покрыто прогонами | ctest 46/46 release+asan; cli-compat ×2, s3cm, jump, product-reverse зелёные ✓ |
+| 2 | Контракт-комментарии к free-сайтам внешних API — **ВЫПОЛНЕНО 2026-10-31** (`8aed303`): compress-контексты, DIR* | realpath-сайт — при касании | S ✓ |
 | 3 | **Windows-клиент висит при недоступном сервере**: dial на закрытый UDP-порт не завершается ошибкой (repro: `ssh3.exe nobody@127.0.0.1:9/ssh3-term` — hang > 120 с; Linux-клиент отказывает сразу). Подозреваемое: select/WinSock-путь не обрабатывает ICMP port unreachable (WSAECONNRESET на connected UDP) | разобрать поведение dial-таймаута в mingw-клиенте, отказ с понятной ошибкой + нога e2e на недоступный порт | M-S |
-| 4 | **Скраб реального адреса из docs/PLAN.md**: `192.168.35.116` (тестовая VM debian13-dev, строка статуса P8) — заменить на обезличенное; правило деперсонализации — перед каждым пушем | S |
+| 4 | Скраб реального адреса из docs/PLAN.md — **ВЫПОЛНЕНО 2026-10-31** (`8aed303`) | S ✓ |
 
 ---
 
