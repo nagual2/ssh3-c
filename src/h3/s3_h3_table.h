@@ -55,7 +55,7 @@ s3_int_t  s3_h3_set_param(s3_connection_t *c, uint64_t id, uint64_t value);
  * apply: s3_h3_enc_field writes only, the state mutation must not
  * run twice)
  */
-s3_int_t  s3_h3_enc_capacity(s3_connection_t *c, s3_uint_t capacity);
-u_char   *s3_h3_enc_field(s3_connection_t *c, u_char *p, s3_str_t *name, s3_str_t *value);
+s3_int_t s3_h3_enc_capacity(s3_connection_t *c, s3_uint_t capacity);
+u_char  *s3_h3_enc_field(s3_connection_t *c, u_char *p, s3_str_t *name, s3_str_t *value);
 
 #endif /* _S3_H3_TABLE_H_INCLUDED_ */

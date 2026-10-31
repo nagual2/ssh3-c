@@ -429,7 +429,7 @@ s3_json_escape(const u_char *src, size_t len, u_char *dst, size_t cap)
 
     dst[n] = '\0';
 
-    return (s3_int_t) n;
+    return (s3_int_t)n;
 }
 
 s3_int_t
@@ -442,5 +442,5 @@ s3_memcmp_ct(const u_char *a, const u_char *b, size_t n)
         d |= a[i] ^ b[i];
     }
 
-    return (s3_int_t) d;
+    return (s3_int_t)d;
 }

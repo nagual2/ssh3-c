@@ -217,8 +217,7 @@ s3_ssh3_version_parse(const u_char *data, size_t len, s3_ssh3_version_t *v)
         extra.data = (u_char *)field[n];
         extra.len = flen[n];
 
-        if (extra.len > spec_key.len &&
-            s3_memcmp(extra.data, spec_key.data, spec_key.len) == 0) {
+        if (extra.len > spec_key.len && s3_memcmp(extra.data, spec_key.data, spec_key.len) == 0) {
 
             v->spec_version.data = extra.data + spec_key.len;
             v->spec_version.len = extra.len - spec_key.len;
@@ -235,8 +234,8 @@ s3_ssh3_version_parse(const u_char *data, size_t len, s3_ssh3_version_t *v)
         if (extra.len > compress_key.len &&
             s3_memcmp(extra.data, compress_key.data, compress_key.len) == 0) {
 
-            v->compress_mask = s3_ssh3_compress_parse(extra.data + compress_key.len,
-                                                       extra.len - compress_key.len);
+            v->compress_mask =
+                s3_ssh3_compress_parse(extra.data + compress_key.len, extra.len - compress_key.len);
         }
     }
 
@@ -248,9 +247,9 @@ s3_ssh3_version_string(u_char *buf, size_t cap)
 {
     static const char *base = S3_SSH3_VERSION_STRING;
 
-    size_t   len = s3_strlen(base);
-    u_char   cap_buf[64];
-    size_t   cap_len;
+    size_t len = s3_strlen(base);
+    u_char cap_buf[64];
+    size_t cap_len;
 
     if (cap < len) {
         return 0;

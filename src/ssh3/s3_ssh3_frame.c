@@ -27,10 +27,10 @@ s3_int_t
 s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len, s3_ssh3_compress_ctx_t *ctx,
                          const u_char *payload, size_t payload_len, size_t *wire_len)
 {
-    size_t plain_len;
-    size_t bound;
-    size_t packed_len = 0;
-    u_char *p;
+    size_t   plain_len;
+    size_t   bound;
+    size_t   packed_len = 0;
+    u_char  *p;
     uint32_t algorithm = s3_ssh3_compress_ctx_algorithm(ctx);
 
     plain_len = s3_ssh3_varint_size(S3_SSH3_MSG_CHANNEL_DATA) + s3_ssh3_sshstring_size(payload_len);
@@ -133,9 +133,9 @@ s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type, u
          * refuses every compressed frame
          */
 
-        algorithm = (uint32_t) msg.algorithm;
+        algorithm = (uint32_t)msg.algorithm;
 
-        if (msg.algorithm != (uint64_t) algorithm ||
+        if (msg.algorithm != (uint64_t)algorithm ||
             (s3_ssh3_compress_bit(algorithm) & decode_mask) == 0) {
             return S3_DECLINED;
         }
@@ -152,8 +152,8 @@ s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type, u
             rc = s3_ssh3_compress_ctx_decode(ctx, scratch, scratch_cap, &plain_len, msg.data.data,
                                              msg.data.len);
         } else {
-            rc = s3_ssh3_compress_decode(scratch, scratch_cap, &plain_len, algorithm,
-                                         msg.data.data, msg.data.len);
+            rc = s3_ssh3_compress_decode(scratch, scratch_cap, &plain_len, algorithm, msg.data.data,
+                                         msg.data.len);
         }
 
         if (rc != S3_OK) {

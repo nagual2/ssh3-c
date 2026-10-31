@@ -361,8 +361,8 @@ s3_ssh3_compress_ctx_create(uint32_t algorithm, unsigned decode)
          * which saves the six bytes of it on every frame */
 
         int rc = decode ? inflateInit2(&ctx->z, -15)
-                        : deflateInit2(&ctx->z, S3_SSH3_COMPRESS_DEFLATE_LEVEL, Z_DEFLATED,
-                                       -15, 8, Z_DEFAULT_STRATEGY);
+                        : deflateInit2(&ctx->z, S3_SSH3_COMPRESS_DEFLATE_LEVEL, Z_DEFLATED, -15, 8,
+                                       Z_DEFAULT_STRATEGY);
 
         if (rc != Z_OK) {
             free(ctx);
@@ -378,7 +378,7 @@ s3_ssh3_compress_ctx_create(uint32_t algorithm, unsigned decode)
 
     if (algorithm == S3_SSH3_COMPRESS_ZSTD) {
 
-        ctx->zstd = decode ? (void *) ZSTD_createDCtx() : (void *) ZSTD_createCCtx();
+        ctx->zstd = decode ? (void *)ZSTD_createDCtx() : (void *)ZSTD_createCCtx();
 
         if (ctx->zstd == NULL) {
             free(ctx);
@@ -409,9 +409,9 @@ s3_ssh3_compress_ctx_destroy(s3_ssh3_compress_ctx_t *ctx)
     if (ctx->z_live) {
 
         if (ctx->decode) {
-            (void) inflateEnd(&ctx->z);
+            (void)inflateEnd(&ctx->z);
         } else {
-            (void) deflateEnd(&ctx->z);
+            (void)deflateEnd(&ctx->z);
         }
     }
 
@@ -422,9 +422,9 @@ s3_ssh3_compress_ctx_destroy(s3_ssh3_compress_ctx_t *ctx)
     if (ctx->zstd != NULL) {
 
         if (ctx->decode) {
-            (void) ZSTD_freeDCtx(ctx->zstd);
+            (void)ZSTD_freeDCtx(ctx->zstd);
         } else {
-            (void) ZSTD_freeCCtx(ctx->zstd);
+            (void)ZSTD_freeCCtx(ctx->zstd);
         }
     }
 
@@ -465,10 +465,10 @@ s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
             return S3_ERROR;
         }
 
-        ctx->z.next_in = (Bytef *) in;
-        ctx->z.avail_in = (uInt) in_len;
+        ctx->z.next_in = (Bytef *)in;
+        ctx->z.avail_in = (uInt)in_len;
         ctx->z.next_out = out;
-        ctx->z.avail_out = (uInt) cap;
+        ctx->z.avail_out = (uInt)cap;
 
         rc = deflate(&ctx->z, Z_FINISH);
 
@@ -476,7 +476,7 @@ s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
             return S3_ERROR;
         }
 
-        *out_len = (size_t) ctx->z.total_out;
+        *out_len = (size_t)ctx->z.total_out;
 
         return S3_OK;
     }
@@ -486,7 +486,7 @@ s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
     case S3_SSH3_COMPRESS_LZ4: {
         int n;
 
-        n = LZ4_compress_default((const char *) in, (char *) out, (int) in_len, (int) cap);
+        n = LZ4_compress_default((const char *)in, (char *)out, (int)in_len, (int)cap);
 
         if (n == 0) {
             /* the codec refuses the payload: the compressed form does
@@ -500,7 +500,7 @@ s3_ssh3_compress_ctx_encode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
             return S3_ERROR;
         }
 
-        *out_len = (size_t) n;
+        *out_len = (size_t)n;
 
         return S3_OK;
     }
@@ -562,10 +562,10 @@ s3_ssh3_compress_ctx_decode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
             return S3_ERROR;
         }
 
-        ctx->z.next_in = (Bytef *) in;
-        ctx->z.avail_in = (uInt) in_len;
+        ctx->z.next_in = (Bytef *)in;
+        ctx->z.avail_in = (uInt)in_len;
         ctx->z.next_out = out;
-        ctx->z.avail_out = (uInt) cap;
+        ctx->z.avail_out = (uInt)cap;
 
         rc = inflate(&ctx->z, Z_FINISH);
 
@@ -576,7 +576,7 @@ s3_ssh3_compress_ctx_decode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
             return S3_ERROR;
         }
 
-        *out_len = (size_t) ctx->z.total_out;
+        *out_len = (size_t)ctx->z.total_out;
 
         return S3_OK;
     }
@@ -586,13 +586,13 @@ s3_ssh3_compress_ctx_decode(s3_ssh3_compress_ctx_t *ctx, u_char *out, size_t cap
     case S3_SSH3_COMPRESS_LZ4: {
         int n;
 
-        n = LZ4_decompress_safe((const char *) in, (char *) out, (int) in_len, (int) cap);
+        n = LZ4_decompress_safe((const char *)in, (char *)out, (int)in_len, (int)cap);
 
         if (n < 0) {
             return S3_ERROR;
         }
 
-        *out_len = (size_t) n;
+        *out_len = (size_t)n;
 
         return S3_OK;
     }
@@ -799,7 +799,7 @@ s3_ssh3_compress_decode(u_char *out, size_t cap, size_t *out_len, uint32_t algor
 #if (S3_HAVE_ZSTD)
     case S3_SSH3_COMPRESS_ZSTD: {
         unsigned long long size;
-        size_t          n;
+        size_t             n;
 
         size = ZSTD_getFrameContentSize(in, in_len);
 

@@ -47,11 +47,11 @@ struct s3_dos_pw_record_s {
 static unsigned s3_dos_unauth_max = S3_DOS_UNAUTH_MAX_DEFAULT;
 static unsigned s3_dos_unauth_n;
 
-static unsigned           s3_dos_pw_failures_max = S3_DOS_PW_FAILURES_MAX_DEFAULT;
-static s3_msec_t          s3_dos_pw_lockout_ms = S3_DOS_PW_LOCKOUT_MSEC_DEFAULT;
+static unsigned            s3_dos_pw_failures_max = S3_DOS_PW_FAILURES_MAX_DEFAULT;
+static s3_msec_t           s3_dos_pw_lockout_ms = S3_DOS_PW_LOCKOUT_MSEC_DEFAULT;
 static s3_dos_pw_record_t *s3_dos_pw_table;
-static unsigned           s3_dos_pw_table_n;  /* the records in use */
-static unsigned           s3_dos_pw_table_cap; /* the records allocated */
+static unsigned            s3_dos_pw_table_n;   /* the records in use */
+static unsigned            s3_dos_pw_table_cap; /* the records allocated */
 
 static s3_dos_pw_record_t *s3_dos_pw_find(const s3_str_t *user, s3_msec_t now);
 static s3_dos_pw_record_t *s3_dos_pw_slot(const s3_str_t *user, s3_msec_t now);
@@ -188,8 +188,7 @@ s3_dos_pw_slot(const s3_str_t *user, s3_msec_t now)
             cap = S3_DOS_PW_RECORDS_MAX;
         }
 
-        s3_dos_pw_record_t *grown =
-            realloc(s3_dos_pw_table, cap * sizeof(s3_dos_pw_record_t));
+        s3_dos_pw_record_t *grown = realloc(s3_dos_pw_table, cap * sizeof(s3_dos_pw_record_t));
 
         if (grown == NULL) {
             return NULL;

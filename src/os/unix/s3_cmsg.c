@@ -13,15 +13,14 @@ size_t
 s3_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *sockaddr)
 {
 #if defined(IPV6_RECVPKTINFO)
-    struct in6_pktinfo *pktinfo6;
+    struct in6_pktinfo  *pktinfo6;
     struct sockaddr_in6 *sin6;
 #endif
-    struct in_pktinfo   *pktinfo;
-    struct sockaddr_in  *sin;
+    struct in_pktinfo  *pktinfo;
+    struct sockaddr_in *sin;
 
-    if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_PKTINFO
-        && sockaddr->sa_family == AF_INET)
-    {
+    if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_PKTINFO &&
+        sockaddr->sa_family == AF_INET) {
         pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
 
         sin = (struct sockaddr_in *)sockaddr;
@@ -32,9 +31,8 @@ s3_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *sockaddr)
 
 #if defined(IPV6_RECVPKTINFO)
 
-    if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO
-        && sockaddr->sa_family == AF_INET6)
-    {
+    if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
+        sockaddr->sa_family == AF_INET6) {
         pktinfo6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
 
         sin6 = (struct sockaddr_in6 *)sockaddr;
@@ -54,11 +52,11 @@ size_t
 s3_set_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *sockaddr)
 {
 #if defined(IPV6_RECVPKTINFO)
-    struct in6_pktinfo   *pktinfo6;
-    struct sockaddr_in6  *sin6;
+    struct in6_pktinfo  *pktinfo6;
+    struct sockaddr_in6 *sin6;
 #endif
-    struct in_pktinfo    *pktinfo;
-    struct sockaddr_in   *sin;
+    struct in_pktinfo  *pktinfo;
+    struct sockaddr_in *sin;
 
     /*
      * the family of the local address decides the control message, and

@@ -57,7 +57,7 @@ s3_int_t s3_ssh3_frame_data_build(u_char *buf, size_t cap, size_t *frame_len,
  */
 
 s3_int_t s3_ssh3_frame_data_parse(const u_char **pos, const u_char *end, uint64_t type,
-                                  uint32_t decode_mask, s3_ssh3_compress_ctx_t *ctx, u_char *scratch,
-                                  size_t scratch_cap, s3_str_t *payload);
+                                  uint32_t decode_mask, s3_ssh3_compress_ctx_t *ctx,
+                                  u_char *scratch, size_t scratch_cap, s3_str_t *payload);
 
 #endif /* _S3_SSH3_FRAME_H_INCLUDED_ */
