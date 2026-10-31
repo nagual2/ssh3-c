@@ -117,7 +117,8 @@ fd, it never calls `bind()`):
 ```ini
 # ssh3-server.socket (excerpt)
 [Socket]
-ListenDatagram=0.0.0.0:443
+ListenDatagram=443
+BindIPv6Only=both
 FreeBind=yes
 
 # ssh3-server.service (excerpt)

@@ -6,12 +6,15 @@ Documentation=man:ssh3-server(8)
 # ssh3 is QUIC over UDP (RFC 9000), the route rides HTTP/3 extended
 # CONNECT (RFC 9220) - one datagram listener serves everything.
 #
-# The wildcard is spelled out on purpose: the daemon speaks IPv4 and
-# serves exactly ONE passed fd (see ssh3-server(8), SOCKET
-# ACTIVATION); a bare "ListenDatagram=443" would create the v6+v4
-# pair and the service would pick only the first socket.  IPv6 needs
-# a dual-stack listener in the daemon first - not a second line here.
-ListenDatagram=0.0.0.0:443
+# The bare port hands over ONE dual-stack IPv6 socket (BindIPv6Only
+# follows the system policy, net.ipv6.bindv6only=0 on the common
+# hosts): the daemon serves both families off the single passed fd
+# (see ssh3-server(8), SOCKET ACTIVATION) - IPv4 arrives as the
+# v4-mapped form, IPv6 natively.  The earlier 0.0.0.0 spelling cut
+# the hosts off IPv6 while the daemon had already grown the
+# dual-stack acceptance.
+ListenDatagram=443
+BindIPv6Only=both
 #
 # Binding as root here is the whole point of the socket activation:
 # the bound fd is handed to ssh3-server.service, so the service
@@ -29,7 +32,7 @@ FreeBind=yes
 # this file:
 #   systemctl edit ssh3-server.socket
 #   [Socket]
-#   ListenDatagram=0.0.0.0:8443
+#   ListenDatagram=8443
 
 [Install]
 WantedBy=sockets.target
