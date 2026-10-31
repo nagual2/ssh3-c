@@ -22,6 +22,8 @@
 #  10. the bare -strict-host-key-checking refuses with the value
 #      hint (the FLAG-ARG-REJECT-255 marker), the destination is
 #      not eaten
+#  11. -o ConnectTimeout=2 against a dead port: the setup timeout
+#      refuses inside ~4 s with the message (the B9-3 hang is gone)
 #
 # the verdicts: CLIENT-OPT-E2E OK / FAILED, the leg markers on the
 # way
@@ -345,6 +347,27 @@ else
         pass "the bare flag refused 255 with the value hint"
     else
         fail "the bare flag leg: rc=$RC $(tail -1 "$WORK/leg10.err")"
+    fi
+fi
+
+echo "== leg 11: -o ConnectTimeout refuses the dead port inside the deadline (CONNECT-TIMEOUT-OK)"
+
+START=$(date +%s)
+
+if HOME="$WORK/home-tofu" timeout 30 "$BUILD/ssh3" -o ConnectTimeout=2 \
+    -i "$WORK/priv.pem" "client@127.0.0.1:9/ssh3-term" "printf no" \
+    > "$WORK/leg11.out" 2> "$WORK/leg11.err"; then
+    fail "the connect timeout leg: the run exited 0"
+else
+    RC=$?
+    NOW=$(date +%s)
+
+    if [ "$RC" -eq 255 ] &&
+        grep -q "the setup timed out" "$WORK/leg11.err" &&
+        [ $((NOW - START)) -le 8 ]; then
+        pass "the setup timed out in $((NOW - START))s (rc $RC)"
+    else
+        fail "the connect timeout leg: rc=$RC in $((NOW - START))s $(tail -1 "$WORK/leg11.err")"
     fi
 fi
 

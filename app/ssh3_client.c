@@ -187,14 +187,17 @@ typedef int s3_cli_cm_h_t;
 #define S3_CLI_RESP_MAX 16384
 
 /*
- * the setup deadline after the dial: 0 = not armed (the wave 1d, the
- * ConnectTimeout unset of the ssh(1) canon - the bring-up runs until
- * the transport or the server ends it); a non-zero value arms the
- * deadline of the handshake, the CONNECT and the channel bring-up
- * (the session itself runs without a deadline, the long exec is
- * legitimate)
+ * the setup deadline after the dial: 30 s by default - QUIC rides the
+ * connectionless UDP and a dead server gives no refused signal (no
+ * RST like the TCP connect), the bring-up without a deadline would
+ * hang forever against the unreachable host (the B9-3 finding, the
+ * windows client hang); the ssh(1) ConnectTimeout unset canon (0 =
+ * not armed) returns with -o ConnectTimeout=0.  A non-zero value
+ * arms the deadline of the handshake, the CONNECT and the channel
+ * bring-up (the session itself runs without a deadline, the long
+ * exec is legitimate)
  */
-#define S3_CLI_SETUP_TIMEOUT 0
+#define S3_CLI_SETUP_TIMEOUT 30000
 
 /*
  * the quic conf guard of the same wave: the engine timer reads a 0
@@ -560,6 +563,11 @@ enum {
 
 static unsigned s3_cli_opt_insecure;
 static unsigned s3_cli_opt_strict;
+
+/* the -o ConnectTimeout (the seconds; -1 = the key unset, the 30 s
+ * default rides; 0 = the deadline not armed, the ssh(1) unset canon) */
+
+static long s3_cli_connect_timeout = -1;
 
 /* the sftp transfer mode of the -J form (the harness shape): the
  * channel type is "sftp", the scp-style driver of s3_ssh3_sftp_cli
@@ -3176,7 +3184,7 @@ s3_cli_cfg_load(const char *host)
 static const char s3_cli_opt_keys[] =
     "insecure, strict-host-key-checking, forwardagent, port, user, identityfile, localforward,"
     " remoteforward, dynamicforward, proxyjump, escapechar, controlmaster, controlpath,"
-    " controlpersist";
+    " controlpersist, connecttimeout";
 
 /* the ASCII case-insensitive compare of the -o texts (the fork
  * accepts any case of the key and the value) */
@@ -3888,6 +3896,22 @@ s3_cli_opt_parse(const char *arg)
         }
 
         s3_cli_have_strict = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "connecttimeout") == 0) {
+
+        /* the ssh(1) canon: the seconds, 0 = the deadline not armed */
+
+        long v = atol(val);
+
+        if (v < 0 || v > 86400) {
+            fprintf(stderr, "ssh3: -o ConnectTimeout wants 0..86400 seconds\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_connect_timeout = v * 1000;
 
         return S3_OK;
     }
@@ -14465,7 +14489,16 @@ main(int argc, char **argv)
     /* the setup deadline rides 0 (not armed) unless the
      * S3_CLI_SETUP_TIMEOUT above carries a real window */
 
-    s3_cli_deadline = (S3_CLI_SETUP_TIMEOUT != 0) ? s3_current_msec + S3_CLI_SETUP_TIMEOUT : 0;
+    /* the -o ConnectTimeout overrides the 30 s default (the seconds
+     * of the ssh(1) canon; 0 = the deadline not armed - the ssh(1)
+     * unset canon) */
+
+    {
+        s3_msec_t setup = (s3_cli_connect_timeout >= 0) ? (s3_msec_t)s3_cli_connect_timeout
+                                                        : S3_CLI_SETUP_TIMEOUT;
+
+        s3_cli_deadline = (setup != 0) ? s3_current_msec + setup : 0;
+    }
     s3_cli_rc = 0;
     s3_cli_phase = S3_CLI_PH_DIAL;
 
