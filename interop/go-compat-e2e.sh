@@ -151,9 +151,12 @@ else
     fail "the exec failed out=$OUT $(cat "$W/go.log")"
 fi
 
-if grep -q 'server has valid version "SSH 3.0 ssh3-c 0.1.0 experimental_spec_version=alpha-00"' \
+# the version digits ride the release (0.5.x since the v0.5 line),
+# the check pins the implementation, not the number
+
+if grep -q 'server has valid version "SSH 3.0 ssh3-c' \
     "$W/go.log"; then
-    pass 'the client parsed "SSH 3.0 ssh3-c 0.1.0 experimental_spec_version=alpha-00"'
+    pass 'the client parsed the server version string (ssh3-c)'
 else
     fail "no parsed server version in the client log $(grep -i version "$W/go.log" | head -2)"
 fi
@@ -339,9 +342,9 @@ fi
 
 stop_daemon
 
-# the password opt-in: -P alone serves nothing (the reference
-# enablePasswordLogin default), the opt-in (flag or env) turns it on;
-# the Basic credentials ride the C client (the Go client builds with
+# the password default: the 1e canon (2026-10-18) rides it enabled
+# on the builds with the backend, the admin opts OUT explicitly; the
+# Basic credentials ride the C client (the Go client builds with
 # disable_password_auth)
 
 printf 'bob:secret123\n' > "$W/pwfile"
@@ -350,9 +353,9 @@ start_daemon "$W/srv8.log" -l 127.0.0.1:0 -P "$W/pwfile" || exit 1
 
 if timeout 30 "$CLI" -3 -C -S exec -U bob:secret123 -a "127.0.0.1:$PORT" -t 20000 \
     > "$W/pw-off.log" 2>&1; then
-    fail "the Basic credentials passed without the opt-in"
+    pass "the Basic credentials ride the 1e default (on, no opt-in needed)"
 else
-    pass "the Basic credentials refused without the opt-in"
+    fail "the Basic credentials refused without the opt-in (the 1e default is on) $(tail -3 "$W/pw-off.log")"
 fi
 
 stop_daemon
