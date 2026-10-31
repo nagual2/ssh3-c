@@ -164,7 +164,7 @@ jobs:
       - name: Install the runner and build dependencies
         run: |
           apk add --no-cache nodejs git bash build-base cmake ninja musl-dev \
-            linux-headers zlib-dev zstd-dev lz4-dev openssl-dev perl pkgconf
+            linux-headers zlib-dev zstd-dev lz4-dev openssl-dev perl pkgconf tar
 
       - uses: actions/checkout@v4
 
