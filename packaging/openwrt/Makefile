@@ -21,11 +21,11 @@ include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
 
 PKG_NAME:=ssh3-server
-PKG_VERSION:=0.5.5
+PKG_VERSION:=0.5.6
 PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/nagual2/ssh3-c.git
-PKG_SOURCE_VERSION:=v0.5.5
+PKG_SOURCE_VERSION:=v0.5.6
 PKG_MIRROR_HASH:=skip
 PKG_MAINTAINER:=ssh3-c maintainers <maintainers@example.com>
 PKG_LICENSE:=BSD-2-Clause
