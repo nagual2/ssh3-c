@@ -529,14 +529,83 @@ completes at `sw_start`**, so no re-entry can underflow.
 `grep -rn "h3-parse-pool-overflow" tests/ CMakeLists.txt` finds no ctest regression test, and the
 nightly fuzz job is the only thing that ever runs it. §3.3 adds the ctest pin.
 
-### 3.3 The fix — `fix/pass4-h3pool`
+### 3.3 The fix — `fix/pass4-h3pool` (designed here, not yet committed)
 
-*(TDD: the failing ctest first, then the minimal fix, then green both presets — see the branch.)*
+The fix is two lines of product code plus one ctest pin. It is **not** on this branch (the report
+branch carries no code change); the delegation that lands it follows the standing TDD order:
+failing ctest → fix → green both presets → PR to `main`.
+
+**The pin** — in `tests/test_h3_parse.c`, a `s3_test_literal_restart(c)` called from
+`s3_test_h3_parse()`:
+
+1. park the pool cursor so the *next* one-byte `s3_pnalloc` sits on the last byte of the block:
+   `for (;;) { rem = c->pool->d.end - c->pool->d.last; if (rem > c->pool->max + 4) { pnalloc(max); continue; } if (rem > 1) pnalloc(rem - 1); break; }`
+   (the pool internals are public in `s3_palloc.h`; without the parking the one-byte reserve lands
+   mid-block and the overrun is silent — that is exactly why the nightly artifact needs its
+   history);
+2. build a HEADERS frame (`0x01`, length, section prefix via
+   `s3_h3_encode_field_section_prefix(sec, 0, 0, 0)`) with **one post-base literal field line**
+   (`0x00` = post-base name reference, 3-bit index 0, then a 7-bit value length `0x04` and
+   `"aaaa"`), so the value literal completes and the table lookup then fails with
+   `S3_H3_ERR_DECOMPRESSION_FAILED` — leaving `st->literal.state == sw_start` and
+   `st->literal.length == 0` while `st->field_rep.state == sw_field_lpbi`;
+3. call `s3_h3_parse_headers(c, &st, &b)` **twice** with the same `st` and the same buffer (the
+   harness's replay), asserting the first call fails and the second does not corrupt the pool.
+
+At HEAD this aborts under ASan at `s3_h3_parse.c:4864`; after the fix it returns
+`S3_H3_ERR_DECOMPRESSION_FAILED` twice and the test is green.
+
+**The fix** — `s3_h3_parse_literal()`, `sw_start`, after the reserve and before the `sw_value`
+fall-through:
+
+```c
+            st->value.data = st->last;
+            st->state = sw_value;
+
+            /*
+             * a zero-length literal completes here: the countdown in
+             * sw_value is a pre-decrement, so a zero length underflows
+             * it and the loop writes every remaining byte of the input
+             * past the one-byte reservation (the FZ1 finding of the
+             * nightly fuzz, 2026-10-30).  the callers refuse a zero
+             * field length today, but the machine is re-entered with
+             * the countdown at zero after a hard error - the guard
+             * belongs to the machine, not to each caller
+             */
+            if (st->length == 0) {
+                st->value.len = 0;
+                *st->last = '\0';
+                goto done;
+            }
+```
+
+Why this shape and not "reset the state machine on error": the reset would have to be repeated in
+every caller (`parse_headers`, `parse_data`, `parse_uni`, and the three insert machines) and any
+future caller could forget it. The `sw_start` guard makes the invariant local: *a literal never
+writes more than the reservation it just took*, whatever state it is entered in.
+
+**Acceptance** for the landing delegation: `ctest --preset linux-release` and `--preset linux-asan`
+both **46/46** (47/47 once the pin is added), the mutation campaign of §3.4 re-run for 1 000 000
+inputs with **no ASan/UBSan report**, and the nightly `fuzz.yml` job green on the next run.
 
 ### 3.4 P-C / P-D — the fuzz campaigns
 
 | Campaign | Driver | Inputs | Result |
 |---|---|---:|---|
 | **P-D** `fuzz_h3_parse` (in-tree target, §3.2/B3) | `pass4_fuzz_drv.c` + `tests/fuzz/fuzz_h3_parse.c`, ASan+UBSan | died < 100 000 | **crash — FZ1** |
-| **P-C** pass-3 QUIC-state driver, re-pointed at `53baa2e` | `pass4/pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, ASan+UBSan, `S3_FUZZ_ITERS=1000000` | see below | see below |
+| **P-C** pass-3 QUIC-state driver, re-pointed at `53baa2e` | `pass4/pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, ASan+UBSan, `S3_FUZZ_ITERS=1000000` | campaign launched, 1 000 000 target | **build clean (`FUZZ_BUILD_EXIT=0`); the run was still in flight when this report was written — result NOT observed, do not read this row as a pass** |
+
+**P-C needs no API update**: the pass-3 driver's includes and the `s3_h3_session_t` layout change
+of F2 do not reach `fuzz_quic_state.c`, so the "re-point the driver" step is a rebuild, not a port
+— worth recording, because the pass-3 scratch copy is reusable as-is.
+
+### 3.5 What this baseline hands to the next delegations
+
+1. **`fix/pass4-h3pool`** — §3.3, ready to land (pin + two-line fix + acceptance criteria).
+2. **The line-by-line protocol-delta review** — §1.2 is the map; the five questions of §1.6 are
+   the acceptance list, and (a2)/item 1 (the QPACK encoder's check-after-write into `buf[1024]`)
+   is the highest-value unexecuted item of the whole pass.
+3. **The runtime/app-layer review** — §1.2 (a1) 0-RTT, (a5) OIDC per-hop, (a6) `-insecure`, and
+   §1.3 (b1) the sftp jail are its reading list; the packaging privilege files of §1.4 are its
+   environment.
 
