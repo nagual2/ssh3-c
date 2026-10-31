@@ -375,6 +375,8 @@ s3_cli_fs_opendir(const char *path)
     _snwprintf(pat, S3_SSH3_SFTP_CLI_PATH_W - 1, L"%s\\*", w);
     pat[S3_SSH3_SFTP_CLI_PATH_W - 1] = L'\0';
 
+    /* the readdir cursor lives outside the pools: closedir at the
+     * dir handle cleanup */
     d = (s3_cli_fs_dir_t *)malloc(sizeof(*d));
 
     if (d == NULL) {

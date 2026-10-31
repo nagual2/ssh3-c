@@ -341,6 +341,9 @@ s3_ssh3_compress_ctx_create(uint32_t algorithm, unsigned decode)
         return NULL;
     }
 
+    /* the codec context lives outside the pools: the foreign
+     * library owns the free (zlib/zstd/lz4 destroy at the channel
+     * cleanup) */
     ctx = malloc(sizeof(*ctx));
 
     if (ctx == NULL) {
