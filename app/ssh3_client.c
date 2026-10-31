@@ -695,7 +695,6 @@ typedef struct {
      * target (the request names it, the spec holds the listener) */
     unsigned socks;
     unsigned socks_step;
-    unsigned t_addr;
     unsigned t_family; /* 4 or 6, the wire target family */
     u_char   t_ip[16];
     unsigned t_port;
@@ -2584,7 +2583,14 @@ s3_cli_jump_hop_defaults(s3_cli_jump_hop_t *hop)
         hop->port = 443;
     }
 
-    snprintf(hop->hostkey, sizeof(hop->hostkey), "%s:%u%s", host, hop->port, "/ssh3-term");
+    /* the bracket form of the v6 hop host (the canon of the
+     * known_hosts key, the tofu_prepare twin) */
+
+    if (strchr(host, ':') != NULL) {
+        snprintf(hop->hostkey, sizeof(hop->hostkey), "[%s]:%u%s", host, hop->port, "/ssh3-term");
+    } else {
+        snprintf(hop->hostkey, sizeof(hop->hostkey), "%s:%u%s", host, hop->port, "/ssh3-term");
+    }
 }
 
 /*
@@ -4030,8 +4036,18 @@ s3_cli_opt_parse(const char *arg)
 static s3_int_t
 s3_cli_tofu_prepare(void)
 {
-    snprintf(s3_cli_hostkey, sizeof(s3_cli_hostkey), "%s:%u%s", s3_cli_host, s3_cli_port,
-             s3_cli_path);
+    /*
+     * the ssh2 canon of the key text: the v6 host rides the bracket
+     * form ([::1]:443) - the bare "::1:443" never parses back
+     */
+
+    if (strchr(s3_cli_host, ':') != NULL) {
+        snprintf(s3_cli_hostkey, sizeof(s3_cli_hostkey), "[%s]:%u%s", s3_cli_host, s3_cli_port,
+                 s3_cli_path);
+    } else {
+        snprintf(s3_cli_hostkey, sizeof(s3_cli_hostkey), "%s:%u%s", s3_cli_host, s3_cli_port,
+                 s3_cli_path);
+    }
 
     return S3_OK;
 }
@@ -6450,23 +6466,46 @@ s3_cli_fwd_socks_ok(s3_cli_fwd_tcp_conn_t *fc, unsigned v4)
     (void)send(fc->fd, (const char *)reply, 8, 0);
 }
 
+/* the v5 success reply of the CONNECT (RFC 1928): the BND rides the
+ * zero address of the target family (ATYP 1/4) - the clients read
+ * the bound port only */
+
+static void
+s3_cli_fwd_socks_ok5(s3_cli_fwd_tcp_conn_t *fc)
+{
+    u_char reply[22];
+
+    memset(reply, 0, sizeof(reply));
+
+    reply[0] = 5;
+    reply[3] = (fc->t_family == 6) ? 4 : 1;
+
+    (void)send(fc->fd, (const char *)reply, (fc->t_family == 6) ? 22 : 10, 0);
+}
+
 /* the client-side resolve of the socks target (the wire rides the
- * raw ipv4, the names never cross the channel) */
+ * raw ip bytes of either family, the names never cross the channel) */
 
 static s3_int_t
 s3_cli_fwd_socks_resolve(s3_cli_fwd_tcp_conn_t *fc, const char *host)
 {
-    struct addrinfo    hints, *res = NULL;
-    struct sockaddr_in sa;
+    struct addrinfo     hints, *res = NULL;
+    struct sockaddr_in  sa4;
+    struct sockaddr_in6 sa6;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
 
-    if (inet_pton(AF_INET, host, &sa.sin_addr) == 1) {
-        fc->t_addr = (unsigned)sa.sin_addr.s_addr;
+    if (inet_pton(AF_INET, host, &sa4.sin_addr) == 1) {
         fc->t_family = 4;
-        memcpy(fc->t_ip, &sa.sin_addr, 4);
+        memcpy(fc->t_ip, &sa4.sin_addr, 4);
+        return S3_OK;
+    }
+
+    if (inet_pton(AF_INET6, host, &sa6.sin6_addr) == 1) {
+        fc->t_family = 6;
+        memcpy(fc->t_ip, &sa6.sin6_addr, 16);
         return S3_OK;
     }
 
@@ -6474,10 +6513,22 @@ s3_cli_fwd_socks_resolve(s3_cli_fwd_tcp_conn_t *fc, const char *host)
         return S3_ERROR;
     }
 
-    memcpy(&sa, res->ai_addr, sizeof(sa));
-    fc->t_addr = (unsigned)sa.sin_addr.s_addr;
-    fc->t_family = 4;
-    memcpy(fc->t_ip, &sa.sin_addr, 4);
+    if (res->ai_family == AF_INET6 && res->ai_addrlen >= sizeof(sa6)) {
+
+        memcpy(&sa6, res->ai_addr, sizeof(sa6));
+        fc->t_family = 6;
+        memcpy(fc->t_ip, &sa6.sin6_addr, 16);
+
+    } else if (res->ai_addrlen >= sizeof(sa4)) {
+
+        memcpy(&sa4, res->ai_addr, sizeof(sa4));
+        fc->t_family = 4;
+        memcpy(fc->t_ip, &sa4.sin_addr, 4);
+
+    } else {
+        freeaddrinfo(res);
+        return S3_ERROR;
+    }
 
     freeaddrinfo(res);
 
@@ -6616,11 +6667,20 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
 
             } else if (atyp == 4) {
 
-                /* the v6 target: the resolve stays v4 in this wave */
+                /* the v6 target: the 16 bytes become the address
+                 * text, the resolve fast-paths the literal */
 
-                s3_cli_fwd_socks_fail(fc, 8); /* the address not supported */
-                s3_cli_fwd_tcp_drop(fc);
-                return;
+                need = 4 + 16 + 2;
+
+                if (fc->socks_len < need) {
+                    return;
+                }
+
+                if (inet_ntop(AF_INET6, fc->socks_buf + 4, host, sizeof(host)) == NULL) {
+                    s3_cli_fwd_socks_fail(fc, 1);
+                    s3_cli_fwd_tcp_drop(fc);
+                    return;
+                }
 
             } else {
                 s3_cli_fwd_socks_fail(fc, 1);
@@ -6648,7 +6708,7 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
 
             fc->t_port = port;
 
-            (void)send(fc->fd, "\005\000\000\001\000\000\000\000\000\000", 10, 0);
+            s3_cli_fwd_socks_ok5(fc);
 
             fc->socks_len = 0;
             fc->socks_step = 3; /* the bridged shape, no parse left */
@@ -6713,7 +6773,6 @@ s3_cli_fwd_socks_local_read(s3_event_t *ev)
                     return;
                 }
 
-                fc->t_addr = (unsigned)a.s_addr;
                 fc->t_family = 4;
                 memcpy(fc->t_ip, &a, 4);
                 fc->t_port = port;

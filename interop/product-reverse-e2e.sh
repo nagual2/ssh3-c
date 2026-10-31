@@ -315,7 +315,9 @@ import sys
 
 pattern = bytes(range(256)) * 256  # 64 KiB
 
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=15)
+host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+
+s = socket.create_connection((host, int(sys.argv[1])), timeout=15)
 s.sendall(pattern)
 
 got = b""
@@ -517,35 +519,33 @@ fi
 stop_cli
 stop_srv
 
-echo "== leg 6: the ipv6 bind is refused by the server (fail-closed)"
+echo "== leg 6: the ipv6 bind serves the relay (PRODUCT-REVERSE-V6BIND-OK)"
 
 start_srv --run-as-user off || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+# the tcp echo of the leg 2 still rides (the stops land at the exit):
+# the wait suffices
+wait_echo tcp || die "the tcp echo did not start"
 
 S3CLILOG="$WORK/cli-v6bind.log"
 start_cli -R "[::1]:0:127.0.0.1:19121"
 
-i=0
-CLI_RC=
-
-while [ "$i" -lt 60 ]; do
-
-    if ! kill -0 "$CLIPID" 2>/dev/null; then
-        wait "$CLIPID"
-        CLI_RC=$?
-        CLIPID=
-        break
+if wait_bind; then
+    if timeout 30 python3 "$WORK/tcp_probe.py" "$RPORT" "::1" > "$WORK/tcp-v6bind.log" 2>&1 &&
+        grep -q "TCP-PROBE-OK" "$WORK/tcp-v6bind.log"; then
+        pass "the ipv6 bind relay carried 64 KiB byte-exact"
+    else
+        fail "the ipv6 bind relay leg: $(tail -2 "$WORK/tcp-v6bind.log")"
     fi
 
-    sleep 0.1
-    i=$((i + 1))
-done
-
-if [ -n "$CLI_RC" ] && [ "$CLI_RC" -ne 0 ] &&
-    grep -q "SSH3-RFWD-DENIED spec=0" "$S3CLILOG" &&
-    grep -q "unsupported ipv6 bind" "$WORK/srv.log"; then
-    pass "the ipv6 bind refused by the server (the client rc $CLI_RC)"
 else
-    fail "the ipv6 bind leg: rc=${CLI_RC:-running} $(tail -2 "$S3CLILOG")"
+    fail "the ipv6 bind leg: no bind $(tail -2 "$S3CLILOG")"
+fi
+
+if grep -q "bind=::1" "$WORK/srv.log"; then
+    pass "the daemon logged the v6 bind address"
+else
+    fail "no bind=::1 in the daemon log"
 fi
 
 stop_cli

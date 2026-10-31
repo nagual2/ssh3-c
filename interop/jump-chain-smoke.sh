@@ -119,6 +119,7 @@ I6PORT=$(port_of "$WORK/srv-5.log")
 # the pin store: both hops and the destination pin before the run
 
 mkdir -p "$WORK/home/.ssh3"
+mkdir -p "$WORK/home6/.ssh3"
 
 for spec in "1 $J1PORT" "2 $J2PORT" "3 $IPORT"; do
 
@@ -127,6 +128,18 @@ for spec in "1 $J1PORT" "2 $J2PORT" "3 $IPORT"; do
     printf '%s x509-certificate %s\n' "127.0.0.1:$2/ssh3-term" \
         "$(openssl x509 -in "$WORK/cert-$1.pem" -outform DER | base64 -w0)" \
         >> "$WORK/home/.ssh3/known_hosts"
+done
+
+# the v6 pins ride the bracket form (the ssh2 canon of the key
+# text): the -6 leg runs WITHOUT -insecure, the pins must match
+
+for spec in "4 $J6PORT" "5 $I6PORT"; do
+
+    set -- $spec
+
+    printf '[::1]:%s/ssh3-term x509-certificate %s\n' "$2" \
+        "$(openssl x509 -in "$WORK/cert-$1.pem" -outform DER | base64 -w0)" \
+        >> "$WORK/home6/.ssh3/known_hosts"
 done
 
 echo "== positive: the exec through the two-hop chain"
@@ -167,7 +180,7 @@ fi
 
 echo "== v6: the -6 chain rides the bracketed hop and destination (JUMP-V6-OK)"
 
-if HOME="$WORK/home6" timeout 40 "$BUILD/ssh3" -6 -insecure -i "$WORK/priv.pem" \
+if HOME="$WORK/home6" timeout 40 "$BUILD/ssh3" -6 -i "$WORK/priv.pem" \
     -J "[::1]:$J6PORT" \
     "client@[::1]:$I6PORT/ssh3-term" "printf S3-JUMP-V6-OK" \
     > "$WORK/v6.out" 2>"$WORK/v6.err" &&

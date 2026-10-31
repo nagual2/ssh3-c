@@ -357,10 +357,10 @@ static int s3_srv_hs_ms = 120000;
 typedef struct s3_srv_reverse_peer_s s3_srv_reverse_peer_t;
 
 struct s3_srv_reverse_peer_s {
-    unsigned           used;
-    s3_connection_t   *sc; /* the forwarded-udp channel */
-    struct sockaddr_in from;
-    socklen_t          from_len;
+    unsigned                used;
+    s3_connection_t        *sc; /* the forwarded-udp channel */
+    struct sockaddr_storage from;
+    socklen_t               from_len;
 };
 
 typedef struct {
@@ -370,7 +370,7 @@ typedef struct {
     s3_event_t               timer; /* the accept / recvfrom tick */
     uint16_t                 bound_port;
     s3_ssh3_forward_target_t target; /* the client-side target */
-    struct sockaddr_in       bind_sa;
+    struct sockaddr_storage  bind_sa;
     unsigned                 used_peers;
     s3_srv_reverse_peer_t    peers[S3_SRV_REVERSE_UDP_PEERS_MAX];
 } s3_srv_reverse_listener_t;
@@ -5270,7 +5270,7 @@ s3_srv_reverse_tcp_timer(s3_event_t *ev)
 
 static void
 s3_srv_reverse_udp_datagram(s3_srv_reverse_listener_t *l, const u_char *buf, size_t len,
-                            const struct sockaddr_in *from)
+                            const struct sockaddr_storage *from)
 {
     s3_srv_reverse_peer_t *peer = NULL;
     unsigned               i;
@@ -5299,10 +5299,34 @@ s3_srv_reverse_udp_datagram(s3_srv_reverse_listener_t *l, const u_char *buf, siz
             continue;
         }
 
-        if (cand->from.sin_addr.s_addr == from->sin_addr.s_addr &&
-            cand->from.sin_port == from->sin_port) {
-            peer = cand;
-            break;
+        /* the peer identity: the family plus the address bytes and
+         * the port (the v4 arrives mapped-free - the listeners bind
+         * the pure forms) */
+
+        if (cand->from.ss_family != from->ss_family) {
+            continue;
+        }
+
+        if (from->ss_family == AF_INET6) {
+
+            const struct sockaddr_in6 *c6 = (const struct sockaddr_in6 *)&cand->from;
+            const struct sockaddr_in6 *f6 = (const struct sockaddr_in6 *)from;
+
+            if (s3_memcmp(&c6->sin6_addr, &f6->sin6_addr, 16) == 0 &&
+                c6->sin6_port == f6->sin6_port) {
+                peer = cand;
+                break;
+            }
+
+        } else {
+
+            const struct sockaddr_in *c4 = (const struct sockaddr_in *)&cand->from;
+            const struct sockaddr_in *f4 = (const struct sockaddr_in *)from;
+
+            if (c4->sin_addr.s_addr == f4->sin_addr.s_addr && c4->sin_port == f4->sin_port) {
+                peer = cand;
+                break;
+            }
         }
     }
 
@@ -5346,7 +5370,7 @@ s3_srv_reverse_udp_timer(s3_event_t *ev)
 {
     s3_srv_reverse_listener_t *l = ev->data;
     static u_char              buf[S3_UDP_DGRAM_SIZE];
-    struct sockaddr_in         from;
+    struct sockaddr_storage    from;
     socklen_t                  from_len;
     ssize_t                    n;
 
@@ -5464,7 +5488,7 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     const char                *kind;
     s3_ssh3_reverse_reply_t    reply;
     s3_srv_reverse_listener_t *l = NULL;
-    struct sockaddr_in         sa;
+    struct sockaddr_storage    sa;
     int                        fd = -1;
     unsigned                   rewritten;
     unsigned                   booked = 0;
@@ -5612,20 +5636,26 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
 
     s3_memzero(&sa, sizeof(sa));
 
-    if (strcmp(bind_host, "::") == 0 || strchr(bind_host, ':') != NULL) {
+    /*
+     * the bind address parses in its own family (the v4 literal, the
+     * v6 literal - the clientspecified policy passes the latter
+     * through; the no/yes policies rewrote it into the v4 loopback or
+     * wildcard above): the reverse listener serves both
+     */
 
-        /* the ipv6 bind under the no policy is the rewritten loopback
-         * only: the rewrite turns every non-loopback request into
-         * 127.0.0.1 and the yes policy into 0.0.0.0, so a ":" here
-         * means the clientspecified policy passed an ipv6 literal
-         * through - the reverse listener machinery is v4-only, the
-         * bind refuses fail-closed */
+    if (strchr(bind_host, ':') != NULL) {
 
-        snprintf(reason, sizeof(reason), "unsupported ipv6 bind %s", bind_host);
-        goto refuse;
-    }
+        if (inet_pton(AF_INET6, bind_host, &((struct sockaddr_in6 *)&sa)->sin6_addr) != 1) {
+            snprintf(reason, sizeof(reason), "invalid bind address %s", bind_host);
+            goto refuse;
+        }
 
-    if (inet_pton(AF_INET, bind_host, &sa.sin_addr) != 1) {
+        sa.ss_family = AF_INET6;
+
+    } else if (inet_pton(AF_INET, bind_host, &((struct sockaddr_in *)&sa)->sin_addr) == 1) {
+        sa.ss_family = AF_INET;
+
+    } else {
         snprintf(reason, sizeof(reason), "invalid bind address %s", bind_host);
         goto refuse;
     }
@@ -5674,37 +5704,67 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
         goto refuse;
     }
 
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(req.bind_port);
+    {
+        socklen_t sa_len;
 
-    fd = socket(AF_INET, (req.proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
+        if (sa.ss_family == AF_INET6) {
 
-    if (fd == -1) {
-        snprintf(reason, sizeof(reason), "socket() failed");
-        goto refuse;
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&sa;
+
+            sa6->sin6_port = htons(req.bind_port);
+            sa_len = sizeof(*sa6);
+
+        } else {
+
+            struct sockaddr_in *sa4 = (struct sockaddr_in *)&sa;
+
+            sa4->sin_port = htons(req.bind_port);
+            sa_len = sizeof(*sa4);
+        }
+
+        fd = socket(sa.ss_family,
+                    (req.proto == S3_SSH3_REVERSE_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM, 0);
+
+        if (fd == -1) {
+            snprintf(reason, sizeof(reason), "socket() failed");
+            goto refuse;
+        }
+
+        {
+            int on = 1;
+
+            (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        }
+
+        if (sa.ss_family == AF_INET6 && req.bind_port != 0) {
+
+            /*
+             * the wildcard "::" stays the pure v6 form (no v4-mapped
+             * steal - the "*" wildcard rides the v4 listener the same
+             * pure way); the bound literals do not care either way
+             */
+
+            int v6only = 1;
+
+            (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        }
+
+        if (bind(fd, (const struct sockaddr *)&sa, sa_len) == -1 ||
+            (req.proto == S3_SSH3_REVERSE_PROTO_TCP && listen(fd, SOMAXCONN) == -1) ||
+            s3_nonblocking(fd) != S3_OK) {
+
+            snprintf(reason, sizeof(reason), "bind %s:%u failed: %s", bind_host,
+                     (unsigned)req.bind_port, strerror(errno));
+
+            (void)close(fd);
+
+            goto refuse;
+        }
     }
 
     {
-        int on = 1;
-
-        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    }
-
-    if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) == -1 ||
-        (req.proto == S3_SSH3_REVERSE_PROTO_TCP && listen(fd, SOMAXCONN) == -1) ||
-        s3_nonblocking(fd) != S3_OK) {
-
-        snprintf(reason, sizeof(reason), "bind %s:%u failed: %s", bind_host,
-                 (unsigned)req.bind_port, strerror(errno));
-
-        (void)close(fd);
-
-        goto refuse;
-    }
-
-    {
-        struct sockaddr_in got;
-        socklen_t          got_len = sizeof(got);
+        struct sockaddr_storage got;
+        socklen_t               got_len = sizeof(got);
 
         if (getsockname(fd, (struct sockaddr *)&got, &got_len) == -1) {
             snprintf(reason, sizeof(reason), "getsockname failed: %s", strerror(errno));
@@ -5712,7 +5772,9 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
             goto refuse;
         }
 
-        l->bound_port = ntohs(got.sin_port);
+        l->bound_port = (got.ss_family == AF_INET6)
+                            ? ntohs(((struct sockaddr_in6 *)&got)->sin6_port)
+                            : ntohs(((struct sockaddr_in *)&got)->sin_port);
     }
 
     l->used = 1;
@@ -5741,9 +5803,11 @@ s3_srv_reverse_request(s3_srv_h3_channel_t *ch, const s3_str_t *payload)
     ch->reverse_served = 1;
 
     {
-        char bip[INET_ADDRSTRLEN];
+        char bip[INET6_ADDRSTRLEN];
 
-        (void)inet_ntop(AF_INET, &sa.sin_addr, bip, sizeof(bip));
+        (void)(sa.ss_family == AF_INET6
+                   ? inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, bip, sizeof(bip))
+                   : inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, bip, sizeof(bip)));
 
         s3_srv_report("INTEROP-RFWD-OPEN kind=%s bind=%s:%u port=%u target=%s:%u\n", kind, bip,
                       (unsigned)req.bind_port, (unsigned)l->bound_port, target_text,

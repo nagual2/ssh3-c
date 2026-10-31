@@ -205,11 +205,13 @@ pin_home() {
 # the local port probe (the listener readiness of the hold runs)
 
 wait_tcp() {
+    # the v6 form rides the second argument (the ::1 targets)
+
     i=0
 
     while [ "$i" -lt 150 ]; do
 
-        if nc -z 127.0.0.1 "$1" > /dev/null 2>&1; then
+        if nc -z "${2:-127.0.0.1}" "$1" > /dev/null 2>&1; then
             return 0
         fi
 
@@ -274,8 +276,34 @@ socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
 HTTPPID=$!
 SRVPIDS="$SRVPIDS $HTTPPID"
 
+# the v6 twin of the http target (the socks v6 leg rides it)
+
+HTTP6PORT=$((49700 + $$ % 300))
+
+(
+    cd "$WORK/www" || exit 1
+    exec python3 -c '
+import http.server, socket, socketserver, sys
+
+class H(http.server.SimpleHTTPRequestHandler):
+
+    def log_message(self, *a):
+        pass
+
+class S6(socketserver.ThreadingTCPServer):
+    address_family = socket.AF_INET6
+
+S6.allow_reuse_address = True
+
+S6(("::1", int(sys.argv[1])), H).serve_forever()
+' "$HTTP6PORT"
+) > "$WORK/http6.log" 2>&1 &
+HTTP6PID=$!
+SRVPIDS="$SRVPIDS $HTTP6PID"
+
 wait_tcp "$ECHOPORT" || die "the echo target did not start"
 wait_tcp "$HTTPPORT" || die "the http target did not start"
+wait_tcp "$HTTP6PORT" ::1 || die "the http6 target did not start"
 
 # the hold-run helper: the background -N client of the forward legs,
 # the pid rides HOLD_PID
@@ -655,6 +683,23 @@ if wait_tcp "$DPORT" &&
     pass "-D carried the curl through the socks5 tunnel"
 else
     fail "-D leg: $(tail -1 "$WORK/hold.log")"
+fi
+
+stop_hold
+
+echo "== leg 14b: -D socks5 carries the v6 target (the atyp 4 round trip)"
+
+D6PORT=$((49400 + ($$ + 7) % 200))
+
+start_hold -N -D "127.0.0.1:$D6PORT" -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term"
+
+if wait_tcp "$D6PORT" &&
+    curl -s --max-time 10 --socks5-hostname "127.0.0.1:$D6PORT" "http://[::1]:$HTTP6PORT/" \
+        > "$WORK/leg-d6.body" 2>/dev/null &&
+    grep -q "S3CLI-SOCKS-BODY-OK" "$WORK/leg-d6.body"; then
+    pass "-D carried the v6-target curl through the socks5 tunnel"
+else
+    fail "-D v6 leg: $(tail -1 "$WORK/hold.log")"
 fi
 
 stop_hold
