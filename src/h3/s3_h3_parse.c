@@ -4812,6 +4812,21 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
                 return S3_H3_ERR_EXCESSIVE_LOAD;
             }
 
+            /*
+             * the zero-length literal parks at once (the FZ1 shape):
+             * the field state machine can re-enter here with the
+             * STALE length of 0 (the byte stream restarted while the
+             * field was mid-value) - the write counter below
+             * decrements before it tests, a zero would underflow to
+             * 2^64-1 and the raw write would never terminate
+             */
+            if (n == 0) {
+                st->value.data = (u_char *)"";
+                st->value.len = 0;
+                st->state = sw_start;
+                return S3_DONE;
+            }
+
             if (st->huffman) {
                 if (n > S3_MAX_INT_T_VALUE / 8) {
                     s3_log_error(S3_LOG_INFO, c->log, 0, "client sent too large field line");
@@ -4846,6 +4861,24 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
             /* fall through */
 
         case sw_value:
+
+            /*
+             * the re-entry with an exhausted counter (the FZ1 shape:
+             * the byte stream restarted while the field was
+             * mid-value, the state machine re-enters here with the
+             * stale length of 0 and the last pointer of the previous
+             * allocation - possibly the exact end of the pool block)
+             * parks the value as the static empty string: the NUL
+             * through the stale last pointer is the one-byte write
+             * past the pool block the nightly fuzz caught
+             */
+
+            if (st->length == 0) {
+                st->value.data = (u_char *)"";
+                st->value.len = 0;
+                st->state = sw_start;
+                return S3_DONE;
+            }
 
             if (b->pos == b->last) {
                 return S3_AGAIN;

@@ -729,6 +729,68 @@ s3_test_field_lifetime(s3_connection_t *c)
     S3_ASSERT(s3_memcmp(st.field_rep.field.value.data, value.data, value.len) == 0);
 }
 
+/*
+ * the FZ1 pin (the nightly fuzz 2026-10-28, fixed by the zero-length
+ * parks plus the exhausted-counter guards of s3_h3_parse_literal): a
+ * section where a zero-length value literal rides next to the full
+ * ones - the following field must parse clean, no stale literal
+ * state may leak into it
+ */
+
+static void
+s3_test_zero_literal(s3_connection_t *c)
+{
+    u_char                sec[64], *p;
+    s3_buf_t              b;
+    s3_int_t              rc;
+    s3_h3_parse_headers_t st;
+    s3_str_t             *name, *value;
+
+    p = sec;
+    *p++ = 0x01; /* the HEADERS frame type */
+    *p++ = 0x0e; /* the frame length: the 14-byte section */
+    *p++ = 0x00; /* the section prefix: insert count 0 */
+    *p++ = 0x00; /* sign 0, delta base 0 */
+
+    /* field_l: the name "abc", the zero-length value */
+
+    *p++ = 0x23;
+    *p++ = 'a';
+    *p++ = 'b';
+    *p++ = 'c';
+    *p++ = 0x00;
+
+    /* field_l: the name "x", the value "yzw" - the FZ1 corruption
+     * shape hit exactly this follower */
+
+    *p++ = 0x21;
+    *p++ = 'x';
+    *p++ = 0x03;
+    *p++ = 'y';
+    *p++ = 'z';
+    *p++ = 'w';
+
+    s3_memzero(&st, sizeof(st));
+
+    b.memory = 1;
+    b.pos = sec;
+    b.last = p;
+
+    rc = s3_h3_parse_headers(c, &st, &b);
+    S3_ASSERT(rc == S3_OK || rc == S3_DONE);
+    name = &st.field_rep.field.name;
+    value = &st.field_rep.field.value;
+    S3_ASSERT(name->len == 3 && s3_memcmp(name->data, "abc", 3) == 0);
+    S3_ASSERT(value->len == 0);
+
+    rc = s3_h3_parse_headers(c, &st, &b);
+    S3_ASSERT(rc == S3_OK || rc == S3_DONE);
+    name = &st.field_rep.field.name;
+    value = &st.field_rep.field.value;
+    S3_ASSERT(name->len == 1 && name->data[0] == 'x');
+    S3_ASSERT(value->len == 3 && s3_memcmp(value->data, "yzw", 3) == 0);
+}
+
 static int
 s3_test_h3_parse(void)
 {
@@ -746,6 +808,7 @@ s3_test_h3_parse(void)
     s3_test_varlen(c);
     s3_test_prefix_int(c);
     s3_test_headers_frames(c);
+    s3_test_zero_literal(c);
     s3_test_literal(c);
     s3_test_field_lifetime(c);
     s3_test_huffman();

@@ -157,10 +157,6 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         return 0;
     }
 
-    s3_memzero(&hst, sizeof(hst));
-    s3_memzero(&dst, sizeof(dst));
-    s3_memzero(&ust, sizeof(ust));
-
     n = size - 1;
 
     if (n > sizeof(buf)) {
@@ -170,6 +166,22 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     s3_memcpy(buf, data + 1, n);
 
     for (i = 0; i < S3_FUZZ_H3_PARSE_ROUNDS; i++) {
+
+        /*
+         * the state machines reset per round: the production resume
+         * is the compacted forward-only shape (the server compacts
+         * the consumed bytes out of the receive buffer, the next
+         * parse continues at exactly the stopped state over the
+         * unconsumed tail - s3_srv_h3_request_read), never the
+         * rewind-and-reconsume of the earlier shape here - that one
+         * fed the already-consumed bytes back through the mid-state
+         * machine and produced the FZ1 finding, an input no caller
+         * can produce
+         */
+
+        s3_memzero(&hst, sizeof(hst));
+        s3_memzero(&dst, sizeof(dst));
+        s3_memzero(&ust, sizeof(ust));
 
         s3_memzero(&b, sizeof(b));
         b.pos = buf;
