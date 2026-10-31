@@ -14449,11 +14449,11 @@ main(int argc, char **argv)
 
             s3_cli_hs_done = 1;
 
-            /* the resumption marker of the 0-RTT stage 1: the e2e
-             * greps it (the second connection of a process rides the
-             * stored ticket), the quiet run keeps the stderr clean */
+            /* the resumption marker: the debug output (-v or the
+             * explicit --log-level) - the plain run keeps the stderr
+             * clean */
 
-            if (!s3_cli_quiet) {
+            if (s3_cli_vcount >= 1 || s3_cli_level_explicit) {
                 fprintf(stderr, "SSH3-SESSION-REUSED %d\n",
                         SSL_session_reused(cli->ssl->connection));
             }
