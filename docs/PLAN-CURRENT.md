@@ -122,6 +122,19 @@
 
 ---
 
+## Блок 8. Волна v6-полноты — **ЗАКРЫТО 2026-10-31** (`bb95177`, `72a0d91`)
+
+| № | Дыра | Фикс | Приёмка |
+|---|------|------|---------|
+| 1 | Сокет-юнит `0.0.0.0:443` — v4-only (хосты без v6) | bare `ListenDatagram=443` + `BindIPv6Only=both` — один dual-stack fd (демон принимает оба семейства с волны снятия guard'а); деплой на минисфорум и WSL 2026-10-31, `ss -lun` = `*:443` на обоих | dual-stack слушатель на прод-хостах ✓ |
+| 2 | Reverse-listener `-R` v4-only (fail-closed гейт) | bind-адрес парсится в своём семействе (v4/v6 литерал; clientspecified пропускает v6), socket/getsockname на sockaddr_storage, `::` — чистый v6 (IPV6_V6ONLY), UDP-пиры ключуются family+addr+port | нога 6 product-reverse инвертирована: PRODUCT-REVERSE-V6BIND-OK (64 КиБ через ::1, лог bind=::1) |
+| 3 | `-D` SOCKS v4-only (AF_INET + SOCKS4-ответ) | resolve AF_UNSPEC + v6-литерал fast-path, atyp 4 (16 байт) парсится, success-reply несёт ATYP семейства цели | нога 14b cli-compat: curl через socks5 на `http://[::1]` — PASS |
+| 4 | known_hosts v6-ключи | скобочная форма ssh2-канона (`[::1]:443`) в главном пине и hop-пинах; jump-chain v6-нога гоняет пины без -insecure | JUMP-V6-OK на живых пинах ✓ |
+
+Го-форку не требуется (dual-stack из коробки: юниты `[::]:443`, net.Listen/ResolveTCPAddr, SOCKS5).
+
+---
+
 ## Календарь и порядок
 
 | № | Что | Срок |
