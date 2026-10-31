@@ -1693,7 +1693,7 @@ static void s3_srv_agent_accept_timer(s3_event_t *ev);
 
 static void s3_srv_reverse_teardown(void);
 
-static s3_srv_h3_channel_t *s3_srv_h3_channel_alloc(s3_connection_t *sc);
+static s3_srv_h3_channel_t *s3_srv_h3_channel_alloc(s3_connection_t *sc, s3_connection_t *pc);
 
 static void s3_srv_h3_channel_read(s3_event_t *ev);
 
@@ -3086,7 +3086,7 @@ s3_srv_channel_user_snapshot(s3_srv_h3_channel_t *ch)
 }
 
 static s3_srv_h3_channel_t *
-s3_srv_h3_channel_alloc(s3_connection_t *sc)
+s3_srv_h3_channel_alloc(s3_connection_t *sc, s3_connection_t *pc)
 {
     unsigned i;
 
@@ -3100,6 +3100,21 @@ s3_srv_h3_channel_alloc(s3_connection_t *sc)
             s3_srv_h3_channels[i].sftp_out = -1;
 
             s3_srv_channel_user_snapshot(&s3_srv_h3_channels[i]);
+
+            /*
+             * the compression of the channel body rides the connection
+             * (the accept path picks the same way): the server-initiated
+             * channels (forward-agent, reverse forwarded-tcp/udp) took
+             * NONE here before B16 and the peer's compressed frames on
+             * them died with "the payload does not decode"
+             */
+
+            {
+                s3_srv_preauth_t *pa = s3_srv_preauth_find(pc);
+
+                s3_srv_h3_channels[i].compress_alg =
+                    (pa != NULL) ? pa->compress_alg : S3_SSH3_COMPRESS_NONE;
+            }
 
             return &s3_srv_h3_channels[i];
         }
@@ -4708,7 +4723,7 @@ s3_srv_agent_conn_open(s3_srv_h3_channel_t *sess_ch, int fd)
         return;
     }
 
-    nch = s3_srv_h3_channel_alloc(nsc);
+    nch = s3_srv_h3_channel_alloc(nsc, pc);
 
     if (nch == NULL) {
         fprintf(stderr, "ssh3-server: agent channel table is full\n");
@@ -5136,7 +5151,7 @@ s3_srv_reverse_channel_open(s3_srv_reverse_listener_t *l, const char *type)
         return NULL;
     }
 
-    nch = s3_srv_h3_channel_alloc(nsc);
+    nch = s3_srv_h3_channel_alloc(nsc, s3_srv_reverse.pc);
 
     if (nch == NULL) {
         (void)s3_quic_cancelable_stream(nsc);

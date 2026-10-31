@@ -7987,18 +7987,38 @@ s3_cli_rev_stream_read(s3_event_t *ev)
                     continue;
                 }
 
-                if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+                if (type == S3_SSH3_MSG_CHANNEL_DATA ||
+                    type == S3_SSH3_MSG_CHANNEL_DATA_COMPRESSED) {
 
-                    s3_ssh3_msg_data_t data;
+                    s3_str_t data;
+                    s3_int_t rc;
+                    size_t   tail_len;
 
                     if (!b->confirmed) {
                         s3_cli_rev_bridge_kill(b, "the bridge data before the confirmation");
                         return;
                     }
 
-                    if (s3_ssh3_msg_parse_data(&pos, end, &data) != S3_OK) {
+                    /*
+                     * the both forms ride one parser: the peer may
+                     * compress by the capability it read in our
+                     * version string, the plain form keeps the same
+                     * bytes (the B16 cross leg: the fork server
+                     * compresses its forwarded-tcp writes)
+                     */
+
+                    rc = s3_ssh3_frame_data_parse(&pos, end, type, s3_ssh3_compress_available(),
+                                                  s3_cli_compress_dec, s3_cli_fwd_plain,
+                                                  sizeof(s3_cli_fwd_plain), &data);
+
+                    if (rc == S3_ERROR) {
                         pos = msg;
                         break;
+                    }
+
+                    if (rc != S3_OK) {
+                        s3_cli_rev_bridge_kill(b, "the bridge payload does not decode");
+                        return;
                     }
 
                     if (b->kind == S3_SSH3_REVERSE_PROTO_UDP) {
@@ -8006,10 +8026,91 @@ s3_cli_rev_stream_read(s3_event_t *ev)
                         return;
                     }
 
-                    if (data.data.len > 0) {
-                        s3_memmove(w, data.data.data, data.data.len);
-                        w += data.data.len;
+                    tail_len = (size_t)(end - pos);
+
+                    /*
+                     * the payload parks at w, the unparsed tail rides
+                     * beyond it: the decoded form is longer than the
+                     * wire frame (the compressed body), so the move
+                     * order follows the payload source - the 94 view
+                     * dies with the frame region and copies first,
+                     * the 192 scratch survives it and the tail
+                     * relocates first; one order for both forms
+                     * clobbered the tail with the previous payload
+                     * (the raw probe bytes sat where the next frame
+                     * header belonged, the B16 hexdump)
+                     */
+
+                    if ((size_t)(w - b->acc) + data.len + tail_len > b->acc_cap) {
+
+                        /* the same growth shape as the recv path: the
+                         * decoded body of one frame rides the buffer
+                         * next to the tail, the seed cap does not
+                         * always hold it */
+
+                        size_t  w_off = (size_t)(w - b->acc);
+                        size_t  pos_off = (size_t)(pos - b->acc);
+                        size_t  view_off = 0;
+                        size_t  cap;
+                        u_char *grown;
+
+                        if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+                            view_off = (size_t)(data.data - b->acc);
+                        }
+
+                        if (b->acc_cap >= S3_CLI_REV_BUF_MAX) {
+                            s3_cli_rev_bridge_kill(b, "the bridge buffer overgrown");
+                            return;
+                        }
+
+                        cap = b->acc_cap + 32768;
+
+                        if (cap > S3_CLI_REV_BUF_MAX) {
+                            cap = S3_CLI_REV_BUF_MAX;
+                        }
+
+                        grown = realloc(b->acc, cap);
+
+                        if (grown == NULL) {
+                            s3_cli_rev_bridge_kill(b, "the bridge buffer growth failed");
+                            return;
+                        }
+
+                        b->acc = grown;
+                        b->acc_cap = cap;
+                        w = b->acc + w_off;
+                        pos = b->acc + pos_off;
+                        end = pos + tail_len;
+
+                        if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+                            data.data = b->acc + view_off;
+                        }
                     }
+
+                    if (type == S3_SSH3_MSG_CHANNEL_DATA) {
+
+                        if (data.len > 0) {
+                            s3_memmove(w, data.data, data.len);
+                        }
+
+                        if (tail_len > 0) {
+                            s3_memmove(w + data.len, pos, tail_len);
+                        }
+
+                    } else {
+
+                        if (tail_len > 0) {
+                            s3_memmove(w + data.len, pos, tail_len);
+                        }
+
+                        if (data.len > 0) {
+                            s3_memmove(w, data.data, data.len);
+                        }
+                    }
+
+                    w += data.len;
+                    pos = w;
+                    end = w + tail_len;
 
                     continue;
                 }
