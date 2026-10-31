@@ -150,15 +150,16 @@ s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key,
 
     /*
      * the session resumption groundwork of the 0-RTT stage 1: the
-     * tickets ride the internal server cache, the early-data
-     * advertisement arms the per-SSL enable hook of
-     * s3_quic_init_connection - the client attempts the early flight,
-     * the 425 gate of the CONNECT keeps the auth out of the replay
-     * window (RFC 8470)
+     * tickets ride the internal server cache.  NO early-data
+     * advertisement here (B21): SSL_CTX_set_max_early_data() leaks
+     * into the NewSessionTicket as the TLS-level max_early_data_size,
+     * and the strict QUIC clients (rustls) reject any value but 0 /
+     * 0xffffffff there - in QUIC the 0-RTT limit rides the transport
+     * parameter (RFC 9001 4.5), the advertisement comes back with the
+     * real early-data wave
      */
 
     SSL_CTX_set_session_cache_mode(ssl->ctx, SSL_SESS_CACHE_SERVER);
-    SSL_CTX_set_max_early_data(ssl->ctx, 16384);
 
     return ssl;
 

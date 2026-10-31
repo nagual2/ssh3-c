@@ -674,6 +674,12 @@ echo "== leg 14: -D socks5 (the curl through the proxy)"
 
 DPORT=$((49400 + $$ % 200))
 
+# the leftover listener of a hard-killed earlier run scans away
+
+while nc -z 127.0.0.1 "$DPORT" 2>/dev/null; do
+    DPORT=$((DPORT + 1))
+done
+
 start_hold -N -D "127.0.0.1:$DPORT" -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term"
 
 if wait_tcp "$DPORT" &&
@@ -689,7 +695,11 @@ stop_hold
 
 echo "== leg 14b: -D socks5 carries the v6 target (the atyp 4 round trip)"
 
-D6PORT=$((49400 + ($$ + 7) % 200))
+D6PORT=$((49700 + $$ % 200))
+
+while nc -z 127.0.0.1 "$D6PORT" 2>/dev/null; do
+    D6PORT=$((D6PORT + 1))
+done
 
 start_hold -N -D "127.0.0.1:$D6PORT" -i "$WORK/priv.pem" "client@127.0.0.1:$PORT/ssh3-term"
 
@@ -710,7 +720,7 @@ PORT6=$(start_srv6 3) || die "the dual-stack daemon did not start"
 
 [ -n "$PORT6" ] || die "no -6 listen port"
 
-pin_home home6 "::1:$PORT6/ssh3-term" 3
+pin_home home6 "[::1]:$PORT6/ssh3-term" 3
 
 echo "== leg 15: -6 against the dual-stack listener"
 
