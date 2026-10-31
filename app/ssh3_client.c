@@ -569,11 +569,20 @@ static unsigned s3_cli_opt_strict;
 #define S3_CLI_SFTP_PUT  1
 #define S3_CLI_SFTP_GET  2
 
-static unsigned           s3_cli_sftp_mode;
-static char              *s3_cli_sftp_local;
-static char              *s3_cli_sftp_remote;
-static unsigned           s3_cli_sftp_recursive;
-static s3_pool_t         *s3_cli_sftp_pool;
+static unsigned   s3_cli_sftp_mode;
+static char      *s3_cli_sftp_local;
+static char      *s3_cli_sftp_remote;
+static unsigned   s3_cli_sftp_recursive;
+static s3_pool_t *s3_cli_sftp_pool;
+
+/*
+ * the process-lifetime strings of the run (the exec command, the sftp
+ * operands, the notes) ride one pool: they live to the exit and die
+ * there - the canon "the small things die with the pool", no point
+ * free lists
+ */
+
+static s3_pool_t         *s3_cli_pool;
 static s3_ssh3_sftp_cli_t s3_cli_sftp;
 static unsigned           s3_cli_sftp_started;
 static unsigned           s3_cli_sftp_parked; /* the flush parks on the stream window */
@@ -691,6 +700,7 @@ typedef struct {
     u_char          *to_local; /* the parked local bytes */
     size_t           to_local_len;
     size_t           to_local_cap;
+    s3_pool_t       *pool; /* the fixed-size buffers of this conn die here */
     /* the -D socks leg: the per-conn handshake state and the per-conn
      * target (the request names it, the spec holds the listener) */
     unsigned socks;
@@ -793,6 +803,7 @@ typedef struct {
     u_char          *frame; /* the in-flight 94 frame */
     size_t           frame_sent;
     size_t           frame_total;
+    s3_pool_t       *pool; /* the fixed-size buffers of this bridge die here */
 } s3_cli_rev_bridge_t;
 
 static s3_cli_rev_bridge_t s3_cli_rev_bridge[S3_CLI_REV_BRIDGES];
@@ -3216,7 +3227,17 @@ s3_cli_note(const char *fmt, ...)
     (void)vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    s3_cli_notes[s3_cli_notes_n++] = strdup(buf);
+    if (s3_cli_pool == NULL) {
+        s3_cli_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    }
+
+    s3_cli_notes[s3_cli_notes_n++] = s3_palloc(s3_cli_pool, strlen(buf) + 1);
+
+    if (s3_cli_notes[s3_cli_notes_n - 1] != NULL) {
+        strcpy(s3_cli_notes[s3_cli_notes_n - 1], buf);
+    } else {
+        s3_cli_notes_n--; /* the pool is out: the note drops silently */
+    }
 }
 
 static void
@@ -3226,7 +3247,6 @@ s3_cli_notes_flush(void)
 
     for (i = 0; i < s3_cli_notes_n; i++) {
         fprintf(stderr, "%s\n", s3_cli_notes[i]);
-        free(s3_cli_notes[i]);
         s3_cli_notes[i] = NULL;
     }
 
@@ -3247,7 +3267,11 @@ s3_cli_join_words(char **argv, size_t first, size_t argc)
         cmdlen += strlen(argv[i]) + 1;
     }
 
-    cmd = malloc(cmdlen);
+    if (s3_cli_pool == NULL) {
+        s3_cli_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    }
+
+    cmd = s3_palloc(s3_cli_pool, cmdlen);
 
     if (cmd == NULL) {
         return NULL;
@@ -3306,7 +3330,11 @@ s3_cli_sftp_spec_parse(const char *rest)
     }
 
     len = (size_t)(sep - rest);
-    s3_cli_sftp_local = malloc(len + 1);
+    if (s3_cli_pool == NULL) {
+        s3_cli_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    }
+
+    s3_cli_sftp_local = s3_palloc(s3_cli_pool, len + 1);
 
     if (s3_cli_sftp_local == NULL) {
         fprintf(stderr, "ssh3: out of memory\n");
@@ -3317,7 +3345,7 @@ s3_cli_sftp_spec_parse(const char *rest)
     s3_cli_sftp_local[len] = '\0';
 
     len = strlen(sep + 1);
-    s3_cli_sftp_remote = malloc(len + 1);
+    s3_cli_sftp_remote = s3_palloc(s3_cli_pool, len + 1);
 
     if (s3_cli_sftp_remote == NULL) {
         fprintf(stderr, "ssh3: out of memory\n");
@@ -3399,7 +3427,11 @@ s3_cli_sftp_positional_parse(const char *src, const char *dst)
         return S3_ERROR;
     }
 
-    s3_cli_sftp_local = malloc(strlen(local) + 1);
+    if (s3_cli_pool == NULL) {
+        s3_cli_pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    }
+
+    s3_cli_sftp_local = s3_palloc(s3_cli_pool, strlen(local) + 1);
 
     if (s3_cli_sftp_local == NULL) {
         fprintf(stderr, "ssh3: out of memory\n");
@@ -3408,7 +3440,7 @@ s3_cli_sftp_positional_parse(const char *src, const char *dst)
 
     strcpy(s3_cli_sftp_local, local);
 
-    s3_cli_sftp_remote = malloc(strlen(remote) + 1);
+    s3_cli_sftp_remote = s3_palloc(s3_cli_pool, strlen(remote) + 1);
 
     if (s3_cli_sftp_remote == NULL) {
         fprintf(stderr, "ssh3: out of memory\n");
@@ -5818,10 +5850,21 @@ s3_cli_fwd_tcp_drop(s3_cli_fwd_tcp_conn_t *fc)
         fc->chan = NULL;
     }
 
-    free(fc->frame);
+    /* the frame dies with the conn pool; the growing accumulators
+     * stay the malloc/realloc kind and free pointwise */
+
     free(fc->chan_acc);
     free(fc->to_chan);
     free(fc->to_local);
+
+    fc->chan_acc = NULL;
+    fc->to_chan = NULL;
+    fc->to_local = NULL;
+
+    if (fc->pool != NULL) {
+        s3_destroy_pool(fc->pool);
+        fc->pool = NULL;
+    }
 
     fc->used = 0;
 }
@@ -6234,7 +6277,19 @@ s3_cli_fwd_conn_open(s3_cli_fwd_tcp_conn_t *fc, unsigned t_family, const u_char 
         return S3_ERROR;
     }
 
-    fc->frame = malloc(S3_CLI_FWD_FRAME);
+    /* the fixed-size frame rides the conn pool (the canon: it dies
+     * with the conn); the growing accumulators stay the
+     * malloc/realloc/free kind - the pool does not fit the growth */
+
+    if (fc->pool == NULL) {
+        fc->pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+    }
+
+    if (fc->pool == NULL) {
+        return S3_ERROR;
+    }
+
+    fc->frame = s3_palloc(fc->pool, S3_CLI_FWD_FRAME);
 
     if (fc->frame == NULL) {
         return S3_ERROR;
@@ -7398,9 +7453,11 @@ s3_cli_rev_bridge_kill(s3_cli_rev_bridge_t *b, const char *why)
         }
     }
 
+    /* the growing accumulators stay the malloc/realloc kind; the
+     * frame dies with the bridge pool */
+
     free(b->acc);
     free(b->to_chan);
-    free(b->frame);
 
     b->acc = NULL;
     b->to_chan = NULL;
@@ -7410,6 +7467,11 @@ s3_cli_rev_bridge_kill(s3_cli_rev_bridge_t *b, const char *why)
     b->to_chan_len = 0;
     b->frame_sent = b->frame_total = 0;
     b->used = 0;
+
+    if (b->pool != NULL) {
+        s3_destroy_pool(b->pool);
+        b->pool = NULL;
+    }
 }
 
 /*
@@ -8147,7 +8209,22 @@ s3_cli_rev_pump(void)
                 }
 
                 if (b->frame == NULL) {
-                    b->frame = malloc(S3_CLI_FWD_FRAME);
+
+                    /* the fixed-size frame rides the bridge pool (the
+                     * canon: it dies with the bridge); the growing
+                     * acc/to_chan stay the malloc/realloc kind - the
+                     * pool does not fit the growth */
+
+                    if (b->pool == NULL) {
+                        b->pool = s3_create_pool(S3_DEFAULT_POOL_SIZE, &s3_cli_log);
+                    }
+
+                    if (b->pool == NULL) {
+                        s3_cli_rev_bridge_kill(b, "the bridge frame alloc failed");
+                        break;
+                    }
+
+                    b->frame = s3_palloc(b->pool, S3_CLI_FWD_FRAME);
 
                     if (b->frame == NULL) {
                         s3_cli_rev_bridge_kill(b, "the bridge frame alloc failed");
