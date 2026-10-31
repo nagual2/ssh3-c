@@ -38,6 +38,13 @@ typedef struct {
 
     /* the stream type is parsed and registered */
     unsigned registered : 1;
+
+    /*
+     * the unknown stream type (B20): the RFC 9114 6.2 discard - the
+     * reading aborted with STOP_SENDING, the data drops, the
+     * connection lives
+     */
+    unsigned discarded : 1;
 } s3_h3_uni_stream_t;
 
 /*
@@ -50,6 +57,7 @@ typedef struct {
 
 static void             s3_h3_close_uni_stream(s3_connection_t *c);
 static void             s3_h3_uni_read_handler(s3_event_t *rev);
+static void             s3_h3_uni_discard_read_handler(s3_event_t *rev);
 static void             s3_h3_uni_dummy_read_handler(s3_event_t *rev);
 static void             s3_h3_uni_dummy_write_handler(s3_event_t *wev);
 static void             s3_h3_cleanup_session(void *data);
@@ -129,7 +137,6 @@ s3_h3_uni_index(s3_connection_t *pc, uint64_t type, unsigned incoming)
 void
 s3_h3_init_uni_stream(s3_connection_t *c)
 {
-    uint64_t            n;
     s3_connection_t    *pc;
     s3_quic_stream_t   *qs;
     s3_h3_uni_stream_t *us;
@@ -139,14 +146,15 @@ s3_h3_init_uni_stream(s3_connection_t *c)
 
     s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 init uni stream");
 
-    n = qs->id >> 2;
-
-    if (n >= S3_H3_MAX_UNI_STREAMS) {
-        s3_quic_finalize_connection(pc, S3_H3_ERR_STREAM_CREATION_ERROR,
-                                    "reached maximum number of uni streams");
-        s3_close_connection(c);
-        return;
-    }
+    /*
+     * the stream type is unknown until the first bytes parse - the
+     * known/unknown policy runs at the registration
+     * (s3_h3_register_uni_stream), never here: the RFC 9114 6.2
+     * forbids treating an unknown uni stream as a connection error
+     * "of any kind" (B20 - the ordinal gate of the earlier shape
+     * finalized the connection on the peer's fourth uni stream before
+     * the type was read)
+     */
 
     s3_quic_cancelable_stream(c);
 
@@ -213,7 +221,6 @@ s3_int_t
 s3_h3_register_uni_stream(s3_connection_t *c, uint64_t type)
 {
     s3_int_t            index;
-    s3_uint_t           streams;
     s3_connection_t    *pc;
     s3_h3_session_t    *h3c;
     s3_h3_uni_stream_t *us;
@@ -245,22 +252,18 @@ s3_h3_register_uni_stream(s3_connection_t *c, uint64_t type)
 
     default:
 
-        s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 stream 0x%02xL", type);
-
         /*
-         * the mandatory streams of the peer: no other uni stream type
-         * may arrive before they are all created
+         * the unknown stream type (the grease form of RFC 9114 6.2.3
+         * included): the discard, never an error - "MUST NOT consider
+         * unknown stream types to be a connection error of any kind"
+         * (B20; the mandatory-trio order check does not extend to the
+         * unknown types, the same MUST NOT covers them)
          */
-        streams = (1u << s3_h3_uni_index(pc, S3_H3_STREAM_CONTROL, 1)) |
-                  (1u << s3_h3_uni_index(pc, S3_H3_STREAM_ENCODER, 1)) |
-                  (1u << s3_h3_uni_index(pc, S3_H3_STREAM_DECODER, 1));
 
-        if ((h3c->created_streams & streams) != streams) {
-            s3_log_error(S3_LOG_INFO, c->log, 0, "missing mandatory stream");
-            return S3_H3_ERR_STREAM_CREATION_ERROR;
-        }
+        s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 unknown uni stream 0x%02xL, discarded",
+                      type);
 
-        index = -1;
+        return S3_DECLINED;
     }
 
     if (index >= 0) {
@@ -375,6 +378,25 @@ s3_h3_uni_read_handler(s3_event_t *rev)
         if (!us->registered && us->parse.state > S3_H3_UNI_PARSE_TYPE_STATE) {
 
             rc = s3_h3_register_uni_stream(c, us->parse.vlint.value);
+
+            if (rc == S3_DECLINED) {
+
+                /*
+                 * the unknown stream type: the RFC 9114 6.2 discard -
+                 * the reading aborts with STOP_SENDING, the tail data
+                 * drops on the floor, the connection lives
+                 */
+
+                us->discarded = 1;
+                us->registered = 1;
+
+                c->read->handler = s3_h3_uni_discard_read_handler;
+
+                (void)s3_quic_shutdown_stream(c, S3_READ_SHUTDOWN);
+
+                return;
+            }
+
             if (rc != S3_OK) {
                 /* rc carries the h3 error code */
                 goto failed;
@@ -397,6 +419,40 @@ failed:
 
     s3_quic_finalize_connection(us->parent, rc, "stream error");
     s3_h3_close_uni_stream(c);
+}
+
+static void
+s3_h3_uni_discard_read_handler(s3_event_t *rev)
+{
+    u_char              buf[512];
+    s3_connection_t    *c;
+    s3_h3_uni_stream_t *us;
+    ssize_t             n;
+
+    us = rev->data;
+    c = us->c;
+
+    if (rev->error) {
+        s3_h3_close_uni_stream(c);
+        return;
+    }
+
+    /*
+     * the data of the discarded stream drops on the floor: the
+     * STOP_SENDING tells the peer to stop, the in-flight tail drains
+     * here until the stream settles (the bounded chunk per call, the
+     * read event re-arms)
+     */
+
+    while (rev->ready) {
+
+        n = c->recv(c, buf, sizeof(buf));
+
+        if (n <= 0) {
+            s3_h3_close_uni_stream(c);
+            return;
+        }
+    }
 }
 
 static void

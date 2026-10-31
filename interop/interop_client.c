@@ -176,8 +176,8 @@ static unsigned         s3_interop_h3_ch_ok;
  * BAD-CHANNEL-VERDICT line of the channel reader (confirmed=0)
  */
 
-static int              s3_interop_preauth_channel;
-static unsigned         s3_interop_preauth_checked;
+static int      s3_interop_preauth_channel;
+static unsigned s3_interop_preauth_checked;
 
 /*
  * the pass-2 e2e probe (S3INTEROP_BAD_CHANNEL=forwarded-tcp|
@@ -355,13 +355,13 @@ static unsigned         s3_interop_jump_ch_sent;
  * client's CONNECT land on the server in between
  */
 
-static s3_event_t      s3_interop_split_timer;
-static u_char          s3_interop_split_tail[1024];
-static size_t          s3_interop_split_tail_len;
+static s3_event_t       s3_interop_split_timer;
+static u_char           s3_interop_split_tail[1024];
+static size_t           s3_interop_split_tail_len;
 static s3_connection_t *s3_interop_split_stream;
 
-static void s3_interop_split_send(s3_event_t *ev);
-static unsigned         s3_interop_jump_ch_confirmed;
+static void     s3_interop_split_send(s3_event_t *ev);
+static unsigned s3_interop_jump_ch_confirmed;
 
 /* the receive accumulator of the jump channel (the 91 confirmation) */
 static u_char s3_interop_jump_ch_buf[64];
@@ -6935,6 +6935,34 @@ s3_interop_h3_client_stream(s3_connection_t *c, s3_quic_stream_t *qs)
         }
     }
 
+    /*
+     * the grease uni stream probe (the B20 e2e): the reserved stream
+     * type rides the wire ahead of the session traffic - the daemon
+     * must discard it without the connection error (RFC 9114 6.2),
+     * the session continues
+     */
+
+    if (getenv("S3INTEROP_UNI_GREASE") != NULL) {
+
+        s3_connection_t *gs;
+        u_char           gre[8], *p;
+
+        gs = s3_quic_open_stream(pc, 0);
+
+        if (gs != NULL) {
+
+            p = gre;
+            *p++ = 0x21; /* the reserved stream type (the grease form) */
+            *p++ = 'g';
+            *p++ = 'r';
+            *p++ = 'e';
+
+            (void)s3_quic_stream_send(gs, gre, (size_t)(p - gre));
+
+            fprintf(stderr, "INTEROP-UNI-GREASE-SENT\n");
+        }
+    }
+
     s3_h3_init_stream(c);
 }
 
@@ -7748,8 +7776,7 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:R:F:e:J:S:j:O:i:M:P:r3CMTSXh")) !=
-           -1) {
+    while ((opt = getopt(argc, argv, "a:n:s:m:t:A:d:W:L:U:K:R:F:e:J:S:j:O:i:M:P:r3CMTSXh")) != -1) {
 
         switch (opt) {
 
@@ -8707,7 +8734,8 @@ main(int argc, char **argv)
                     m = s3_quic_stream_send(s3_interop_h3_stream, frame, half);
 
                     if (m != (ssize_t)half) {
-                        fprintf(stderr, "interop-client: the first half of the request send failed\n");
+                        fprintf(stderr,
+                                "interop-client: the first half of the request send failed\n");
                         rc = 1;
                         goto teardown;
                     }
@@ -8807,8 +8835,7 @@ main(int argc, char **argv)
                 }
 
             } else if ((s3_interop_h3_status_seen ||
-                        (s3_interop_preauth_channel &&
-                         s3_interop_h3_stream != NULL)) &&
+                        (s3_interop_preauth_channel && s3_interop_h3_stream != NULL)) &&
                        (s3_interop_h3_channel_mode || s3_interop_fwd_mode ||
                         s3_interop_sftp_mode)) {
 

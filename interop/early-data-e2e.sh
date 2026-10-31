@@ -98,6 +98,25 @@ else
     fail "the retry run: rc=$RC $(tail -3 "$W/retry-cli.log")"
 fi
 
+echo "== 3: the grease uni stream is discarded, the session lives (B20)"
+
+timeout 30 env S3INTEROP_UNI_GREASE=1 "$BUILD/s3interop_client" -3 -C -a "127.0.0.1:$PORT" \
+    -t 20000 > "$W/grease-cli.log" 2>&1
+RC=$?
+
+if [ "$RC" -eq 0 ] && grep -q "INTEROP-UNI-GREASE-SENT" "$W/grease-cli.log" &&
+    grep -q "INTEROP-CHANNEL-OK" "$W/grease-cli.log"; then
+    pass "the session crossed the reserved uni stream (the exec rode through)"
+else
+    fail "the grease run: rc=$RC $(tail -3 "$W/grease-cli.log")"
+fi
+
+if grep -q "reached maximum number of uni streams" "$SRV"; then
+    fail "the daemon finalized on the peer uni stream (the B20 violation shape)"
+else
+    pass "the daemon log carries no uni-stream finalize"
+fi
+
 kill "$SRVPID" 2>/dev/null
 wait "$SRVPID" 2>/dev/null
 

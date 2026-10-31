@@ -20,7 +20,7 @@
 # usage: s3cm-e2e.sh [worktree]
 set -u
 
-ROOT=${1:-/mnt/c/Git/project/ssh3-c}
+ROOT=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 # the BUILD override rides the valgrind harness (the wrapper dir), the
 # default is the worktree release build
 BUILD=${BUILD:-$ROOT/build/linux-release}
