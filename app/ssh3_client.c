@@ -15194,8 +15194,9 @@ s3_cli_teardown(void)
 
     s3_event_ctx_shutdown(&s3_cli_ctx);
 
-    free(s3_cli_cmd);
-    s3_cli_cmd = NULL;
+    /* the command and the sftp operands ride the client pool (they
+     * die with it); the cm exec and the sftp io buffers stay the
+     * malloc kind */
 
     free(s3_cli_cm_exec);
     s3_cli_cm_exec = NULL;
@@ -15206,11 +15207,10 @@ s3_cli_teardown(void)
     free(s3_cli_sftp_buf);
     s3_cli_sftp_buf = NULL;
 
-    free(s3_cli_sftp_local);
-    s3_cli_sftp_local = NULL;
-
-    free(s3_cli_sftp_remote);
-    s3_cli_sftp_remote = NULL;
+    if (s3_cli_pool != NULL) {
+        s3_destroy_pool(s3_cli_pool);
+        s3_cli_pool = NULL;
+    }
 
     s3_cli_net_cleanup();
 }
