@@ -13222,15 +13222,72 @@ main(int argc, char **argv)
      * the long forms ride the pre-scan before the short getopt (the
      * server shape): --log-level carries the s3 log level the -l
      * login key vacated, --help spells the usage, --sftp carries the
-     * transfer spec the -J key gave back
+     * transfer spec the -J key gave back.  the destination index
+     * comes from a quiet getopt walk with the POSIX stop (the leading
+     * '+' of the opt string): the pre-scan and the parse ride the
+     * option region only, the command words keep their dashes (the
+     * ssh shape)
      */
 
     {
+        /*
+         * the destination index: the walk mirrors the getopt shape (the
+         * '+' stop, the value-taking shorts, the optional -C) - the
+         * command words keep their dashes (the ssh shape)
+         */
 
+        static const char valshort[] = "DeFiJlLpStoURO";
+
+        int   dest;
         int   n, m, keep, drop;
         char *value;
 
-        for (n = 1; n < argc;) {
+        dest = argc;
+
+        for (n = 1; n < argc; n++) {
+
+            if (argv[n][0] != '-' || argv[n][1] == '\0') {
+                dest = n;
+                break;
+            }
+
+            if (argv[n][1] == '-') {
+
+                /* the pre-scan long forms with a value eat the next
+                 * word, the rest ride word-wise */
+
+                if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
+                    strcmp(argv[n], "--sftp") == 0 ||
+                    strcmp(argv[n], "-strict-host-key-checking") == 0) {
+                    n++;
+                }
+
+                continue;
+            }
+
+            {
+                const char *q;
+
+                for (q = argv[n] + 1; *q != '\0'; q++) {
+
+                    if (*q == 'C') {
+                        /* the optional value attaches only (-Cname) */
+                        break;
+                    }
+
+                    if (strchr(valshort, *q) != NULL) {
+
+                        if (q[1] == '\0') {
+                            n++; /* the value rides the next word */
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (n = 1; n < dest && n < argc;) {
 
             keep = 1;
             drop = 0;
@@ -13472,7 +13529,11 @@ main(int argc, char **argv)
         }
     }
 
-    while ((opt = getopt(argc, argv, "46AC::D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
+    /* the leading '+' pins the POSIX walk: the parsing stops at the
+     * destination operand, the command words ride verbatim (the ssh
+     * shape; the GNU permutation ate the dashed command words) */
+
+    while ((opt = getopt(argc, argv, "+46AC::D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
@@ -14171,11 +14232,15 @@ main(int argc, char **argv)
         }
     }
 
-    /* the sftp transfer and the forwards carry no exec words */
+    /*
+     * the sftp transfer and the master carry no exec words; the
+     * forwards ride the command (the ssh2 shape: -L/-R with a command
+     * runs it over the session while the forwards stay up, the B16
+     * CLI note)
+     */
 
-    if ((s3_cli_sftp_mode || s3_cli_fwd_count || s3_cli_cm_master || s3_cli_rspec_count) &&
-        optind < argc) {
-        fprintf(stderr, "ssh3: the transfers and the forwards take no command\n");
+    if ((s3_cli_sftp_mode || s3_cli_cm_master) && optind < argc) {
+        fprintf(stderr, "ssh3: the sftp transfer and the master take no command\n");
         return S3_CLI_EXIT_ERROR;
     }
 
@@ -14816,12 +14881,13 @@ main(int argc, char **argv)
             }
         }
 
-        /* the 200 opens the session channel (the forwards, the
-         * reverse and the master carry no session of their own, the
-         * -N holds the run without one) */
+        /* the 200 opens the session channel: the forwards carry a
+         * session only under a command (the ssh2 shape), the
+         * forward-only run, the master and the -N hold none) */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
-            s3_cli_rspec_count == 0 && !s3_cli_no_session && s3_cli_chan == NULL) {
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_cm_master && !s3_cli_no_session &&
+            s3_cli_chan == NULL &&
+            (s3_cli_cmd != NULL || (!s3_cli_fwd_count && s3_cli_rspec_count == 0))) {
 
             s3_cli_chan = s3_quic_open_stream(cli, 1);
 
@@ -14857,8 +14923,9 @@ main(int argc, char **argv)
 
         /* the header plus the session requests ride one send */
 
-        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_fwd_count && !s3_cli_cm_master &&
-            s3_cli_rspec_count == 0 && !s3_cli_no_session && !s3_cli_ch_sent) {
+        if (s3_cli_status_seen && s3_cli_status == 200 && !s3_cli_cm_master && !s3_cli_no_session &&
+            !s3_cli_ch_sent &&
+            (s3_cli_cmd != NULL || (!s3_cli_fwd_count && s3_cli_rspec_count == 0))) {
 
             u_char            frame[2048];
             u_char           *p;

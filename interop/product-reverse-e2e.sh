@@ -629,6 +629,62 @@ else
     stop_srv
 fi
 
+echo "== leg 9: the -R rides the command (PRODUCT-REVERSE-CMD-OK)"
+
+start_srv --run-as-user off || die "the daemon did not start: $(tail -3 "$WORK/srv.log")"
+
+pin_home
+S3CLILOG="$WORK/cli-cmd.log"
+
+# the ssh2 shape: the command rides the session while the forward
+# stays up; the dashed words of the command keep their dashes (the
+# option walk stops at the destination)
+
+setsid nohup env HOME="$WORK/home" "$BUILD/ssh3" -n -R "0:127.0.0.1:19121" \
+    -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" "sleep 4; exit 7" \
+    > "$S3CLILOG" 2>&1 < /dev/null &
+CLIPID=$!
+
+CMD_OK=
+
+if wait_bind; then
+
+    if timeout 30 python3 "$WORK/tcp_probe.py" "$RPORT" > "$WORK/tcp-cmd.log" 2>&1 &&
+        grep -q "TCP-PROBE-OK bytes=65536" "$WORK/tcp-cmd.log"; then
+        CMD_OK=relay
+    else
+        CMD_OK="relay $(tail -2 "$WORK/tcp-cmd.log")"
+    fi
+
+else
+    CMD_OK="no bind port"
+fi
+
+i=0
+CLI_RC=
+
+while [ "$i" -lt 80 ]; do
+
+    if ! kill -0 "$CLIPID" 2>/dev/null; then
+        wait "$CLIPID"
+        CLI_RC=$?
+        CLIPID=
+        break
+    fi
+
+    sleep 0.1
+    i=$((i + 1))
+done
+
+if [ "$CMD_OK" = relay ] && [ -n "$CLI_RC" ] && [ "$CLI_RC" -eq 7 ]; then
+    pass "the -R rides the command: the relay round-tripped, the exit 7 rode the verdict (PRODUCT-REVERSE-CMD-OK, port $RPORT)"
+else
+    fail "the -R command leg: relay=$CMD_OK rc=${CLI_RC:-running} $(tail -2 "$S3CLILOG")"
+fi
+
+stop_cli
+stop_srv
+
 if [ "$FAILURES" -eq 0 ]; then
     echo "PRODUCT-REVERSE-E2E OK"
     exit 0
