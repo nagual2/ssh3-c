@@ -529,7 +529,7 @@ completes at `sw_start`**, so no re-entry can underflow.
 `grep -rn "h3-parse-pool-overflow" tests/ CMakeLists.txt` finds no ctest regression test, and the
 nightly fuzz job is the only thing that ever runs it. §3.3 adds the ctest pin.
 
-### 3.3 The fix — `fix/pass4-h3pool` (designed here, not yet committed)
+### 3.3 The fix — `fix/pass4-h3pool`, LANDED (PR #13)
 
 The fix is two lines of product code plus one ctest pin. It is **not** on this branch (the report
 branch carries no code change); the delegation that lands it follows the standing TDD order:
@@ -592,8 +592,9 @@ inputs with **no ASan/UBSan report**, and the nightly `fuzz.yml` job green on th
 
 | Campaign | Driver | Inputs | Result |
 |---|---|---:|---|
-| **P-D** `fuzz_h3_parse` (in-tree target, §3.2/B3) | `pass4_fuzz_drv.c` + `tests/fuzz/fuzz_h3_parse.c`, ASan+UBSan | died < 100 000 | **crash — FZ1** |
-| **P-C** pass-3 QUIC-state driver, re-pointed at `53baa2e` | `pass4/pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, ASan+UBSan, `S3_FUZZ_ITERS=1000000` | campaign launched, 1 000 000 target | **build clean (`FUZZ_BUILD_EXIT=0`); the run was still in flight when this report was written — result NOT observed, do not read this row as a pass** |
+| **P-D** `fuzz_h3_parse` (in-tree target, §3.2/B3) | `pass4_fuzz_drv.c` + `tests/fuzz/fuzz_h3_parse.c`, ASan+UBSan | died < 100 000 | **crash — FZ1**, fixed by PR #13 (pin `test_h3_literal_restart`, 47/47 both presets) |
+| **P-D re-run** at `54dd089` (FZ1 fixed) | same driver, rebuilt against the fixed `libs3core.a` | 1 000 000 target | **crash — FZ2, a distinct defect**, at `s3_h3_huff_decode_bits` (`s3_h3_parse.c:4299`) via `parse_literal:4875`; reproduces deterministically between 90 000 and 100 000 inputs; the artifact itself (B1/B2) is clean (`no ASan/UBSan report`). `sw_value`'s huffman branch returns `S3_ERROR` **before** the countdown is decremented, so a re-entered literal re-decodes bytes it was already charged for and the `n * 8 / 5 + 1` reservation holds for one pass only. Proposed shape: spend the countdown when the byte is consumed, before the decode |
+| **P-C** pass-3 QUIC-state driver, re-pointed at `53baa2e` | `pass4/pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, ASan+UBSan, `S3_FUZZ_ITERS=1000000` | **1 000 000** | **clean: `PASS3_FUZZ inputs=1000000 seed=20261018 seconds=233.06 inputs_per_sec=4291 ... PASS3_FUZZ_RESULT: no ASan/UBSan report`** (`pass4/logs/quic_run.out`) — the campaign completed after all; the "died unobserved" note of the first draft was the box replacement losing the *terminal*, not the run. Re-run on the rebuilt box at `54dd089`: launched detached, `pass4/logs/quic_run2.out` (in flight when this line was written) |
 
 **P-C needs no API update**: the pass-3 driver's includes and the `s3_h3_session_t` layout change
 of F2 do not reach `fuzz_quic_state.c`, so the "re-point the driver" step is a rebuild, not a port
@@ -601,7 +602,8 @@ of F2 do not reach `fuzz_quic_state.c`, so the "re-point the driver" step is a r
 
 ### 3.5 What this baseline hands to the next delegations
 
-1. **`fix/pass4-h3pool`** — §3.3, ready to land (pin + two-line fix + acceptance criteria).
+1. **`fix/pass4-h3pool`** — §3.3, **landed as PR #13** (pin + guard, 47/47 both presets). Next
+   defect PR: **FZ2** (§3.4), the same `sw_value` loop's huffman branch.
 2. **The line-by-line protocol-delta review** — §1.2 is the map; the five questions of §1.6 are
    the acceptance list, and (a2)/item 1 (the QPACK encoder's check-after-write into `buf[1024]`)
    is the highest-value unexecuted item of the whole pass.
