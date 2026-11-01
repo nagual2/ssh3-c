@@ -562,6 +562,7 @@ set(S3_TESTS
     test_quic_idle
     test_h3_qpack
     test_h3_parse
+    test_h3_literal_restart
     test_h3_uni
     test_ssh3_version
     test_ssh3_wire

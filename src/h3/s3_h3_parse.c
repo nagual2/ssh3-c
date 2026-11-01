@@ -4843,6 +4843,24 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
             st->value.data = st->last;
             st->state = sw_value;
 
+            /*
+             * a zero-length literal completes here: the countdown in
+             * sw_value is a pre-decrement, so a zero length underflows
+             * it and the loop writes every remaining byte of the input
+             * past the one-byte reservation (FZ1, the nightly fuzz of
+             * 2026-10-30).  the callers refuse a zero field length
+             * today, but the machine is re-entered with the countdown
+             * at zero after a hard error - the guard belongs to the
+             * machine, not to each caller
+             */
+
+            if (st->length == 0) {
+                st->value.len = 0;
+                *st->last = '\0';
+
+                goto done;
+            }
+
             /* fall through */
 
         case sw_value:
