@@ -1568,6 +1568,22 @@ s3_cli_kh_path(char *buf, size_t cap)
     return S3_OK;
 }
 
+/* the ticket cache path of the 0-RTT stage 2 (the same home) */
+
+static s3_int_t
+s3_cli_tickets_path(char *buf, size_t cap)
+{
+    const char *home = getenv("USERPROFILE");
+
+    if (home == NULL || home[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    snprintf(buf, cap, "%s\\.ssh3\\tickets", home);
+
+    return S3_OK;
+}
+
 /* the pin appends, the .ssh3 dir creates on demand */
 
 static s3_int_t
@@ -1698,6 +1714,22 @@ s3_cli_kh_path(char *buf, size_t cap)
     }
 
     snprintf(buf, cap, "%s/.ssh3/known_hosts", home);
+
+    return S3_OK;
+}
+
+/* the ticket cache path of the 0-RTT stage 2 (the same home) */
+
+static s3_int_t
+s3_cli_tickets_path(char *buf, size_t cap)
+{
+    const char *home = getenv("HOME");
+
+    if (home == NULL || home[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    snprintf(buf, cap, "%s/.ssh3/tickets", home);
 
     return S3_OK;
 }
@@ -14620,6 +14652,28 @@ main(int argc, char **argv)
         fprintf(stderr, "ssh3: the ssl init failed\n");
         s3_cli_teardown();
         return S3_CLI_EXIT_ERROR;
+    }
+
+    /*
+     * the ticket persistence of the 0-RTT stage 2: the cache line of
+     * this host loads at the dial, the new-session callback rewrites
+     * the file on every fresh ticket
+     */
+
+    {
+        char tpath[1024];
+        char tkey[300];
+
+        if (s3_cli_tickets_path(tpath, sizeof(tpath)) == S3_OK) {
+
+            snprintf(tkey, sizeof(tkey), "%s:%u", s3_cli_host, s3_cli_port);
+
+            snprintf(s3_cli_conf.ssl->ticket_path, sizeof(s3_cli_conf.ssl->ticket_path), "%s",
+                     tpath);
+            snprintf(s3_cli_conf.ssl->ticket_key, sizeof(s3_cli_conf.ssl->ticket_key), "%s", tkey);
+
+            s3_ssl_ticket_load(s3_cli_conf.ssl);
+        }
     }
 
     s3_cli_conf.ctx = &s3_cli_ctx;

@@ -55,7 +55,19 @@ struct s3_ssl_s {
      * stage 2 (the CONNECT-in-0-RTT flight)
      */
     SSL_SESSION *stored_session;
+
+    /*
+     * the ticket persistence of the 0-RTT stage 2: the cache file
+     * (~/.ssh3/tickets) and the host:port identity of the line; both
+     * empty = the run keeps the ticket in the process memory only
+     */
+
+    char ticket_path[1024];
+    char ticket_key[300];
 };
+
+void s3_ssl_ticket_load(s3_ssl_t *ssl);
+void s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session);
 
 /*
  * the PEM strings may be file contents or in-memory certificates;

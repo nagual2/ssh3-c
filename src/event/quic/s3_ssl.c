@@ -8,9 +8,15 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <s3_ssl.h>
 #include <s3_string.h>
@@ -170,6 +176,265 @@ failed:
     return NULL;
 }
 
+/* the hex of the DER form: the ticket is small, the form is plain */
+
+static int
+s3_ssl_ticket_hex(char *dst, size_t dst_cap, const u_char *src, size_t len)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    size_t i;
+
+    if (dst_cap < len * 2 + 1) {
+        return 0;
+    }
+
+    for (i = 0; i < len; i++) {
+        dst[i * 2] = digits[src[i] >> 4];
+        dst[i * 2 + 1] = digits[src[i] & 0xf];
+    }
+
+    dst[len * 2] = '\0';
+
+    return 1;
+}
+
+static int
+s3_ssl_ticket_unhex(u_char *dst, size_t *len, const char *src)
+{
+    size_t n, i;
+    int    hi, lo;
+
+    n = strlen(src);
+
+    if (n == 0 || n % 2 != 0) {
+        return 0;
+    }
+
+    for (i = 0; i < n; i += 2) {
+
+        hi = src[i];
+        lo = src[i + 1];
+
+        if (hi >= '0' && hi <= '9') {
+            hi -= '0';
+
+        } else if (hi >= 'a' && hi <= 'f') {
+            hi -= 'a' - 10;
+
+        } else {
+            return 0;
+        }
+
+        if (lo >= '0' && lo <= '9') {
+            lo -= '0';
+
+        } else if (lo >= 'a' && lo <= 'f') {
+            lo -= 'a' - 10;
+
+        } else {
+            return 0;
+        }
+
+        dst[i / 2] = (u_char)(hi * 16 + lo);
+    }
+
+    *len = n / 2;
+
+    return 1;
+}
+
+/*
+ * the ticket cache line of the key: the whole file rewrites on every
+ * store, the other hosts' lines ride through (the tmp+rename swap,
+ * the owner-only mode)
+ */
+
+void
+s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
+{
+    u_char  der[2048];
+    u_char *p;
+    char    hex[sizeof(der) * 2 + 1];
+    char    line[1024 + sizeof(hex) + 2];
+    char    body[16384];
+    char    tmp[1100];
+    int     len, fd, n;
+    FILE   *src;
+
+    len = i2d_SSL_SESSION(session, NULL);
+
+    if (len <= 0 || (size_t)len > sizeof(der)) {
+        return;
+    }
+
+    p = der;
+    len = i2d_SSL_SESSION(session, &p);
+
+    if (len <= 0 || !s3_ssl_ticket_hex(hex, sizeof(hex), der, (size_t)len)) {
+        return;
+    }
+
+    n = snprintf(line, sizeof(line), "%s %s\n", ssl->ticket_key, hex);
+
+    if (n <= 0 || (size_t)n >= sizeof(line)) {
+        return;
+    }
+
+    /* the other lines ride through the rewrite */
+
+    body[0] = '\0';
+
+    src = fopen(ssl->ticket_path, "r");
+
+    if (src != NULL) {
+
+        while (fgets(line, sizeof(line), src) != NULL) {
+
+            line[strcspn(line, "\n")] = '\0';
+
+            if (strncmp(line, ssl->ticket_key, strlen(ssl->ticket_key)) == 0 &&
+                line[strlen(ssl->ticket_key)] == ' ') {
+                continue; /* our old line, the new one replaces it */
+            }
+
+            if (strlen(body) + strlen(line) + 2 < sizeof(body)) {
+                strcat(body, line);
+                strcat(body, "\n");
+            }
+        }
+
+        fclose(src);
+    }
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", ssl->ticket_path);
+
+    /* the .ssh3 directory may not exist yet (a run without the pin
+     * writes never made it); the home above it may be missing too -
+     * mkdir is not recursive, the two levels go one by one */
+
+    {
+        char        dir[1024], parent[1024];
+        const char *slash = strrchr(ssl->ticket_path, '/');
+        size_t      dlen = slash != NULL ? (size_t)(slash - ssl->ticket_path) : 0;
+
+        if (dlen > 0 && dlen < sizeof(dir)) {
+
+            memcpy(dir, ssl->ticket_path, dlen);
+            dir[dlen] = '\0';
+
+            if (mkdir(dir, 0700) != 0 && errno == ENOENT) {
+
+                const char *up = strrchr(dir, '/');
+                size_t      plen = up != NULL ? (size_t)(up - dir) : 0;
+
+                if (plen > 0 && plen < sizeof(parent)) {
+
+                    memcpy(parent, dir, plen);
+                    parent[plen] = '\0';
+
+                    (void)mkdir(parent, 0700);
+                    (void)mkdir(dir, 0700);
+                }
+            }
+        }
+    }
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd == -1) {
+        return;
+    }
+
+    {
+        ssize_t w;
+        int     ok = 1;
+
+        /* the key-hex line (the same form the load reads) */
+
+        w = write(fd, body, strlen(body));
+        ok = ok && w >= 0;
+
+        w = write(fd, line, strlen(line));
+        ok = ok && w >= 0;
+
+        (void)close(fd);
+
+        /* the failed tmp dies, the old file (if any) stays */
+
+        if (!ok) {
+            (void)unlink(tmp);
+            return;
+        }
+    }
+
+    (void)rename(tmp, ssl->ticket_path);
+}
+
+/*
+ * the load side: the line of the key, the hex back to the DER, the
+ * expiry of the ticket honors the session timeout; the failures are
+ * silent - a cold cache is a plain 1-RTT dial
+ */
+
+void
+s3_ssl_ticket_load(s3_ssl_t *ssl)
+{
+    u_char       der[2048];
+    u_char      *p;
+    size_t       dlen;
+    char         line[2048];
+    const char  *hex;
+    long         age;
+    SSL_SESSION *session;
+    FILE        *src;
+
+    src = fopen(ssl->ticket_path, "r");
+
+    if (src == NULL) {
+        return;
+    }
+
+    while (fgets(line, sizeof(line), src) != NULL) {
+
+        line[strcspn(line, "\n")] = '\0';
+
+        if (strncmp(line, ssl->ticket_key, strlen(ssl->ticket_key)) != 0 ||
+            line[strlen(ssl->ticket_key)] != ' ') {
+            continue;
+        }
+
+        hex = line + strlen(ssl->ticket_key) + 1;
+
+        if (!s3_ssl_ticket_unhex(der, &dlen, hex) || dlen == 0) {
+            break;
+        }
+
+        p = der;
+        session = d2i_SSL_SESSION(NULL, (const unsigned char **)&p, (long)dlen);
+
+        if (session == NULL) {
+            ERR_clear_error();
+            break;
+        }
+
+        /* the expired ticket rides no 0-RTT: drop it silently */
+
+        age = (long)time(NULL) - (long)SSL_SESSION_get_time_ex(session);
+
+        if (age > (long)SSL_SESSION_get_timeout(session)) {
+            SSL_SESSION_free(session);
+            break;
+        }
+
+        ssl->stored_session = session;
+
+        break;
+    }
+
+    fclose(src);
+}
+
 void
 s3_ssl_free(s3_ssl_t *ssl)
 {
@@ -224,6 +489,12 @@ s3_ssl_client_new_session_cb(SSL *ssl, SSL_SESSION *session)
     }
 
     ssl_conf->stored_session = session;
+
+    /* the persistence of the 0-RTT stage 2: the cache file rides */
+
+    if (ssl_conf->ticket_path[0] != '\0') {
+        s3_ssl_ticket_persist(ssl_conf, session);
+    }
 
     return 1;
 }
