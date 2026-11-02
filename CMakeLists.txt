@@ -18,7 +18,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 # struct in6_pktinfo) live behind __USE_MISC, and the strict POSIX mode
 # hides them — with the POSIX mode alone the S3_HAVE_ADDRINFO_CMSG check
 # below can never pass and the whole local address path stays compiled out
-set(S3_FEATURE_DEFINITIONS -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L)
+set(S3_FEATURE_DEFINITIONS _GNU_SOURCE _POSIX_C_SOURCE=200809L)
 
 add_compile_definitions(${S3_FEATURE_DEFINITIONS})
 
@@ -229,7 +229,8 @@ endif()
 
 include(CheckCSourceCompiles)
 
-set(CMAKE_REQUIRED_DEFINITIONS ${S3_FEATURE_DEFINITIONS})
+list(TRANSFORM S3_FEATURE_DEFINITIONS PREPEND "-D"
+     OUTPUT_VARIABLE CMAKE_REQUIRED_DEFINITIONS)
 
 # the UDP GSO (man 7 udp UDP_SEGMENT) support, like NGX_HAVE_UDP_SEGMENT
 check_c_source_compiles(
