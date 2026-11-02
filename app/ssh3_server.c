@@ -1347,6 +1347,7 @@ typedef struct {
     s3_connection_t *pc; /* the quic conn of the CONNECT */
     uint64_t         conv_id;
     unsigned         responded;
+    unsigned         retry_open; /* the 425/401-authless state, the retry may ride */
 
     /*
      * the compression of the channel body (PLAN.md 9, B8): the
@@ -2662,6 +2663,7 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
              * is done (go_server: TLS handshake incomplete) */
 
             code = 425;
+            s3_srv_report("INTEROP-EARLY-425\n");
 
         } else if (s3_dos_unauth_try_acquire() != S3_OK) {
 
@@ -2763,6 +2765,34 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
     if (code != 200) {
         /* the rejected request stream closes right after the status */
         (void)s3_quic_shutdown_stream(pa->sc, S3_WRITE_SHUTDOWN);
+    }
+
+    if (code == 425) {
+
+        /*
+         * RFC 8470: the early-data request draws 425 until the
+         * handshake completes, the client RETRIES the CONNECT over a
+         * fresh request stream of this connection - the responded
+         * flag stays off, the fresh-CONNECT path reuses this preauth
+         * state and the verdict chain runs again
+         */
+
+        pa->retry_open = 1;
+        return;
+    }
+
+    if (code == 401 && pa->auth_len == 0) {
+
+        /*
+         * the loopback shape of the same retry: the early CONNECT
+         * landed when the server handshake was already done, the
+         * auth-less request draws the plain refusal - the response
+         * carries no verdict on credentials (there were none), the
+         * retry stays possible (the flag stays off)
+         */
+
+        pa->retry_open = 1;
+        return;
     }
 
     pa->responded = 1;
@@ -7061,14 +7091,18 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
 
     pa = s3_srv_preauth_find(pc);
 
-    if (pa != NULL) {
+    if (pa != NULL && (pa->responded || !pa->retry_open)) {
 
         /*
          * every bidi stream after the CONNECT is an ssh3 channel
          * (docs/P4-WIRE.md 1, the server dispatch rule); the pc
          * check keeps a SECOND client connection on the fresh
          * CONNECT path below - the harness serves them one after
-         * another out of one process (the sftp put/get pair)
+         * another out of one process (the sftp put/get pair).  the
+         * 425/401-authless state (responded off, retry_open set, the
+         * RFC 8470 retry) takes the CONNECT path below instead - a
+         * channel opened BEFORE any verdict (the pre-auth probe)
+         * still meets the funnel here
          */
         s3_srv_h3_channel_accept(sc);
         return;
@@ -7078,13 +7112,26 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
      * per connection, so a second client that connects at the same
      * time gets its own fields and its own verdict */
 
-    pa = s3_srv_preauth_create(pc);
+    pa = s3_srv_preauth_find(pc);
 
     if (pa == NULL) {
-        fprintf(stderr, "ssh3-server: the pre-auth table is full, the CONNECT is refused\n");
-        (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
-        return;
+
+        pa = s3_srv_preauth_create(pc);
+
+        if (pa == NULL) {
+            fprintf(stderr, "ssh3-server: the pre-auth table is full, the CONNECT is refused\n");
+            (void)s3_quic_shutdown_stream(sc, S3_RDWR_SHUTDOWN);
+            return;
+        }
     }
+
+    /*
+     * the fresh state of this CONNECT: the plain first CONNECT gets
+     * the virgin record, the 425 retry reuses the record of the
+     * connection - every captured field resets, a retry section
+     * without a field (the early flight carries no authorization)
+     * cannot inherit the value of the previous flight
+     */
 
     pa->sc = sc;
     pa->pc = pc;
@@ -7096,6 +7143,9 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
     pa->protocol_len = 0;
     pa->path_len = 0;
     pa->auth_len = 0;
+    pa->ua_len = 0;
+    pa->authority_len = 0;
+    pa->scheme_len = 0;
 
     s3_memzero(&pa->parse, sizeof(s3_h3_parse_headers_t));
 

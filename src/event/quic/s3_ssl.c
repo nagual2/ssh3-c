@@ -256,6 +256,7 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
     u_char  der[2048];
     u_char *p;
     char    hex[sizeof(der) * 2 + 1];
+    char    newline[1024 + sizeof(hex) + 2];
     char    line[1024 + sizeof(hex) + 2];
     char    body[16384];
     char    tmp[1100];
@@ -275,9 +276,14 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
         return;
     }
 
-    n = snprintf(line, sizeof(line), "%s %s\n", ssl->ticket_key, hex);
+    /* the newline buffer: the dedupe read below rides `line`, the
+     * fresh record must survive it (the stale line of the old file
+     * kept winning the rewrite, the flag never reached the cache) */
 
-    if (n <= 0 || (size_t)n >= sizeof(line)) {
+    n = snprintf(newline, sizeof(newline), "%s %s %s\n", ssl->ticket_key, ssl->server_c ? "c" : "-",
+                 hex);
+
+    if (n <= 0 || (size_t)n >= sizeof(newline)) {
         return;
     }
 
@@ -350,12 +356,12 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
         ssize_t w;
         int     ok = 1;
 
-        /* the key-hex line (the same form the load reads) */
+        /* the key-flag-hex line (the same form the load reads) */
 
         w = write(fd, body, strlen(body));
         ok = ok && w >= 0;
 
-        w = write(fd, line, strlen(line));
+        w = write(fd, newline, strlen(newline));
         ok = ok && w >= 0;
 
         (void)close(fd);
@@ -404,7 +410,27 @@ s3_ssl_ticket_load(s3_ssl_t *ssl)
             continue;
         }
 
-        hex = line + strlen(ssl->ticket_key) + 1;
+        /*
+         * the v2 form: key, the retry-contract flag (c = the ssh3-c
+         * server, - = anything else), the hex; the flag of the line
+         * gates the early flight.  the flag sits right behind the
+         * key (the field width of one), the hex rides two positions
+         * behind the key terminator
+         */
+
+        {
+            size_t klen = strlen(ssl->ticket_key);
+
+            if (line[klen + 1] == 'c' && line[klen + 2] == ' ') {
+                ssl->server_c = 1;
+                hex = line + klen + 3;
+            } else if (line[klen + 1] == '-' && line[klen + 2] == ' ') {
+                ssl->server_c = 0;
+                hex = line + klen + 3;
+            } else {
+                break; /* an unknown form: no flight this dial */
+            }
+        }
 
         if (!s3_ssl_ticket_unhex(der, &dlen, hex) || dlen == 0) {
             break;

@@ -357,12 +357,16 @@ static s3_msec_t               s3_cli_deadline;
 
 /* the bring-up facts the main loop acts on */
 
-static unsigned s3_cli_hs_done;
-static unsigned s3_cli_req_sent;
-static unsigned s3_cli_status_seen;
-static unsigned s3_cli_status;
-static unsigned s3_cli_ch_sent;
-static unsigned s3_cli_verdict;
+static unsigned         s3_cli_hs_done;
+static unsigned         s3_cli_req_sent;
+static unsigned         s3_cli_status_seen;
+static unsigned         s3_cli_status;
+static unsigned         s3_cli_ch_sent;
+static unsigned         s3_cli_early_done; /* the 0-RTT CONNECT flew (the stage 2) */
+static unsigned         s3_cli_retry_wait; /* the 425 of the early flight, the retry waits */
+static unsigned         s3_cli_retry_used; /* the one-shot guard of the early-flight retry */
+static s3_connection_t *s3_cli_ctrl_dead;  /* the stream the 425/401 retry retired */
+static unsigned         s3_cli_verdict;
 
 /* the verdict of the session: the winning 98 exit-status */
 
@@ -2653,6 +2657,95 @@ s3_cli_jump_hop_defaults(s3_cli_jump_hop_t *hop)
  * jump exporter)
  */
 
+/*
+ * the 0-RTT flight of the stage 2: the conf init callback rides the
+ * early-data branch of the stream init - the only place where the
+ * EARLY window exists (the handshake processing holds it).  the
+ * cert pin checks first (the peer certificate exists since the
+ * ServerHello), the CONNECT flies without the authorization field
+ * (RFC 8470: the auth stays out of the replay window), the server
+ * answers 425 and the post-handshake retry carries the credentials.
+ * the jump chain rides its own per-hop shaping and stays 1-RTT
+ */
+
+static unsigned s3_cli_early_done;
+
+static size_t s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target,
+                                   const char *auth);
+
+static s3_int_t
+s3_cli_early_init(s3_connection_t *c)
+{
+    char    authority[320];
+    u_char  frame[1024];
+    u_char *p;
+    size_t  sec_len, total;
+    ssize_t m;
+
+    s3_cli_early_done = 1;
+
+    /*
+     * the pin check runs when the peer certificate has arrived - the
+     * EARLY write keys exist before the ServerHello (the flight is
+     * protected by the ticket PSK), a cold loopback pass may reach
+     * the early branch before the certificate does; the skipped pin
+     * is not a hole: the early CONNECT carries no credentials (the
+     * RFC 8470 canon) and the post-handshake retry rides behind the
+     * pin check of the handshake block (the B17 order)
+     */
+
+    if (SSL_get1_peer_certificate(c->ssl->connection) != NULL &&
+        s3_cli_cert_check_conn(c, s3_cli_hostkey) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (s3_h3_get_session(c) == NULL && s3_h3_init_session(c) != S3_OK) {
+        fprintf(stderr, "ssh3: the h3 session init failed\n");
+        return S3_ERROR;
+    }
+
+    memset(&s3_cli_h3parse, 0, sizeof(s3_cli_h3parse));
+
+    s3_cli_ctrl = s3_quic_open_stream(c, 1);
+
+    if (s3_cli_ctrl == NULL) {
+        fprintf(stderr, "ssh3: the stream open failed\n");
+        return S3_ERROR;
+    }
+
+    s3_cli_ctrl->read->handler = s3_cli_ctrl_read;
+    s3_cli_ctrl->read->data = s3_cli_ctrl;
+    s3_cli_ctrl->read->active = 1;
+
+    snprintf(authority, sizeof(authority), "%s:%u", s3_cli_host, s3_cli_port);
+
+    sec_len = s3_cli_h3_section_ex(NULL, authority, s3_cli_target, NULL);
+
+    p = frame;
+    p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
+    p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
+    sec_len = s3_cli_h3_section_ex(p, authority, s3_cli_target, NULL);
+    total = (size_t)(p - frame) + sec_len;
+
+    m = s3_quic_stream_send(s3_cli_ctrl, frame, total);
+
+    if (m != (ssize_t)total && m != (ssize_t)S3_AGAIN) {
+        fprintf(stderr, "ssh3: the CONNECT send failed\n");
+        return S3_ERROR;
+    }
+
+    if (m == (ssize_t)total) {
+        s3_cli_req_sent = 1;
+    }
+
+    return S3_OK;
+}
+
+/*
+ * the h3 CONNECT section builder: the authority of the run, the
+ * target and the auth value (NULL = no authorization field)
+ */
+
 static size_t
 s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const char *auth)
 {
@@ -4559,6 +4652,17 @@ s3_cli_ctrl_read(s3_event_t *ev)
     s3_buf_t         b;
     s3_int_t         rc;
 
+    /*
+     * the stream the 425/401 retry retired: the server closed it, the
+     * posted events of it are noise (the pointer form, the jump hops
+     * share this handler with their own streams - the global s3_cli_ctrl
+     * does not name them)
+     */
+
+    if (sc == s3_cli_ctrl_dead) {
+        return;
+    }
+
     if (s3_cli_status_seen) {
         return;
     }
@@ -4612,6 +4716,35 @@ s3_cli_ctrl_read(s3_event_t *ev)
                     s3_cli_status = code;
                     s3_cli_status_seen = 1;
 
+                    if ((code == 425 || code == 401) && s3_cli_early_done && !s3_cli_retry_used) {
+
+                        /*
+                         * RFC 8470: the CONNECT of the early flight
+                         * may be replayed, the server answers 425
+                         * until its handshake completes - the retry
+                         * carries the credentials (the auth stays
+                         * out of the replay window, the backlog #6
+                         * canon).  a 401 lands the same way on the
+                         * loopback race: the early CONNECT arrives
+                         * when the server handshake is already done
+                         * and the auth-less request draws the plain
+                         * refusal - the one-shot retry (the gate is
+                         * the empty auth of the flight; the refusal
+                         * of the real credentials rides the retry
+                         * WITH the auth and terminates) reopens the
+                         * stream post-handshake
+                         */
+
+                        s3_cli_retry_wait = 1;
+                        s3_cli_retry_used = 1;
+                        s3_cli_req_sent = 0;
+                        s3_cli_status_seen = 1; /* the old-stream events stay muted */
+                        s3_cli_ctrl_dead = sc;
+                        s3_cli_ctrl = NULL;
+
+                        return;
+                    }
+
                     if (code != 200) {
                         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
                                      "the server refused the session (HTTP %ud)", code);
@@ -4635,6 +4768,36 @@ s3_cli_ctrl_read(s3_event_t *ev)
                     if (s3_ssh3_version_parse(value->data, value->len, &ver) == S3_OK) {
 
                         s3_cli_compress_mask = ver.compress_mask;
+
+                        /* the retry contract of the peer: the ssh3-c
+                         * servers answer 425/authless-401 and take
+                         * the fresh-CONNECT retry, the foreign ones
+                         * may just drop the connection - the early
+                         * flight gates on the flag (persisted with
+                         * the ticket) */
+
+                        if (s3_cli_conf.ssl != NULL) {
+                            unsigned was = s3_cli_conf.ssl->server_c;
+
+                            s3_cli_conf.ssl->server_c =
+                                (ver.implementation.len == 6 &&
+                                 s3_memcmp(ver.implementation.data, "ssh3-c", 6) == 0);
+
+                            /*
+                             * the cache line rewrites at once: the
+                             * NST of the handshake may have landed
+                             * it before this header (the flag was
+                             * the default then), the next dial must
+                             * not read the stale value
+                             */
+
+                            if (!was && s3_cli_conf.ssl->server_c &&
+                                s3_cli_conf.ssl->stored_session != NULL &&
+                                s3_cli_conf.ssl->ticket_path[0] != '\0') {
+                                s3_ssl_ticket_persist(s3_cli_conf.ssl,
+                                                      s3_cli_conf.ssl->stored_session);
+                            }
+                        }
 
                         /*
                          * the decode side rides the peer's pick over
@@ -14673,6 +14836,17 @@ main(int argc, char **argv)
             snprintf(s3_cli_conf.ssl->ticket_key, sizeof(s3_cli_conf.ssl->ticket_key), "%s", tkey);
 
             s3_ssl_ticket_load(s3_cli_conf.ssl);
+
+            /* the warm cache arms the 0-RTT flight: the CONNECT
+             * leaves inside the early-data branch of the stream init
+             * (the jump chain dials its own confs and stays 1-RTT);
+             * the flight rides only the peers carrying the ssh3-c
+             * retry contract (the flag of the cache line) */
+
+            if (!s3_cli_jump_on && s3_cli_conf.ssl->stored_session != NULL &&
+                s3_cli_conf.ssl->server_c) {
+                s3_cli_conf.init = s3_cli_early_init;
+            }
         }
     }
 
@@ -14816,22 +14990,31 @@ main(int argc, char **argv)
                 break;
             }
 
-            memset(&s3_cli_h3parse, 0, sizeof(s3_cli_h3parse));
+            /* the 0-RTT flight opened the stream already: the h3
+             * session and the parse state ride, the open stays away;
+             * the 425 retry opens its stream in the CONNECT block */
 
-            s3_cli_ctrl = s3_quic_open_stream(cli, 1);
+            if (s3_cli_ctrl == NULL && !s3_cli_retry_wait) {
 
-            if (s3_cli_ctrl == NULL) {
-                fprintf(stderr, "ssh3: the stream open failed\n");
-                s3_cli_rc = S3_CLI_EXIT_ERROR;
-                break;
+                memset(&s3_cli_h3parse, 0, sizeof(s3_cli_h3parse));
+
+                s3_cli_ctrl = s3_quic_open_stream(cli, 1);
+
+                if (s3_cli_ctrl == NULL) {
+                    fprintf(stderr, "ssh3: the stream open failed\n");
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                    break;
+                }
+
+                s3_cli_ctrl->read->handler = s3_cli_ctrl_read;
+                s3_cli_ctrl->read->data = s3_cli_ctrl;
+                s3_cli_ctrl->read->active = 1;
             }
-
-            s3_cli_ctrl->read->handler = s3_cli_ctrl_read;
-            s3_cli_ctrl->read->data = s3_cli_ctrl;
-            s3_cli_ctrl->read->active = 1;
         }
 
-        /* the CONNECT section rides the first writable pass */
+        /* the CONNECT section rides the first writable pass; the 425
+         * retry reopens the stream (the early flight lost it) and
+         * rides the credentials now */
 
         if (s3_cli_hs_done && !s3_cli_req_sent) {
 
@@ -14839,6 +15022,28 @@ main(int argc, char **argv)
             u_char *p;
             size_t  sec_len, total;
             ssize_t m;
+
+            if (s3_cli_retry_wait) {
+
+                s3_cli_retry_wait = 0;
+                s3_cli_status_seen = 0;
+                s3_cli_status = 0;
+                s3_cli_resp_len = 0;
+
+                memset(&s3_cli_h3parse, 0, sizeof(s3_cli_h3parse));
+
+                s3_cli_ctrl = s3_quic_open_stream(cli, 1);
+
+                if (s3_cli_ctrl == NULL) {
+                    fprintf(stderr, "ssh3: the retry stream open failed\n");
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
+                    break;
+                }
+
+                s3_cli_ctrl->read->handler = s3_cli_ctrl_read;
+                s3_cli_ctrl->read->data = s3_cli_ctrl;
+                s3_cli_ctrl->read->active = 1;
+            }
 
             sec_len = s3_cli_h3_section(NULL);
 

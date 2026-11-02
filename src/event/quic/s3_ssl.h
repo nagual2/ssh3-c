@@ -62,8 +62,9 @@ struct s3_ssl_s {
      * empty = the run keeps the ticket in the process memory only
      */
 
-    char ticket_path[1024];
-    char ticket_key[300];
+    char     ticket_path[1024];
+    char     ticket_key[300];
+    unsigned server_c; /* the peer speaks the ssh3-c retry contract */
 };
 
 void s3_ssl_ticket_load(s3_ssl_t *ssl);
