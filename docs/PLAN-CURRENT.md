@@ -131,6 +131,7 @@
 | 2 | Reverse-listener `-R` v4-only (fail-closed гейт) | bind-адрес парсится в своём семействе (v4/v6 литерал; clientspecified пропускает v6), socket/getsockname на sockaddr_storage, `::` — чистый v6 (IPV6_V6ONLY), UDP-пиры ключуются family+addr+port | нога 6 product-reverse инвертирована: PRODUCT-REVERSE-V6BIND-OK (64 КиБ через ::1, лог bind=::1) |
 | 3 | `-D` SOCKS v4-only (AF_INET + SOCKS4-ответ) | resolve AF_UNSPEC + v6-литерал fast-path, atyp 4 (16 байт) парсится, success-reply несёт ATYP семейства цели | нога 14b cli-compat: curl через socks5 на `http://[::1]` — PASS |
 | 4 | known_hosts v6-ключи | скобочная форма ssh2-канона (`[::1]:443`) в главном пине и hop-пинах; jump-chain v6-нога гоняет пины без -insecure | JUMP-V6-OK на живых пинах ✓ |
+| 5 | **Живая v6-проверка 2026-11-02**: APKv3-демон на openwrt-dev (procd, UCI `listen [::]:443`) — dual-stack bind V6ONLY=0 («the [v6] bind serves both families»), Windows-клиент `-6` + операнд `root@[fd15:c98c:85dc::1]:443/ssh3-term` → exec V6-EXEC-OK через ULA br-lan | живой v6-exec Windows-клиент → OpenWrt ✓. Примечание: главный диал дефолтит family=v4 — v6-операнд требует `-6` (AF_UNSPEC-дефолт по ssh(1)-канону — отдельная опция, не дефект) | живой v6-exec ✓ |
 
 Го-форку не требуется (dual-stack из коробки: юниты `[::]:443`, net.Listen/ResolveTCPAddr, SOCKS5).
 
