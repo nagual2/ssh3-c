@@ -593,7 +593,7 @@ inputs with **no ASan/UBSan report**, and the nightly `fuzz.yml` job green on th
 | Campaign | Driver | Inputs | Result |
 |---|---|---:|---|
 | **P-D** `fuzz_h3_parse` (in-tree target, §3.2/B3) | `pass4_fuzz_drv.c` + `tests/fuzz/fuzz_h3_parse.c`, ASan+UBSan | died < 100 000 | **crash — FZ1**, fixed by PR #13 (pin `test_h3_literal_restart`, 47/47 both presets) |
-| **P-D re-run** at `54dd089` (FZ1 fixed) | same driver, rebuilt against the fixed `libs3core.a` | 1 000 000 target | **crash — FZ2, a distinct defect**, at `s3_h3_huff_decode_bits` (`s3_h3_parse.c:4299`) via `parse_literal:4875`; reproduces deterministically between 90 000 and 100 000 inputs; the artifact itself (B1/B2) is clean (`no ASan/UBSan report`). `sw_value`'s huffman branch returns `S3_ERROR` **before** the countdown is decremented, so a re-entered literal re-decodes bytes it was already charged for and the `n * 8 / 5 + 1` reservation holds for one pass only. Proposed shape: spend the countdown when the byte is consumed, before the decode |
+| **P-D re-run** at `54dd089` (FZ1 fixed) | same driver, rebuilt against the fixed `libs3core.a` | 1 000 000 target | **crash — FZ2, a distinct defect**, at `s3_h3_huff_decode_bits` (`s3_h3_parse.c:4299`) via `parse_literal:4875`; reproduces deterministically between 90 000 and 100 000 inputs; the artifact itself (B1/B2) is clean (`no ASan/UBSan report`). `sw_value`'s huffman branch returns `S3_ERROR` **before** the countdown is decremented, so a re-entered literal re-decodes bytes it was already charged for and the `n * 8 / 5 + 1` reservation holds for one pass only. Proposed shape: spend the countdown when the byte is consumed, before the decode. **Fixed by PR #14** (`fix/pass4-h3huff`, pin `test_h3_huffman_restart`, 48/48 both presets, 1 000 000-input re-run clean) - see §3.5 item 1 |
 | **P-C** pass-3 QUIC-state driver, re-pointed at `53baa2e` | `pass4/pass3_fuzz_drv.c` + `tests/fuzz/fuzz_quic_state.c`, ASan+UBSan, `S3_FUZZ_ITERS=1000000` | **1 000 000** | **clean: `PASS3_FUZZ inputs=1000000 seed=20261018 seconds=233.06 inputs_per_sec=4291 ... PASS3_FUZZ_RESULT: no ASan/UBSan report`** (`pass4/logs/quic_run.out`) — the campaign completed after all; the "died unobserved" note of the first draft was the box replacement losing the *terminal*, not the run. Re-run on the rebuilt box at `54dd089` (box replaced, /opt/openssl35 + build/linux-* rebuilt first): **1 000 000 inputs, seed 20261018, 231.36 s, 4 322 inputs/s, no ASan/UBSan report** — `pass4/logs/fuzz-quic.out`, script `pass4/pass4_quic_run.sh` |
 
 **P-C needs no API update**: the pass-3 driver's includes and the `s3_h3_session_t` layout change
@@ -602,8 +602,45 @@ of F2 do not reach `fuzz_quic_state.c`, so the "re-point the driver" step is a r
 
 ### 3.5 What this baseline hands to the next delegations
 
-1. **`fix/pass4-h3pool`** — §3.3, **landed as PR #13** (pin + guard, 47/47 both presets). Next
-   defect PR: **FZ2** (§3.4), the same `sw_value` loop's huffman branch.
+1. **FZ1 and FZ2 are landed as PRs, not merged.** `fix/pass4-h3pool` — §3.3, **PR #13** (pin +
+   guard, 47/47 both presets). `fix/pass4-h3huff` — **PR #14**, FZ2 (§3.4), the same `sw_value`
+   loop's huffman branch; the stack reads PR #12 (docs) <- PR #13 (FZ1) <- PR #14 (FZ2).
+
+   **FZ2, landed** (`fix/pass4-h3huff`, 2 commits: the pin, then the fix):
+
+   - *Root cause*: `sw_value` spent the literal's countdown only after the huffman decode had
+     succeeded, but `s3_h3_huff_decode()` decodes (and emits for) the high nibble of the byte
+     before it rejects the low one, and it emits every complete code it finds before the trailing
+     bits turn out to be incomplete. A failing decode therefore consumed the input byte and may
+     already have written to the output while the countdown stayed where it was; the caller keeps
+     its own state after the hard error (`parse_field_l` stays in `sw_name`, the literal stays in
+     `sw_value`), so a re-entered literal decodes more bytes against a countdown that never moves
+     and the `n * 8 / 5 + 1` reservation of `sw_start` bounds one pass only.
+   - *The pin*: `tests/test_h3_huffman_restart.c` (47 -> 48 entries both presets), the shape of
+     the FZ1 pin - park the pool cursor so a one-byte huffman literal's two-byte reservation is
+     the last two bytes of the first 16 KiB block, one HEADERS frame with a literal-name field
+     line (`0x29`) holding `0x00` (its five-bit code emits `'0'`, the three leftover bits fail the
+     final-byte check), then replay the failing byte into the same state.
+   - *RED at the parent tree, both presets*: `linux-release` 47/48, `FAIL
+     tests/test_h3_huffman_restart.c:196: spent == 0`; `linux-asan` 47/48,
+     `AddressSanitizer: heap-buffer-overflow`, `#0 s3_h3_huff_decode_bits src/h3/s3_h3_parse.c:4299`,
+     `0 bytes after 16384-byte region` on the replay - the FZ2 signature itself.
+   - *The fix*: spend the countdown when the byte is consumed, before the decode, and complete a
+     literal re-entered with the countdown at zero instead of charging one more (`+31/-2`, one
+     file). The countdown bounds the writes in whatever state the machine is entered, error path
+     and success path alike - the same "the guard belongs to the machine" shape as FZ1.
+   - *GREEN*: `linux-release` 48/48, `linux-asan` 48/48 (FZ1's pin included).
+   - *Campaign acceptance* (ASan+UBSan, `fuzz_h3_parse` + `pass4/pass4_fuzz_drv.c`):
+     `PASS4_FUZZ inputs=1000000 seed=20261018 seconds=1.28 inputs_per_sec=780529 result=no
+     ASan/UBSan report`, and FZ1's own acceptance re-run on the branch: the nightly artifact, one
+     call and 1000x replay, `no ASan/UBSan report`.
+   - *The rate, honestly*: this driver's corpus is mostly small, early-rejected inputs, so
+     1 000 000 inputs is ~1.3 s; the acceptance is the clean result, not the throughput.
+     `pass4/fz2_validate.sh` re-ran the identical corpus against the **unpatched** parser and got
+     the FZ2 report again (`heap-buffer-overflow ... s3_h3_huff_decode_bits:4299`, exit 134) and
+     against the branch and got `exit 0` - the campaign does reach the code under test.
+   - *Logs*: `pass4/logs/fz2_{red2,green}_ctest_*.log`, `pass4/logs/fz2_h3_campaign.log`,
+     `pass4/logs/fz2_repro_b{1,2}.log`, `pass4/logs/fz2_val_{red,green}_campaign.log`.
 2. **The line-by-line protocol-delta review** — §1.2 is the map; the five questions of §1.6 are
    the acceptance list, and (a2)/item 1 (the QPACK encoder's check-after-write into `buf[1024]`)
    is the highest-value unexecuted item of the whole pass.
