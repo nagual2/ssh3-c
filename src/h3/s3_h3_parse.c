@@ -4865,14 +4865,43 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
 
         case sw_value:
 
+            /*
+             * the countdown is spent by the byte that was consumed, so a
+             * literal re-entered here with the countdown at zero has
+             * already taken every byte of its value: it completes instead
+             * of charging (and writing) one more.  the caller keeps its
+             * own state after a hard error, and the machine is re-entered
+             * with whatever the failed pass left behind
+             */
+
+            if (st->length == 0) {
+                st->value.len = st->last - st->value.data;
+                *st->last = '\0';
+
+                goto done;
+            }
+
             if (b->pos == b->last) {
                 return S3_AGAIN;
             }
 
             ch = *b->pos++;
 
+            /*
+             * spend the countdown when the byte is consumed, before the
+             * decode: a decode that fails has already consumed the input
+             * and may already have written to the output (the high nibble
+             * of the byte is decoded, and emitted, before the low one is
+             * rejected), so charging after the decode leaves a re-entered
+             * literal free to write past the n * 8 / 5 + 1 reservation of
+             * sw_start - the FZ2 heap-buffer-overflow of the pass-4
+             * campaign, the same error-path family as FZ1
+             */
+
+            st->length--;
+
             if (st->huffman) {
-                if (s3_h3_huff_decode(&st->huffstate, &ch, 1, &st->last, st->length == 1, c->log) !=
+                if (s3_h3_huff_decode(&st->huffstate, &ch, 1, &st->last, st->length == 0, c->log) !=
                     S3_OK) {
                     s3_log_error(S3_LOG_INFO, c->log, 0, "client sent invalid encoded field line");
                     return S3_ERROR;
@@ -4882,7 +4911,7 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
                 *st->last++ = ch;
             }
 
-            if (--st->length) {
+            if (st->length) {
                 break;
             }
 
