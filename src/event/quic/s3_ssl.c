@@ -181,6 +181,17 @@ s3_ssl_free(s3_ssl_t *ssl)
         SSL_CTX_free(ssl->ctx);
     }
 
+    /*
+     * the stored ticket of the resumption (the new-session callback
+     * hands the ownership over): the wave 2 tickets really arrive, an
+     * unfreed session died with the report of the sanitizers
+     */
+
+    if (ssl->stored_session != NULL) {
+        SSL_SESSION_free(ssl->stored_session);
+        ssl->stored_session = NULL;
+    }
+
     if (ssl->keylog_file != NULL) {
         (void)fclose(ssl->keylog_file);
     }

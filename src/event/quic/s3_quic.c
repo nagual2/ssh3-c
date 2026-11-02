@@ -1211,6 +1211,21 @@ s3_quic_handle_payload(s3_connection_t *c, s3_quic_header_t *pkt)
     qc->error = 0;
     qc->error_reason = NULL;
 
+    /*
+     * the 0-RTT flight of the peer (the wave 2): the short header
+     * carries no level of its own, the packet arrived before the
+     * 1-RTT keys rides the EARLY protection; the trial mapping stays
+     * safe - the EARLY keys exist only while the server armed the
+     * 0-RTT accept (RFC 9000, 12.3: the shared number space of the
+     * 0-RTT and the 1-RTT)
+     */
+
+    if (pkt->level == S3_QUIC_ENCRYPTION_APPLICATION &&
+        !s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_APPLICATION, 0) &&
+        s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_EARLY_DATA, 0)) {
+        pkt->level = S3_QUIC_ENCRYPTION_EARLY_DATA;
+    }
+
     if (!s3_quic_keys_available(qc->keys, pkt->level, 0)) {
         s3_log_error(S3_LOG_INFO, c->log, 0, "quic no %s keys, ignoring packet",
                      s3_quic_level_name(pkt->level));

@@ -1093,12 +1093,159 @@ s3_test_quic_e2e_idle_zero(void)
  * match; only the runtime call is.
  */
 
+/*
+ * the 0-RTT flight of the wave 2: the first connection completes the
+ * full handshake and lands a ticket (the server pump of the wave 2);
+ * the second connection resumes it - the client arms the EARLY write
+ * keys, the datagram queued by the conf init callback (the early
+ * branch of the stream init) flies before the handshake completes,
+ * the server decrypts it the same way and the echo comes back once
+ * its 1-RTT keys are up
+ */
+
+static u_char s3_test_0rtt_payload[13] = "0rtt-datagram";
+static int    s3_test_0rtt_arm;
+
+static s3_int_t
+s3_test_0rtt_client_init(s3_connection_t *c)
+{
+    /* the application writes inside the 0-RTT window: the conf init
+     * runs from the early-data branch of the stream init */
+
+    if (s3_test_0rtt_arm) {
+        s3_test_0rtt_arm = 0;
+
+        return s3_quic_send_datagram(c, s3_test_0rtt_payload, sizeof(s3_test_0rtt_payload)) == S3_OK
+                   ? S3_OK
+                   : S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+static int
+s3_test_quic_e2e_early(void)
+{
+    s3_test_e2e_env_t    *env = &s3_test_e2e;
+    int                   i, dg_sent;
+    s3_quic_connection_t *qc;
+    s3_ssl_t             *kept;
+    s3_ssl_t             *kept_srv;
+
+    /* --- the first connection: the full handshake, the ticket lands */
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked &&
+            env->cli_conf.ssl->stored_session != NULL) {
+            break;
+        }
+    }
+
+    S3_ASSERT(env->cli->ssl->handshaked);
+    S3_ASSERT(env->cli_conf.ssl->stored_session != NULL);
+
+    /*
+     * both ssl confs outlive the env cycle: the stored ticket is the
+     * carrier of the resumption, the server ctx keeps its ticket keys
+     * (a fresh ctx cannot decrypt the ticket and the PSK dies with it)
+     */
+
+    kept = env->cli_conf.ssl;
+    env->cli_conf.ssl = NULL;
+
+    kept_srv = env->srv_conf.ssl;
+    env->srv_conf.ssl = NULL;
+
+    s3_test_env_done(env);
+
+    /* --- the second connection: the resumption with the 0-RTT flight */
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+
+    /* the fresh confs of the cycle give way to the kept ones */
+
+    s3_ssl_free(env->cli_conf.ssl);
+    s3_ssl_free(env->srv_conf.ssl);
+
+    env->cli_conf.ssl = kept;
+    env->srv_conf.ssl = kept_srv;
+
+    /*
+     * the conf init carries the 0-RTT write: the early-data branch of
+     * the stream init runs it while the handshake still runs
+     */
+
+    env->cli_conf.init = s3_test_0rtt_client_init;
+
+    s3_test_0rtt_arm = 1;
+
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    qc = s3_quic_get_connection(env->cli);
+    S3_ASSERT(qc != NULL);
+
+    dg_sent = 0;
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        if (s3_test_srv_received_len == sizeof(s3_test_0rtt_payload)) {
+            dg_sent = 1;
+            break;
+        }
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+    }
+
+    /* the datagram flew at the EARLY level and reached the server */
+
+    S3_ASSERT(dg_sent == 1);
+    S3_ASSERT(s3_test_srv_received_len == sizeof(s3_test_0rtt_payload));
+    S3_ASSERT(s3_memcmp(s3_test_srv_received, s3_test_0rtt_payload, sizeof(s3_test_0rtt_payload)) ==
+              0);
+
+    /* the handshake completed and the echo came back at the 1-RTT */
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked &&
+            s3_test_cli_received_len == sizeof(s3_test_0rtt_payload)) {
+            break;
+        }
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+    }
+
+    S3_ASSERT(env->cli->ssl->handshaked);
+    S3_ASSERT(s3_test_cli_received_len == sizeof(s3_test_0rtt_payload));
+    S3_ASSERT(s3_memcmp(s3_test_cli_received, s3_test_0rtt_payload, sizeof(s3_test_0rtt_payload)) ==
+              0);
+
+    s3_test_env_done(env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_e2e_exporter(void)
 {
     s3_test_e2e_env_t *env = &s3_test_e2e;
-    u_char            cli_mat[32], srv_mat[32], cli_other[32];
-    int               i;
+    u_char             cli_mat[32], srv_mat[32], cli_other[32];
+    int                i;
 
     s3_test_cli_received_len = 0;
     s3_test_srv_received_len = 0;
@@ -1116,9 +1263,8 @@ s3_test_quic_e2e_exporter(void)
         s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
         s3_process_events_and_timers(&env->ctx);
 
-        if (env->cli->ssl != NULL && env->cli->ssl->handshaked &&
-            env->server != NULL && env->server->ssl != NULL &&
-            env->server->ssl->handshaked) {
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked && env->server != NULL &&
+            env->server->ssl != NULL && env->server->ssl->handshaked) {
             break;
         }
     }
@@ -1153,6 +1299,7 @@ s3_test_quic_e2e(void)
     (void)s3_test_quic_e2e_idle_close();
     (void)s3_test_quic_e2e_idle_zero();
     (void)s3_test_quic_e2e_exporter();
+    (void)s3_test_quic_e2e_early();
 
     OPENSSL_cleanup();
 

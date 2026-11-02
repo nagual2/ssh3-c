@@ -67,7 +67,7 @@ static ssize_t   s3_quic_send_segments(s3_connection_t *c, u_char *buf, size_t l
 static ssize_t s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
                                      size_t max, size_t min, s3_uint_t ack_only);
 static void s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, s3_quic_header_t *pkt,
-                                s3_quic_path_t *path);
+                                s3_quic_path_t *path, s3_uint_t level);
 static s3_uint_t s3_quic_get_padding_level(s3_connection_t *c);
 static ssize_t  s3_quic_send(s3_connection_t *c, u_char *buf, size_t len, struct sockaddr *sockaddr,
                              socklen_t socklen);
@@ -601,6 +601,26 @@ s3_quic_get_padding_level(s3_connection_t *c)
     return S3_QUIC_SEND_CTX_LAST;
 }
 
+/*
+ * the protection level of the packet from the shared send context: a
+ * client protects its application data with the EARLY keys until the
+ * handshake confirms - the APPLICATION write secret yields before
+ * that point (it rides out of the EE derivation), so the key
+ * availability cannot be the gate; the confirmation is (RFC 9000,
+ * 12.3: the shared number space of the 0-RTT and the 1-RTT)
+ */
+
+static s3_uint_t
+s3_quic_output_level(s3_connection_t *c, s3_quic_connection_t *qc, s3_quic_send_ctx_t *ctx)
+{
+    if (ctx->level == S3_QUIC_ENCRYPTION_APPLICATION && !c->ssl->handshaked &&
+        s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_EARLY_DATA, 1)) {
+        return S3_QUIC_ENCRYPTION_EARLY_DATA;
+    }
+
+    return ctx->level;
+}
+
 static ssize_t
 s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data, size_t max,
                       size_t min, s3_uint_t ack_only)
@@ -616,20 +636,23 @@ s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
     s3_quic_frame_t      *f;
     s3_quic_header_t      pkt;
     s3_quic_connection_t *qc;
+    s3_uint_t             level;
     static u_char         src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
     if (s3_queue_empty(&ctx->frames)) {
         return 0;
     }
 
-    s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic output %s packet max:%uz min:%uz",
-                  s3_quic_level_name(ctx->level), max, min);
-
     qc = s3_quic_get_connection(c);
 
-    if (!s3_quic_keys_available(qc->keys, ctx->level, 1)) {
+    level = s3_quic_output_level(c, qc, ctx);
+
+    s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic output %s packet max:%uz min:%uz",
+                  s3_quic_level_name(level), max, min);
+
+    if (!s3_quic_keys_available(qc->keys, level, 1)) {
         s3_log_error(S3_LOG_ALERT, c->log, 0, "quic %s write keys discarded",
-                     s3_quic_level_name(ctx->level));
+                     s3_quic_level_name(level));
 
         while (!s3_queue_empty(&ctx->frames)) {
             q = s3_queue_head(&ctx->frames);
@@ -642,7 +665,7 @@ s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
         return 0;
     }
 
-    s3_quic_init_packet(c, ctx, &pkt, qc->path);
+    s3_quic_init_packet(c, ctx, &pkt, qc->path, level);
 
     min_payload = s3_quic_payload_size(&pkt, min);
     max_payload = s3_quic_payload_size(&pkt, max);
@@ -749,7 +772,7 @@ s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
 
 static void
 s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, s3_quic_header_t *pkt,
-                    s3_quic_path_t *path)
+                    s3_quic_path_t *path, s3_uint_t level)
 {
     s3_quic_connection_t *qc;
 
@@ -759,13 +782,16 @@ s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, s3_quic_header_
 
     pkt->flags = S3_QUIC_PKT_FIXED_BIT;
 
-    if (ctx->level == S3_QUIC_ENCRYPTION_INITIAL) {
+    if (level == S3_QUIC_ENCRYPTION_INITIAL) {
         pkt->flags |= S3_QUIC_PKT_LONG | S3_QUIC_PKT_INITIAL;
 
-    } else if (ctx->level == S3_QUIC_ENCRYPTION_HANDSHAKE) {
+    } else if (level == S3_QUIC_ENCRYPTION_HANDSHAKE) {
         pkt->flags |= S3_QUIC_PKT_LONG | S3_QUIC_PKT_HANDSHAKE;
 
     } else {
+        /* the APPLICATION and the EARLY forms share the short header
+         * (the number space is shared, the key phase rides) */
+
         if (qc->key_phase) {
             pkt->flags |= S3_QUIC_PKT_KPHASE;
         }
@@ -778,7 +804,7 @@ s3_quic_init_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, s3_quic_header_
 
     pkt->version = qc->version;
     pkt->log = c->log;
-    pkt->level = ctx->level;
+    pkt->level = level;
 
     pkt->keys = qc->keys;
 
@@ -1331,6 +1357,8 @@ s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_
     static u_char src[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
     static u_char dst[S3_QUIC_MAX_UDP_PAYLOAD_SIZE];
 
+    s3_uint_t level;
+
     qc = s3_quic_get_connection(c);
     cg = &qc->congestion;
     ctx = s3_quic_get_send_ctx(qc, frame->level);
@@ -1349,15 +1377,17 @@ s3_quic_frame_sendto(s3_connection_t *c, s3_quic_frame_t *frame, size_t min, s3_
         min = s3_max(min, S3_QUIC_MIN_INITIAL_SIZE);
     }
 
+    level = s3_quic_output_level(c, qc, ctx);
+
     s3_log_debug3(S3_LOG_DEBUG_EVENT, c->log, 0, "quic sendto %s packet max:%uz min:%uz",
-                  s3_quic_level_name(ctx->level), max, min);
+                  s3_quic_level_name(level), max, min);
 
     if (cg->in_flight >= cg->window && !frame->ignore_congestion) {
         s3_quic_free_frame(c, frame);
         return S3_AGAIN;
     }
 
-    s3_quic_init_packet(c, ctx, &pkt, path);
+    s3_quic_init_packet(c, ctx, &pkt, path, level);
 
     min_payload = s3_quic_payload_size(&pkt, min);
     max_payload = s3_quic_payload_size(&pkt, max);

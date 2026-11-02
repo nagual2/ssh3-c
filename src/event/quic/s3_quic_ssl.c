@@ -429,19 +429,25 @@ s3_quic_post_handshake(s3_connection_t *c)
      *
      * a server delivers its tickets right after the handshake, so a
      * client keeps receiving CRYPTO frames in 1-RTT packets; the
-     * records are pulled through the read callback as usual and
-     * SSL_do_handshake() dispatches them
+     * records are pulled through the read callback as usual and the
+     * zero-length SSL_read() dispatches them - the doc of the
+     * quic-tls cbs: once the handshake is complete, the QUIC stack
+     * must call one of the SSL_read() variants whenever a
+     * post-handshake CRYPTO frame is received (SSL_do_handshake()
+     * returns success without touching them - the wave 2 diagnosis:
+     * the tickets arrived for months and nobody read them)
      */
 
-    n = SSL_do_handshake(ssl_conn);
+    n = SSL_read(ssl_conn, NULL, 0);
 
-    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "SSL_do_handshake (post): %d", n);
+    s3_log_debug1(S3_LOG_DEBUG_EVENT, c->log, 0, "SSL_read (post): %d", n);
 
     if (n <= 0) {
         sslerr = SSL_get_error(ssl_conn, n);
 
-        if (sslerr != SSL_ERROR_WANT_READ && sslerr != SSL_ERROR_WANT_WRITE) {
-            s3_ssl_error(c->log, 0, "SSL_do_handshake() failed after handshake");
+        if (sslerr != SSL_ERROR_WANT_READ && sslerr != SSL_ERROR_WANT_WRITE &&
+            sslerr != SSL_ERROR_ZERO_RETURN) {
+            s3_ssl_error(c->log, 0, "SSL_read() failed after handshake");
             return S3_ERROR;
         }
 
@@ -509,12 +515,26 @@ s3_quic_handshake(s3_connection_t *c)
         /*
          * the reference starts 0-RTT streams here when the early data
          * keys and the client transport parameters are ready
-         * (ngx_quic_init_streams() in the early data branch)
+         * (ngx_quic_init_streams() in the early data branch); the
+         * direction follows the role - the server reads the peer
+         * EARLY (the client slot), the client writes its own (the
+         * client slot, the wave 2)
          */
 
-        if (s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_EARLY_DATA, 0) &&
+        if (s3_quic_keys_available(qc->keys, S3_QUIC_ENCRYPTION_EARLY_DATA, qc->client ? 1 : 0) &&
             qc->client_tp_done) {
             if (s3_quic_init_streams(c) != S3_OK) {
+                return S3_ERROR;
+            }
+
+            /*
+             * the 0-RTT flight leaves at once: the next output pass
+             * would find the handshake confirmed (the server flight
+             * of the loopback lands whole) and the frames would lose
+             * the EARLY window
+             */
+
+            if (qc->client && s3_quic_output(c) != S3_OK) {
                 return S3_ERROR;
             }
         }
@@ -604,6 +624,19 @@ s3_quic_handshake(s3_connection_t *c)
         return S3_ERROR;
     }
 
+    /*
+     * the session tickets of the 0-RTT wave 2: the TLS 1.3 server
+     * writes the NST records on a FOLLOW-UP state machine run (the
+     * one that processed the client Finished completes the handshake,
+     * the tickets queue behind TLS_ST_OK) - without this single pump
+     * they never leave and the resumption stays dead (the wave 2
+     * diagnosis: the client cb saw zero tickets)
+     */
+
+    if (!qc->client && s3_quic_post_handshake(c) != S3_OK) {
+        return S3_ERROR;
+    }
+
     return S3_OK;
 }
 
@@ -650,6 +683,7 @@ s3_quic_ssl_tls_init(s3_connection_t *c)
 s3_int_t
 s3_quic_init_connection(s3_connection_t *c)
 {
+    s3_int_t              rc;
     s3_str_t              dcid;
     s3_quic_socket_t     *qsock;
     s3_quic_connection_t *qc;
@@ -662,10 +696,6 @@ s3_quic_init_connection(s3_connection_t *c)
 
     c->ssl->no_wait_shutdown = 1;
 
-    if (SSL_CTX_get_max_early_data(qc->conf->ssl->ctx)) {
-        SSL_set_quic_tls_early_data_enabled(c->ssl->connection, 1);
-    }
-
     qsock = s3_quic_get_socket(c);
 
     dcid.data = qsock->sid.id;
@@ -675,12 +705,33 @@ s3_quic_init_connection(s3_connection_t *c)
         return S3_ERROR;
     }
 
-    return s3_quic_ssl_tls_init(c);
+    rc = s3_quic_ssl_tls_init(c);
+
+    if (rc != S3_OK) {
+        return rc;
+    }
+
+    /*
+     * the 0-RTT accept of the wave 2: the quic-tls hook arms the
+     * EARLY state with the neutral max_early_data = 0xffffffff (the
+     * value the strict peers, rustls, accept in the NST - the RFC
+     * 9001 4.5 form); the ctx setter of the stage 1 stays away, the
+     * TLS-level number 16384 of it was the B21 break.  the hook rides
+     * after the cbs registration - the quic-tls state must exist
+     */
+
+    if (SSL_set_quic_tls_early_data_enabled(c->ssl->connection, 1) == 0) {
+        s3_ssl_error(c->log, 0, "quic SSL_set_quic_tls_early_data_enabled() failed");
+        return S3_ERROR;
+    }
+
+    return S3_OK;
 }
 
 s3_int_t
 s3_quic_client_init_connection(s3_connection_t *c)
 {
+    s3_int_t              rc;
     s3_ssl_conn_t        *ssl_conn;
     s3_quic_connection_t *qc;
 
@@ -699,9 +750,8 @@ s3_quic_client_init_connection(s3_connection_t *c)
 
     /*
      * the session resumption of the 0-RTT stage 1: the stored ticket
-     * rides the ClientHello (the 1-RTT resumption - the early-data
-     * enable waits for the 0-RTT wave, the server carries no
-     * advertisement meanwhile, B21)
+     * rides the ClientHello (the early-data enable rides after the
+     * cbs registration, the wave 2)
      */
 
     SSL_set_app_data(ssl_conn->connection, qc->conf->ssl);
@@ -721,5 +771,26 @@ s3_quic_client_init_connection(s3_connection_t *c)
 
     c->ssl = ssl_conn;
 
-    return s3_quic_ssl_tls_init(c);
+    rc = s3_quic_ssl_tls_init(c);
+
+    if (rc != S3_OK) {
+        return rc;
+    }
+
+    /*
+     * the client 0-RTT of the wave 2: the enable rides after the cbs
+     * registration (the quic-tls state must exist) and needs the
+     * resumed session of the 0xffffffff form - a refusal is not
+     * fatal, the run stays 1-RTT then
+     */
+
+    if (qc->conf->ssl->stored_session != NULL &&
+        SSL_set_quic_tls_early_data_enabled(ssl_conn->connection, 1) == 0) {
+        fprintf(stderr, "DIAG-CLI-ENABLE-REFUSED\n");
+        s3_log_error(S3_LOG_INFO, c->log, 0,
+                     "quic early data not enabled (the session carries no 0-RTT ticket)");
+        ERR_clear_error();
+    }
+
+    return S3_OK;
 }
