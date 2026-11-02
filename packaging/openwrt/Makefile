@@ -16,21 +16,29 @@
 # without one of them the channel body rides the remaining codecs (the
 # B8 gate is the intersection of the peer mask).
 
-include $(TOPDIR)/rules.mk
-include $(INCLUDE_DIR)/package.mk
-include $(INCLUDE_DIR)/cmake.mk
+# the package variables ride BEFORE the includes: the stamps of
+# package.mk (STAMP_BUILT) freeze PKG_BUILD_DIR at the include time,
+# the variables after the include freeze empty (the git proto of the
+# stub masked it with its own download fields)
 
 PKG_NAME:=ssh3-server
 PKG_VERSION:=0.5.6
 PKG_RELEASE:=1
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/nagual2/ssh3-c.git
-PKG_SOURCE_VERSION:=v0.5.6
-PKG_MIRROR_HASH:=skip
+
+include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/cmake.mk
+# the SDK build rides the tarball of the release tag placed into the
+# SDK dl/ directory by hand (the release script builds it with git
+# archive); the Download machinery is bypassed - the prepare unpacks
+# the tarball straight into the build dir (the file:// self-download
+# of the SDK overwrote the mirror copy)
 PKG_MAINTAINER:=ssh3-c maintainers <maintainers@example.com>
 PKG_LICENSE:=BSD-2-Clause
 PKG_LICENSE_FILES:=LICENSE
 PKG_BUILD_PARALLEL:=1
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+export PKG_BUILD_DIR
 
 define Package/ssh3-server
   SECTION:=net
@@ -58,9 +66,23 @@ define Package/ssh3-server/conffiles
 /etc/ssh3/authorized_keys
 endef
 
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(TAR) -xzf $(TOPDIR)/dl/ssh3-c-$(PKG_VERSION).tar.gz -C $(PKG_BUILD_DIR)
+endef
+
 # build only the daemon target, not the bench/interop/test binaries
 define Build/Compile
 	$(call Build/Compile/Default,ssh3-server)
+endef
+
+# the cmake tree carries no install rules: the daemon binary copies
+# into the ipkg-install dir by hand (the Build/Install/Default ninja
+# install target does not exist)
+
+define Build/Install
+	$(INSTALL_DIR) $(PKG_INSTALL_DIR)/usr/sbin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-server $(PKG_INSTALL_DIR)/usr/sbin/
 endef
 
 define Package/ssh3-server/install
