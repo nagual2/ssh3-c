@@ -12,6 +12,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdarg.h>
+
+#if (S3_WIN32)
+/* mingw: mkdir rides direct.h with the single argument */
+#include <direct.h>
+#define s3_mkdir(dir) _mkdir(dir)
+#else
+#define s3_mkdir(dir) mkdir(dir, 0700)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -329,7 +337,7 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
             memcpy(dir, ssl->ticket_path, dlen);
             dir[dlen] = '\0';
 
-            if (mkdir(dir, 0700) != 0 && errno == ENOENT) {
+            if (s3_mkdir(dir) != 0 && errno == ENOENT) {
 
                 const char *up = strrchr(dir, '/');
                 size_t      plen = up != NULL ? (size_t)(up - dir) : 0;
@@ -339,8 +347,8 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
                     memcpy(parent, dir, plen);
                     parent[plen] = '\0';
 
-                    (void)mkdir(parent, 0700);
-                    (void)mkdir(dir, 0700);
+                    (void)s3_mkdir(parent);
+                    (void)s3_mkdir(dir);
                 }
             }
         }
