@@ -153,6 +153,20 @@ s3_fuzz_open_step(s3_fuzz_env_t *env, const u_char *chunk, size_t len)
         return;
     }
 
+    /* the descriptor rides the library domain before the round-trip
+     * pin: the parse clamps the floor up (F-1, the reference
+     * clampPeerMaxPacketSize) and refuses above the limit, so the
+     * generated value is normalized here - the ceiling refusal is
+     * fuzzed through the rawhdr op instead */
+
+    if (wire.max_packet_size > S3_SSH3_CHANNEL_MAX_PACKET_LIMIT) {
+        return;
+    }
+
+    if (wire.max_packet_size < S3_SSH3_CHANNEL_MIN_PACKET_SIZE) {
+        wire.max_packet_size = S3_SSH3_CHANNEL_MIN_PACKET_SIZE;
+    }
+
     switch (sel) {
 
     case 0:

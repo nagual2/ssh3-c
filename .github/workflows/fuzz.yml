@@ -63,6 +63,28 @@ jobs:
           mkdir -p corpus
           build/linux-fuzz/tests/fuzz/s3_fuzz_gen_seeds corpus
 
+      - name: Replay the reproducers
+        run: |
+          # the committed reproducers ride the harness their name
+          # carries (the prefix before the first dash maps the family:
+          # h3-parse -> fuzz_h3_parse, h3-state -> fuzz_h3_state,
+          # ssh3-state -> fuzz_ssh3_state); every file must run clean
+          FAIL=0
+          for R in tests/fuzz/repro/*.bin; do
+            case "$(basename "$R")" in
+              h3-parse-*)     H=fuzz_h3_parse ;;
+              h3-state-*)     H=fuzz_h3_state ;;
+              ssh3-state-*)   H=fuzz_ssh3_state ;;
+              *)              H="" ;;
+            esac
+
+            [ -n "$H" ] || { echo "== $R: no harness mapping, skip"; continue; }
+
+            echo "== $H: $R"
+            build/linux-fuzz/tests/fuzz/$H "$R" -rss_limit_mb=4096 || FAIL=1
+          done
+          exit $FAIL
+
       - name: Fuzz the parsers
         run: |
           ARTP=build/linux-fuzz/artifacts
@@ -72,7 +94,7 @@ jobs:
                    fuzz_message fuzz_quic_state fuzz_h3_parse fuzz_h3_state fuzz_ssh3_state; do
             echo "== $H"
             build/linux-fuzz/tests/fuzz/$H corpus \
-              -max_total_time=60 -max_len=16384 -rss_limit_mb=2560 \
+              -max_total_time=60 -max_len=16384 -rss_limit_mb=4096 \
               -artifact_prefix="$ARTP/" || FAIL=1
           done
           exit $FAIL

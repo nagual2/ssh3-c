@@ -204,6 +204,15 @@ s3_h3_insert(s3_connection_t *c, s3_str_t *name, s3_str_t *value)
     s3_h3_session_t       *h3c;
     s3_h3_dynamic_table_t *dt;
 
+    /* the empty field name refuses at the gate: the field-line parse
+     * rejects a zero-length name, an entry that slipped past here
+     * would decode into a field the own encoder output cannot parse
+     * back (the FZ2 chronic family of the nightly fuzz) */
+
+    if (name->len == 0) {
+        return S3_H3_ERR_ENCODER_STREAM_ERROR;
+    }
+
     size = s3_h3_table_entry_size(name, value);
 
     h3c = s3_h3_get_session(c);

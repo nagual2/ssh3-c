@@ -4912,6 +4912,18 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
             }
 
             st->value.len = st->last - st->value.data;
+
+            /* the pure-EOS padding refuses (RFC 7541 6.2, the FZ2
+             * chronic family): a non-empty huffman input carries at
+             * least one symbol - the decode yielding nothing is the
+             * EOS symbol riding as data, the field-line parse cannot
+             * carry such a field back through the encoders */
+
+            if (st->huffman && st->value.len == 0) {
+                s3_log_error(S3_LOG_INFO, c->log, 0, "client sent invalid encoded field line");
+                return S3_ERROR;
+            }
+
             *st->last = '\0';
             goto done;
         }

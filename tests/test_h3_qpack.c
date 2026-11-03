@@ -546,6 +546,18 @@ s3_test_dynamic_table(s3_test_env_t *e)
 
     S3_ASSERT(s3_h3_insert(e->c, &name, &value) == S3_H3_ERR_ENCODER_STREAM_ERROR);
 
+    /* an empty field name is refused at the insert gate (the FZ2
+     * chronic family): the field-line parse refuses a zero-length
+     * name, an entry that slips past the insert would decode into a
+     * field the own encoder output cannot parse back */
+
+    name.data = (u_char *)"";
+    name.len = 0;
+    value.data = (u_char *)"v";
+    value.len = 1;
+
+    S3_ASSERT(s3_h3_insert(e->c, &name, &value) == S3_H3_ERR_ENCODER_STREAM_ERROR);
+
     /* the decoder stream feedback: the section ack is a tracked
      * no-op (the entry gate rides the Insert Count Increment), the
      * increment of unknown inserts refuses (the F2 contract) */

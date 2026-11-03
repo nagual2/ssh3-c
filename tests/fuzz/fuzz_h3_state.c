@@ -458,12 +458,13 @@ s3_fuzz_dynref_step(s3_fuzz_env_t *e, s3_fuzz_machines_t *m, u_char *chunk)
     rel = n - 1 - a;
 
     /*
-     * the required insert count encodes as (n & 0xff) + 1: the
-     * QPACK 4.5.1.1 windowing of s3_h3_decode_insert_count() maps it
-     * back to exactly n for every table state; the section sits
+     * the raw required insert count rides the prefix encoder: the
+     * helper applies the RFC 9204 4.5.1.1 wire form itself (the raw
+     * count + 1 modulo 2N, the F2 wave form) and the decoder
+     * reconstructs exactly n for every table state; the section sits
      * directly behind the one-byte frame header
      */
-    p = (u_char *)s3_h3_encode_field_section_prefix(frame + 2, (s3_uint_t)((n & 0xff) + 1), 0, 0);
+    p = (u_char *)s3_h3_encode_field_section_prefix(frame + 2, (s3_uint_t)n, 0, 0);
     p = (u_char *)s3_h3_encode_field_ri(p, 1, (s3_uint_t)rel);
 
     if ((size_t)(p - frame) > 65 || (size_t)(p - (frame + 2)) > 63) {

@@ -730,6 +730,49 @@ s3_test_field_lifetime(s3_connection_t *c)
 }
 
 /*
+ * the FZ2-chronic pin (the nightly fuzz + the state-harness round-trip
+ * driver, 2026-11-03): the huffman name of a non-zero wire length must
+ * carry at least one symbol - the pure-EOS padding input decodes to a
+ * zero-length name the field-line parse refuses (RFC 7541 6.2, the
+ * EOS symbol never rides as data), the whole section refuses
+ */
+static void
+s3_test_huff_empty(s3_connection_t *c)
+{
+    u_char                buf[64];
+    u_char               *p, *sec;
+    size_t                sec_len;
+    s3_buf_t              b;
+    s3_int_t              rc;
+    s3_h3_parse_headers_t st;
+
+    sec = buf + 2; /* the frame header takes the first two bytes */
+
+    p = (u_char *)s3_h3_encode_field_section_prefix(sec, 0, 0, 0);
+
+    /* the literal field line: 0x2a = the literal-name form, the name
+     * huffman flag set, the 3-bit length = 2; the name payload is the
+     * pure EOS padding (the two all-ones bytes), the value rides the
+     * plain empty form */
+
+    *p++ = 0x2a;
+    *p++ = 0xff;
+    *p++ = 0xff;
+    *p++ = 0x00;
+
+    sec_len = (size_t)(p - sec);
+
+    buf[0] = 0x01;
+    buf[1] = (u_char)sec_len;
+
+    s3_memzero(&st, sizeof(st));
+    b = s3_test_buf(buf, 2 + sec_len);
+    rc = s3_h3_parse_headers(c, &st, &b);
+
+    S3_ASSERT(rc != S3_DONE && rc != S3_OK);
+}
+
+/*
  * the FZ1 pin (the nightly fuzz 2026-10-28, fixed by the zero-length
  * parks plus the exhausted-counter guards of s3_h3_parse_literal): a
  * section where a zero-length value literal rides next to the full
@@ -811,6 +854,7 @@ s3_test_h3_parse(void)
     s3_test_zero_literal(c);
     s3_test_literal(c);
     s3_test_field_lifetime(c);
+    s3_test_huff_empty(c);
     s3_test_huffman();
     s3_test_encoder_decoder(c);
     s3_test_control(c);
