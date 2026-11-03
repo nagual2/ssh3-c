@@ -7,7 +7,7 @@
 # inside the -t deadline
 set -u
 
-ROOT=/mnt/c/Git/project/ssh3-c
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/build/linux-release}
 WORK=$(mktemp -d /tmp/s3pj.XXXXXX)
 FAILURES=0
