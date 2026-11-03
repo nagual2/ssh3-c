@@ -4886,8 +4886,18 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
 
             ch = *b->pos++;
 
+            /*
+             * the countdown is spent when the byte is consumed (the
+             * FZ2 shape): a decode that fails has already consumed
+             * the input and may already have written the high-nibble
+             * byte - charging after the decode leaves the re-entered
+             * literal a free write past the reservation
+             */
+
+            st->length--;
+
             if (st->huffman) {
-                if (s3_h3_huff_decode(&st->huffstate, &ch, 1, &st->last, st->length == 1, c->log) !=
+                if (s3_h3_huff_decode(&st->huffstate, &ch, 1, &st->last, st->length == 0, c->log) !=
                     S3_OK) {
                     s3_log_error(S3_LOG_INFO, c->log, 0, "client sent invalid encoded field line");
                     return S3_ERROR;
@@ -4897,7 +4907,7 @@ s3_h3_parse_literal(s3_connection_t *c, s3_h3_parse_literal_t *st, s3_buf_t *b)
                 *st->last++ = ch;
             }
 
-            if (--st->length) {
+            if (st->length) {
                 break;
             }
 
