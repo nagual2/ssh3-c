@@ -226,6 +226,13 @@ jobs:
 
       - name: Stage the package feed and build the ipk
         run: |
+          # the Makefile unpacks dl/ssh3-c-<ver>.tar.gz straight into
+          # the build dir (the rootless git archive of the checkout -
+          # the tag content the job runs on); the dl/ placement was
+          # the hand step of the dev stand, the job does it itself
+          VER=$(sed -n 's/^PKG_VERSION:=//p' src/packaging/openwrt/Makefile)
+          git -C src archive --format=tar.gz \
+            -o ~/openwrt-sdk/sdk/dl/ssh3-c-$VER.tar.gz HEAD
           cp -r src/packaging/openwrt ~/openwrt-sdk/sdk/package/ssh3-server
           cd ~/openwrt-sdk/sdk
           make defconfig >/dev/null 2>&1
