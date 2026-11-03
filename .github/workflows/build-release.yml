@@ -235,6 +235,13 @@ jobs:
             -o ~/openwrt-sdk/sdk/dl/ssh3-c-$VER.tar.gz HEAD
           cp -r src/packaging/openwrt ~/openwrt-sdk/sdk/package/ssh3-server
           cd ~/openwrt-sdk/sdk
+
+          # the fresh SDK carries no feeds: the DEPENDS closure
+          # (libopenssl with the QUIC TLS API, the codecs) stages from
+          # the official feeds, the defconfig resolves it to =m
+          ./scripts/feeds update -a
+          ./scripts/feeds install libopenssl zlib libzstd liblz4 openssl-util
+          echo CONFIG_PACKAGE_ssh3-server=m >> .config
           make defconfig >/dev/null 2>&1
           make package/ssh3-server/compile V=s
 
