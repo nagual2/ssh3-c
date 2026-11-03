@@ -18,6 +18,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if (S3_WIN32)
+#include <direct.h>
+#endif
+
 #include <s3_ssl.h>
 #include <s3_string.h>
 
@@ -244,6 +248,19 @@ s3_ssl_ticket_unhex(u_char *dst, size_t *len, const char *src)
     return 1;
 }
 
+/* the portable mkdir of the cache directory: the mode rides the
+ * unix leg, the win one takes the single-argument form (direct.h) */
+
+static int
+s3_ssl_mkdir(const char *dir)
+{
+#if (S3_WIN32)
+    return _mkdir(dir);
+#else
+    return mkdir(dir, 0700);
+#endif
+}
+
 /*
  * the ticket cache line of the key: the whole file rewrites on every
  * store, the other hosts' lines ride through (the tmp+rename swap,
@@ -320,8 +337,14 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
      * mkdir is not recursive, the two levels go one by one */
 
     {
-        char        dir[1024], parent[1024];
-        const char *slash = strrchr(ssl->ticket_path, '/');
+        char dir[1024], parent[1024];
+
+        /* the win home rides the backslash form, the unix one the
+         * slash - the split takes the last separator of either */
+
+        const char *s1 = strrchr(ssl->ticket_path, '/');
+        const char *s2 = strrchr(ssl->ticket_path, '\\');
+        const char *slash = (s1 > s2) ? s1 : s2;
         size_t      dlen = slash != NULL ? (size_t)(slash - ssl->ticket_path) : 0;
 
         if (dlen > 0 && dlen < sizeof(dir)) {
@@ -329,9 +352,11 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
             memcpy(dir, ssl->ticket_path, dlen);
             dir[dlen] = '\0';
 
-            if (mkdir(dir, 0700) != 0 && errno == ENOENT) {
+            if (s3_ssl_mkdir(dir) != 0 && errno == ENOENT) {
 
-                const char *up = strrchr(dir, '/');
+                const char *u1 = strrchr(dir, '/');
+                const char *u2 = strrchr(dir, '\\');
+                const char *up = (u1 > u2) ? u1 : u2;
                 size_t      plen = up != NULL ? (size_t)(up - dir) : 0;
 
                 if (plen > 0 && plen < sizeof(parent)) {
@@ -339,8 +364,8 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
                     memcpy(parent, dir, plen);
                     parent[plen] = '\0';
 
-                    (void)mkdir(parent, 0700);
-                    (void)mkdir(dir, 0700);
+                    (void)s3_ssl_mkdir(parent);
+                    (void)s3_ssl_mkdir(dir);
                 }
             }
         }

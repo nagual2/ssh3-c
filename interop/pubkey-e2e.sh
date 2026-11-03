@@ -19,7 +19,7 @@
 # usage: pubkey-e2e.sh [worktree] [go-ssh3-binary]
 set -u
 
-ROOT=${1:-/mnt/c/Git/project/ssh3-c}
+ROOT=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 GOSSH3=${2:-/tmp/pubkey-e2e/ssh3}
 BUILD=$ROOT/build/linux-release
 # the server binary override (P6.5 wave 2): the ssh3-server daemon

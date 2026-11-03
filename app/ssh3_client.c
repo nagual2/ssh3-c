@@ -425,10 +425,12 @@ static char s3_cli_login[128]; /* the -l user, the operand wins on a conflict */
 
 static int s3_cli_escape_ch = '~';
 
-/* the address family of the dial, AF_INET default (the v4 shape of
- * this port, documented), -4 pins it, -6 rides the v6 dial */
+/* the family pick of the dial: -4 pins the v4, -6 pins the v6, the
+ * unforced default passes AF_UNSPEC (the ssh(1) canon: both families
+ * resolve, the first answer picks the socket family, the literal
+ * dials its own) */
 
-static int s3_cli_family = AF_INET;
+static int s3_cli_family = AF_UNSPEC;
 
 /* -N holds the forwards without the session channel, -n leaves the
  * stdin unpumped, the pty policy rides -t/-tt/-T (0 auto keeps the
@@ -13381,6 +13383,8 @@ main(int argc, char **argv)
     s3_connection_t      *cli;
     s3_quic_connection_t *qc;
     struct addrinfo       hints, *res = NULL;
+    struct sockaddr_in    sa4;
+    struct sockaddr_in6   sa6;
 
     /* the net bootstrap (the winsock startup of win, the signal flags
      * of unix) */
@@ -14530,31 +14534,53 @@ main(int argc, char **argv)
 
     (void)s3_cli_tofu_prepare();
 
-    /* the resolution first: the literal or the name; the family is
-     * the -4/-6 pick of the run (the v4 default), the chain targets
-     * carry it family-tagged on the wire */
+    /* the resolution first: the unforced literal dials its own
+     * family (the inet_pton fast-path, the scope-id forms fall back
+     * to the resolver), the name rides getaddrinfo - the unforced
+     * run passes AF_UNSPEC and takes the first answer (the ssh
+     * order), the -4/-6 pick filters at the hints; the chain targets
+     * carry the resolved family-tagged form on the wire */
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = s3_cli_family;
-    hints.ai_socktype = SOCK_DGRAM;
+    memset(&sa4, 0, sizeof(sa4));
+    memset(&sa6, 0, sizeof(sa6));
 
-    if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
-        fprintf(stderr, "ssh3: cannot resolve %s\n", s3_cli_host);
-        s3_cli_net_cleanup();
-        return S3_CLI_EXIT_ERROR;
-    }
+    if (s3_cli_family == AF_UNSPEC && inet_pton(AF_INET, s3_cli_host, &sa4.sin_addr) == 1) {
+        sa4.sin_family = AF_INET;
+        sa4.sin_port = htons((u_short)s3_cli_port);
+        memcpy(&s3_cli_sa, &sa4, sizeof(sa4));
+        s3_cli_sa_len = sizeof(sa4);
 
-    s3_cli_sa_len = res->ai_addrlen;
-    memcpy(&s3_cli_sa, res->ai_addr, s3_cli_sa_len);
-
-    if (s3_cli_sa.ss_family == AF_INET6) {
-        ((struct sockaddr_in6 *)&s3_cli_sa)->sin6_port = htons((u_short)s3_cli_port);
+    } else if (s3_cli_family == AF_UNSPEC &&
+               inet_pton(AF_INET6, s3_cli_host, &sa6.sin6_addr) == 1) {
+        sa6.sin6_family = AF_INET6;
+        sa6.sin6_port = htons((u_short)s3_cli_port);
+        memcpy(&s3_cli_sa, &sa6, sizeof(sa6));
+        s3_cli_sa_len = sizeof(sa6);
 
     } else {
-        ((struct sockaddr_in *)&s3_cli_sa)->sin_port = htons((u_short)s3_cli_port);
-    }
 
-    freeaddrinfo(res);
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = s3_cli_family;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
+            fprintf(stderr, "ssh3: cannot resolve %s\n", s3_cli_host);
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_sa_len = res->ai_addrlen;
+        memcpy(&s3_cli_sa, res->ai_addr, s3_cli_sa_len);
+
+        if (s3_cli_sa.ss_family == AF_INET6) {
+            ((struct sockaddr_in6 *)&s3_cli_sa)->sin6_port = htons((u_short)s3_cli_port);
+
+        } else {
+            ((struct sockaddr_in *)&s3_cli_sa)->sin_port = htons((u_short)s3_cli_port);
+        }
+
+        freeaddrinfo(res);
+    }
 
     if (s3_event_ctx_init(&s3_cli_ctx, &s3_cli_log) != S3_OK) {
         fprintf(stderr, "ssh3: the event context failed\n");
@@ -14573,9 +14599,9 @@ main(int argc, char **argv)
         struct addrinfo jhints, *jres = NULL;
         unsigned        k;
 
-        /* the hop resolution: the family rides the -4/-6 pick like
-         * the destination (the v6 hop dials v6, the v4-mapped
-         * literals stay the v4 form) */
+        /* the hop resolution: the -4/-6 pick forces every hop like
+         * the destination, the unforced run lets each hop take its
+         * own family from the first answer (the ssh order) */
 
         memset(&jhints, 0, sizeof(jhints));
         jhints.ai_family = s3_cli_family;
@@ -14750,7 +14776,11 @@ main(int argc, char **argv)
 
     } else {
 
-        fd = (s3_fd_t)socket(s3_cli_family, SOCK_DGRAM, 0);
+        /* the socket rides the resolved family: the unforced dial
+         * picks it from the answer, AF_UNSPEC is not a socket
+         * family */
+
+        fd = (s3_fd_t)socket(s3_cli_sa.ss_family, SOCK_DGRAM, 0);
 
         if (fd == (s3_fd_t)INVALID_SOCKET) {
             fprintf(stderr, "ssh3: socket() failed\n");
