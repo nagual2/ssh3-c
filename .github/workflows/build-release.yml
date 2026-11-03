@@ -193,7 +193,7 @@ jobs:
           path: dist/
 
   openwrt-ipk:
-    name: openwrt (ipk, SDK 25.12.6)
+    name: openwrt (apk, SDK 25.12.6)
     runs-on: ubuntu-24.04
     # the SDK source-download machinery quirk (the git clone into
     # tmp/dl lands empty, the unpack takes the true shortcut) is under
@@ -248,7 +248,7 @@ jobs:
       - name: Stage artifacts
         run: |
           mkdir -p dist
-          find ~/openwrt-sdk/sdk/bin/packages -name 'ssh3-server*.ipk' -exec cp -v {} dist/ \;
+          find ~/openwrt-sdk/sdk/bin/packages -name 'ssh3-server*.apk' -exec cp -v {} dist/ \;
           ls -l dist/
 
       - uses: actions/upload-artifact@v4
