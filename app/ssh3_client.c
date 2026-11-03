@@ -439,6 +439,16 @@ static int s3_cli_family = AF_UNSPEC;
 static unsigned s3_cli_no_session;
 static unsigned s3_cli_no_stdin;
 
+/* the -f background run (the ssh2 canon): the flag gates the
+ * parent-side refusals and the post-verdict detach, the done flag
+ * fires once (the section parse may land twice) */
+
+static unsigned s3_cli_fork_bg;
+
+#if !(S3_WIN32)
+static unsigned s3_cli_bg_done;
+#endif
+
 enum {
     S3_CLI_PTY_AUTO = 0,    /* the console pty, the pipe 80x24 force */
     S3_CLI_PTY_FORCE,       /* -t: a local tty is required */
@@ -1274,6 +1284,10 @@ s3_cli_usage(const char *prog)
             "  -M          the control master: the control socket serves the\n"
             "              slaves and the ops, the sessions ride the same\n"
             "              connection\n"
+            "  -f          the background run after the auth verdict: the refusals\n"
+            "              gate the interactive configs before the dial, the child\n"
+            "              holds the session or the forwards (unix, the win run\n"
+            "              warns and stays foreground)\n"
             "  -n          the stdin stays /dev/null (no pump)\n"
             "  -N          no session, the forwards hold the run\n"
             "  -O check|stop|exit  the control op against the -S master\n"
@@ -4215,6 +4229,121 @@ s3_cli_opt_parse(const char *arg)
  * policy (yes refuses at once, no accepts without a pin write,
  * accept-new is the default TOFU)
  */
+
+/* the -f gate helper: the target is pinned already (the pin text of
+ * the host rides the known_hosts file, the first token matches the
+ * parse the cert check runs) - the unix leg only, the win gate
+ * passes everything */
+
+#if !(S3_WIN32)
+static unsigned
+s3_cli_bg_host_pinned(void)
+{
+    char     line[17408], kh_path[1024];
+    FILE    *f;
+    unsigned pinned = 0;
+
+    if (s3_cli_kh_path(kh_path, sizeof(kh_path)) != S3_OK) {
+        return 0;
+    }
+
+    f = fopen(kh_path, "r");
+
+    if (f == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+
+        char *sp, *nl;
+
+        nl = strchr(line, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+
+        sp = strchr(line, ' ');
+
+        if (sp == NULL) {
+            continue;
+        }
+
+        *sp = '\0';
+
+        if (strcmp(line, s3_cli_hostkey) == 0) {
+            pinned = 1;
+            break;
+        }
+    }
+
+    fclose(f);
+
+    return pinned;
+}
+#endif
+
+/*
+ * the -f gate (the ssh2 canon, the эталон cmd/background.go): every
+ * refusal rides the parent before the dial - the backgrounded child
+ * cannot prompt and would die silently.  The interactive set of this
+ * client: the OIDC browser flow, the TOFU ask on an unpinned host
+ * and the control master (the эталон form); the Basic credentials
+ * embed in the run and the passphrase-protected keys refuse at load,
+ * so no password gate rides here
+ */
+
+static s3_int_t
+s3_cli_fork_bg_validate(void)
+{
+    if (!s3_cli_fork_bg) {
+        return S3_OK;
+    }
+
+#if (S3_WIN32)
+
+    /* the win leg has no session detach (the эталон stance): the run
+     * stays foreground, the gate passes everything */
+
+    fprintf(stderr, "ssh3: -f: backgrounding is unavailable on windows, "
+                    "running the session in the foreground\n");
+    s3_cli_fork_bg = 0;
+
+    return S3_OK;
+
+#else
+
+    if (s3_cli_cmd == NULL && !s3_cli_no_session && s3_cli_fwd_count == 0 &&
+        s3_cli_rspec_count == 0 && !s3_cli_sftp_mode) {
+        fprintf(stderr, "ssh3: -f: nothing to keep running in the background: "
+                        "give a remote command, -N or a forward (-L/-D/-R/--sftp)\n");
+        return S3_ERROR;
+    }
+
+    if (s3_cli_oidc_issuer != NULL && s3_cli_oidc_raw == NULL) {
+        fprintf(stderr, "ssh3: -f: the OIDC flow opens a browser and cannot run "
+                        "in the background (the raw --oidc-token rides)\n");
+        return S3_ERROR;
+    }
+
+    if (s3_cli_cm_master) {
+        fprintf(stderr, "ssh3: -f: the control master combination refuses -f "
+                        "(the эталон form): drop -f\n");
+        return S3_ERROR;
+    }
+
+    if (s3_cli_opt_strict == S3_CLI_SHK_ACCEPT_NEW && !s3_cli_opt_insecure &&
+        !s3_cli_bg_host_pinned()) {
+        fprintf(stderr, "ssh3: -f: the default ask policy cannot prompt in the "
+                        "background and the host is not pinned yet: pin it (run "
+                        "once without -f) or pass -o strict-host-key-checking=no\n");
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+
+#endif
+}
 
 static s3_int_t
 s3_cli_tofu_prepare(void)
@@ -13732,7 +13861,7 @@ main(int argc, char **argv)
      * destination operand, the command words ride verbatim (the ssh
      * shape; the GNU permutation ate the dashed command words) */
 
-    while ((opt = getopt(argc, argv, "+46AC::D:e:F:i:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
+    while ((opt = getopt(argc, argv, "+46AC::D:e:F:fi:J:l:L:MnNp:qrS:s:tTo:VvxXYU:R:O:h")) != -1) {
 
         switch (opt) {
 
@@ -14028,6 +14157,15 @@ main(int argc, char **argv)
 
             snprintf(s3_cli_cfg_path, sizeof(s3_cli_cfg_path), "%s", optarg);
             s3_cli_cfg_explicit = 1;
+            break;
+
+        case 'f':
+
+            /* the -f background run (the ssh2 canon): the parent-side
+             * gate refuses the interactive configs, the detach rides
+             * the auth verdict */
+
+            s3_cli_fork_bg = 1;
             break;
 
         case 'C':
@@ -14533,6 +14671,11 @@ main(int argc, char **argv)
     }
 
     (void)s3_cli_tofu_prepare();
+
+    if (s3_cli_fork_bg_validate() != S3_OK) {
+        s3_cli_net_cleanup();
+        return S3_CLI_EXIT_ERROR;
+    }
 
     /* the resolution first: the unforced literal dials its own
      * family (the inet_pton fast-path, the scope-id forms fall back
@@ -15096,6 +15239,63 @@ main(int argc, char **argv)
                 s3_cli_req_sent = 1;
             }
         }
+
+#if !(S3_WIN32)
+
+        /* the -f detach (the ssh2 canon, the эталон cmd/background.go):
+         * the verdict is in, the session and the forwards start in the
+         * child - the parent reports the pid and exits 0, the child
+         * takes the new session, the /dev/null stdio and the loop with
+         * the inherited connection (the exit skips the teardown: the
+         * state belongs to the child now) */
+
+        if (s3_cli_fork_bg && !s3_cli_bg_done && s3_cli_status_seen &&
+            s3_cli_status == 200) {
+
+            pid_t bgpid;
+
+            s3_cli_bg_done = 1;
+
+            bgpid = fork();
+
+            if (bgpid < 0) {
+                fprintf(stderr, "ssh3: -f: the fork failed\n");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
+
+            if (bgpid > 0) {
+                fprintf(stderr,
+                        "ssh3: -f: the session continues in the background (pid %d)\n",
+                        (int)bgpid);
+                exit(0);
+            }
+
+            (void)setsid();
+
+            /* the -f implies -n (the ssh2 canon): the stdin of the
+             * child rides /dev/null and the epoll of that stdin
+             * refuses (EPERM on the plain char device) - the no-pump
+             * flag keeps the console init off the stdin */
+
+            s3_cli_no_stdin = 1;
+
+            {
+                int nfd = open("/dev/null", O_RDWR);
+
+                if (nfd >= 0) {
+                    (void)dup2(nfd, 0);
+                    (void)dup2(nfd, 1);
+                    (void)dup2(nfd, 2);
+
+                    if (nfd > 2) {
+                        (void)close(nfd);
+                    }
+                }
+            }
+        }
+
+#endif
 
         /* the 200 brings the -L listeners up: the forward run carries
          * no session channel, the bridges live on the event loop; the
