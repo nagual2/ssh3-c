@@ -130,6 +130,7 @@ typedef unsigned short u_short;
 #include <s3_ssh3_forward.h>
 #include <s3_ssh3_message.h>
 #include <s3_ssh3_oidc.h>
+#include <s3_ssh3_agent_client.h>
 #include <s3_ssh3_oidc_client.h>
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_reverse.h>
@@ -324,7 +325,13 @@ struct termios {
 
 #endif
 
-enum { S3_CLI_AUTH_NONE = 0, S3_CLI_AUTH_BASIC, S3_CLI_AUTH_PUBKEY, S3_CLI_AUTH_OIDC };
+enum {
+    S3_CLI_AUTH_NONE = 0,
+    S3_CLI_AUTH_BASIC,
+    S3_CLI_AUTH_PUBKEY,
+    S3_CLI_AUTH_AGENT,
+    S3_CLI_AUTH_OIDC
+};
 
 /* the session state machine of the main loop */
 
@@ -382,6 +389,7 @@ static char        s3_cli_path[384];    /* the operand path, the default /ssh3-t
 static char        s3_cli_target[640];  /* the CONNECT :path with the ?user= */
 static char        s3_cli_hostkey[768]; /* the known_hosts key, host:port/path */
 static char        s3_cli_keyfile[1024];
+static char        s3_cli_agent_keyfile[1024]; /* the --agent-key pubkey match */
 static char        s3_cli_basic[512];
 static char        s3_cli_bearer[2048];
 static const char *s3_cli_auth_value;
@@ -392,6 +400,7 @@ static const char *s3_cli_auth_value;
  * tab closed for the full flow) */
 
 static const char *s3_cli_oidc_issuer;
+static char        s3_cli_agent_sock[256]; /* the SSH_AUTH_SOCK snapshot */
 static const char *s3_cli_oidc_aud;
 static const char *s3_cli_oidc_raw;
 static char        s3_cli_oidc_bearer[S3_SSH3_OIDC_CLI_TOKEN_MAX + 8];
@@ -1123,6 +1132,11 @@ static EVP_PKEY *s3_cli_ossh_ec256(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_ossh_rsa(const u_char **pos, const u_char *end);
 static EVP_PKEY *s3_cli_openssh_key(const char *buf);
 static s3_int_t  s3_cli_jwt_build(SSL *ssl);
+static s3_int_t  s3_cli_jwt_build_agent(SSL *ssl, const char *user, char *out, size_t cap);
+static s3_int_t  s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg,
+                                       size_t seg_cap, size_t *tlen);
+static s3_int_t  s3_cli_jwt_token_assemble(const char *seg, size_t tlen, const u_char *sig,
+                                           size_t siglen, char *out, size_t cap);
 static s3_int_t  s3_cli_oidc_acquire(SSL *ssl, char *bearer, size_t cap);
 static uintptr_t s3_cli_h3_field_l(u_char *p, const char *name, const char *value);
 static size_t    s3_cli_h3_section(u_char *p);
@@ -1333,6 +1347,9 @@ s3_cli_usage(const char *prog)
             "  --log-level 0..9|all  the s3 log level\n"
             "  --password user:pass  the Basic auth (RFC 7617), the ?user=\n"
             "              of the target\n"
+            "  --agent-key pubfile  the JWT signs with the ssh-agent key\n"
+            "              whose public part matches pubfile (SSH_AUTH_SOCK,\n"
+            "              ed25519 or rsa)\n"
             "  --sftp put|get:local:remote | SRC DST  the transfer: the\n"
             "              positional form derives the direction from the\n"
             "              leading colon of the remote operand (the session\n"
@@ -2249,11 +2266,8 @@ s3_cli_openssh_key(const char *buf)
 static s3_int_t
 s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
 {
-    static const char label[] = "EXPORTER-SSH3";
-
-    char        header[64], payload[512], seg[1024], jti[64], tok[1200];
-    char        user_esc[512];
-    u_char      conv[32], sig[1024];
+    char        seg[1024];
+    u_char      sig[1024];
     BIO        *bio;
     EVP_PKEY   *key = NULL;
     FILE       *kf;
@@ -2262,9 +2276,8 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
     size_t      len;
     unsigned    ok;
     const char *alg;
-    long long   iat, exp;
-    s3_int_t    elen;
-    size_t      hlen, plen, tlen, siglen;
+    size_t      tlen, siglen;
+    s3_int_t    rc;
 
     /* the file loads once: the OpenSSH container takes its parser,
      * the PEM and PKCS#8 bodies stay with the OpenSSL reader */
@@ -2369,10 +2382,48 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
         return S3_ERROR;
     }
 
-    if (ssl == NULL || SSL_export_keying_material(ssl, conv, sizeof(conv), label, sizeof(label) - 1,
-                                                  NULL, 0, 0) != 1) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the exporter failed");
+    if (s3_cli_jwt_claims_seg(ssl, user, alg, seg, sizeof(seg), &tlen) != S3_OK) {
         EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    siglen = sizeof(sig);
+
+    if (s3_cli_jwt_sign(key, alg, (const u_char *)seg, tlen, sig, &siglen) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the signing failed (%s)", alg);
+        EVP_PKEY_free(key);
+        return S3_ERROR;
+    }
+
+    EVP_PKEY_free(key);
+
+    rc = s3_cli_jwt_token_assemble(seg, tlen, sig, siglen, out, cap);
+
+    return rc;
+}
+
+/* the claims and the signing input: the exporter, the jti, the fresh
+ * window and the two url segments joined by the dot; the alg names
+ * the JOSE family of the signer (the keyfile EVP or the agent reply) */
+
+static s3_int_t
+s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg,
+                      size_t seg_cap, size_t *tlen)
+{
+    static const char label[] = "EXPORTER-SSH3";
+
+    char      header[64], payload[512], jti[64], user_esc[512];
+    u_char    conv[32];
+    long long iat, exp;
+    s3_int_t  elen;
+    size_t    hlen, plen;
+
+    (void)seg_cap;
+
+    if (ssl == NULL ||
+        SSL_export_keying_material(ssl, conv, sizeof(conv), label, sizeof(label) - 1, NULL, 0,
+                                   0) != 1) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the exporter failed");
         return S3_ERROR;
     }
 
@@ -2392,7 +2443,6 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
 
     if (elen < 0) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the login does not escape into the claims");
-        EVP_PKEY_free(key);
         return S3_ERROR;
     }
 
@@ -2404,28 +2454,30 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
 
     if (hlen >= sizeof(header) || plen >= sizeof(payload)) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the claim buffers overflow");
-        EVP_PKEY_free(key);
         return S3_ERROR;
     }
 
     /* the signing input: the two url segments joined by the dot */
 
     s3_cli_b64url((const u_char *)header, hlen, seg);
-    tlen = strlen(seg);
-    seg[tlen++] = '.';
+    *tlen = strlen(seg);
+    seg[*tlen] = '.';
+    (*tlen)++;
 
-    s3_cli_b64url((const u_char *)payload, plen, seg + tlen);
-    tlen += strlen(seg + tlen);
+    s3_cli_b64url((const u_char *)payload, plen, seg + *tlen);
+    *tlen += strlen(seg + *tlen);
 
-    siglen = sizeof(sig);
+    return S3_OK;
+}
 
-    if (s3_cli_jwt_sign(key, alg, (const u_char *)seg, tlen, sig, &siglen) != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the signing failed (%s)", alg);
-        EVP_PKEY_free(key);
-        return S3_ERROR;
-    }
+/* the token assemble: the seg, the dot and the url signature under the
+ * Bearer scheme */
 
-    EVP_PKEY_free(key);
+static s3_int_t
+s3_cli_jwt_token_assemble(const char *seg, size_t tlen, const u_char *sig, size_t siglen,
+                          char *out, size_t cap)
+{
+    char tok[1200];
 
     if (tlen + 1 + siglen * 4 / 3 + 4 >= sizeof(tok)) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the token buffer overflow");
@@ -2446,12 +2498,90 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
     return S3_OK;
 }
 
+/* the agent path of the backlog row 13: the pubkey file names the
+ * agent key, the agent signs the same claim set over SSH_AUTH_SOCK,
+ * the JOSE alg rides the signature blob the agent returned; the
+ * server sees the ordinary JWT (the authorized keys loop), the agent
+ * never crosses the session wire */
+
+static s3_int_t
+s3_cli_jwt_build_agent(SSL *ssl, const char *user, char *out, size_t cap)
+{
+    u_char      blob[1024], sig[1024];
+    size_t      blen = 0, siglen = 0, tlen = 0;
+    char        seg[1024], alg[16];
+    const char *jalg = NULL;
+    s3_int_t    rc;
+
+    if (s3_ssh3_agent_cli_pubkey_file(s3_cli_agent_keyfile, blob, sizeof(blob),
+                                      &blen) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "cannot read the agent pubkey %s",
+                     s3_cli_agent_keyfile);
+        return S3_ERROR;
+    }
+
+    /* the JOSE alg of the request: the blob head names the key type,
+     * the agent reply confirms it (the rsa carries the sha-256 flag) */
+
+    if (blen >= 15 && memcmp(blob, "\000\000\000\013ssh-ed25519", 15) == 0) {
+        jalg = "EdDSA";
+    } else if (blen >= 16 && memcmp(blob, "\000\000\000\007ssh-rsa", 11) == 0) {
+        jalg = "RS256";
+    } else {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                     "the agent key wants ed25519 or rsa (the %uz-byte blob)", blen);
+        return S3_ERROR;
+    }
+
+    if (s3_cli_jwt_claims_seg(ssl, user, jalg, seg, sizeof(seg), &tlen) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    rc = s3_ssh3_agent_cli_sign(s3_cli_agent_sock, blob, blen, (const u_char *)seg, tlen,
+                                sig, sizeof(sig), &siglen, alg, sizeof(alg));
+
+    if (rc == S3_DECLINED) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the agent does not hold the key of %s",
+                     s3_cli_agent_keyfile);
+        return S3_ERROR;
+    }
+
+    if (rc != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the agent signing failed (%s)",
+                     s3_cli_agent_sock);
+        return S3_ERROR;
+    }
+
+    if (strcmp(alg, jalg) != 0) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the agent signed %s but the key blob names %s",
+                     alg, jalg);
+        return S3_ERROR;
+    }
+
+    rc = s3_cli_jwt_token_assemble(seg, tlen, sig, siglen, out, cap);
+
+    return rc;
+}
+
 /* the main conversation wrapper: the JWT rides the live TLS exporter
- * and feeds the session auth value */
+ * and feeds the session auth value; the agent kind routes to the
+ * agent signer */
 
 static s3_int_t
 s3_cli_jwt_build(SSL *ssl)
 {
+    if (s3_cli_auth == S3_CLI_AUTH_AGENT) {
+
+        if (s3_cli_jwt_build_agent(ssl, s3_cli_user, s3_cli_bearer,
+                                   sizeof(s3_cli_bearer)) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        s3_cli_auth_value = s3_cli_bearer;
+
+        return S3_OK;
+    }
+
     if (s3_cli_jwt_build_user(ssl, s3_cli_user, s3_cli_bearer, sizeof(s3_cli_bearer)) != S3_OK) {
         return S3_ERROR;
     }
@@ -13585,7 +13715,7 @@ main(int argc, char **argv)
                  * word, the rest ride word-wise */
 
                 if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
-                    strcmp(argv[n], "--sftp") == 0 ||
+                    strcmp(argv[n], "--sftp") == 0 || strcmp(argv[n], "--agent-key") == 0 ||
                     strcmp(argv[n], "-strict-host-key-checking") == 0) {
                     n++;
                 }
@@ -13648,6 +13778,24 @@ main(int argc, char **argv)
                 s3_cli_usage(argv[0]);
                 s3_cli_net_cleanup();
                 return 0;
+
+            } else if (strcmp(argv[n], "--agent-key") == 0 && n + 1 < argc) {
+
+                /* the agent auth (the backlog row 13): the pubkey file
+                 * names the agent key, the socket rides SSH_AUTH_SOCK;
+                 * the long form only (the cli canon of 2026-10-27) */
+
+                if (strlen(argv[n + 1]) >= sizeof(s3_cli_agent_keyfile)) {
+                    fprintf(stderr, "ssh3: --agent-key path is too long\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                snprintf(s3_cli_agent_keyfile, sizeof(s3_cli_agent_keyfile), "%s",
+                         argv[n + 1]);
+                s3_cli_auth = S3_CLI_AUTH_AGENT;
+
+                value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--password") == 0 && n + 1 < argc) {
 
@@ -14459,6 +14607,15 @@ main(int argc, char **argv)
                 return S3_CLI_EXIT_ERROR;
             }
         }
+
+        if (s3_cli_agent_keyfile[0] != '\0') {
+
+            if (s3_cli_auth_flag_kind != S3_CLI_AUTH_NONE &&
+                s3_cli_auth_flag_kind != S3_CLI_AUTH_AGENT) {
+                fprintf(stderr, "ssh3: --agent-key excludes -i, --password and --oidc-*\n");
+                return S3_CLI_EXIT_ERROR;
+            }
+        }
     }
 
     /* the -t force without a local tty is the ssh2 refusal */
@@ -14618,6 +14775,23 @@ main(int argc, char **argv)
         }
 
         s3_cli_auth = S3_CLI_AUTH_OIDC;
+    }
+
+    /* the agent mode overrides the config defaults the same way (the
+     * config IdentityFile is a default, the explicit --agent-key
+     * wins); the socket snapshot rides here, the JWT build reads it */
+
+    if (s3_cli_agent_keyfile[0] != '\0') {
+
+        const char *sock = getenv("SSH_AUTH_SOCK");
+
+        if (sock == NULL || sock[0] == '\0') {
+            fprintf(stderr, "ssh3: --agent-key wants SSH_AUTH_SOCK (no agent is running)\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        snprintf(s3_cli_agent_sock, sizeof(s3_cli_agent_sock), "%s", sock);
+        s3_cli_auth = S3_CLI_AUTH_AGENT;
     }
 
     if (s3_cli_auth == S3_CLI_AUTH_OIDC) {
@@ -15140,7 +15314,8 @@ main(int argc, char **argv)
                 break;
             }
 
-            if (s3_cli_auth == S3_CLI_AUTH_PUBKEY &&
+
+            if ((s3_cli_auth == S3_CLI_AUTH_PUBKEY || s3_cli_auth == S3_CLI_AUTH_AGENT) &&
                 s3_cli_jwt_build(cli->ssl->connection) != S3_OK) {
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 break;

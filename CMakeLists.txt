@@ -376,6 +376,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_forward_policy.c
     src/ssh3/s3_ssh3_reverse.c
     src/ssh3/s3_ssh3_agent.c
+    src/ssh3/s3_ssh3_agent_client.c
     src/ssh3/s3_ssh3_sftp_codec.c
     src/ssh3/s3_ssh3_sftp_srv.c
     src/ssh3/s3_ssh3_sftp_jail.c
@@ -583,6 +584,7 @@ set(S3_TESTS
     test_ssh3_forward
     test_ssh3_forward_policy
     test_ssh3_agent
+    test_ssh3_agent_client
     test_ssh3_reverse
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
