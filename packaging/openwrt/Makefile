@@ -22,7 +22,7 @@
 # stub masked it with its own download fields)
 
 PKG_NAME:=ssh3-server
-PKG_VERSION:=0.5.8
+PKG_VERSION:=0.5.9
 PKG_RELEASE:=1
 
 include $(TOPDIR)/rules.mk
@@ -102,4 +102,49 @@ define Package/ssh3-server/install
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-ssh3-server-cert $(1)/etc/uci-defaults/
 endef
 
+# the bundle variant: the same daemon binary, the OpenSSL 3.5 (musl)
+# rides inside the package under /usr/lib/ssh3-c/lib and the loader
+# picks it through LD_LIBRARY_PATH of its own init - for the targets
+# without the system libopenssl3 3.5 (the pre-25.12 images, the
+# isolated installs without the feed access)
+define Package/ssh3-server-bundle
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=SSH
+  TITLE:=SSH3 server - bundled OpenSSL (no system libopenssl3 needed)
+  DEPENDS:=+libc +zlib +libzstd +liblz4
+  CONFLICTS:=ssh3-server
+endef
+
+define Package/ssh3-server-bundle/description
+ SSH3 server daemon with the bundled OpenSSL 3.5 (musl): the same
+ daemon as ssh3-server, but the libssl/libcrypto ride inside the
+ package (/usr/lib/ssh3-c/lib/) - the target needs no system
+ libopenssl3.  For the pre-25.12 images and the isolated installs.
+ The codecs ride the feeds where present (zlib/libzstd/liblz4 are
+ optional - the channel body falls back to the remaining codecs).
+endef
+
+define Package/ssh3-server-bundle/install
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-server $(1)/usr/sbin/
+
+	$(INSTALL_DIR) $(1)/usr/lib/ssh3-c/lib
+	$(INSTALL_DATA) $(STAGING_DIR)/usr/lib/libssl.so.3 $(1)/usr/lib/ssh3-c/lib/
+	$(INSTALL_DATA) $(STAGING_DIR)/usr/lib/libcrypto.so.3 $(1)/usr/lib/ssh3-c/lib/
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/ssh3-server-bundle $(1)/etc/init.d/
+
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/etc/config/ssh3 $(1)/etc/config/
+
+	$(INSTALL_DIR) $(1)/etc/ssh3
+	$(INSTALL_CONF) ./files/etc/ssh3/authorized_keys $(1)/etc/ssh3/authorized_keys
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/etc/uci-defaults/99-ssh3-server-cert $(1)/etc/uci-defaults/
+endef
+
 $(eval $(call BuildPackage,ssh3-server))
+$(eval $(call BuildPackage,ssh3-server-bundle))

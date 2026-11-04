@@ -1,0 +1,20 @@
+Package: ssh3-server
+Version: 0.5.9-1
+Architecture: @ARCH@
+Maintainer: ssh3-c maintainers <maintainers@example.com>
+Section: net
+Priority: optional
+Depends: libc6, libssl3 (>= 3.5) | libssl3t64 (>= 3.5), zlib1g, libzstd1, adduser
+Conflicts: ssh3-go-client, ssh3-go-server, @CONFLICT@
+Replaces: ssh3-go-client, ssh3-go-server
+Description: SSH3 server - SSH over QUIC/HTTP3 transport
+ SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),
+ implemented in C in the nginx style on top of the OpenSSL QUIC TLS API.
+ .
+ The OpenSSL 3.5 QUIC TLS API rides the system libssl3 (>= 3.5), the
+ system libssl (any version) is neither required nor touched.
+ .
+ The daemon is configured through environment variables (SSH3_LOG_LEVEL,
+ SSH3_LOG_FILE, SSH3_SHUTDOWN_DRAIN) and command-line flags (ssh3-server --help);
+ it drops privileges to the system user "ssh3" and keeps its state under
+ /var/lib/ssh3.

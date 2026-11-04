@@ -1,11 +1,11 @@
-Package: ssh3-server
-Version: 0.5.8-1
+Package: ssh3-server-bundle
+Version: 0.5.9-1
 Architecture: @ARCH@
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: net
 Priority: optional
 Depends: libc6, zlib1g, libzstd1, adduser, ssh3c-libssl3
-Conflicts: ssh3-go-client, ssh3-go-server
+Conflicts: ssh3-go-client, ssh3-go-server, @CONFLICT@
 Replaces: ssh3-go-client, ssh3-go-server
 Description: SSH3 server - SSH over QUIC/HTTP3 transport
  SSH3 server daemon: the SSH3 protocol carried over HTTP/3 (QUIC),

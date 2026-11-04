@@ -269,19 +269,20 @@ ensure_client() {
 }
 
 build_deb() {
-    log "building the deb package"
+    log "building the bundled deb package (ssh3-server-bundle)"
     local stage="$STAGE_ROOT/deb/pkg"
     local debver
-    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control-bundle" | head -n 1)
     [ "${debver%%-*}" = "$VERSION" ] \
-        || die "deb/control Version ($debver) does not match the binary ($VERSION)"
+        || die "deb/control-bundle Version ($debver) does not match the binary ($VERSION)"
     fetch_bundle
     mkdir -p "$stage/DEBIAN" "$stage/usr/sbin" "$stage/usr/share/doc/ssh3-server"
     mkdir -p "$stage/usr/lib/systemd/system"
     chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN"
     install -m 0755 "$BIN" "$stage/usr/sbin/ssh3-server"
     set_runpath "$stage/usr/sbin/ssh3-server"
-    sed "s/@ARCH@/$DEB_ARCH/" "$SCRIPT_DIR/deb/control" \
+    sed -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-server/" \
+        "$SCRIPT_DIR/deb/control-bundle" \
         > "$stage/DEBIAN/control"
     install -m 0755 "$SCRIPT_DIR/deb/postinst" "$stage/DEBIAN/postinst"
     install -m 0644 "$SCRIPT_DIR/deb/copyright" "$stage/usr/share/doc/ssh3-server/copyright"
@@ -297,6 +298,39 @@ build_deb() {
         "$stage/usr/lib/systemd/system/ssh3-server.service"
     bundle_report
     dpkg-deb --root-owner-group --build "$stage" \
+        "$OUT_DIR/ssh3-server-bundle_${debver}_${DEB_ARCH}.deb"
+}
+
+# the system-channel server deb (ssh3-server): the same daemon binary
+# with the RUNPATH stripped - the loader resolves the system libssl
+# 3.5 (the QUIC TLS API) and the codecs from the distribution; no
+# bundle package rides.  the clean name belongs to this channel: the
+# modern distros (mint 23+, ubuntu 26.04+) install the plain names.
+
+build_deb_server_sys() {
+    log "building the system deb package (ssh3-server)"
+    local stage="$STAGE_ROOT/deb/pkg-sys"
+    local debver
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control-sys" | head -n 1)
+    [ "${debver%%-*}" = "$VERSION" ] \
+        || die "deb/control-sys Version ($debver) does not match the binary ($VERSION)"
+    mkdir -p "$stage/DEBIAN" "$stage/usr/sbin" "$stage/usr/share/doc/ssh3-server"
+    mkdir -p "$stage/usr/lib/systemd/system"
+    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN"
+    install -m 0755 "$BIN" "$stage/usr/sbin/ssh3-server"
+    strip_runpath "$stage/usr/sbin/ssh3-server"
+    sed -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-server-bundle/" \
+        "$SCRIPT_DIR/deb/control-sys" \
+        > "$stage/DEBIAN/control"
+    install -m 0755 "$SCRIPT_DIR/deb/postinst" "$stage/DEBIAN/postinst"
+    install -m 0644 "$SCRIPT_DIR/deb/copyright" "$stage/usr/share/doc/ssh3-server/copyright"
+    install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" \
+        "$stage/usr/share/doc/ssh3-server/THIRD-PARTY-NOTICES"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-server.socket" \
+        "$stage/usr/lib/systemd/system/ssh3-server.socket"
+    install -m 0644 "$SCRIPT_DIR/systemd/ssh3-server.service" \
+        "$stage/usr/lib/systemd/system/ssh3-server.service"
+    dpkg-deb --root-owner-group --build "$stage" \
         "$OUT_DIR/ssh3-server_${debver}_${DEB_ARCH}.deb"
 }
 
@@ -308,7 +342,7 @@ build_deb_libs() {
     log "building the bundled-libs deb package"
     local stage="$STAGE_ROOT/deb/libs"
     local debver
-    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
+    debver=$(sed -n "s/^Version: //p" "$SCRIPT_DIR/deb/control-bundle" | head -n 1)
     [ "${debver%%-*}" = "$VERSION" ] \
         || die "deb/control Version ($debver) does not match the binary ($VERSION)"
     fetch_bundle
@@ -330,14 +364,14 @@ build_deb_libs() {
 # bundle directory, the man page, and the postinst compatibility link
 # /usr/local/bin/ssh3 -> /usr/bin/ssh3 (the admin's own file wins)
 build_deb_client() {
-    log "building the client deb package"
+    log "building the bundled client deb package (ssh3-client-bundle)"
     local stage="$STAGE_ROOT/deb/client"
     local client="$CLIENT_BIN"
     [ -x "$client" ] || die "no client binary at '$client' (cmake --build --preset linux-release)"
     local debver
-    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/control" | head -n 1)
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/client-control-bundle" | head -n 1)
     [ "${debver%%-*}" = "$VERSION" ] \
-        || die "deb/control Version ($debver) does not match the binary ($VERSION)"
+        || die "deb/client-control-bundle Version ($debver) does not match the binary ($VERSION)"
     mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/man/man1"
     chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN" \
         "$stage/usr/bin"
@@ -345,8 +379,34 @@ build_deb_client() {
     set_runpath "$stage/usr/bin/ssh3"
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
     install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
-    sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" \
-        "$SCRIPT_DIR/deb/client-control" \
+    sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-client/" \
+        "$SCRIPT_DIR/deb/client-control-bundle" \
+        > "$stage/DEBIAN/control"
+    dpkg-deb --root-owner-group --build "$stage" \
+        "$OUT_DIR/ssh3-client-bundle_${debver}_${DEB_ARCH}.deb"
+}
+
+# the system-channel client deb (ssh3-client): the RUNPATH stripped,
+# the system libssl 3.5 resolves the QUIC TLS API
+
+build_deb_client_sys() {
+    log "building the system client deb package (ssh3-client)"
+    local stage="$STAGE_ROOT/deb/client-sys"
+    local client="$CLIENT_BIN"
+    [ -x "$client" ] || die "no client binary at '$client' (cmake --build --preset linux-release)"
+    local debver
+    debver=$(sed -n 's/^Version: //p' "$SCRIPT_DIR/deb/client-control-sys" | head -n 1)
+    [ "${debver%%-*}" = "$VERSION" ] \
+        || die "deb/client-control-sys Version ($debver) does not match the binary ($VERSION)"
+    mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/man/man1"
+    chmod 0755 "$STAGE_ROOT/deb" "$stage" "$stage/usr" "$stage/DEBIAN" \
+        "$stage/usr/bin"
+    install -m 0755 "$client" "$stage/usr/bin/ssh3"
+    strip_runpath "$stage/usr/bin/ssh3"
+    gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
+    install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
+    sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-client-bundle/" \
+        "$SCRIPT_DIR/deb/client-control-sys" \
         > "$stage/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$stage" \
         "$OUT_DIR/ssh3-client_${debver}_${DEB_ARCH}.deb"
@@ -491,12 +551,12 @@ build_apk() {
 
 FMT="${1:-all}"
 case "$FMT" in
-    deb) ensure_bin; build_deb ;;
+    deb) ensure_bin; build_deb; build_deb_libs; build_deb_client; build_deb_server_sys; build_deb_client_sys ;;
     deb-libs) ensure_bin; fetch_bundle; build_deb_libs ;;
     deb-client) ensure_bin; build_deb_client ;;
     rpm) ensure_bin; build_rpm ;;
     apk) ensure_bin; build_apk ;;
-    all) ensure_bin; build_deb; build_deb_libs; build_deb_client; build_rpm; build_apk ;;
+    all) ensure_bin; build_deb; build_deb_libs; build_deb_client; build_deb_server_sys; build_deb_client_sys; build_rpm; build_apk ;;
     *) die "usage: bash packaging/build.sh [deb|rpm|apk|all]" ;;
 esac
 
