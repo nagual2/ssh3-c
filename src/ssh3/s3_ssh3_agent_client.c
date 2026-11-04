@@ -327,6 +327,17 @@ s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen,
     /* the win agent rides the named pipe of OpenSSH for Windows; the
      * bench legs of the wave run the unix stand */
 
+    (void)sock;
+    (void)blob;
+    (void)blen;
+    (void)data;
+    (void)dlen;
+    (void)sig;
+    (void)sig_cap;
+    (void)sig_len;
+    (void)alg;
+    (void)alg_cap;
+
     return S3_ERROR;
 #else
     int                     fd, n;

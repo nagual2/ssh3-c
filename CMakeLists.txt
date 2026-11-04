@@ -118,6 +118,7 @@ if(WIN32)
         src/ssh3/s3_ssh3_dos_guard.c
         src/ssh3/s3_ssh3_sftp_codec.c
         src/ssh3/s3_ssh3_sftp_cli.c
+        src/ssh3/s3_ssh3_agent_client.c
         src/ssh3/s3_ssh3_cm.c
         src/ssh3/s3_ssh3_session_cli.c
         src/ssh3/s3_ssh3_oidc.c
