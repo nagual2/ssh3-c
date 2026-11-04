@@ -374,15 +374,6 @@ s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen,
 
     req_len = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, dlen);
 
-    {
-        FILE *df = fopen("/tmp/s3ag-req.bin", "wb");
-
-        if (df != NULL) {
-            fwrite(req, 1, req_len, df);
-            fclose(df);
-        }
-    }
-
     if (write(fd, req, req_len) != (ssize_t)req_len) {
         close(fd);
         return S3_ERROR;
