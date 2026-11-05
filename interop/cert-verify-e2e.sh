@@ -129,7 +129,7 @@ start_srv() {
     local cert=$1
     local key=$2
 
-    SRVLOG="$WORK/srv-$2.log"
+    SRVLOG="$WORK/srv-$3.log"
 
     local p=$((47400 + ($$ % 300)))
     local i=0
