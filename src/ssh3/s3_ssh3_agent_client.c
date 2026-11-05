@@ -17,6 +17,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 /* the message codes of the agent protocol */
@@ -45,8 +47,7 @@ s3_put_be32(u_char *p, uint32_t v)
 static uint32_t
 s3_get_be32(const u_char *p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) |
-           (uint32_t)p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 /* the base64 decode of the authorized_keys body (the standard alphabet,
@@ -65,12 +66,10 @@ s3_agent_b64dec(const char *src, u_char *dst, size_t cap, size_t *dlen)
     }
 
     for (n = 0; n < 64; n++) {
-        tbl[(int)("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[n])] =
-            (int)n;
+        tbl[(int)("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[n])] = (int)n;
     }
 
-    for (; *src != '\0' && *src != '\n' && *src != '\r' && *src != ' ' && *src != '\t';
-         src++) {
+    for (; *src != '\0' && *src != '\n' && *src != '\r' && *src != ' ' && *src != '\t'; src++) {
 
         if (*src == '=') {
             break;
@@ -102,14 +101,13 @@ s3_agent_b64dec(const char *src, u_char *dst, size_t cap, size_t *dlen)
 s3_int_t
 s3_ssh3_agent_cli_pubkey_file(const char *path, u_char *blob, size_t cap, size_t *blen)
 {
-    FILE   *f;
-    char    line[8192], *sp;
-    size_t  out = 0;
+    FILE  *f;
+    char   line[8192], *sp;
+    size_t out = 0;
 
     f = fopen(path, "rb");
 
     if (f == NULL) {
-        fprintf(stderr, "DBG loader: fopen failed\n");
         return S3_ERROR;
     }
 
@@ -137,7 +135,6 @@ s3_ssh3_agent_cli_pubkey_file(const char *path, u_char *blob, size_t cap, size_t
         }
 
         if (s3_agent_b64dec(sp, blob, cap, &out) != 0 || out == 0) {
-            fprintf(stderr, "DBG loader: b64 failed on [%.24s]\n", sp);
             fclose(f);
             return S3_ERROR;
         }
@@ -150,7 +147,6 @@ s3_ssh3_agent_cli_pubkey_file(const char *path, u_char *blob, size_t cap, size_t
 
     fclose(f);
 
-    fprintf(stderr, "DBG loader: no key line\n");
     return S3_ERROR;
 }
 
@@ -164,8 +160,8 @@ s3_ssh3_agent_cli_req_identities(u_char *p)
 }
 
 size_t
-s3_ssh3_agent_cli_req_sign(u_char *p, const u_char *blob, size_t blen,
-                           const u_char *data, size_t dlen)
+s3_ssh3_agent_cli_req_sign(u_char *p, const u_char *blob, size_t blen, const u_char *data,
+                           size_t dlen)
 {
     u_char  *body = p + 4;
     u_char  *q = body;
@@ -200,8 +196,8 @@ s3_ssh3_agent_cli_req_sign(u_char *p, const u_char *blob, size_t blen,
 }
 
 s3_int_t
-s3_ssh3_agent_cli_parse_identities(const u_char *reply, size_t len, s3_str_t *blobs,
-                                   size_t *nblobs, size_t cap)
+s3_ssh3_agent_cli_parse_identities(const u_char *reply, size_t len, s3_str_t *blobs, size_t *nblobs,
+                                   size_t cap)
 {
     const u_char *p, *end;
     uint32_t      n, i;
@@ -250,8 +246,8 @@ s3_ssh3_agent_cli_parse_identities(const u_char *reply, size_t len, s3_str_t *bl
 }
 
 s3_int_t
-s3_ssh3_agent_cli_parse_sign(const u_char *reply, size_t len, u_char *sig,
-                             size_t sig_cap, size_t *sig_len, char *alg, size_t alg_cap)
+s3_ssh3_agent_cli_parse_sign(const u_char *reply, size_t len, u_char *sig, size_t sig_cap,
+                             size_t *sig_len, char *alg, size_t alg_cap)
 {
     const u_char *p, *end;
     uint32_t      alen, slen;
@@ -317,35 +313,96 @@ s3_ssh3_agent_cli_parse_sign(const u_char *reply, size_t len, u_char *sig,
     return S3_OK;
 }
 
-s3_int_t
-s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen,
-                       const u_char *data, size_t dlen, u_char *sig, size_t sig_cap,
-                       size_t *sig_len, char *alg, size_t alg_cap)
-{
 #if (S3_WIN32)
 
-    /* the win agent rides the named pipe of OpenSSH for Windows; the
-     * bench legs of the wave run the unix stand */
+/* the win agent rides the named pipe of OpenSSH for Windows: the sock
+ * argument carries the pipe text when the caller resolved one, the
+ * OpenSSH default pipe serves otherwise; the exchange is the same
+ * u32-framed request/reply the unix socket flow speaks, the pipe is
+ * byte-mode sync and closes after the exchange */
 
-    (void)sock;
-    (void)blob;
-    (void)blen;
-    (void)data;
-    (void)dlen;
-    (void)sig;
-    (void)sig_cap;
-    (void)sig_len;
-    (void)alg;
-    (void)alg_cap;
+#define S3_AGENT_PIPE_DEFAULT "\\\\.\\pipe\\openssh-ssh-agent"
 
-    return S3_ERROR;
+s3_int_t
+s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen, const u_char *data,
+                       size_t dlen, u_char *sig, size_t sig_cap, size_t *sig_len, char *alg,
+                       size_t alg_cap)
+{
+    const char *pipe_name = (sock != NULL && sock[0] != '\0') ? sock : S3_AGENT_PIPE_DEFAULT;
+    wchar_t     wpipe[256];
+    HANDLE      pipe;
+    u_char      req[8192], reply[8192];
+    size_t      req_len, got;
+    uint32_t    rlen;
+    DWORD       put, n;
+    int         wn;
+
+    wn = MultiByteToWideChar(CP_UTF8, 0, pipe_name, -1, wpipe, 256);
+
+    if (wn <= 0) {
+        return S3_ERROR;
+    }
+
+    pipe = CreateFileW(wpipe, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+    if (pipe == INVALID_HANDLE_VALUE) {
+        return S3_ERROR;
+    }
+
+    req_len = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, dlen);
+
+    if (!WriteFile(pipe, req, (DWORD)req_len, &put, NULL) || put != (DWORD)req_len) {
+        CloseHandle(pipe);
+        return S3_ERROR;
+    }
+
+    got = 0;
+
+    while (got < 4) {
+
+        if (!ReadFile(pipe, reply + got, (DWORD)(4 - got), &n, NULL) || n == 0) {
+            CloseHandle(pipe);
+            return S3_ERROR;
+        }
+
+        got += n;
+    }
+
+    rlen = s3_get_be32(reply);
+
+    if (rlen < 1 || rlen > sizeof(reply) - 4) {
+        CloseHandle(pipe);
+        return S3_ERROR;
+    }
+
+    while (got < (size_t)rlen + 4) {
+
+        if (!ReadFile(pipe, reply + got, (DWORD)(rlen + 4 - got), &n, NULL) || n == 0) {
+            CloseHandle(pipe);
+            return S3_ERROR;
+        }
+
+        got += n;
+    }
+
+    CloseHandle(pipe);
+
+    return s3_ssh3_agent_cli_parse_sign(reply, 4 + rlen, sig, sig_cap, sig_len, alg, alg_cap);
+}
+
 #else
-    int                     fd, n;
-    struct sockaddr_un      addr;
-    u_char                  req[8192], reply[8192];
-    size_t                  req_len;
-    uint32_t                rlen;
-    ssize_t                 got;
+
+s3_int_t
+s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen, const u_char *data,
+                       size_t dlen, u_char *sig, size_t sig_cap, size_t *sig_len, char *alg,
+                       size_t alg_cap)
+{
+    int                fd, n;
+    struct sockaddr_un addr;
+    u_char             req[8192], reply[8192];
+    size_t             req_len;
+    uint32_t           rlen;
+    ssize_t            got;
 
     if (sock == NULL || sock[0] == '\0') {
         return S3_ERROR;
@@ -411,7 +468,7 @@ s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen,
 
     close(fd);
 
-    return s3_ssh3_agent_cli_parse_sign(reply, 4 + rlen, sig, sig_cap, sig_len, alg,
-                                        alg_cap);
-#endif
+    return s3_ssh3_agent_cli_parse_sign(reply, 4 + rlen, sig, sig_cap, sig_len, alg, alg_cap);
 }
+
+#endif

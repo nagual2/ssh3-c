@@ -19,9 +19,7 @@
 
 /* the crafted key blob: ssh-ed25519 + the 32 bytes 00..1f */
 
-static const char *ED_B64 =
-    "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
-
+static const char *ED_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
 
 static void
 s3_test_agent_blob(u_char *blob, size_t blen)
@@ -36,12 +34,12 @@ s3_test_agent_blob(u_char *blob, size_t blen)
 static int
 s3_test_agent_pubkey_file(void)
 {
-    char        path[256];
-    FILE       *f;
-    u_char      blob[1024];
-    size_t      blen = 0;
-    u_char      want[47];
-    s3_int_t    rc;
+    char     path[256];
+    FILE    *f;
+    u_char   blob[1024];
+    size_t   blen = 0;
+    u_char   want[47];
+    s3_int_t rc;
 
     snprintf(path, sizeof(path), "/tmp/s3agent-test-%d.pub", (int)getpid());
     f = fopen(path, "wb");
@@ -215,8 +213,7 @@ s3_test_agent_parse_sign(void)
         reply[3] = (u_char)total;
     }
 
-    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg,
-                                      sizeof(alg));
+    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg, sizeof(alg));
     S3_ASSERT(rc == S3_OK);
     S3_ASSERT(sig_len == 64);
     S3_ASSERT(memcmp(sig, want, 64) == 0);
@@ -251,8 +248,7 @@ s3_test_agent_parse_sign(void)
         reply[3] = (u_char)total;
     }
 
-    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg,
-                                      sizeof(alg));
+    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg, sizeof(alg));
     S3_ASSERT(rc == S3_OK);
     S3_ASSERT(sig_len == 4);
     S3_ASSERT(strcmp(alg, "RS256") == 0);
@@ -260,18 +256,195 @@ s3_test_agent_parse_sign(void)
     /* the FAILURE reply: the agent does not hold the key */
 
     reply[4] = 5;
-    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg,
-                                      sizeof(alg));
+    rc = s3_ssh3_agent_cli_parse_sign(reply, len, sig, sizeof(sig), &sig_len, alg, sizeof(alg));
     S3_ASSERT(rc == S3_DECLINED);
 
     /* the truncated framing refuses */
 
-    rc = s3_ssh3_agent_cli_parse_sign(reply, len - 4, sig, sizeof(sig), &sig_len, alg,
-                                      sizeof(alg));
+    rc = s3_ssh3_agent_cli_parse_sign(reply, len - 4, sig, sizeof(sig), &sig_len, alg, sizeof(alg));
     S3_ASSERT(rc == S3_ERROR);
 
     return 0;
 }
+
+#if (S3_WIN32)
+
+/*
+ * the win transport leg: a stub pipe agent serves one SIGN_REQUEST
+ * with a well-formed SIGN_RESPONSE, the client rides the named pipe
+ * the OpenSSH for Windows agent speaks (the codec pins ride above;
+ * the live agent flow rides the Windows stand)
+ */
+
+#include <windows.h>
+
+static DWORD WINAPI
+s3_test_agent_pipe_server(LPVOID arg)
+{
+    char    pipe_name[128];
+    HANDLE  pipe;
+    u_char  req[256], reply[128];
+    u_char *p;
+    DWORD   n, put;
+    ULONG   len, got;
+
+    (void)arg;
+
+    snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\s3-agent-test-%lu",
+             (unsigned long)GetCurrentProcessId());
+
+    pipe =
+        CreateNamedPipeA(pipe_name, PIPE_ACCESS_DUPLEX,
+                         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, NULL);
+
+    if (pipe == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+
+    if (!ConnectNamedPipe(pipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        CloseHandle(pipe);
+        return 1;
+    }
+
+    /* the request: the u32 frame then the body */
+
+    got = 0;
+
+    while (got < 4) {
+
+        if (!ReadFile(pipe, req + got, 4 - got, &n, NULL) || n == 0) {
+            CloseHandle(pipe);
+            return 1;
+        }
+
+        got += n;
+    }
+
+    len = ((ULONG)req[0] << 24) | ((ULONG)req[1] << 16) | ((ULONG)req[2] << 8) | (ULONG)req[3];
+
+    if (len < 1 || len > sizeof(req) - 4) {
+        CloseHandle(pipe);
+        return 1;
+    }
+
+    while (got < len + 4) {
+
+        if (!ReadFile(pipe, req + got, len + 4 - got, &n, NULL) || n == 0) {
+            CloseHandle(pipe);
+            return 1;
+        }
+
+        got += n;
+    }
+
+    if (req[4] != 13) { /* the SIGN_REQUEST code */
+        CloseHandle(pipe);
+        return 1;
+    }
+
+    /* the SIGN_RESPONSE: [14][flags=0][ssh-ed25519][32 sig bytes] */
+
+    p = reply;
+    {
+        uint32_t total = 1 + 4 + 4 + 11 + 4 + 32;
+        *p++ = (u_char)(total >> 24);
+        *p++ = (u_char)(total >> 16);
+        *p++ = (u_char)(total >> 8);
+        *p++ = (u_char)total;
+    }
+    *p++ = 14;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0; /* the flags */
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 11;
+    memcpy(p, "ssh-ed25519", 11);
+    p += 11;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 32;
+
+    {
+        unsigned i;
+
+        for (i = 0; i < 32; i++) {
+            *p++ = (u_char)(0xa0 + i);
+        }
+    }
+
+    if (!WriteFile(pipe, reply, (DWORD)(p - reply), &put, NULL) || put != (DWORD)(p - reply)) {
+        CloseHandle(pipe);
+        return 1;
+    }
+
+    FlushFileBuffers(pipe);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+
+    return 0;
+}
+
+static int
+s3_test_agent_pipe_sign(void)
+{
+    HANDLE   thread;
+    DWORD    thread_rc = 1;
+    char     pipe_name[128];
+    u_char   blob[64], sig[128], data[16];
+    size_t   blen = 51, sig_len = 0;
+    char     alg[16];
+    s3_int_t rc;
+    unsigned i;
+
+    /* the blob: [u32 11]["ssh-ed25519"][32 bytes] */
+
+    blob[0] = 0;
+    blob[1] = 0;
+    blob[2] = 0;
+    blob[3] = 11;
+    memcpy(blob + 4, "ssh-ed25519", 11);
+    blen = 15 + 32;
+
+    for (i = 0; i < 32; i++) {
+        blob[15 + i] = (u_char)i;
+    }
+
+    for (i = 0; i < sizeof(data); i++) {
+        data[i] = (u_char)(0x20 + i);
+    }
+
+    snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\s3-agent-test-%lu",
+             (unsigned long)GetCurrentProcessId());
+
+    thread = CreateThread(NULL, 0, s3_test_agent_pipe_server, NULL, 0, NULL);
+
+    if (thread == NULL) {
+        return 1;
+    }
+
+    Sleep(150); /* the pipe server binds first */
+
+    rc = s3_ssh3_agent_cli_sign(pipe_name, blob, blen, data, sizeof(data), sig, sizeof(sig),
+                                &sig_len, alg, sizeof(alg));
+
+    S3_ASSERT(rc == S3_OK);
+    S3_ASSERT(strcmp(alg, "EdDSA") == 0);
+    S3_ASSERT(sig_len == 32);
+
+    WaitForSingleObject(thread, 5000);
+    GetExitCodeThread(thread, &thread_rc);
+    CloseHandle(thread);
+
+    S3_ASSERT(thread_rc == 0);
+
+    return 0;
+}
+
+#endif /* S3_WIN32 */
 
 static int
 s3_test_agent_client(void)
@@ -282,6 +455,9 @@ s3_test_agent_client(void)
     failures += s3_test_agent_req_sign();
     failures += s3_test_agent_parse_identities();
     failures += s3_test_agent_parse_sign();
+#if (S3_WIN32)
+    failures += s3_test_agent_pipe_sign();
+#endif
 
     return failures;
 }

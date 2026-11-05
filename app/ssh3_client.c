@@ -15437,6 +15437,27 @@ main(int argc, char **argv)
 
     if (s3_cli_agent_keyfile[0] != '\0') {
 
+#if (S3_WIN32)
+
+        /*
+         * the pipe resolution of the bridge (the OpenSSH for Windows
+         * agent): the SSH_AUTH_SOCK when it names a pipe, the default
+         * agent pipe otherwise - the module falls back to the same
+         * default when the snapshot carries nothing
+         */
+
+        const char *sock = getenv("SSH_AUTH_SOCK");
+
+        if (sock != NULL && strncmp(sock, "\\\\", 2) == 0) {
+            snprintf(s3_cli_agent_sock, sizeof(s3_cli_agent_sock), "%s", sock);
+        } else {
+            s3_cli_agent_sock[0] = '\0'; /* the module default pipe rides */
+        }
+
+        s3_cli_auth = S3_CLI_AUTH_AGENT;
+
+#else
+
         const char *sock = getenv("SSH_AUTH_SOCK");
 
         if (sock == NULL || sock[0] == '\0') {
@@ -15446,6 +15467,8 @@ main(int argc, char **argv)
 
         snprintf(s3_cli_agent_sock, sizeof(s3_cli_agent_sock), "%s", sock);
         s3_cli_auth = S3_CLI_AUTH_AGENT;
+
+#endif
     }
 
     if (s3_cli_auth == S3_CLI_AUTH_OIDC) {
