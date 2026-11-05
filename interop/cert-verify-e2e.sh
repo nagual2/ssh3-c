@@ -214,6 +214,7 @@ DNSPORT=
 start_dns() {
 
     local fp_hex=$1
+    local algo=$2
 
     DNSPORT=$((47800 + ($$ % 100)))
 
