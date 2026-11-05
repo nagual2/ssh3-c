@@ -599,11 +599,7 @@ enum {
 static unsigned s3_cli_opt_insecure;
 static unsigned s3_cli_opt_strict;
 
-enum {
-    S3_CLI_SSHFP_NO = 0,
-    S3_CLI_SSHFP_ASK,
-    S3_CLI_SSHFP_YES
-};
+enum { S3_CLI_SSHFP_NO = 0, S3_CLI_SSHFP_ASK, S3_CLI_SSHFP_YES };
 
 static unsigned s3_cli_opt_sshfp;
 
@@ -2636,8 +2632,8 @@ s3_cli_jwt_build_user(SSL *ssl, const char *user, char *out, size_t cap)
  * the JOSE family of the signer (the keyfile EVP or the agent reply) */
 
 static s3_int_t
-s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg,
-                      size_t seg_cap, size_t *tlen)
+s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg, size_t seg_cap,
+                      size_t *tlen)
 {
     static const char label[] = "EXPORTER-SSH3";
 
@@ -2649,9 +2645,8 @@ s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg,
 
     (void)seg_cap;
 
-    if (ssl == NULL ||
-        SSL_export_keying_material(ssl, conv, sizeof(conv), label, sizeof(label) - 1, NULL, 0,
-                                   0) != 1) {
+    if (ssl == NULL || SSL_export_keying_material(ssl, conv, sizeof(conv), label, sizeof(label) - 1,
+                                                  NULL, 0, 0) != 1) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the exporter failed");
         return S3_ERROR;
     }
@@ -2703,8 +2698,8 @@ s3_cli_jwt_claims_seg(SSL *ssl, const char *user, const char *alg, char *seg,
  * Bearer scheme */
 
 static s3_int_t
-s3_cli_jwt_token_assemble(const char *seg, size_t tlen, const u_char *sig, size_t siglen,
-                          char *out, size_t cap)
+s3_cli_jwt_token_assemble(const char *seg, size_t tlen, const u_char *sig, size_t siglen, char *out,
+                          size_t cap)
 {
     char tok[1200];
 
@@ -2742,8 +2737,7 @@ s3_cli_jwt_build_agent(SSL *ssl, const char *user, char *out, size_t cap)
     const char *jalg = NULL;
     s3_int_t    rc;
 
-    if (s3_ssh3_agent_cli_pubkey_file(s3_cli_agent_keyfile, blob, sizeof(blob),
-                                      &blen) != S3_OK) {
+    if (s3_ssh3_agent_cli_pubkey_file(s3_cli_agent_keyfile, blob, sizeof(blob), &blen) != S3_OK) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "cannot read the agent pubkey %s",
                      s3_cli_agent_keyfile);
         return S3_ERROR;
@@ -2766,8 +2760,8 @@ s3_cli_jwt_build_agent(SSL *ssl, const char *user, char *out, size_t cap)
         return S3_ERROR;
     }
 
-    rc = s3_ssh3_agent_cli_sign(s3_cli_agent_sock, blob, blen, (const u_char *)seg, tlen,
-                                sig, sizeof(sig), &siglen, alg, sizeof(alg));
+    rc = s3_ssh3_agent_cli_sign(s3_cli_agent_sock, blob, blen, (const u_char *)seg, tlen, sig,
+                                sizeof(sig), &siglen, alg, sizeof(alg));
 
     if (rc == S3_DECLINED) {
         s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the agent does not hold the key of %s",
@@ -2801,8 +2795,8 @@ s3_cli_jwt_build(SSL *ssl)
 {
     if (s3_cli_auth == S3_CLI_AUTH_AGENT) {
 
-        if (s3_cli_jwt_build_agent(ssl, s3_cli_user, s3_cli_bearer,
-                                   sizeof(s3_cli_bearer)) != S3_OK) {
+        if (s3_cli_jwt_build_agent(ssl, s3_cli_user, s3_cli_bearer, sizeof(s3_cli_bearer)) !=
+            S3_OK) {
             return S3_ERROR;
         }
 
@@ -4350,9 +4344,8 @@ s3_cli_shk_parse(const char *val)
 static s3_int_t
 s3_cli_sshfp_parse(const char *val)
 {
-    if (val[0] == '\0' || s3_cli_streq_ci(val, "no") == 0 ||
-        s3_cli_streq_ci(val, "false") == 0 || s3_cli_streq_ci(val, "off") == 0 ||
-        strcmp(val, "0") == 0) {
+    if (val[0] == '\0' || s3_cli_streq_ci(val, "no") == 0 || s3_cli_streq_ci(val, "false") == 0 ||
+        s3_cli_streq_ci(val, "off") == 0 || strcmp(val, "0") == 0) {
         return S3_CLI_SSHFP_NO;
     }
 
@@ -4778,8 +4771,7 @@ s3_cli_fork_bg_validate(void)
         return S3_ERROR;
     }
 
-    if (s3_cli_opt_strict == S3_CLI_SHK_ASK && !s3_cli_opt_insecure &&
-        !s3_cli_bg_host_pinned()) {
+    if (s3_cli_opt_strict == S3_CLI_SHK_ASK && !s3_cli_opt_insecure && !s3_cli_bg_host_pinned()) {
         fprintf(stderr, "ssh3: -f: the default ask policy cannot prompt in the "
                         "background and the host is not pinned yet: pin it (run "
                         "once without -f) or pass -o strict-host-key-checking=no\n");
@@ -5072,9 +5064,9 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
 
     if (s3_cli_opt_sshfp != S3_CLI_SSHFP_NO) {
 
-        char            qname[300], errbuf[256];
-        s3_pool_t      *pool = s3_create_pool(1024, &s3_cli_log);
-        s3_sshfp_rec_t  matched;
+        char              qname[300], errbuf[256];
+        s3_pool_t        *pool = s3_create_pool(1024, &s3_cli_log);
+        s3_sshfp_rec_t    matched;
         s3_sshfp_status_t st;
 
         if (pool != NULL && s3_sshfp_query_name(hostkey, qname, sizeof(qname)) == S3_OK) {
@@ -5098,14 +5090,14 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
                 break;
 
             case S3_SSHFP_NO_RECORDS:
-                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
-                             "no SSHFP record is published for %s", qname);
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0, "no SSHFP record is published for %s",
+                             qname);
                 break;
 
             default:
                 s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
-                             "the SSHFP lookup of %s failed (%s), the signal is soft",
-                             qname, errbuf[0] != '\0' ? errbuf : "no answer");
+                             "the SSHFP lookup of %s failed (%s), the signal is soft", qname,
+                             errbuf[0] != '\0' ? errbuf : "no answer");
                 break;
             }
 
@@ -5121,9 +5113,9 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
 
     pin = s3_cli_kh_walk(hostkey, der, derlen, NULL, NULL, 0, NULL);
 
-    verdict = s3_hostkey_decide(pin, chain_err, self_signed, san_ok,
-                                (s3_hostkey_shk_t)s3_cli_opt_strict, sshfp_verified,
-                                sshfp_mismatch);
+    verdict =
+        s3_hostkey_decide(pin, chain_err, self_signed, san_ok, (s3_hostkey_shk_t)s3_cli_opt_strict,
+                          sshfp_verified, sshfp_mismatch);
 
     switch (verdict) {
 
@@ -14452,8 +14444,7 @@ main(int argc, char **argv)
                     return S3_CLI_EXIT_ERROR;
                 }
 
-                snprintf(s3_cli_agent_keyfile, sizeof(s3_cli_agent_keyfile), "%s",
-                         argv[n + 1]);
+                snprintf(s3_cli_agent_keyfile, sizeof(s3_cli_agent_keyfile), "%s", argv[n + 1]);
                 s3_cli_auth = S3_CLI_AUTH_AGENT;
 
                 value = argv[n + 1];
@@ -14627,7 +14618,8 @@ main(int argc, char **argv)
                                       s3_cli_streq_ci(argv[n + 1], "no") != 0 &&
                                       s3_cli_streq_ci(argv[n + 1], "ask") != 0 &&
                                       s3_cli_streq_ci(argv[n + 1], "accept-new") != 0)) {
-                    fprintf(stderr, "ssh3: -strict-host-key-checking wants ask|yes|no|accept-new\n");
+                    fprintf(stderr,
+                            "ssh3: -strict-host-key-checking wants ask|yes|no|accept-new\n");
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
@@ -16112,8 +16104,7 @@ main(int argc, char **argv)
          * the inherited connection (the exit skips the teardown: the
          * state belongs to the child now) */
 
-        if (s3_cli_fork_bg && !s3_cli_bg_done && s3_cli_status_seen &&
-            s3_cli_status == 200) {
+        if (s3_cli_fork_bg && !s3_cli_bg_done && s3_cli_status_seen && s3_cli_status == 200) {
 
             pid_t bgpid;
 
@@ -16128,8 +16119,7 @@ main(int argc, char **argv)
             }
 
             if (bgpid > 0) {
-                fprintf(stderr,
-                        "ssh3: -f: the session continues in the background (pid %d)\n",
+                fprintf(stderr, "ssh3: -f: the session continues in the background (pid %d)\n",
                         (int)bgpid);
                 exit(0);
             }
