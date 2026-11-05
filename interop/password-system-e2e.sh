@@ -265,7 +265,7 @@ if HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$S3GATE:$P280" \
     "$S3GATE@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$WORK/leg1b-b.log" 2>&1; then
     fail "the 280-byte password crossed the server gate (256)"
 else
-    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg1b-b.log"; then
+    if grep -qE "INTEROP-H3-STATUS 401|HTTP 401" "$WORK/leg1b-b.log"; then
         pass "the 280-byte password refuses at the server gate (401)"
     else
         fail "no 401 at the gate: $(tail -2 "$WORK/leg1b-b.log")"
@@ -276,7 +276,7 @@ if HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$S3LESS:$P280" \
     "$S3LESS@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$WORK/leg1b-c.log" 2>&1; then
     fail "the passwordless account accepted a credential"
 else
-    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg1b-c.log"; then
+    if grep -qE "INTEROP-H3-STATUS 401|HTTP 401" "$WORK/leg1b-c.log"; then
         pass "the passwordless account refuses the long credential (401)"
     else
         fail "no 401 for the passwordless account: $(tail -2 "$WORK/leg1b-c.log")"
