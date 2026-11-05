@@ -129,7 +129,7 @@ start_srv() {
     local cert=$1
     local key=$2
 
-    SRVLOG="$WORK/srv.log"
+    SRVLOG="$WORK/srv-$2.log"
 
     local p=$((47400 + ($$ % 300)))
     local i=0
@@ -277,7 +277,7 @@ stop_dns() {
 
 echo "== leg 1: the CA-anchored first contact accepts without a pin (CA-FIRST-CONTACT)"
 
-start_srv "$WORK/a.pem" "$WORK/a.key" || die "the daemon start failed"
+start_srv "$WORK/a.pem" "$WORK/a.key" a || die "the daemon start failed"
 
 mkdir -p "$WORK/home-ca"
 
@@ -321,7 +321,7 @@ else
 fi
 
 stop_srv
-start_srv "$WORK/b.pem" "$WORK/b.key" || die "the daemon restart failed"
+start_srv "$WORK/b.pem" "$WORK/b.key" b || die "the daemon restart failed"
 
 if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
     -o strict-host-key-checking=yes -i "$WORK/priv.pem" \
@@ -363,14 +363,13 @@ stop_srv
 
 echo "== leg 3: the self-signed first contact auto-pins on accept-new (SELF-ACCEPT-NEW)"
 
-start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" || die "the daemon start failed"
+start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" self || die "the daemon start failed"
 
 mkdir -p "$WORK/home-acc"
 
 if timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
-    printf S3-CERT-OK < /dev/null > "$WORK/home-acc.out" 2>&1 \
-    2> "$WORK/home-acc.err"; then
+    printf S3-CERT-OK < /dev/null > "$WORK/home-acc.out" 2>&1; then
 
     if grep -q "accept-new: pinned the first-use certificate" "$WORK/home-acc.out" &&
         grep -q "S3-CERT-OK" "$WORK/home-acc.out"; then
@@ -379,7 +378,7 @@ if timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
         fail "the accept-new leg: the pin log or the output missing"
     fi
 else
-    fail "the accept-new leg: rc=$? ($(tail -2 "$WORK/home-acc.out" "$WORK/home-acc.err" 2>/dev/null))"
+    fail "the accept-new leg: rc=$? ($(tail -2 "$WORK/home-acc.out"))"
 fi
 
 echo "== leg 4: the self-signed first contact refuses on a pipe with the default ask (ASK-NONCONSOLE)"
@@ -408,7 +407,7 @@ stop_srv
 
 echo "== leg 5: the SSHFP mismatch refuses (SSHFP-MISMATCH-REJECT)"
 
-start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" || die "the daemon start failed"
+start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" self || die "the daemon start failed"
 
 FP_REAL=$(openssl x509 -in "$WORK/scert-s.pem" -outform DER | sha256sum | cut -d' ' -f1)
 FP_FAKE=0000000000000000000000000000000000000000000000000000000000000000

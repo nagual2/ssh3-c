@@ -15979,6 +15979,28 @@ main(int argc, char **argv)
                 break;
             }
 
+            /*
+             * the early flight rode the ticket PSK: when the session
+             * did not resume (the daemon restarted, its ticket keys
+             * are gone), the server silently ignores the early CONNECT
+             * and no :status ever answers - the flight retires the
+             * same way the 425 retry does, the CONNECT re-rides
+             * post-handshake with the credentials (a resumed session
+             * never lands here: the server answers the flight with the
+             * 200 or the 425 of the replay window, the one-shot retry
+             * stays armed for it)
+             */
+
+            if (s3_cli_early_done && !s3_cli_retry_used && !s3_cli_status_seen &&
+                s3_cli_ctrl != NULL && SSL_session_reused(cli->ssl->connection) == 0) {
+
+                s3_cli_retry_wait = 1;
+                s3_cli_retry_used = 1;
+                s3_cli_req_sent = 0;
+                s3_cli_status_seen = 1; /* the old-stream events stay muted */
+                s3_cli_ctrl_dead = s3_cli_ctrl;
+                s3_cli_ctrl = NULL;
+            }
 
             if ((s3_cli_auth == S3_CLI_AUTH_PUBKEY || s3_cli_auth == S3_CLI_AUTH_AGENT) &&
                 s3_cli_jwt_build(cli->ssl->connection) != S3_OK) {
