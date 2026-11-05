@@ -138,6 +138,8 @@ typedef unsigned short u_short;
 #include <s3_ssh3_sftp_cli.h>
 #include <s3_ssh3_version.h>
 #include <s3_ssh3_wire.h>
+#include <s3_ssh3_hostkey.h>
+#include <s3_ssh3_sshfp.h>
 #include <s3_ssl.h>
 
 #if (S3_WIN32)
@@ -421,6 +423,7 @@ static unsigned s3_cli_port_operand;   /* the operand carried its own port */
 static unsigned s3_cli_have_keyfile;   /* -i or -o IdentityFile= */
 static unsigned s3_cli_have_escape;    /* -e or -o EscapeChar= */
 static unsigned s3_cli_have_strict;    /* -o strict-host-key-checking= */
+static unsigned s3_cli_have_sshfp;     /* -o VerifyHostKeyDNS= */
 static unsigned s3_cli_have_master;    /* -M or -o ControlMaster= */
 static unsigned s3_cli_have_agent;     /* -A/-X or -o ForwardAgent= */
 static unsigned s3_cli_have_jump;      /* -J jump or -o ProxyJump= */
@@ -574,20 +577,33 @@ static struct sockaddr_in s3_cli_bridge_sa;
 
 /*
  * the -o options (the backlog 7, the fork keys, case-insensitive):
- * the insecure run accepts any server certificate (the TLS layer
- * rides SSL_VERIFY_NONE already, the TOFU pin store is the check it
- * skips), the strict-host-key-checking picks the unknown-host policy
- * of the TOFU
+ * the insecure run accepts any server certificate (the chain verdict
+ * the ssl layer records stays unconsumed, the TOFU pin store is the
+ * check it skips), the strict-host-key-checking picks the host
+ * verification policy (CERT-VERIFICATION-CANON.md 2.3: ask is the
+ * default and prompts on a console, yes refuses, no warns and
+ * accepts, accept-new auto-pins the unknown first use), the
+ * verifyhostkeydns rides the SSHFP records of the zone (RFC 4255;
+ * no is the default: an ordinary run carries no DNS round-trip)
  */
 
 enum {
-    S3_CLI_SHK_ACCEPT_NEW = 0, /* the default TOFU: accept and record */
-    S3_CLI_SHK_YES,            /* the unknown host refuses at once */
-    S3_CLI_SHK_NO              /* the unknown host accepts, no pin write */
+    S3_CLI_SHK_ASK = 0,   /* the default: the console prompt decides, a pipe session refuses */
+    S3_CLI_SHK_YES,       /* the unverifiable or changed host refuses at once */
+    S3_CLI_SHK_NO,        /* warn and accept (the self-signed first use still pins) */
+    S3_CLI_SHK_ACCEPT_NEW /* the unknown first use auto-pins, the changed host refuses */
 };
 
 static unsigned s3_cli_opt_insecure;
 static unsigned s3_cli_opt_strict;
+
+enum {
+    S3_CLI_SSHFP_NO = 0,
+    S3_CLI_SSHFP_ASK,
+    S3_CLI_SSHFP_YES
+};
+
+static unsigned s3_cli_opt_sshfp;
 
 /* the -o ConnectTimeout (the seconds; -1 = the key unset, the 30 s
  * default rides; 0 = the deadline not armed, the ssh(1) unset canon) */
@@ -1324,8 +1340,8 @@ s3_cli_usage(const char *prog)
             "  -h          this help\n"
             "  -v          verbose (repeatable: -vv debug, -vvv everything)\n"
             "  -o Key=Value  the client option (repeatable, case-insensitive):\n"
-            "              insecure, strict-host-key-checking, forwardagent,\n"
-            "              port, user, identityfile, localforward,\n"
+            "              insecure, strict-host-key-checking, verifyhostkeydns,\n"
+            "              forwardagent, port, user, identityfile, localforward,\n"
             "              remoteforward, dynamicforward, proxyjump,\n"
             "              escapechar, controlmaster, controlpath,\n"
             "              controlpersist; the unknown key refuses with the\n"
@@ -1364,11 +1380,12 @@ s3_cli_usage(const char *prog)
             "              the peer must announce the capability); -Cnone is\n"
             "              the explicit off, a codec name pins it\n"
             "  -insecure   the test-mode TLS: any peer certificate is\n"
-            "              accepted (the pin check skips; the -o insecure\n"
-            "              twin)\n"
-            "  -strict-host-key-checking yes|no|accept-new  the\n"
-            "              unknown-host policy of the TOFU as a flag (the\n"
-            "              bare form refuses: the value would eat the\n"
+            "              accepted (the chain verdict and the pin store\n"
+            "              skip; the -o insecure twin)\n"
+            "  -strict-host-key-checking ask|yes|no|accept-new  the host\n"
+            "              verification policy as a flag (ask is the\n"
+            "              default: the console prompt decides; the bare\n"
+            "              form refuses: the value would eat the\n"
             "              destination)\n"
             " no command opens an interactive shell (pty on a console, the\n"
             " stdin pipe pumps without one), a command runs exec; the server\n"
@@ -1666,6 +1683,105 @@ s3_cli_kh_append(const char *kh_path, const char *body)
     return S3_OK;
 }
 
+/*
+ * the pin of the key rewrites (the renewal re-pin, the canon 2.4):
+ * the pin lines of the key drop, the new line appends; the temp file
+ * + MoveFileEx keeps the store atomic-ish, the missing store rides
+ * the plain append
+ */
+
+static s3_int_t
+s3_cli_kh_replace(const char *kh_path, const char *hostkey, const char *body)
+{
+    char        line[17408], tmp[1060], dir[1024];
+    const char *slash = strrchr(kh_path, '\\');
+    size_t      dlen = slash != NULL ? (size_t)(slash - kh_path) : 0;
+    FILE       *src, *dst;
+    unsigned    dropped = 0;
+
+    if (slash == NULL || dlen >= sizeof(dir)) {
+        return S3_ERROR;
+    }
+
+    memcpy(dir, kh_path, dlen);
+    dir[dlen] = '\0';
+
+    CreateDirectoryA(dir, NULL);
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", kh_path);
+
+    src = fopen(kh_path, "r");
+
+    if (src == NULL) {
+        return s3_cli_kh_append(kh_path, body);
+    }
+
+    dst = fopen(tmp, "w");
+
+    if (dst == NULL) {
+        fclose(src);
+        return S3_ERROR;
+    }
+
+    while (fgets(line, sizeof(line), src) != NULL) {
+
+        char *sp1, *sp2, *nl;
+
+        nl = strchr(line, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+
+        sp1 = strchr(line, ' ');
+
+        if (sp1 == NULL) {
+            fprintf(dst, "%s\n", line);
+            continue;
+        }
+
+        sp2 = strchr(sp1 + 1, ' ');
+
+        if (sp2 == NULL) {
+            fprintf(dst, "%s\n", line);
+            continue;
+        }
+
+        *sp1 = '\0';
+        *sp2 = '\0';
+
+        if (strcmp(line, hostkey) == 0 && strcmp(sp1 + 1, "x509-certificate") == 0) {
+            dropped = 1;
+            continue;
+        }
+
+        fprintf(dst, "%s %s %s\n", line, sp1 + 1, sp2 + 1);
+    }
+
+    fprintf(dst, "%s\n", body);
+
+    fclose(src);
+
+    if (fclose(dst) != 0) {
+        (void)remove(tmp);
+        return S3_ERROR;
+    }
+
+    if (!dropped) {
+        /* the key rode no pin line: nothing to rewrite, the store
+         * keeps the plain append shape */
+        (void)remove(tmp);
+        return s3_cli_kh_append(kh_path, body);
+    }
+
+    if (!MoveFileExA(tmp, kh_path, MOVEFILE_REPLACE_EXISTING)) {
+        (void)remove(tmp);
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
 #else
 
 static void
@@ -1804,6 +1920,115 @@ s3_cli_kh_append(const char *kh_path, const char *body)
     }
 
     close(fd);
+
+    return S3_OK;
+}
+
+/*
+ * the pin of the key rewrites (the renewal re-pin, the canon 2.4):
+ * the pin lines of the key drop, the new line appends; the temp file
+ * + rename keeps the store atomic-ish (0600 preserved), the missing
+ * store rides the plain append
+ */
+
+static s3_int_t
+s3_cli_kh_replace(const char *kh_path, const char *hostkey, const char *body)
+{
+    char        line[17408], tmp[1060], dir[1024];
+    const char *slash = strrchr(kh_path, '/');
+    size_t      dlen = slash != NULL ? (size_t)(slash - kh_path) : 0;
+    FILE       *src, *dst;
+    int         fd, tfd;
+    unsigned    dropped = 0;
+
+    if (dlen > 0 && dlen < sizeof(dir)) {
+
+        memcpy(dir, kh_path, dlen);
+        dir[dlen] = '\0';
+
+        (void)mkdir(dir, 0700);
+    }
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", kh_path);
+
+    src = fopen(kh_path, "r");
+
+    if (src == NULL) {
+        /* nothing to rewrite: the first pin of the key appends */
+        return s3_cli_kh_append(kh_path, body);
+    }
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0) {
+        fclose(src);
+        return S3_ERROR;
+    }
+
+    tfd = fd;
+    dst = fdopen(tfd, "w");
+
+    if (dst == NULL) {
+        close(tfd);
+        fclose(src);
+        return S3_ERROR;
+    }
+
+    while (fgets(line, sizeof(line), src) != NULL) {
+
+        char *sp1, *sp2, *nl;
+
+        nl = strchr(line, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+
+        sp1 = strchr(line, ' ');
+
+        if (sp1 == NULL) {
+            fprintf(dst, "%s\n", line);
+            continue;
+        }
+
+        sp2 = strchr(sp1 + 1, ' ');
+
+        if (sp2 == NULL) {
+            fprintf(dst, "%s\n", line);
+            continue;
+        }
+
+        *sp1 = '\0';
+        *sp2 = '\0';
+
+        if (strcmp(line, hostkey) == 0 && strcmp(sp1 + 1, "x509-certificate") == 0) {
+            dropped = 1;
+            continue;
+        }
+
+        fprintf(dst, "%s %s %s\n", line, sp1 + 1, sp2 + 1);
+    }
+
+    fprintf(dst, "%s\n", body);
+
+    fclose(src);
+
+    if (fclose(dst) != 0) {
+        (void)unlink(tmp);
+        return S3_ERROR;
+    }
+
+    if (!dropped) {
+        /* the key rode no pin line: nothing to rewrite, the store
+         * keeps the plain append shape */
+        (void)unlink(tmp);
+        return s3_cli_kh_append(kh_path, body);
+    }
+
+    if (rename(tmp, kh_path) != 0) {
+        (void)unlink(tmp);
+        return S3_ERROR;
+    }
 
     return S3_OK;
 }
@@ -2831,16 +3056,18 @@ s3_cli_early_init(s3_connection_t *c)
     s3_cli_early_done = 1;
 
     /*
-     * the pin check runs when the peer certificate has arrived - the
-     * EARLY write keys exist before the ServerHello (the flight is
-     * protected by the ticket PSK), a cold loopback pass may reach
-     * the early branch before the certificate does; the skipped pin
-     * is not a hole: the early CONNECT carries no credentials (the
-     * RFC 8470 canon) and the post-handshake retry rides behind the
-     * pin check of the handshake block (the B17 order)
+     * the pin check runs when the peer certificate has arrived (the
+     * chain verdict recorded) - the EARLY write keys exist before the
+     * ServerHello (the flight is protected by the ticket PSK), a cold
+     * loopback pass may reach the early branch before the certificate
+     * does; the skipped check is not a hole: the early CONNECT
+     * carries no credentials (the RFC 8470 canon) and the
+     * post-handshake retry rides behind the host verification of the
+     * handshake block (the B17 order)
      */
 
-    if (SSL_get1_peer_certificate(c->ssl->connection) != NULL &&
+    if (s3_ssl_chain_seen(c->ssl) &&
+        SSL_get1_peer_certificate(c->ssl->connection) != NULL &&
         s3_cli_cert_check_conn(c, s3_cli_hostkey) != S3_OK) {
         return S3_ERROR;
     }
@@ -3204,21 +3431,40 @@ s3_cli_cfg_apply(const char *key, const char *val)
 
     if (s3_cli_streq_ci(key, "stricthostkeychecking") == 0) {
 
+        s3_int_t v;
+
         if (s3_cli_have_strict) {
             return S3_OK;
         }
 
-        if (s3_cli_streq_ci(val, "yes") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_YES;
+        v = s3_cli_shk_parse(val);
 
-        } else if (s3_cli_streq_ci(val, "no") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_NO;
-
-        } else if (s3_cli_streq_ci(val, "accept-new") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_ACCEPT_NEW;
+        if (v < 0) {
+            return S3_OK;
         }
 
+        s3_cli_opt_strict = (unsigned)v;
         s3_cli_have_strict = 1;
+
+        return S3_OK;
+    }
+
+    if (s3_cli_streq_ci(key, "verifyhostkeydns") == 0) {
+
+        s3_int_t v;
+
+        if (s3_cli_have_sshfp) {
+            return S3_OK;
+        }
+
+        v = s3_cli_sshfp_parse(val);
+
+        if (v < 0) {
+            return S3_OK;
+        }
+
+        s3_cli_opt_sshfp = (unsigned)v;
+        s3_cli_have_sshfp = 1;
 
         return S3_OK;
     }
@@ -3453,9 +3699,9 @@ s3_cli_cfg_load(const char *host)
 }
 
 static const char s3_cli_opt_keys[] =
-    "insecure, strict-host-key-checking, forwardagent, port, user, identityfile, localforward,"
-    " remoteforward, dynamicforward, proxyjump, escapechar, controlmaster, controlpath,"
-    " controlpersist, connecttimeout";
+    "insecure, strict-host-key-checking, verifyhostkeydns, forwardagent, port, user, identityfile,"
+    " localforward, remoteforward, dynamicforward, proxyjump, escapechar, controlmaster,"
+    " controlpath, controlpersist, connecttimeout";
 
 /* the ASCII case-insensitive compare of the -o texts (the fork
  * accepts any case of the key and the value) */
@@ -4064,6 +4310,60 @@ s3_cli_escape_feed(const u_char *src, size_t n, u_char *dst)
     return o;
 }
 
+/*
+ * the OpenSSH value set of strict-host-key-checking (the fork form,
+ * case-insensitive: ask, yes|true|on, no|false|off, accept-new);
+ * -1 rides the caller's refusal
+ */
+
+static s3_int_t
+s3_cli_shk_parse(const char *val)
+{
+    if (s3_cli_streq_ci(val, "ask") == 0) {
+        return S3_CLI_SHK_ASK;
+    }
+
+    if (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "true") == 0 ||
+        s3_cli_streq_ci(val, "on") == 0) {
+        return S3_CLI_SHK_YES;
+    }
+
+    if (s3_cli_streq_ci(val, "no") == 0 || s3_cli_streq_ci(val, "false") == 0 ||
+        s3_cli_streq_ci(val, "off") == 0) {
+        return S3_CLI_SHK_NO;
+    }
+
+    if (s3_cli_streq_ci(val, "accept-new") == 0) {
+        return S3_CLI_SHK_ACCEPT_NEW;
+    }
+
+    return -1;
+}
+
+/* the VerifyHostKeyDNS value set (the OpenSSH keywords): no (the
+ * default), ask, yes; -1 rides the caller's refusal */
+
+static s3_int_t
+s3_cli_sshfp_parse(const char *val)
+{
+    if (val[0] == '\0' || s3_cli_streq_ci(val, "no") == 0 ||
+        s3_cli_streq_ci(val, "false") == 0 || s3_cli_streq_ci(val, "off") == 0 ||
+        strcmp(val, "0") == 0) {
+        return S3_CLI_SSHFP_NO;
+    }
+
+    if (s3_cli_streq_ci(val, "ask") == 0) {
+        return S3_CLI_SSHFP_ASK;
+    }
+
+    if (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "true") == 0 ||
+        s3_cli_streq_ci(val, "on") == 0 || strcmp(val, "1") == 0) {
+        return S3_CLI_SSHFP_YES;
+    }
+
+    return -1;
+}
+
 static s3_int_t
 s3_cli_opt_parse(const char *arg)
 {
@@ -4152,21 +4452,30 @@ s3_cli_opt_parse(const char *arg)
 
     if (strcmp(key, "strict-host-key-checking") == 0) {
 
-        if (s3_cli_streq_ci(val, "yes") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_YES;
+        s3_int_t v = s3_cli_shk_parse(val);
 
-        } else if (s3_cli_streq_ci(val, "no") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_NO;
-
-        } else if (s3_cli_streq_ci(val, "accept-new") == 0) {
-            s3_cli_opt_strict = S3_CLI_SHK_ACCEPT_NEW;
-
-        } else {
-            fprintf(stderr, "ssh3: -o strict-host-key-checking wants yes|no|accept-new\n");
+        if (v < 0) {
+            fprintf(stderr, "ssh3: -o strict-host-key-checking wants ask|yes|no|accept-new\n");
             return S3_ERROR;
         }
 
+        s3_cli_opt_strict = (unsigned)v;
         s3_cli_have_strict = 1;
+
+        return S3_OK;
+    }
+
+    if (strcmp(key, "verifyhostkeydns") == 0) {
+
+        s3_int_t v = s3_cli_sshfp_parse(val);
+
+        if (v < 0) {
+            fprintf(stderr, "ssh3: -o VerifyHostKeyDNS wants yes|ask|no\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_opt_sshfp = (unsigned)v;
+        s3_cli_have_sshfp = 1;
 
         return S3_OK;
     }
@@ -4350,14 +4659,17 @@ s3_cli_opt_parse(const char *arg)
 }
 
 /*
- * the known_hosts check of the DER: S3_OK when the certificate
- * matches a pin or was just accepted, S3_DECLINED when the host is
- * unknown and the user declined (or the session is not a console),
- * S3_ERROR on a changed certificate (the MITM shape) or a file error;
- * the line format is the Go client one; the -o insecure skips the
- * whole check, the -o strict-host-key-checking picks the unknown-host
- * policy (yes refuses at once, no accepts without a pin write,
- * accept-new is the default TOFU)
+ * the host verification of the DER (the canon 2.1-2.5 machine, the
+ * s3_hostkey_decide output enforced here): S3_OK when the
+ * certificate rides (a pin match, a CA-anchored chain with SAN, an
+ * accepted first use or a legitimate renewal), S3_DECLINED when the
+ * host is unverifiable or the user declined (or the session is not a
+ * console), S3_ERROR on a changed certificate (the MITM shape); the
+ * line format is the Go client one; the -o insecure skips the whole
+ * question, the -o strict-host-key-checking picks the policy (ask
+ * prompts, yes refuses, no warns and accepts, accept-new auto-pins
+ * the unknown first use), the -o VerifyHostKeyDNS rides the SSHFP
+ * records of the zone
  */
 
 /* the -f gate helper: the target is pinned already (the pin text of
@@ -4462,7 +4774,7 @@ s3_cli_fork_bg_validate(void)
         return S3_ERROR;
     }
 
-    if (s3_cli_opt_strict == S3_CLI_SHK_ACCEPT_NEW && !s3_cli_opt_insecure &&
+    if (s3_cli_opt_strict == S3_CLI_SHK_ASK && !s3_cli_opt_insecure &&
         !s3_cli_bg_host_pinned()) {
         fprintf(stderr, "ssh3: -f: the default ask policy cannot prompt in the "
                         "background and the host is not pinned yet: pin it (run "
@@ -4494,56 +4806,31 @@ s3_cli_tofu_prepare(void)
     return S3_OK;
 }
 
-static s3_int_t
-s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
+/*
+ * the known_hosts walk of one target key: the classification of the
+ * raw DER against the pin lines (UNKNOWN / MATCHES / CHANGED) and,
+ * when pins != NULL, the collection of the pinned DER blobs of the
+ * key (the ssl store anchors, canon 2.2); der == NULL rides the
+ * collection only (the pre-dial loader), the classification is
+ * UNKNOWN then; the missing store rides UNKNOWN with nothing
+ * collected
+ */
+
+static s3_hostkey_pin_t
+s3_cli_kh_walk(const char *hostkey, const u_char *der, size_t derlen, u_char pins[][8192],
+               size_t pinlens[], unsigned pins_cap, unsigned *npins)
 {
-    char    line[17408], fp[64], pin[16384], kh_path[1024];
-    u_char *der = NULL, dec[8192];
-    size_t  derlen;
-    int     matched = 0, pinned = 0;
-    FILE   *f;
+    char             line[17408], kh_path[1024];
+    u_char           dec[8192];
+    s3_hostkey_pin_t st = S3_HOSTKEY_UNKNOWN;
+    FILE            *f;
 
-    /* the -o insecure: any certificate of the server rides (the TLS
-     * layer never verified the chain, the TOFU pin store is skipped
-     * with the whole question and the record) */
-
-    if (s3_cli_opt_insecure) {
-        return S3_OK;
+    if (npins != NULL) {
+        *npins = 0;
     }
-
-    /* the leaf of the handshake, the i2d form the pins store */
-
-    {
-        X509 *cert = SSL_get1_peer_certificate(conn->ssl->connection);
-
-        if (cert == NULL) {
-            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the server presented no certificate");
-            return S3_ERROR;
-        }
-
-        derlen = (size_t)i2d_X509(cert, &der);
-        X509_free(cert);
-
-        if (derlen == 0 || der == NULL) {
-            return S3_ERROR;
-        }
-
-        /* the pin store is sized for the certificates of the real
-         * peers, a leaf above the decode buffer refuses here */
-
-        if (derlen > sizeof(dec)) {
-            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the certificate is too large to pin");
-            OPENSSL_free(der);
-            return S3_ERROR;
-        }
-    }
-
-    s3_cli_sha256_fp(der, derlen, fp);
 
     if (s3_cli_kh_path(kh_path, sizeof(kh_path)) != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the home directory is not set, cannot pin");
-        OPENSSL_free(der);
-        return S3_ERROR;
+        return S3_HOSTKEY_UNKNOWN;
     }
 
     /* the ANSI file surface: the getenv and the CRT open share the
@@ -4551,146 +4838,494 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
 
     f = fopen(kh_path, "r");
 
-    if (f != NULL) {
+    if (f == NULL) {
+        return S3_HOSTKEY_UNKNOWN;
+    }
 
-        while (fgets(line, sizeof(line), f) != NULL) {
+    while (fgets(line, sizeof(line), f) != NULL) {
 
-            char  *sp1, *sp2, *nl;
-            size_t dlen;
+        char  *sp1, *sp2, *nl;
+        size_t dlen;
 
-            nl = strchr(line, '\n');
+        nl = strchr(line, '\n');
 
-            if (nl != NULL) {
-                *nl = '\0';
-            }
-
-            sp1 = strchr(line, ' ');
-
-            if (sp1 == NULL) {
-                continue;
-            }
-
-            sp2 = strchr(sp1 + 1, ' ');
-
-            if (sp2 == NULL) {
-                continue;
-            }
-
-            *sp1 = '\0';
-            *sp2 = '\0';
-
-            if (strcmp(line, hostkey) != 0 || strcmp(sp1 + 1, "x509-certificate") != 0) {
-                continue;
-            }
-
-            /* the pin compares on the raw DER bytes */
-
-            dlen = s3_cli_b64dec(sp2 + 1, dec, sizeof(dec));
-
-            pinned = 1;
-
-            if (dlen == derlen && memcmp(dec, der, derlen) == 0) {
-                matched = 1;
-                break;
-            }
+        if (nl != NULL) {
+            *nl = '\0';
         }
 
-        fclose(f);
+        sp1 = strchr(line, ' ');
+
+        if (sp1 == NULL) {
+            continue;
+        }
+
+        sp2 = strchr(sp1 + 1, ' ');
+
+        if (sp2 == NULL) {
+            continue;
+        }
+
+        *sp1 = '\0';
+        *sp2 = '\0';
+
+        if (strcmp(line, hostkey) != 0 || strcmp(sp1 + 1, "x509-certificate") != 0) {
+            continue;
+        }
+
+        /* the pin compares on the raw DER bytes; the truncated line
+         * rides nothing (the store keeps the real peer certificates) */
+
+        dlen = s3_cli_b64dec(sp2 + 1, dec, sizeof(dec));
+
+        if (dlen == 0) {
+            continue;
+        }
+
+        if (st == S3_HOSTKEY_UNKNOWN) {
+            st = S3_HOSTKEY_CHANGED;
+        }
+
+        if (der != NULL && dlen == derlen && memcmp(dec, der, derlen) == 0) {
+            st = S3_HOSTKEY_MATCHES;
+        }
+
+        if (pins != NULL && *npins < pins_cap) {
+            memcpy(pins[*npins], dec, dlen);
+            pinlens[*npins] = dlen;
+            (*npins)++;
+        }
     }
 
-    if (matched) {
-        OPENSSL_free(der);
+    fclose(f);
 
-        return S3_OK;
+    return st;
+}
+
+/* the pinned anchors ride the client ssl store before the dial (canon
+ * 2.2: the anchor is the pins union the system CAs; the Go fork adds
+ * the pinned certificates to the pool the same way); the insecure run
+ * loads no anchors (canon 2.1) */
+
+static void
+s3_cli_load_pins(s3_ssl_t *ssl, const char *hostkey)
+{
+    u_char   pins[8][8192];
+    size_t   lens[8];
+    unsigned i, n;
+
+    if (s3_cli_opt_insecure) {
+        return;
     }
 
-    if (pinned) {
+    (void)s3_cli_kh_walk(hostkey, NULL, 0, pins, lens, 8, &n);
 
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
-                     "WARNING: the certificate of %s does not match the pin in known_hosts"
-                     " (received %s): a machine-in-the-middle attack or a server change",
-                     hostkey, fp);
+    for (i = 0; i < n; i++) {
 
-        OPENSSL_free(der);
-        return S3_ERROR;
+        if (s3_ssl_client_add_pin(ssl, pins[i], lens[i]) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "the pinned anchor of %s rides not the ssl store", hostkey);
+        }
+    }
+}
+
+/*
+ * the SAN check of the target (canon 2.2): the IP literal checks the
+ * iPAddress SAN (the binary form), a name checks the dNSName SAN (the
+ * RFC 6125 wildcard semantics of the default flags); the hostkey text
+ * rides "host:port/path", the bracket form unwraps first
+ */
+
+static unsigned
+s3_cli_san_ok(X509 *cert, const char *hostkey)
+{
+    char        host[300];
+    const char *src, *close_br, *slash, *colon;
+    size_t      n;
+    u_char      ipbin[16];
+
+    if (hostkey[0] == '[') {
+
+        close_br = strchr(hostkey, ']');
+
+        if (close_br == NULL) {
+            return 0;
+        }
+
+        src = hostkey + 1;
+        n = (size_t)(close_br - src);
+
+    } else {
+
+        slash = strchr(hostkey, '/');
+
+        n = slash != NULL ? (size_t)(slash - hostkey) : strlen(hostkey);
+
+        colon = memchr(hostkey, ':', n);
+
+        if (colon != NULL) {
+            n = (size_t)(colon - hostkey);
+        }
+
+        src = hostkey;
     }
 
-    /* the unknown host: the -o strict-host-key-checking policy first
-     * (yes refuses at once, no accepts without the record), the
-     * accept-new default runs the TOFU question on a console, a pipe
-     * session refuses (the reference ask mode) */
-
-    if (s3_cli_opt_strict == S3_CLI_SHK_YES) {
-
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
-                     "the authenticity of %s cannot be established (certificate %s) and"
-                     " strict-host-key-checking=yes refuses an unpinned host",
-                     hostkey, fp);
-
-        OPENSSL_free(der);
-        return S3_DECLINED;
+    if (n == 0 || n >= sizeof(host)) {
+        return 0;
     }
 
-    if (s3_cli_opt_strict == S3_CLI_SHK_NO) {
+    memcpy(host, src, n);
+    host[n] = '\0';
+
+    /* the v4 literal first, the v6 second; inet_pton refuses the
+     * scope suffix, the canon key text carries none */
+
+    if (inet_pton(AF_INET, host, ipbin) == 1) {
+        return X509_check_ip(cert, ipbin, 4, 0) == 1;
+    }
+
+    if (inet_pton(AF_INET6, host, ipbin) == 1) {
+        return X509_check_ip(cert, ipbin, 16, 0) == 1;
+    }
+
+    return X509_check_host(cert, host, strlen(host), 0, NULL) == 1;
+}
+
+/*
+ * the host verification of one connection (CERT-VERIFICATION-CANON.md
+ * 2.1-2.5, the s3_hostkey_decide machine): the chain verdict the
+ * record-only verify callback recorded, the SAN of the target, the
+ * self-signed shape, the pin classification of the known_hosts store
+ * and the SSHFP verdict ride the machine together; the app enforces
+ * the output before any credential goes out (the B17 order). S3_OK
+ * when the certificate rides (pinned, CA-anchored or accepted),
+ * S3_DECLINED when the host is unknown or the user declined,
+ * S3_ERROR on a changed certificate (the MITM shape)
+ */
+
+static s3_int_t
+s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
+{
+    char                 fp[64], pin_b64[16384], kh_path[1024];
+    u_char              *der = NULL;
+    size_t               derlen;
+    X509                *cert;
+    long                 chain_err;
+    unsigned             self_signed, san_ok, sshfp_verified = 0, sshfp_mismatch = 0;
+    s3_hostkey_pin_t     pin;
+    s3_hostkey_verdict_t verdict;
+
+    /* the -o insecure (canon 2.1): the whole question skips - the
+     * chain verdict the ssl layer recorded stays unconsumed, the pin
+     * store neither reads nor writes; the dev-only marker rides the
+     * log */
+
+    if (s3_cli_opt_insecure) {
 
         s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
-                     "the certificate of %s is accepted without a pin"
-                     " (strict-host-key-checking=no, certificate %s)",
-                     hostkey, fp);
+                     "TLS host verification disabled (-insecure), dev only");
 
-        OPENSSL_free(der);
         return S3_OK;
     }
 
-    if (!s3_cli_console) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
-                     "the authenticity of %s cannot be established (certificate %s) and the"
-                     " session is not interactive, aborting",
-                     hostkey, fp);
+    /* the leaf of the handshake, the i2d form the pins store; the
+     * pin store is sized for the certificates of the real peers */
 
-        OPENSSL_free(der);
-        return S3_DECLINED;
-    }
+    cert = SSL_get1_peer_certificate(conn->ssl->connection);
 
-    fprintf(stderr,
-            "The authenticity of host %s cannot be established.\n"
-            "Certificate fingerprint: %s\n"
-            "Do you want to add this certificate to %s (yes/no)? ",
-            hostkey, fp, S3_CLI_KH_LABEL);
-    fflush(stderr);
-
-    {
-        char answer[16];
-
-        if (fgets(answer, sizeof(answer), stdin) == NULL) {
-            answer[0] = '\0';
-        }
-
-        answer[strcspn(answer, "\r\n")] = '\0';
-
-        if (strcmp(answer, "yes") != 0 && strcmp(answer, "y") != 0) {
-            fprintf(stderr, "Host key verification failed.\n");
-            OPENSSL_free(der);
-            return S3_DECLINED;
-        }
-    }
-
-    /* the pin appends (the line terminator rides the platform helper) */
-
-    s3_cli_b64std(der, derlen, pin);
-    snprintf(line, sizeof(line), "%s x509-certificate %s", hostkey, pin);
-
-    if (s3_cli_kh_append(kh_path, line) != S3_OK) {
-        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the known_hosts append failed");
-        OPENSSL_free(der);
+    if (cert == NULL) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the server presented no certificate");
         return S3_ERROR;
     }
 
-    fprintf(stderr, "Pinned %s (%s)\n", hostkey, fp);
+    derlen = (size_t)i2d_X509(cert, &der);
 
-    OPENSSL_free(der);
+    if (derlen == 0 || der == NULL) {
+        X509_free(cert);
+        return S3_ERROR;
+    }
 
-    return S3_OK;
+    if (derlen > 8192) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the certificate is too large to pin");
+        OPENSSL_free(der);
+        X509_free(cert);
+        return S3_ERROR;
+    }
+
+    s3_cli_sha256_fp(der, derlen, fp);
+
+    /* the chain verdict (the wave A record-only callback): X509_V_OK
+     * when the chain reached a system CA or a pinned anchor, the
+     * first fatal X509_V_ERR_* otherwise */
+
+    chain_err = s3_ssl_chain_err(conn->ssl);
+
+    self_signed = X509_self_signed(cert, 1) == 1;
+    san_ok = s3_cli_san_ok(cert, hostkey);
+
+    /* the SSHFP verdict (canon 2.5, the -o VerifyHostKeyDNS): the
+     * blocking UDP exchange of the raw resolver, the CLI context
+     * only; the digests ride the same DER bytes the pin compares */
+
+    if (s3_cli_opt_sshfp != S3_CLI_SSHFP_NO) {
+
+        char            qname[300], errbuf[256];
+        s3_pool_t      *pool = s3_create_pool(1024, &s3_cli_log);
+        s3_sshfp_rec_t  matched;
+        s3_sshfp_status_t st;
+
+        if (pool != NULL && s3_sshfp_query_name(hostkey, qname, sizeof(qname)) == S3_OK) {
+
+            st = s3_sshfp_check(qname, cert, NULL, 0, pool, &matched, errbuf, sizeof(errbuf));
+
+            switch (st) {
+            case S3_SSHFP_VERIFIED:
+                sshfp_verified = 1;
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                             "SSHFP verification of %s succeeded (algorithm %d, digest %d)",
+                             hostkey, matched.algorithm, matched.digest_type);
+                break;
+
+            case S3_SSHFP_MISMATCH:
+                sshfp_mismatch = 1;
+                s3_log_error(S3_LOG_WARN, &s3_cli_log, 0,
+                             "the SSHFP records published for %s do not match the presented"
+                             " host key",
+                             qname);
+                break;
+
+            case S3_SSHFP_NO_RECORDS:
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                             "no SSHFP record is published for %s", qname);
+                break;
+
+            default:
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                             "the SSHFP lookup of %s failed (%s), the signal is soft",
+                             qname, errbuf[0] != '\0' ? errbuf : "no answer");
+                break;
+            }
+
+        } else {
+            s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                         "the SSHFP lookup of %s cannot start, the signal is soft", hostkey);
+        }
+
+        if (pool != NULL) {
+            s3_destroy_pool(pool);
+        }
+    }
+
+    pin = s3_cli_kh_walk(hostkey, der, derlen, NULL, NULL, 0, NULL);
+
+    verdict = s3_hostkey_decide(pin, chain_err, self_signed, san_ok,
+                                (s3_hostkey_shk_t)s3_cli_opt_strict, sshfp_verified,
+                                sshfp_mismatch);
+
+    switch (verdict) {
+
+    case S3_HOSTKEY_ACCEPT:
+
+        /* the machine accepted without a pin write: the plain ride
+         * (the pinned match, the CA-anchored first contact) or the
+         * explicit no-policy warns */
+
+        if (s3_cli_opt_strict == S3_CLI_SHK_NO && pin != S3_HOSTKEY_MATCHES) {
+            s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                         "the certificate of %s is accepted without a pin"
+                         " (strict-host-key-checking=no, certificate %s)",
+                         hostkey, fp);
+        }
+
+        OPENSSL_free(der);
+        X509_free(cert);
+
+        return S3_OK;
+
+    case S3_HOSTKEY_ACCEPT_PIN:
+
+        /* the pin writes: the renewal re-pins (the canon 2.4 wording
+         * of the log), the first use appends (the accept-new canon or
+         * the no-policy self-signed shape) */
+
+        if (s3_cli_kh_path(kh_path, sizeof(kh_path)) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the home directory is not set, cannot pin");
+            OPENSSL_free(der);
+            X509_free(cert);
+            return S3_ERROR;
+        }
+
+        s3_cli_b64std(der, derlen, pin_b64);
+
+        if (pin == S3_HOSTKEY_CHANGED) {
+
+            /* the replace rides the composed line of the new pin */
+
+            {
+                char body[17408];
+
+                snprintf(body, sizeof(body), "%s x509-certificate %s", hostkey, pin_b64);
+
+                if (s3_cli_kh_replace(kh_path, hostkey, body) != S3_OK) {
+                    s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the known_hosts rewrite failed");
+                    OPENSSL_free(der);
+                    X509_free(cert);
+                    return S3_ERROR;
+                }
+            }
+
+            s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                         "certificate rotated, chain valid: re-pinned %s (received %s)",
+                         hostkey, fp);
+
+        } else {
+
+            char body[17408];
+
+            snprintf(body, sizeof(body), "%s x509-certificate %s", hostkey, pin_b64);
+
+            if (s3_cli_kh_append(kh_path, body) != S3_OK) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the known_hosts append failed");
+                OPENSSL_free(der);
+                X509_free(cert);
+                return S3_ERROR;
+            }
+
+            if (s3_cli_opt_strict == S3_CLI_SHK_NO) {
+                s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
+                             "strict-host-key-checking=no: pinned the first-use certificate"
+                             " of %s (%s)",
+                             hostkey, fp);
+            } else {
+                fprintf(stderr, "accept-new: pinned the first-use certificate of %s (SHA256:%s)\n",
+                        hostkey, fp);
+            }
+        }
+
+        OPENSSL_free(der);
+        X509_free(cert);
+
+        return S3_OK;
+
+    case S3_HOSTKEY_ASK:
+
+        /* the TOFU question (the ask default): a pipe session
+         * refuses, the console decides */
+
+        if (!s3_cli_console) {
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "the authenticity of %s cannot be established (certificate %s) and the"
+                         " session is not interactive, aborting",
+                         hostkey, fp);
+
+            OPENSSL_free(der);
+            X509_free(cert);
+
+            return S3_DECLINED;
+        }
+
+        fprintf(stderr,
+                "The authenticity of host %s cannot be established.\n"
+                "Certificate fingerprint: %s\n"
+                "Do you want to add this certificate to %s (yes/no)? ",
+                hostkey, fp, S3_CLI_KH_LABEL);
+        fflush(stderr);
+
+        {
+            char answer[16];
+
+            if (fgets(answer, sizeof(answer), stdin) == NULL) {
+                answer[0] = '\0';
+            }
+
+            answer[strcspn(answer, "\r\n")] = '\0';
+
+            if (strcmp(answer, "yes") != 0 && strcmp(answer, "y") != 0) {
+                fprintf(stderr, "Host key verification failed.\n");
+                OPENSSL_free(der);
+                X509_free(cert);
+                return S3_DECLINED;
+            }
+        }
+
+        if (s3_cli_kh_path(kh_path, sizeof(kh_path)) != S3_OK) {
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the home directory is not set, cannot pin");
+            OPENSSL_free(der);
+            X509_free(cert);
+            return S3_ERROR;
+        }
+
+        s3_cli_b64std(der, derlen, pin_b64);
+
+        {
+            char body[17408];
+
+            snprintf(body, sizeof(body), "%s x509-certificate %s", hostkey, pin_b64);
+
+            if (s3_cli_kh_append(kh_path, body) != S3_OK) {
+                s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the known_hosts append failed");
+                OPENSSL_free(der);
+                X509_free(cert);
+                return S3_ERROR;
+            }
+        }
+
+        fprintf(stderr, "Pinned %s (%s)\n", hostkey, fp);
+
+        OPENSSL_free(der);
+        X509_free(cert);
+
+        return S3_OK;
+
+    case S3_HOSTKEY_DECLINE:
+    default:
+
+        if (pin == S3_HOSTKEY_CHANGED) {
+
+            /* the MITM shape of the changed pin: the OpenSSH-style
+             * warning with the remediation (the canon 2.3 reject) */
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "WARNING: the certificate of %s does not match the pin in known_hosts"
+                         " (received %s): a machine-in-the-middle attack or a server change",
+                         hostkey, fp);
+
+            OPENSSL_free(der);
+            X509_free(cert);
+
+            return S3_ERROR;
+        }
+
+        if (sshfp_mismatch) {
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "the host key presented by %s does not match any of the SSHFP records"
+                         " published for it (RFC 4255): this can be a machine-in-the-middle"
+                         " attack, or a stale SSHFP record. If the change is legitimate, update"
+                         " the SSHFP records of the host, or connect again with"
+                         " -o StrictHostKeyChecking=no",
+                         hostkey);
+
+        } else if (s3_cli_opt_strict == S3_CLI_SHK_YES) {
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "the authenticity of %s cannot be established (certificate %s) and"
+                         " strict-host-key-checking=yes refuses an unpinned host",
+                         hostkey, fp);
+
+        } else {
+
+            s3_log_error(S3_LOG_ERR, &s3_cli_log, 0,
+                         "the authenticity of %s cannot be established (certificate %s): the"
+                         " certificate is not verifiable, refusing",
+                         hostkey, fp);
+        }
+
+        OPENSSL_free(der);
+        X509_free(cert);
+
+        return S3_DECLINED;
+    }
 }
 
 /* the main connection check: the destination host key against the
@@ -10275,6 +10910,11 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
         return S3_ERROR;
     }
 
+    /* the pinned anchors of the hop ride the hop store before the
+     * dial (canon 2.2, the main conn loads its own) */
+
+    s3_cli_load_pins(conf->ssl, hop->hostkey);
+
     conf->ctx = ctx;
     conf->handshake_timeout = timeout;
     /* the 24 h idle of the ssh2 canon (the wave 1d, the same window
@@ -10338,10 +10978,10 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
 
         if (!hop->hs && hop->cli->ssl != NULL && hop->cli->ssl->handshaked) {
 
-            /* the pin gate: the TLS layer rides SSL_VERIFY_NONE, the
-             * known_hosts hop pin is the only MITM barrier, and it
-             * closes before any credential goes out (the main conn
-             * checks at its own handshake the same way) */
+            /* the hostkey gate: the chain verdict, the SAN, the pins
+             * and the SSHFP policy of the hop ride the same machine
+             * as the main conn (the canon 2.2-2.5), and it closes
+             * before any credential goes out */
 
             if (s3_cli_cert_check_conn(hop->cli, hop->hostkey) != S3_OK) {
                 return S3_ERROR;
@@ -13964,8 +14604,9 @@ main(int argc, char **argv)
 
                 if (n + 1 >= argc || (s3_cli_streq_ci(argv[n + 1], "yes") != 0 &&
                                       s3_cli_streq_ci(argv[n + 1], "no") != 0 &&
+                                      s3_cli_streq_ci(argv[n + 1], "ask") != 0 &&
                                       s3_cli_streq_ci(argv[n + 1], "accept-new") != 0)) {
-                    fprintf(stderr, "ssh3: -strict-host-key-checking wants yes|no|accept-new\n");
+                    fprintf(stderr, "ssh3: -strict-host-key-checking wants ask|yes|no|accept-new\n");
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
@@ -15163,6 +15804,11 @@ main(int argc, char **argv)
         s3_cli_teardown();
         return S3_CLI_EXIT_ERROR;
     }
+
+    /* the pinned anchors ride the store before the dial (canon 2.2:
+     * the anchor of the chain is the pins union the system CAs) */
+
+    s3_cli_load_pins(s3_cli_conf.ssl, s3_cli_hostkey);
 
     /*
      * the ticket persistence of the 0-RTT stage 2: the cache line of
