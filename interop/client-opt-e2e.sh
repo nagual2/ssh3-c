@@ -67,12 +67,16 @@ cleanup() {
         SRVPID=
     fi
 
-    rm -rf "$WORK"
+    # the debug run keeps the artifacts: S3OPT_KEEP=1 with S3OPT_WORK
+    # pinning the tree (the leg failures inspect the .out and the
+    # pin store then)
+
+    [ -n "$S3OPT_KEEP" ] || rm -rf "$WORK"
 }
 
 trap cleanup EXIT INT TERM
 
-WORK=$(mktemp -d /tmp/s3opte2e.XXXXXX)
+WORK=${S3OPT_WORK:-$(mktemp -d /tmp/s3opte2e.XXXXXX)}
 
 # the identity: the PKCS8 ed25519 of the C client, the authorized
 # keys line built by hand (ssh-keygen reads no PKCS8 ed25519)
@@ -227,7 +231,7 @@ mkdir -p "$WORK/home-tofu"
 
 run_cli_pty home-tofu "printf S3-ACCEPT-NEW-OK"
 
-if grep -q "Pinned 127.0.0.1:$PORT/ssh3-term" "$WORK/home-tofu.out" &&
+if grep -q "pinned the first-use certificate of 127.0.0.1:$PORT/ssh3-term" "$WORK/home-tofu.out" &&
     grep -q "S3-ACCEPT-NEW-OK" "$WORK/home-tofu.out"; then
     pass "the TOFU question pinned and the exec rode through"
 
