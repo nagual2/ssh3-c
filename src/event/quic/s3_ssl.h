@@ -65,6 +65,20 @@ struct s3_ssl_s {
     char     ticket_path[1024];
     char     ticket_key[300];
     unsigned server_c; /* the peer speaks the ssh3-c retry contract */
+
+    /*
+     * the record-only verify verdict of the last handshake (the
+     * client role): the callback stores the first fatal x509 error
+     * and never aborts - the ssh3 layer enforces the verdict before
+     * any credential rides (CERT-VERIFICATION-CANON.md 2.2, the B17
+     * order)
+     */
+    long chain_err;
+
+    /* the verify callback ran at least once on this ssl: the server
+     * certificate arrived (the 0-RTT early window checks it before
+     * consulting the verdict) */
+    unsigned chain_seen;
 };
 
 void s3_ssl_ticket_load(s3_ssl_t *ssl);
@@ -80,10 +94,35 @@ void      s3_ssl_free(s3_ssl_t *ssl);
 
 /*
  * the client role context (TLS_client_method, no certificate); the
- * peer certificates are not verified yet (the QUIC-go interop probe
- * uses a self-signed certificate)
+ * chain is verified against the system store and the pinned anchors
+ * on every handshake, the verdict rides s3_ssl_chain_err() - the
+ * ssh3 layer enforces it (CERT-VERIFICATION-CANON.md 2.2)
  */
 s3_ssl_t *s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn);
+
+/*
+ * adds a pinned leaf certificate (raw DER) as a trust anchor of the
+ * client store: d2i_X509 + X509_STORE_add_cert into
+ * SSL_CTX_get_cert_store().  A duplicate DER is a no-op success
+ * (X509_R_CERT_ALREADY_IN_HASH_TABLE).  The first call sets
+ * X509_V_FLAG_PARTIAL_CHAIN on the ctx verify param - the Go anchor
+ * semantics (any pinned cert anchors, not only self-signed roots).
+ * Returns S3_OK / S3_ERROR.
+ */
+s3_int_t s3_ssl_client_add_pin(s3_ssl_t *ssl, const u_char *der, size_t len);
+
+/*
+ * the recorded first fatal x509 error of the last handshake on this
+ * ssl (X509_V_OK when the chain verified clean; X509_V_ERR_*
+ * constants otherwise)
+ */
+long s3_ssl_chain_err(s3_ssl_t *ssl);
+
+/*
+ * whether the verify callback ran (the server certificate arrived):
+ * the 0-RTT early window checks this before consulting the verdict
+ */
+unsigned s3_ssl_chain_seen(s3_ssl_t *ssl);
 
 /*
  * the NSS keylog file for the Wireshark/Tshark decoding of the TLS

@@ -2,6 +2,8 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+#include <openssl/x509v3.h>
+
 #include "s3_quic_tls_helper.h"
 
 /*
@@ -228,6 +230,14 @@ s3_test_env_done(s3_test_env_t *env)
         SSL_free(env->conn.ssl->connection);
         env->conn.ssl = NULL;
     }
+
+    /*
+     * the quic keys of the env: the next env_init wipes the whole
+     * struct, the ctx pointers must die here or they die unreferenced
+     * (the asan run of the verify cases rides one static env)
+     */
+
+    s3_quic_keys_cleanup(&env->keys);
 
     if (env->pool != NULL) {
         s3_destroy_pool(env->pool);
@@ -459,6 +469,446 @@ test_transport_params_roundtrip(void)
     return s3_test_failures;
 }
 
+/*
+ * the x509 side of the verify tests: the raw DER feeds
+ * s3_ssl_client_add_pin(), the PEM drives the server side env; the
+ * minimal certs (subject only, no SAN) - the SAN check is the app
+ * layer business (the wave C), the chain verdict is what rides here
+ */
+
+#define S3_TEST_DER_LEN 2048
+
+static X509 *
+s3_test_x509_new(EVP_PKEY *pkey, const char *cn)
+{
+    X509      *x509;
+    X509_NAME *name;
+
+    x509 = X509_new();
+    if (x509 == NULL) {
+        return NULL;
+    }
+
+    X509_set_version(x509, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x509), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x509), 31536000);
+    X509_set_pubkey(x509, pkey);
+
+    name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)cn, -1, -1, 0);
+
+    return x509;
+}
+
+static int
+s3_test_x509_sign(X509 *x509, X509_NAME *issuer, EVP_PKEY *key, int ca)
+{
+    X509_EXTENSION *bc;
+
+    /* the basic constraints make the issuer a purpose ca; the leaves
+     * ride without them, like s3_test_tls_gen_cert() does */
+
+    if (ca) {
+        bc = X509V3_EXT_nconf_nid(NULL, NULL, NID_basic_constraints, "critical,CA:TRUE");
+        if (bc == NULL || X509_add_ext(x509, bc, -1) != 1) {
+            X509_EXTENSION_free(bc);
+            return -1;
+        }
+
+        X509_EXTENSION_free(bc);
+    }
+
+    X509_set_issuer_name(x509, issuer);
+
+    if (X509_sign(x509, key, EVP_sha256()) == 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* the self-signed leaf, no extensions (the case 1 and 2 server) */
+
+static int
+s3_test_gen_selfsigned(X509 **out, EVP_PKEY **out_key)
+{
+    X509     *x509;
+    EVP_PKEY *pkey;
+
+    pkey = EVP_EC_gen("P-256");
+    if (pkey == NULL) {
+        return -1;
+    }
+
+    x509 = s3_test_x509_new(pkey, "s3-test");
+    if (x509 == NULL) {
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    if (s3_test_x509_sign(x509, X509_get_subject_name(x509), pkey, 0) != 0) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    *out = x509;
+    *out_key = pkey;
+
+    return 0;
+}
+
+/* the self-signed ca with the basic constraints (the case 3 issuer) */
+
+static int
+s3_test_gen_ca(X509 **out, EVP_PKEY **out_key)
+{
+    X509     *x509;
+    EVP_PKEY *pkey;
+
+    pkey = EVP_EC_gen("P-256");
+    if (pkey == NULL) {
+        return -1;
+    }
+
+    x509 = s3_test_x509_new(pkey, "s3-test-ca");
+    if (x509 == NULL) {
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    if (s3_test_x509_sign(x509, X509_get_subject_name(x509), pkey, 1) != 0) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    *out = x509;
+    *out_key = pkey;
+
+    return 0;
+}
+
+/* the leaf issued by the ca; the leaf key rides out for the server */
+
+static int
+s3_test_gen_leaf(X509 *ca, EVP_PKEY *ca_key, X509 **out, EVP_PKEY **out_key)
+{
+    X509     *x509;
+    EVP_PKEY *pkey;
+
+    pkey = EVP_EC_gen("P-256");
+    if (pkey == NULL) {
+        return -1;
+    }
+
+    x509 = s3_test_x509_new(pkey, "s3-test-leaf");
+    if (x509 == NULL) {
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    if (s3_test_x509_sign(x509, X509_get_subject_name(ca), ca_key, 0) != 0) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    *out = x509;
+    *out_key = pkey;
+
+    return 0;
+}
+
+static int
+s3_test_x509_pem(X509 *x509, u_char *out, size_t *out_len)
+{
+    BIO *bio;
+    long n;
+
+    bio = BIO_new(BIO_s_mem());
+    if (bio == NULL || PEM_write_bio_X509(bio, x509) != 1) {
+        BIO_free(bio);
+        return -1;
+    }
+
+    n = BIO_get_mem_data(bio, NULL);
+    if (n <= 0) {
+        BIO_free(bio);
+        return -1;
+    }
+
+    *out_len = (size_t)n;
+    (void)BIO_read(bio, out, (int)*out_len);
+    BIO_free(bio);
+
+    return 0;
+}
+
+static int
+s3_test_key_pem(EVP_PKEY *pkey, u_char *out, size_t *out_len)
+{
+    BIO *bio;
+    long n;
+
+    bio = BIO_new(BIO_s_mem());
+    if (bio == NULL || PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL) != 1) {
+        BIO_free(bio);
+        return -1;
+    }
+
+    n = BIO_get_mem_data(bio, NULL);
+    if (n <= 0) {
+        BIO_free(bio);
+        return -1;
+    }
+
+    *out_len = (size_t)n;
+    (void)BIO_read(bio, out, (int)*out_len);
+    BIO_free(bio);
+
+    return 0;
+}
+
+static int
+s3_test_x509_der(X509 *x509, u_char *out, size_t *out_len)
+{
+    u_char *p;
+    int     n;
+
+    p = out;
+    n = i2d_X509(x509, &p);
+
+    if (n <= 0 || (size_t)n > S3_TEST_DER_LEN) {
+        return -1;
+    }
+
+    *out_len = (size_t)n;
+
+    return 0;
+}
+
+/*
+ * the lockstep of the verify tests: the client ssl rides the real s3
+ * client conf (SSL_new from its ctx, the app data carries the conf
+ * back - as s3_quic_client_init_connection does), the pump drives
+ * both sides as the base handshake test does; S3_OK when the
+ * handshake completed on both ends
+ */
+static int
+s3_test_verify_handshake(s3_test_env_t *env, s3_ssl_t *conf)
+{
+    u_char tp[64];
+    size_t tp_len, n;
+    int    i, rc, srv_done = 0, cli_done = 0;
+
+    s3_memzero(&env->cli, sizeof(s3_test_tls_side_t));
+    s3_memzero(env->cli_off, sizeof(env->cli_off));
+
+    env->cli.name = "client";
+
+    env->client = SSL_new(conf->ctx);
+    if (env->client == NULL) {
+        return S3_ERROR;
+    }
+
+    /* the app data carries the conf: the verify cb reaches it there */
+
+    SSL_set_app_data(env->client, conf);
+
+    if (SSL_set_quic_tls_cbs(env->client, s3_test_tls_dis, &env->cli) != 1) {
+        return S3_ERROR;
+    }
+
+    tp_len = s3_test_client_tp(tp, s3_test_cid, sizeof(s3_test_cid));
+
+    if (SSL_set_quic_tls_transport_params(env->client, tp, tp_len) != 1) {
+        return S3_ERROR;
+    }
+
+    if (conf->alpn.len > 0 &&
+        SSL_set_alpn_protos(env->client, conf->alpn.data, (unsigned int)conf->alpn.len) != 0) {
+        return S3_ERROR;
+    }
+
+    SSL_set_connect_state(env->client);
+
+    for (i = 0; i < 32 && !(srv_done && cli_done); i++) {
+
+        if (!cli_done) {
+            n = SSL_do_handshake(env->client);
+
+            if (n == 1) {
+                cli_done = 1;
+
+            } else {
+                rc = SSL_get_error(env->client, (int)n);
+                S3_ASSERT(rc == SSL_ERROR_WANT_READ);
+            }
+        }
+
+        for (n = 0; n < S3_TEST_TLS_LEVELS; n++) {
+
+            if (env->cli.out_len[n] > env->cli_off[n]) {
+                S3_ASSERT(s3_test_feed_crypto(
+                              &env->conn, (s3_uint_t)n, env->cli.out[n] + env->cli_off[n],
+                              env->cli.out_len[n] - env->cli_off[n], &env->cli_off[n]) == S3_OK);
+            }
+        }
+
+        s3_test_drain_crypto(&env->conn, &env->cli);
+
+        if (env->conn.ssl->handshaked) {
+            srv_done = 1;
+        }
+    }
+
+    return (srv_done && cli_done) ? S3_OK : S3_ERROR;
+}
+
+static int
+test_client_verify(void)
+{
+    u_char    pem[4096], pem_key[4096], der[S3_TEST_DER_LEN], ca_der[S3_TEST_DER_LEN];
+    size_t    pem_len = 0, pem_key_len = 0, der_len = 0, ca_der_len = 0;
+    s3_str_t  alpn;
+    s3_ssl_t *conf;
+    X509     *self_x = NULL, *ca_x = NULL, *leaf_x = NULL;
+    EVP_PKEY *self_k = NULL, *ca_k = NULL, *leaf_k = NULL;
+
+    static s3_test_env_t env;
+
+    s3_test_tls_log_init();
+
+    alpn.data = (u_char *)s3_test_alpn;
+    alpn.len = S3_TEST_ALPN_LEN;
+
+    S3_ASSERT(s3_test_gen_selfsigned(&self_x, &self_k) == 0);
+    S3_ASSERT(s3_test_x509_pem(self_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(self_k, pem_key, &pem_key_len) == 0);
+    S3_ASSERT(s3_test_x509_der(self_x, der, &der_len) == 0);
+
+    /*
+     * case 1: the self-signed leaf, no pins - the handshake lives
+     * (the verdict is record-only), the callback saw the certificate
+     * and recorded the depth-zero self-signed error
+     */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(conf != NULL);
+
+    /* the fresh conf starts clean */
+
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_OK);
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 0);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, conf) == S3_OK);
+
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 1);
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(conf);
+
+    /*
+     * case 2: the same leaf pinned before the handshake - the pin is
+     * the anchor (the partial chain), the verdict is clean
+     */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(conf != NULL);
+    S3_ASSERT(s3_ssl_client_add_pin(conf, der, der_len) == S3_OK);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, conf) == S3_OK);
+
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 1);
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_OK);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(conf);
+
+    /*
+     * case 5: the duplicate pin is a no-op success - the second call
+     * of the same DER rides the already-in-hash-table reason and the
+     * handshake stays clean
+     */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(conf != NULL);
+    S3_ASSERT(s3_ssl_client_add_pin(conf, der, der_len) == S3_OK);
+    S3_ASSERT(s3_ssl_client_add_pin(conf, der, der_len) == S3_OK);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, conf) == S3_OK);
+
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 1);
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_OK);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(conf);
+
+    /* the ca-signed leaf of the case 3 and 4, the ca DER for the pin */
+
+    S3_ASSERT(s3_test_gen_ca(&ca_x, &ca_k) == 0);
+    S3_ASSERT(s3_test_gen_leaf(ca_x, ca_k, &leaf_x, &leaf_k) == 0);
+    S3_ASSERT(s3_test_x509_pem(leaf_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(leaf_k, pem_key, &pem_key_len) == 0);
+    S3_ASSERT(s3_test_x509_der(ca_x, ca_der, &ca_der_len) == 0);
+
+    /*
+     * case 4: the ca-signed leaf without the ca anchor - the verdict
+     * is the missing local issuer, the handshake still lives
+     * (record-only)
+     */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(conf != NULL);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, conf) == S3_OK);
+
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 1);
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(conf);
+
+    /*
+     * case 3: the same leaf, the ca added by the pin - any added cert
+     * anchors (the Go anchor semantics), the verdict is clean
+     */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(conf != NULL);
+    S3_ASSERT(s3_ssl_client_add_pin(conf, ca_der, ca_der_len) == S3_OK);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, conf) == S3_OK);
+
+    S3_ASSERT(s3_ssl_chain_seen(conf) == 1);
+    S3_ASSERT(s3_ssl_chain_err(conf) == X509_V_OK);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(conf);
+
+    X509_free(self_x);
+    EVP_PKEY_free(self_k);
+    X509_free(ca_x);
+    EVP_PKEY_free(ca_k);
+    X509_free(leaf_x);
+    EVP_PKEY_free(leaf_k);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_ssl(void)
 {
@@ -468,6 +918,7 @@ s3_test_quic_ssl(void)
     test_ssl_create();
     test_quic_tls_handshake();
     test_transport_params_roundtrip();
+    test_client_verify();
 
     /* release the one-time openssl allocations for the leak check */
     OPENSSL_cleanup();

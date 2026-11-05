@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@
 
 static int s3_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                                  const unsigned char *in, unsigned int inlen, void *arg);
+static int s3_ssl_client_verify_cb(int ok, X509_STORE_CTX *sctx);
 
 /*
  * the interop probe: TLS secrets on stderr in the NSS keylog format,
@@ -550,10 +552,45 @@ s3_ssl_client_new_session_cb(SSL *ssl, SSL_SESSION *session)
     return 1;
 }
 
+/*
+ * the record-only verify of the client ctx: the chain is checked
+ * against the system store and the pinned anchors on every handshake,
+ * the first fatal x509 error rides the conf and the handshake never
+ * aborts here - the ssh3 layer enforces the verdict before any
+ * credential rides (CERT-VERIFICATION-CANON.md 2.2, the B17 order)
+ */
+static int
+s3_ssl_client_verify_cb(int ok, X509_STORE_CTX *sctx)
+{
+    /* reach the s3_ssl_t: X509_STORE_CTX -> SSL (ex-data idx) ->
+     * app_data (s3_quic_client_init_connection stores the s3_ssl_t
+     * there) */
+
+    SSL      *ssl_conn;
+    s3_ssl_t *s;
+
+    ssl_conn = X509_STORE_CTX_get_ex_data(sctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+
+    s = ssl_conn != NULL ? SSL_get_app_data(ssl_conn) : NULL;
+
+    if (s != NULL) {
+        s->chain_seen = 1;
+
+        if (!ok && s->chain_err == X509_V_OK) {
+            s->chain_err = X509_STORE_CTX_get_error(sctx);
+        }
+    }
+
+    /* the verdict rides the ssh3 layer, the handshake stays alive */
+
+    return 1;
+}
+
 s3_ssl_t *
 s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
 {
-    s3_ssl_t *ssl;
+    X509_VERIFY_PARAM *param;
+    s3_ssl_t          *ssl;
 
     ssl = s3_alloc(sizeof(s3_ssl_t), log);
     if (ssl == NULL) {
@@ -563,6 +600,9 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
     s3_memzero(ssl, sizeof(s3_ssl_t));
 
     ssl->log = log;
+
+    ssl->chain_err = X509_V_OK;
+    ssl->chain_seen = 0;
 
     if (alpn != NULL && alpn->len > 0) {
         ssl->alpn.data = s3_alloc(alpn->len, log);
@@ -585,10 +625,43 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
     SSL_CTX_set_min_proto_version(ssl->ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ssl->ctx, TLS1_3_VERSION);
 
-    /* the interop probe accepts any peer certificate for now */
-    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_NONE, NULL);
+    /*
+     * the system trust store rides the anchors of every handshake
+     * (canon 2.2: the pins of the target sit on top of it); the call
+     * honors SSL_CERT_FILE/SSL_CERT_DIR.  the bundled win build ships
+     * no default cert dir - a failure here degrades the anchors to
+     * the pins only, the verdict enforcement stays with the ssh3
+     * layer
+     */
 
-    SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
+    if (SSL_CTX_set_default_verify_paths(ssl->ctx) != 1) {
+        ERR_clear_error();
+    }
+
+    /*
+     * any pinned certificate is a trust anchor on its own (the Go
+     * anchor semantics): not only the self-signed roots
+     */
+
+    param = SSL_CTX_get0_param(ssl->ctx);
+    X509_VERIFY_PARAM_set_flags(param, X509_V_FLAG_PARTIAL_CHAIN);
+
+    /*
+     * the chain is verified against the system store and the pinned
+     * anchors on every handshake; the callback records the first
+     * fatal error and never aborts - the ssh3 layer enforces the
+     * verdict before any credential rides (CERT-VERIFICATION-CANON.md
+     * 2.2, the B17 order)
+     */
+
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, s3_ssl_client_verify_cb);
+
+    /* the release client carries no keylog callback (canon 3.3); the
+     * env hook is the debug build's switch */
+
+    if (getenv("S3_KEYLOG") != NULL) {
+        SSL_CTX_set_keylog_callback(ssl->ctx, s3_ssl_keylog_cb);
+    }
 
     /* the client keeps no internal session cache: the tickets land in
      * the new-session callback (the store of s3_ssl_t) */
@@ -598,6 +671,91 @@ s3_ssl_client_create(s3_log_t *log, const s3_str_t *alpn)
     SSL_CTX_sess_set_new_cb(ssl->ctx, s3_ssl_client_new_session_cb);
 
     return ssl;
+}
+
+/*
+ * the pin of the target (canon 2.2): the raw DER of the leaf
+ * certificate rides the client store next to the system CAs
+ */
+s3_int_t
+s3_ssl_client_add_pin(s3_ssl_t *ssl, const u_char *der, size_t len)
+{
+    const u_char *p;
+    X509         *x509;
+    X509_STORE   *store;
+
+    if (ssl == NULL || ssl->ctx == NULL || der == NULL || len == 0) {
+        return S3_ERROR;
+    }
+
+    /* d2i advances the pointer, the caller's der stays untouched */
+
+    p = der;
+
+    x509 = d2i_X509(NULL, &p, (long)len);
+    if (x509 == NULL) {
+        s3_ssl_error(ssl->log, 0, "d2i_X509() failed");
+        return S3_ERROR;
+    }
+
+    store = SSL_CTX_get_cert_store(ssl->ctx);
+    if (store == NULL) {
+        s3_ssl_error(ssl->log, 0, "SSL_CTX_get_cert_store() failed");
+        X509_free(x509);
+        return S3_ERROR;
+    }
+
+    /* any pinned cert anchors on its own (the Go anchor semantics) */
+
+    X509_VERIFY_PARAM_set_flags(SSL_CTX_get0_param(ssl->ctx), X509_V_FLAG_PARTIAL_CHAIN);
+
+    if (X509_STORE_add_cert(store, x509) != 1) {
+
+        /* the duplicate of an already added pin is a no-op success */
+
+        if (ERR_GET_REASON(ERR_peek_error()) == X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+            ERR_clear_error();
+            X509_free(x509);
+            return S3_OK;
+        }
+
+        s3_ssl_error(ssl->log, 0, "X509_STORE_add_cert() failed");
+        X509_free(x509);
+        return S3_ERROR;
+    }
+
+    X509_free(x509);
+
+    return S3_OK;
+}
+
+/*
+ * the verdict of the last handshake on this ssl: X509_V_OK when the
+ * chain verified clean, the first fatal X509_V_ERR_* otherwise - the
+ * ssh3 layer reads it before any credential rides (the B17 order)
+ */
+long
+s3_ssl_chain_err(s3_ssl_t *ssl)
+{
+    if (ssl == NULL) {
+        return X509_V_ERR_UNSPECIFIED;
+    }
+
+    return ssl->chain_err;
+}
+
+/*
+ * whether the verify callback ran on this ssl (the server certificate
+ * arrived): the 0-RTT early window checks it before the verdict
+ */
+unsigned
+s3_ssl_chain_seen(s3_ssl_t *ssl)
+{
+    if (ssl == NULL) {
+        return 0;
+    }
+
+    return ssl->chain_seen;
 }
 
 s3_int_t
