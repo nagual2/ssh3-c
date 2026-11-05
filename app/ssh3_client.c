@@ -5200,7 +5200,7 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
                              " of %s (%s)",
                              hostkey, fp);
             } else {
-                fprintf(stderr, "accept-new: pinned the first-use certificate of %s (SHA256:%s)\n",
+                fprintf(stderr, "accept-new: pinned the first-use certificate of %s (%s)\n",
                         hostkey, fp);
             }
         }
@@ -5406,6 +5406,15 @@ s3_cli_chan_park(const u_char *buf, size_t len)
 static void
 s3_cli_outbox_flush(void)
 {
+    /* no session channel yet: the parked input rides when the 200
+     * opens the channel (the outbox is the parking lot, the early
+     * stdin bytes of a pty run - a typed-ahead line or the answer a
+     * policy consumed differently - must not finalize the run) */
+
+    if (s3_cli_chan == NULL) {
+        return;
+    }
+
     while (s3_cli_outbox_sent < s3_cli_outbox_len) {
 
         ssize_t m = s3_quic_stream_send(s3_cli_chan, s3_cli_outbox + s3_cli_outbox_sent,

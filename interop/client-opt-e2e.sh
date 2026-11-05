@@ -343,7 +343,7 @@ else
     RC=$?
 
     if [ "$RC" -eq 255 ] &&
-        grep -q "strict-host-key-checking wants yes|no|accept-new" "$WORK/leg10.err"; then
+        grep -q "strict-host-key-checking wants ask|yes|no|accept-new" "$WORK/leg10.err"; then
         pass "the bare flag refused 255 with the value hint"
     else
         fail "the bare flag leg: rc=$RC $(tail -1 "$WORK/leg10.err")"
