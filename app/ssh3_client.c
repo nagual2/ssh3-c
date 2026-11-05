@@ -112,6 +112,8 @@ typedef unsigned short u_short;
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <s3_core.h>
 #include <s3_h3.h>
@@ -1159,6 +1161,8 @@ static size_t    s3_cli_h3_section(u_char *p);
 static s3_int_t  s3_cli_tofu_prepare(void);
 static s3_int_t  s3_cli_cert_check(void);
 static s3_int_t  s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey);
+static s3_int_t  s3_cli_shk_parse(const char *val);
+static s3_int_t  s3_cli_sshfp_parse(const char *val);
 static s3_int_t  s3_cli_opt_parse(const char *arg);
 static u_char   *s3_cli_session_request(u_char *p, s3_ssh3_request_kind_t kind, unsigned want_reply,
                                         const s3_ssh3_request_t *body);
@@ -3066,7 +3070,7 @@ s3_cli_early_init(s3_connection_t *c)
      * handshake block (the B17 order)
      */
 
-    if (s3_ssl_chain_seen(c->ssl) &&
+    if (s3_ssl_chain_seen(SSL_get_app_data(c->ssl->connection)) &&
         SSL_get1_peer_certificate(c->ssl->connection) != NULL &&
         s3_cli_cert_check_conn(c, s3_cli_hostkey) != S3_OK) {
         return S3_ERROR;
@@ -5057,7 +5061,7 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
      * when the chain reached a system CA or a pinned anchor, the
      * first fatal X509_V_ERR_* otherwise */
 
-    chain_err = s3_ssl_chain_err(conn->ssl);
+    chain_err = s3_ssl_chain_err(SSL_get_app_data(conn->ssl->connection));
 
     self_signed = X509_self_signed(cert, 1) == 1;
     san_ok = s3_cli_san_ok(cert, hostkey);
