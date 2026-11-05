@@ -17,7 +17,7 @@
 
 set -u
 
-BIN=~/git/ssh3-c/build/linux-release/s3interop_server
+BIN=~/git/ssh3-c/build/linux-release/ssh3-server
 BUILD=~/git/ssh3-c/build/linux-release
 
 # the optional pin of the tree (the debug run): S3OPT_WORK + S3OPT_KEEP
