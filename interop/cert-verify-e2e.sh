@@ -222,7 +222,7 @@ import socket
 import sys
 
 fp = bytes.fromhex("$fp_hex")
-rdata = bytes([3, 2]) + fp  # the ECDSA leaf, the sha256 digest
+rdata = bytes([int(sys.argv[2]), 2]) + fp  # the leaf algorithm, the sha256 digest
 rr = bytes([0xc0, 0x0c]) + (44).to_bytes(2, "big") + (1).to_bytes(2, "big")
 rr += (60).to_bytes(4, "big") + len(rdata).to_bytes(2, "big") + rdata
 
@@ -367,7 +367,7 @@ start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" self || die "the daemon start f
 
 mkdir -p "$WORK/home-acc"
 
-if timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+if env HOME="$WORK/home-acc" timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-acc.out" 2>&1; then
 
@@ -385,7 +385,7 @@ echo "== leg 4: the self-signed first contact refuses on a pipe with the default
 
 mkdir -p "$WORK/home-ask"
 
-if timeout 30 "$BUILD/ssh3" -i "$WORK/priv.pem" \
+if env HOME="$WORK/home-ask" timeout 30 "$BUILD/ssh3" -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ask.out" 2>&1; then
     fail "the ask leg: the pipe session connected"
@@ -413,7 +413,7 @@ FP_REAL=$(openssl x509 -in "$WORK/scert-s.pem" -outform DER | sha256sum | cut -d
 FP_FAKE=0000000000000000000000000000000000000000000000000000000000000000
 
 mkdir -p "$WORK/home-fp"
-start_dns "$FP_FAKE" || die "the dns stub start failed"
+start_dns "$FP_FAKE" 1 || die "the dns stub start failed"
 
 if env HOME="$WORK/home-fp" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=accept-new \
@@ -434,7 +434,7 @@ stop_dns
 echo "== leg 6: the SSHFP verified record rides the accept-new pin (SSHFP-VERIFIED-OK)"
 
 mkdir -p "$WORK/home-fpv"
-start_dns "$FP_REAL" || die "the dns stub start failed"
+start_dns "$FP_REAL" 1 || die "the dns stub start failed"
 
 if env HOME="$WORK/home-fpv" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=accept-new \
@@ -456,7 +456,7 @@ stop_dns
 echo "== leg 6b: the sshfp mismatch softens under strict-host-key-checking=no (SSHFP-NO-SOFTEN)"
 
 mkdir -p "$WORK/home-fpn"
-start_dns "$FP_FAKE" || die "the dns stub start failed"
+start_dns "$FP_FAKE" 1 || die "the dns stub start failed"
 
 if env HOME="$WORK/home-fpn" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=no \
@@ -473,7 +473,7 @@ echo "== leg 7: the release client carries no keylog without S3_KEYLOG (KEYLOG-G
 
 mkdir -p "$WORK/home-kl"
 
-timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+env HOME="$WORK/home-kl" timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-kl.out" 2>&1
 
@@ -483,7 +483,7 @@ else
     pass "no keylog lines without S3_KEYLOG"
 fi
 
-timeout 30 env S3_KEYLOG=1 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+env HOME="$WORK/home-kl" S3_KEYLOG=1 timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-kl2.out" 2>&1
 

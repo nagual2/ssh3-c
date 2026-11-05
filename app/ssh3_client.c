@@ -15982,24 +15982,23 @@ main(int argc, char **argv)
             /*
              * the early flight rode the ticket PSK: when the session
              * did not resume (the daemon restarted, its ticket keys
-             * are gone), the server silently ignores the early CONNECT
-             * and no :status ever answers - the flight retires the
-             * same way the 425 retry does, the CONNECT re-rides
-             * post-handshake with the credentials (a resumed session
-             * never lands here: the server answers the flight with the
-             * 200 or the 425 of the replay window, the one-shot retry
-             * stays armed for it)
+             * are gone), the server silently ignores the whole flight
+             * and no :status ever answers - the CONNECT re-rides THE
+             * SAME stream (the server side of it sits open and empty,
+             * a fresh bidi would land in the channel dispatch), now
+             * with the credentials (a resumed session never lands
+             * here: the server answers the flight with the 200 or the
+             * 425 of the replay window)
              */
 
-            if (s3_cli_early_done && !s3_cli_retry_used && !s3_cli_status_seen &&
-                s3_cli_ctrl != NULL && SSL_session_reused(cli->ssl->connection) == 0) {
+            if (s3_cli_early_done && !s3_cli_status_seen && s3_cli_ctrl != NULL &&
+                s3_cli_req_sent && SSL_session_reused(cli->ssl->connection) == 0) {
 
-                s3_cli_retry_wait = 1;
-                s3_cli_retry_used = 1;
                 s3_cli_req_sent = 0;
-                s3_cli_status_seen = 1; /* the old-stream events stay muted */
-                s3_cli_ctrl_dead = s3_cli_ctrl;
-                s3_cli_ctrl = NULL;
+                s3_cli_status = 0;
+                s3_cli_resp_len = 0;
+
+                memset(&s3_cli_h3parse, 0, sizeof(s3_cli_h3parse));
             }
 
             if ((s3_cli_auth == S3_CLI_AUTH_PUBKEY || s3_cli_auth == S3_CLI_AUTH_AGENT) &&
