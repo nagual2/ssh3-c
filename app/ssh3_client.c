@@ -13740,9 +13740,12 @@ s3_cli_console_init(void)
     InitializeCriticalSection(&s3_cli_ring_cs);
 
     /* the -n run: the stdin stays unpumped (the EOF semantics of
-     * /dev/null), no reader thread rides */
+     * /dev/null), no reader thread rides; the exec run forwards no
+     * stdin either (the fin closes the write side at the open), the
+     * console bytes racing the fin would ride garbage into the
+     * session channel */
 
-    if (s3_cli_no_stdin) {
+    if (s3_cli_no_stdin || s3_cli_cmd != NULL) {
         DeleteCriticalSection(&s3_cli_ring_cs);
         return S3_OK;
     }
@@ -13771,9 +13774,11 @@ s3_cli_console_init(void)
 
     /* the stdin rides the event loop: the handler chunks the bytes
      * into the channel frames directly (the ring of the win build
-     * exists because the console read is not selectable there) */
+     * exists because the console read is not selectable there); the
+     * exec run forwards no stdin (the fin closes the write side at
+     * the open), the pump stays unarmed */
 
-    if (s3_cli_no_stdin) {
+    if (s3_cli_no_stdin || s3_cli_cmd != NULL) {
         return S3_OK;
     }
 
