@@ -5409,9 +5409,10 @@ s3_cli_outbox_flush(void)
     /* no session channel yet: the parked input rides when the 200
      * opens the channel (the outbox is the parking lot, the early
      * stdin bytes of a pty run - a typed-ahead line or the answer a
-     * policy consumed differently - must not finalize the run) */
+     * policy consumed differently - must not finalize the run); the
+     * fin of the exec shape closed the write side, nothing rides */
 
-    if (s3_cli_chan == NULL) {
+    if (s3_cli_chan == NULL || s3_cli_fin_sent) {
         return;
     }
 
