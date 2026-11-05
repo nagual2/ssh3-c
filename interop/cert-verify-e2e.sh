@@ -127,6 +127,7 @@ selfcert s
 start_srv() {
 
     local cert=$1
+    local key=$2
 
     SRVLOG="$WORK/srv.log"
 
@@ -136,7 +137,7 @@ start_srv() {
     while [ "$i" -lt 8 ]; do
 
         setsid nohup env SSH3C_PROTO=1 "$BIN" -3 -l "127.0.0.1:$p" -c "$cert" \
-            -k "$WORK/priv.pem" -K "$WORK/authorized_keys" > "$SRVLOG" 2>&1 < /dev/null &
+            -k "$key" -K "$WORK/authorized_keys" > "$SRVLOG" 2>&1 < /dev/null &
         SRVPID=$!
 
         local j=0
@@ -189,13 +190,14 @@ run_cli() {
 }
 
 # the kh pin text of a certificate: key + x509-certificate + base64 DER
+# (the cert argument rides the path as given)
 
 pin_line() {
 
     local cert=$1
 
     printf '127.0.0.1:%s/ssh3-term x509-certificate %s' \
-        "$SRVPORT" "$(openssl x509 -in "$WORK/$cert" -outform DER | base64 -w0)"
+        "$SRVPORT" "$(openssl x509 -in "$cert" -outform DER | base64 -w0)"
 }
 
 # --- the SSHFP stub resolver -------------------------------------------------
@@ -275,7 +277,7 @@ stop_dns() {
 
 echo "== leg 1: the CA-anchored first contact accepts without a pin (CA-FIRST-CONTACT)"
 
-start_srv "$WORK/a.pem" || die "the daemon start failed"
+start_srv "$WORK/a.pem" "$WORK/a.key" || die "the daemon start failed"
 
 mkdir -p "$WORK/home-ca"
 
@@ -319,7 +321,7 @@ else
 fi
 
 stop_srv
-start_srv "$WORK/b.pem" || die "the daemon restart failed"
+start_srv "$WORK/b.pem" "$WORK/b.key" || die "the daemon restart failed"
 
 if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
     -o strict-host-key-checking=yes -i "$WORK/priv.pem" \
@@ -361,7 +363,7 @@ stop_srv
 
 echo "== leg 3: the self-signed first contact auto-pins on accept-new (SELF-ACCEPT-NEW)"
 
-start_srv "$WORK/scert-s.pem" || die "the daemon start failed"
+start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" || die "the daemon start failed"
 
 mkdir -p "$WORK/home-acc"
 
@@ -406,7 +408,7 @@ stop_srv
 
 echo "== leg 5: the SSHFP mismatch refuses (SSHFP-MISMATCH-REJECT)"
 
-start_srv "$WORK/scert-s.pem" || die "the daemon start failed"
+start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" || die "the daemon start failed"
 
 FP_REAL=$(openssl x509 -in "$WORK/scert-s.pem" -outform DER | sha256sum | cut -d' ' -f1)
 FP_FAKE=0000000000000000000000000000000000000000000000000000000000000000
