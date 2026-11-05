@@ -5177,9 +5177,11 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
                 }
             }
 
-            s3_log_error(S3_LOG_INFO, &s3_cli_log, 0,
-                         "certificate rotated, chain valid: re-pinned %s (received %s)",
-                         hostkey, fp);
+            /* the rotation is a security-relevant event, the plain
+             * stderr line keeps it visible on the quiet run (the
+             * s3 log rides the verbose level) */
+
+            fprintf(stderr, "certificate rotated, chain valid: re-pinned %s (%s)\n", hostkey, fp);
 
         } else {
 

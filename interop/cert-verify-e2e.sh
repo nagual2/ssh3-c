@@ -239,7 +239,7 @@ while True:
     s.sendto(an + q[12:] + rr, peer)
 PYEOF
 
-    setsid nohup python3 "$WORK/dns_stub.py" "$DNSPORT" > "$WORK/dns.log" 2>&1 < /dev/null &
+    setsid nohup python3 "$WORK/dns_stub.py" "$DNSPORT" "$algo" > "$WORK/dns.log" 2>&1 < /dev/null &
     DNSPID=$!
 
     local j=0
