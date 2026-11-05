@@ -411,6 +411,18 @@ s3_ssh3_auth_password_file_check(const char *path, const s3_str_t *user, const s
                     n = (size_t)(line_end - colon) - 1;
 
                     /*
+                     * the PermitEmptyPasswords=no analog: a line with an
+                     * empty password is a deployment mistake, it never
+                     * authenticates (the empty Basic credential rides
+                     * the same decline)
+                     */
+
+                    if (n == 0) {
+                        rc = S3_DECLINED;
+                        break;
+                    }
+
+                    /*
                      * the password is a secret: the compare is the
                      * constant-time one (the length check in front of
                      * it leaks nothing but the length)
@@ -505,6 +517,17 @@ s3_ssh3_auth_password_hash_check(const s3_str_t *pass, const char *hash)
      */
 
     if (pass->data == NULL || pass->len == 0 || pass->len >= sizeof(key)) {
+        return S3_DECLINED;
+    }
+
+    /*
+     * the SSHole hardening (the OpenSSH 10.6p2 alignment): a password
+     * above the 256-byte boundary never reaches the crypt — the long
+     * key shapes of the musl crypt are the reported bypass primitive,
+     * and no honest credential rides that far
+     */
+
+    if (pass->len > 256) {
         return S3_DECLINED;
     }
 

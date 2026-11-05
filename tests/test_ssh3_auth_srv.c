@@ -219,6 +219,13 @@ s3_test_password_file(void)
 
     (void)s3_test_expect_pwfile("", "tester", "secret123", S3_DECLINED);
 
+    /* the PermitEmptyPasswords=no analog: a line with an empty stored
+     * password never authenticates — neither with the empty credential
+     * (the pre-fix shape) nor with any other */
+
+    (void)s3_test_expect_pwfile("tester:\n", "tester", "", S3_DECLINED);
+    (void)s3_test_expect_pwfile("tester:\n", "tester", "anything", S3_DECLINED);
+
     return s3_test_failures;
 }
 
@@ -296,6 +303,20 @@ s3_test_password_hash_check(void)
         big[sizeof(big) - 1] = '\0';
 
         (void)s3_test_expect_hash(big, s3_test_hash_sha512, S3_DECLINED);
+    }
+
+    /* the SSHole hardening (the OpenSSH 10.6p2 alignment): the
+     * passwords above the 256-byte boundary refuse even against a
+     * valid hash — the musl crypt long-key shapes are the reported
+     * bypass primitive; the boundary itself still rides */
+
+    {
+        char longpw[300];
+
+        s3_memset(longpw, 'a', sizeof(longpw) - 1);
+        longpw[sizeof(longpw) - 1] = '\0';
+
+        (void)s3_test_expect_hash(longpw, s3_test_hash_sha512, S3_DECLINED);
     }
 
 #else
