@@ -65,6 +65,7 @@ fail() {
 S3BENCH=s3bench
 S3BENCH_PW=s3benchpw
 S3LESS=s3less
+S3GATE=s3gate
 WORK=$(mktemp -d /tmp/s3pwsystem.XXXXXX)
 SRVPID=""
 
@@ -75,6 +76,7 @@ cleanup() {
 
     sudo -n userdel -r "$S3BENCH" >/dev/null 2>&1
     sudo -n userdel -r "$S3LESS" >/dev/null 2>&1
+    sudo -n userdel -r "$S3GATE" >/dev/null 2>&1
     rm -rf "$WORK"
 }
 
@@ -228,6 +230,69 @@ else
     fail "no lockout one-liner in the server log"
 fi
 
+echo "== stage 1b: the SSHole regression (the OpenSSH 10.6p2 alignment)"
+
+# the fresh users (the stage-1 lockout must not touch the verdicts):
+# the gate user rides the honest password first (the success clears the
+# counter), then the over-boundary one; the passwordless user carries
+# the empty shadow field the musl systems ship on their default
+# installs
+
+sudo -n userdel -r "$S3GATE" >/dev/null 2>&1
+sudo -n userdel -r "$S3LESS" >/dev/null 2>&1
+sudo -n useradd -m -s /bin/sh "$S3GATE" || die "useradd $S3GATE failed"
+sudo -n useradd -m -s /bin/sh "$S3LESS" || die "useradd $S3LESS failed"
+sudo -n usermod -p "" "$S3LESS"
+
+P200=$(printf 'b%.0s' $(seq 1 200))
+P280=$(printf 'c%.0s' $(seq 1 280))
+printf '%s:%s\n' "$S3GATE" "$P200" | sudo -n chpasswd || die "chpasswd 200 failed"
+
+prod_pw() {
+    HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$1" \
+        "$2@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$3" 2>&1
+}
+
+if prod_pw "$S3GATE:$P200" "$S3GATE" "$WORK/leg1b-a.log"; then
+    pass "the 200-byte honest password rides"
+else
+    fail "the 200-byte honest password refused: $(tail -2 "$WORK/leg1b-a.log")"
+fi
+
+printf '%s:%s\n' "$S3GATE" "$P280" | sudo -n chpasswd || die "chpasswd 280 failed"
+
+if HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$S3GATE:$P280" \
+    "$S3GATE@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$WORK/leg1b-b.log" 2>&1; then
+    fail "the 280-byte password crossed the server gate (256)"
+else
+    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg1b-b.log"; then
+        pass "the 280-byte password refuses at the server gate (401)"
+    else
+        fail "no 401 at the gate: $(tail -2 "$WORK/leg1b-b.log")"
+    fi
+fi
+
+if HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$S3LESS:$P280" \
+    "$S3LESS@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$WORK/leg1b-c.log" 2>&1; then
+    fail "the passwordless account accepted a credential"
+else
+    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg1b-c.log"; then
+        pass "the passwordless account refuses the long credential (401)"
+    else
+        fail "no 401 for the passwordless account: $(tail -2 "$WORK/leg1b-c.log")"
+    fi
+fi
+
+if HOME="$WORK" timeout 30 "$BUILD/ssh3" -insecure --password "$S3LESS:" \
+    "$S3LESS@127.0.0.1:$SRVPORT/ssh3-term" whoami > "$WORK/leg1b-d.log" 2>&1; then
+    fail "the passwordless account accepted the empty password"
+else
+    pass "the passwordless account refuses the empty password"
+fi
+
+sudo -n userdel -r "$S3GATE" >/dev/null 2>&1
+sudo -n userdel -r "$S3LESS" >/dev/null 2>&1
+
 stop_server
 
 echo "== stage 2: the explicit --password-system off keeps the closed shape"
@@ -341,62 +406,6 @@ else
     fi
 fi
 
-echo "== stage 8: the SSHole regression (the OpenSSH 10.6p2 alignment)"
-
-# the passwordless account refuses every credential shape before any
-# crypt: the empty hash gate rides first (the musl systems without PAM
-# carry this shape on their default installs), the long passwords
-# never reach the crypt against any stored hash
-
-LONGPW=$(printf 'a%.0s' $(seq 1 300))
-
-if HOME="$WORK" timeout 30 "$CLI" -3 -C -S exec -e "whoami" \
-    -U "$S3LESS:$LONGPW" -a "127.0.0.1:$SRVPORT" -t 20000 \
-    > "$WORK/leg8a.log" 2>&1; then
-    fail "the passwordless account accepted a 300-char password"
-else
-    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg8a.log"; then
-        pass "the passwordless account refused the long password (401)"
-    else
-        fail "no 401 for the long password: $(tail -3 "$WORK/leg8a.log")"
-    fi
-fi
-
-if HOME="$WORK" timeout 30 "$CLI" -3 -C -S exec -e "whoami" \
-    -U "$S3LESS:" -a "127.0.0.1:$SRVPORT" -t 20000 \
-    > "$WORK/leg8b.log" 2>&1; then
-    fail "the passwordless account accepted the empty password"
-else
-    pass "the passwordless account refused the empty password"
-fi
-
-# the boundary rides: the 200-byte honest credential still works, the
-# 300-byte one refuses even against the valid hash
-
-LONGOK=$(printf 'b%.0s' $(seq 1 200))
-printf '%s:%s\n' "$S3BENCH" "$LONGOK" | sudo -n chpasswd || die "chpasswd long failed"
-
-if HOME="$WORK" timeout 30 "$CLI" -3 -C -S exec -e "whoami" \
-    -U "$S3BENCH:$LONGOK" -a "127.0.0.1:$SRVPORT" -t 20000 \
-    > "$WORK/leg8c.log" 2>&1; then
-    pass "the 200-byte honest password rides"
-else
-    fail "the 200-byte honest password refused: $(tail -3 "$WORK/leg8c.log")"
-fi
-
-if HOME="$WORK" timeout 30 "$CLI" -3 -C -S exec -e "whoami" \
-    -U "$S3BENCH:$LONGPW" -a "127.0.0.1:$SRVPORT" -t 20000 \
-    > "$WORK/leg8d.log" 2>&1; then
-    fail "the 300-byte password crossed the boundary"
-else
-    if grep -q "INTEROP-H3-STATUS 401" "$WORK/leg8d.log"; then
-        pass "the 300-byte password refused at the boundary (401)"
-    else
-        fail "no 401 at the boundary: $(tail -3 "$WORK/leg8d.log")"
-    fi
-fi
-
-stop_server
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "PASSWORD-SYSTEM-E2E OK"
