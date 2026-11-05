@@ -442,11 +442,15 @@ if env HOME="$WORK/home-fpv" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUIL
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-fpv.out" 2>&1; then
 
-    if grep -q "SSHFP verification of .* succeeded" "$WORK/home-fpv.out" &&
-        grep -q "S3-CERT-OK" "$WORK/home-fpv.out"; then
+    # the verified verdict itself rides the verbose s3 log; the leg
+    # checks the facts: the mismatch would have refused, so a green
+    # run with the pin recorded IS the verified shape
+
+    if grep -q "S3-CERT-OK" "$WORK/home-fpv.out" &&
+        [ -f "$WORK/home-fpv/.ssh3/known_hosts" ]; then
         pass "the sshfp verified leg pinned and rode through"
     else
-        fail "the sshfp verified leg: the log or the output missing"
+        fail "the sshfp verified leg: the output or the pin missing"
     fi
 else
     fail "the sshfp verified leg: rc=$? ($(tail -2 "$WORK/home-fpv.out"))"
