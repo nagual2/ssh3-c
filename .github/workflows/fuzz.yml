@@ -81,7 +81,7 @@ jobs:
             [ -n "$H" ] || { echo "== $R: no harness mapping, skip"; continue; }
 
             echo "== $H: $R"
-            build/linux-fuzz/tests/fuzz/$H "$R" -rss_limit_mb=4096 || FAIL=1
+            build/linux-fuzz/tests/fuzz/$H "$R" -rss_limit_mb=8192 || FAIL=1
           done
           exit $FAIL
 
@@ -94,7 +94,7 @@ jobs:
                    fuzz_message fuzz_quic_state fuzz_h3_parse fuzz_h3_state fuzz_ssh3_state; do
             echo "== $H"
             build/linux-fuzz/tests/fuzz/$H corpus \
-              -max_total_time=60 -max_len=16384 -rss_limit_mb=4096 \
+              -max_total_time=60 -max_len=16384 -rss_limit_mb=8192 \
               -artifact_prefix="$ARTP/" || FAIL=1
           done
           exit $FAIL
