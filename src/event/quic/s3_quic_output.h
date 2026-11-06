@@ -33,4 +33,10 @@ size_t   s3_quic_path_limit(s3_connection_t *c, s3_quic_path_t *path, size_t siz
 /* RFC 9221: the public datagram send API (porting map 3.4.2) */
 s3_int_t s3_quic_send_datagram(s3_connection_t *c, const u_char *data, size_t len);
 
+/* the path MTU cap for a connection riding another connection's
+ * datagrams (the jump flow): the cap demotes both the current size
+ * and the discovery ceiling (the canon both-ends pin) */
+void s3_quic_conn_mtu_cap_tunnel(s3_connection_t *c, s3_connection_t *tunnel,
+                                 size_t overhead);
+
 #endif /* _S3_QUIC_OUTPUT_H_INCLUDED_ */

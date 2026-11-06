@@ -3905,6 +3905,19 @@ s3_srv_fwd_udp_reply(s3_srv_h3_channel_t *ch, const u_char *data, size_t len)
     u_char            dg[2048];
     u_char           *p;
 
+    /*
+     * the tunnel capacity of the hop connection caps the return
+     * packets: a return datagram above the hop conn's packet budget
+     * never leaves the server (the frame does not fit the packet) and
+     * the destination connection's path MTU demotes to the tunnel
+     * reality - the quic-go peers ack any probe size, the cap rides
+     * the demotion instead of the dropped probes (the canon
+     * both-ends pin); the current datagram drops, the QUIC
+     * retransmission rides the shrunk size
+     */
+
+    s3_quic_conn_mtu_cap_tunnel(ch->pc, qs->parent, 48);
+
     /* the harness payloads fit one datagram, the bigger ones drop */
 
     if (len + 8 > sizeof(dg)) {

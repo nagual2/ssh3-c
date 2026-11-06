@@ -696,6 +696,25 @@ s3_quic_output_packet(s3_connection_t *c, s3_quic_send_ctx_t *ctx, u_char *data,
         }
 
         if (len + f->len > max_payload) {
+
+            if (f->type == S3_QUIC_FT_DATAGRAM || f->type == S3_QUIC_FT_DATAGRAM_WITH_LENGTH) {
+
+                /*
+                 * RFC 9221, 5: datagrams are droppable, and an
+                 * oversized one must not stall the whole connection's
+                 * output: the frame drops and the packing continues
+                 * with the frames behind it (the tunneled destination
+                 * connections of the jump flow ride the bridge; their
+                 * oversized datagrams drew the connection-wide stall)
+                 */
+
+                q = s3_queue_next(q);
+                s3_queue_remove(&f->queue);
+                s3_quic_free_frame(c, f);
+                q = s3_queue_prev(q);
+                continue;
+            }
+
             rc = s3_quic_split_frame(c, f, max_payload - len);
 
             if (rc == S3_ERROR) {
@@ -1542,4 +1561,51 @@ s3_quic_send_datagram(s3_connection_t *c, const u_char *data, size_t len)
     s3_quic_queue_frame(qc, frame);
 
     return S3_OK;
+}
+
+/*
+ * the path MTU cap for a connection riding another connection's
+ * datagrams (the jump flow: the destination connection's packets
+ * travel as the datagrams of the hop connection): a return datagram
+ * above the rider cap never fits the hop conn's packets, and the
+ * quic-go peers ack any probe size - the cap rides this demotion
+ * instead of the dropped probes (the canon both-ends pin of the
+ * reference client)
+ */
+void
+s3_quic_conn_mtu_cap_tunnel(s3_connection_t *c, s3_connection_t *tunnel, size_t overhead)
+{
+    s3_quic_connection_t *qc, *tq;
+    size_t                cap;
+    s3_uint_t             i;
+
+    qc = s3_quic_get_connection(c);
+    tq = s3_quic_get_connection(tunnel);
+
+    if (qc == NULL || tq == NULL || qc->path == NULL || tq->path == NULL ||
+        tq->path->mtu <= overhead)
+    {
+        return;
+    }
+
+    cap = tq->path->mtu - overhead;
+
+    if (qc->path->mtu <= cap) {
+        return;
+    }
+
+    qc->path->mtu = cap;
+    qc->path->max_mtu = cap;
+    qc->path->mtud = cap;
+    qc->path->state = S3_QUIC_PATH_IDLE;
+
+    /* the stale probe numbers of the discovery cycle would regrow the
+     * path on their acks (mtu = mtud above the cap) */
+
+    for (i = 0; i < S3_QUIC_PATH_RETRIES; i++) {
+        qc->path->mtu_pnum[i] = 0;
+    }
+
+    s3_log_error(S3_LOG_INFO, c->log, 0, "quic path mtu capped at %uz (the tunnel rider)",
+                 (s3_uint_t)cap);
 }
