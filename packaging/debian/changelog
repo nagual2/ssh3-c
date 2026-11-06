@@ -1,3 +1,14 @@
+ssh3-c (0.5.10-1) unstable; urgency=medium
+
+  * New upstream release 0.5.10: the early-window 0-RTT wave, the SSHole
+    hardening (the OpenSSH 10.6p2 alignment: the 256-byte crypt cap, the
+    passfile empty-password refusal), the jump return-path fixes (the
+    relay nil-address gate, the oversized datagram builder drop, the
+    destination conn path-MTU cap), the spec section 16 (the early window
+    and the tunnel MTU contract).
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Fri, 06 Nov 2026 18:30:00 +0100
+
 ssh3-c (0.5.5-1) unstable; urgency=medium
 
   * New upstream release 0.5.5: the session flow-control wave (B19b) -
