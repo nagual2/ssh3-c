@@ -561,6 +561,8 @@ struct s3_cli_jump_hop_s {
     unsigned         mtu_pin;    /* the path mtu cap of this level (0 rides the discovery) */
     unsigned         dgram_need; /* the peer datagram acceptance this level's channel wants */
     unsigned         bridge_cap; /* the packet cap of the next level this hop carries */
+    s3_connection_t *inner;      /* the next leg conn this bridge tunnels */
+    unsigned         mtu_capped; /* the one-shot bridge demotion of inner is done (spec 16.4) */
     u_char           ch_buf[64]; /* the receive accumulator (the 91 confirmation) */
     size_t           ch_len;
     s3_cli_jump_bridge_t *bridge; /* toward the next leg */
@@ -1226,6 +1228,8 @@ static void     s3_cli_agent_read(s3_event_t *ev);
 static void     s3_cli_agent_teardown(const char *why);
 static void     s3_cli_agent_pump(void);
 static void     s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data);
+static unsigned s3_cli_jump_dcid_match(s3_cli_jump_hop_t *hop, const u_char *data, size_t len);
+static void     s3_cli_jump_cap_inner(s3_cli_jump_hop_t *hop, const u_char *data, size_t len);
 static void     s3_cli_jump_bridge_read(s3_event_t *ev);
 static void     s3_cli_jump_bridge_flush(s3_cli_jump_hop_t *hop);
 static s3_int_t s3_cli_jump_bridge_create(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop);
@@ -10513,6 +10517,117 @@ s3_cli_jump_hop_by_bridge(s3_connection_t *c)
 }
 
 /*
+ * the packet DCID of the bridge return path (RFC 9000, 12.2: the cid
+ * bytes ride the header in the clear): the long header carries the
+ * length, the short one rides the local cid length of the next conn
+ * - the match against the next conn's client ids pins the demotion
+ * target (the DCID-based demotion of the spec 16.4)
+ */
+
+static unsigned
+s3_cli_jump_dcid_match(s3_cli_jump_hop_t *hop, const u_char *data, size_t len)
+{
+    s3_quic_connection_t *qc;
+    s3_queue_t           *q;
+    s3_quic_client_id_t  *cid;
+    const u_char         *id;
+    size_t                idlen = 0;
+
+    if (hop->inner == NULL || len < 7) {
+        return 0;
+    }
+
+    if (data[0] & 0x80) {
+
+        /* the long header: the version rides [1..4], the dcid
+         * length byte 5, the cid bytes follow (the version
+         * negotiation shape parses the same way) */
+
+        idlen = data[5];
+
+        if (idlen == 0 || idlen > S3_QUIC_CID_LEN_MAX || 6 + idlen > len) {
+            return 0;
+        }
+
+        id = data + 6;
+
+    } else if (data[0] & 0x40) {
+
+        /* the short header: the dcid is the next conn's local cid,
+         * its length rides the client id list (the header
+         * protection never covers the cid bytes) */
+
+        id = data + 1;
+
+    } else {
+        return 0;
+    }
+
+    qc = s3_quic_get_connection(hop->inner);
+
+    if (qc == NULL) {
+        return 0;
+    }
+
+    for (q = s3_queue_head(&qc->client_ids); q != s3_queue_sentinel(&qc->client_ids);
+         q = s3_queue_next(q)) {
+        cid = s3_queue_data(q, s3_quic_client_id_t, queue);
+
+        if (idlen != 0 && cid->len != idlen) {
+            continue;
+        }
+
+        if (idlen == 0 && (cid->len == 0 || 1 + cid->len > len)) {
+            continue;
+        }
+
+        if (s3_memcmp(id, cid->id, cid->len) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * the one-shot demotion of the next leg conn (spec 16.4): the quic-go
+ * peers ack any probe size, the return packets of the next leg grow
+ * past the bridge budget and the hop's output builder drops them -
+ * the oversized return datagram is the evidence, the DCID pins the
+ * conn, the cap rides the tunnel budget minus the bridge overhead
+ */
+
+static void
+s3_cli_jump_cap_inner(s3_cli_jump_hop_t *hop, const u_char *data, size_t len)
+{
+    s3_quic_connection_t *tq;
+    size_t                ovr;
+
+    if (hop->mtu_capped || hop->inner == NULL) {
+        return;
+    }
+
+    if (!s3_cli_jump_dcid_match(hop, data, len)) {
+        return;
+    }
+
+    tq = s3_quic_get_connection(hop->cli);
+
+    if (tq == NULL || tq->path == NULL || tq->path->mtu <= hop->bridge_cap) {
+        return;
+    }
+
+    /* the bridge level overhead: the hop conn's current packet
+     * budget minus the next leg's datagram cap */
+
+    ovr = tq->path->mtu - hop->bridge_cap;
+
+    s3_quic_conn_mtu_cap_tunnel(hop->inner, hop->cli, ovr);
+
+    hop->mtu_capped = 1;
+}
+
+/*
  * the datagram handler of a hop conversation: the tunnel frames
  * carry the prefix of the hop channel, the payloads are the raw quic
  * packets of the next leg, one send() into the bridge socket b
@@ -10565,7 +10680,17 @@ s3_cli_jump_datagram(s3_connection_t *c, s3_chain_t *data)
     }
 
     if (payload.len > hop->bridge_cap) {
-        /* the next level pins below the cap, the rest drops */
+
+        /*
+         * the return packet of the next leg outran the bridge
+         * budget: the packet DCID pins the next conn and the
+         * one-shot demotion caps its path at the bridge reality
+         * (spec 16.4); the current datagram drops, the QUIC
+         * retransmission rides the shrunk size
+         */
+
+        s3_cli_jump_cap_inner(hop, payload.data, payload.len);
+
         return;
     }
 
@@ -15733,6 +15858,14 @@ main(int argc, char **argv)
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
+
+                /* the previous hop's bridge tunnels this conn: the
+                 * inner reference rides the bridge (the demotion
+                 * target of spec 16.4); a fresh conn resets the
+                 * one-shot */
+
+                s3_cli_jump_hops[k - 1].inner = hop->cli;
+                s3_cli_jump_hops[k - 1].mtu_capped = 0;
             }
         }
 
@@ -15800,6 +15933,16 @@ main(int argc, char **argv)
     }
 
     s3_cli_conn = cli;
+
+    if (s3_cli_jump_on) {
+
+        /* the destination bridge tunnels the main conn (the inner
+         * phase): the last hop's bridge carries it, the one-shot
+         * demotion of spec 16.4 rides the same reference */
+
+        s3_cli_jump_hops[s3_cli_jump_n - 1].inner = cli;
+        s3_cli_jump_hops[s3_cli_jump_n - 1].mtu_capped = 0;
+    }
 
     cli->pool = s3_create_pool((size_t)S3_DEFAULT_POOL_SIZE, &s3_cli_log);
 

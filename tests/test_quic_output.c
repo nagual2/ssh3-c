@@ -75,7 +75,7 @@ s3_test_udp_socket(struct sockaddr_in *sa)
 }
 
 static s3_int_t
-s3_test_env_init(s3_test_out_env_t *env)
+s3_test_env_init_at(s3_test_out_env_t *env, s3_event_ctx_t *shared_ctx)
 {
     s3_str_t           alpn;
     s3_uint_t          i;
@@ -91,13 +91,28 @@ s3_test_env_init(s3_test_out_env_t *env)
         return S3_ERROR;
     }
 
-    s3_memzero(&env->ctx, sizeof(s3_event_ctx_t));
-    env->ctx.log = &s3_test_tls_log;
-    env->ctx.pool = env->pool;
-    s3_queue_init(&env->ctx.posted_events);
+    if (shared_ctx == NULL) {
 
-    if (s3_event_timer_init(&env->ctx) != S3_OK) {
-        return S3_ERROR;
+        s3_memzero(&env->ctx, sizeof(s3_event_ctx_t));
+        env->ctx.log = &s3_test_tls_log;
+        env->ctx.pool = env->pool;
+        s3_queue_init(&env->ctx.posted_events);
+
+        if (s3_event_timer_init(&env->ctx) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        env->conf.ctx = &env->ctx;
+
+    } else {
+
+        /*
+         * the second connection shares the event context: the
+         * timer rbtree rides the process (the nginx globals
+         * porting), only the ssl objects split
+         */
+
+        env->conf.ctx = shared_ctx;
     }
 
     alpn.data = (u_char *)"\x04ssh3";
@@ -109,7 +124,6 @@ s3_test_env_init(s3_test_out_env_t *env)
         return S3_ERROR;
     }
 
-    env->conf.ctx = &env->ctx;
     env->conf.handshake_timeout = 10000;
     env->conf.idle_timeout = 60000;
     env->conf.stream_buffer_size = 16384;
@@ -136,7 +150,9 @@ s3_test_env_init(s3_test_out_env_t *env)
     }
 
     /* the connection socket is bound to its own port */
-    env->conn = s3_get_connection(&env->ctx, s3_test_udp_socket(&conn_sa));
+
+    env->conn = s3_get_connection((shared_ctx != NULL) ? shared_ctx : &env->ctx,
+                                  s3_test_udp_socket(&conn_sa));
     if (env->conn == NULL || env->conn->fd == (s3_fd_t)-1) {
         return S3_ERROR;
     }
@@ -156,6 +172,12 @@ s3_test_env_init(s3_test_out_env_t *env)
     env->conn->socklen = sizeof(sa);
 
     return S3_OK;
+}
+
+static s3_int_t
+s3_test_env_init(s3_test_out_env_t *env)
+{
+    return s3_test_env_init_at(env, NULL);
 }
 
 static void
@@ -424,12 +446,134 @@ test_gso_segments(void)
     return s3_test_failures;
 }
 
+/*
+ * the tunnel rider cap (the jump flow, spec 16.3): the one-shot
+ * demotion of a connection riding another connection's datagrams
+ */
+
+static int
+test_mtu_cap_tunnel_demotes(void)
+{
+    s3_test_out_env_t     env, tun;
+    s3_quic_connection_t *qc;
+
+    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env.conn, &env.conf) == S3_OK);
+
+    S3_ASSERT(s3_test_env_init_at(&tun, &env.ctx) == S3_OK);
+    S3_ASSERT(s3_quic_connect(tun.conn, &tun.conf) == S3_OK);
+
+    env.qc = s3_quic_get_connection(env.conn);
+    tun.qc = s3_quic_get_connection(tun.conn);
+    S3_ASSERT(env.qc != NULL && env.qc->path != NULL);
+    S3_ASSERT(tun.qc != NULL && tun.qc->path != NULL);
+
+    qc = env.qc;
+
+    qc->path->state = S3_QUIC_PATH_MTUD;
+    qc->path->mtu = 1452;
+    qc->path->mtud = 1200;
+    qc->path->max_mtu = 1452;
+    qc->path->mtu_pnum[0] = 111;
+    qc->path->mtu_pnum[1] = 222;
+    qc->path->mtu_pnum[2] = 333;
+
+    /* the tunnel budget 1348 minus the 48 overhead of the bridge
+     * level demotes the rider to 1300 */
+
+    tun.qc->path->mtu = 1348;
+
+    s3_quic_conn_mtu_cap_tunnel(env.conn, tun.conn, 48);
+
+    S3_ASSERT(qc->path->mtu == 1300);
+    S3_ASSERT(qc->path->max_mtu == 1300);
+
+    /* the discovery ceiling only ever falls: a cap above the
+     * current ceiling must not reopen the probing */
+
+    S3_ASSERT(qc->path->mtud == 1200);
+    S3_ASSERT(qc->path->state == S3_QUIC_PATH_IDLE);
+
+    /* the stale probe numbers would regrow the path on their acks */
+
+    S3_ASSERT(qc->path->mtu_pnum[0] == 0);
+    S3_ASSERT(qc->path->mtu_pnum[1] == 0);
+    S3_ASSERT(qc->path->mtu_pnum[2] == 0);
+
+    /* the tunnel env rides the base pool: it closes first */
+
+    s3_test_env_done(&tun);
+    s3_test_env_done(&env);
+
+    return s3_test_failures;
+}
+
+static int
+test_mtu_cap_tunnel_noop(void)
+{
+    s3_test_out_env_t     env, tun;
+    s3_quic_connection_t *qc;
+
+    S3_ASSERT(s3_test_env_init(&env) == S3_OK);
+    S3_ASSERT(s3_quic_connect(env.conn, &env.conf) == S3_OK);
+
+    S3_ASSERT(s3_test_env_init_at(&tun, &env.ctx) == S3_OK);
+    S3_ASSERT(s3_quic_connect(tun.conn, &tun.conf) == S3_OK);
+
+    env.qc = s3_quic_get_connection(env.conn);
+    tun.qc = s3_quic_get_connection(tun.conn);
+    S3_ASSERT(env.qc != NULL && env.qc->path != NULL);
+    S3_ASSERT(tun.qc != NULL && tun.qc->path != NULL);
+
+    qc = env.qc;
+    tun.qc->path->mtu = 1348;
+
+    /* the rider already fits the budget: the demotion is a no-op,
+     * the discovery state and the probe numbers stay intact */
+
+    qc->path->state = S3_QUIC_PATH_MTUD;
+    qc->path->mtu = 1300;
+    qc->path->mtud = 1300;
+    qc->path->max_mtu = 1300;
+    qc->path->mtu_pnum[0] = 55;
+
+    s3_quic_conn_mtu_cap_tunnel(env.conn, tun.conn, 48);
+
+    S3_ASSERT(qc->path->mtu == 1300);
+    S3_ASSERT(qc->path->max_mtu == 1300);
+    S3_ASSERT(qc->path->mtud == 1300);
+    S3_ASSERT(qc->path->state == S3_QUIC_PATH_MTUD);
+    S3_ASSERT(qc->path->mtu_pnum[0] == 55);
+
+    /* the rider outran the bridge later: the demotion caps it at
+     * 1300, and the previously demoted ceiling stays put */
+
+    qc->path->mtu = 1452;
+    qc->path->max_mtu = 1452;
+
+    s3_quic_conn_mtu_cap_tunnel(env.conn, tun.conn, 48);
+
+    S3_ASSERT(qc->path->mtu == 1300);
+    S3_ASSERT(qc->path->max_mtu == 1300);
+    S3_ASSERT(qc->path->mtud == 1300);
+    S3_ASSERT(qc->path->state == S3_QUIC_PATH_IDLE);
+
+    /* the tunnel env rides the base pool: it closes first */
+
+    s3_test_env_done(&tun);
+    s3_test_env_done(&env);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_output(void)
 {
     test_datagram_roundtrip();
     test_need_ack_not_tracked();
     test_gso_segments();
+    test_mtu_cap_tunnel_demotes();
+    test_mtu_cap_tunnel_noop();
 
     OPENSSL_cleanup();
 

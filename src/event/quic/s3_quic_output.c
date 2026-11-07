@@ -1583,8 +1583,7 @@ s3_quic_conn_mtu_cap_tunnel(s3_connection_t *c, s3_connection_t *tunnel, size_t 
     tq = s3_quic_get_connection(tunnel);
 
     if (qc == NULL || tq == NULL || qc->path == NULL || tq->path == NULL ||
-        tq->path->mtu <= overhead)
-    {
+        tq->path->mtu <= overhead) {
         return;
     }
 
@@ -1596,7 +1595,11 @@ s3_quic_conn_mtu_cap_tunnel(s3_connection_t *c, s3_connection_t *tunnel, size_t 
 
     qc->path->mtu = cap;
     qc->path->max_mtu = cap;
-    qc->path->mtud = cap;
+
+    /* the discovery ceiling only ever falls: a cap above the current
+     * ceiling must not reopen the probing */
+
+    qc->path->mtud = s3_min(qc->path->mtud, cap);
     qc->path->state = S3_QUIC_PATH_IDLE;
 
     /* the stale probe numbers of the discovery cycle would regrow the
