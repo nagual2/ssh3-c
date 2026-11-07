@@ -14,7 +14,7 @@
 # the %build stage (the cmake configure is the gate).
 
 Name:           ssh3-server
-Version:        0.5.9
+Version:        0.5.11
 Release:        1%{?dist}
 Summary:        SSH3 server - SSH over QUIC/HTTP3 transport
 License:        BSD-2-Clause

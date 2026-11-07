@@ -1,3 +1,15 @@
+ssh3-c (0.5.11-1) unstable; urgency=medium
+
+  * New upstream release 0.5.11: the DCID-based demotion of the
+    destination conn rides (the one-shot bridge demotion on the
+    oversized return datagram, the spec 16.4 open item closed), the
+    tunnel rider cap keeps the discovery ceiling falling only
+    (the mtud min semantics), the client opt tree pins by S3OPT_WORK.
+    The 0.5.10 changelog line "the destination conn path-MTU cap"
+    describes the demotion that this release actually ships.
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Sat, 07 Nov 2026 14:00:00 +0100
+
 ssh3-c (0.5.10-1) unstable; urgency=medium
 
   * New upstream release 0.5.10: the early-window 0-RTT wave, the SSHole
