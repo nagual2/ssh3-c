@@ -20,6 +20,8 @@
 #  14. -F config (HostName/Port/User/LocalForward from the file)
 #  15. -D socks5 (the curl through the proxy)
 #  16. -6 vs the dual-stack daemon
+#  19. exec piped stdin (the ssh(1) canon: the pipe rides the exec,
+#      the EOF half-closes the write side)
 #
 # the verdicts: CLI-COMPAT-E2E OK / FAILED, the leg markers on the
 # way
@@ -827,6 +829,18 @@ else
     else
         fail "-J hop pin leg: rc=$rc $(tail -1 "$WORK/leg-jump-pin.err")"
     fi
+fi
+
+echo "== leg 19: exec piped stdin (the ssh(1) canon: the pipe rides the exec)"
+
+printf "S3-PIPE-STDIN-OK" | HOME="$WORK/home" timeout 20 "$BUILD/ssh3" -i "$WORK/priv.pem" \
+    "client@127.0.0.1:$PORT/ssh3-term" "cat" \
+    > "$WORK/leg-pipe.out" 2>/dev/null
+
+if grep -q "S3-PIPE-STDIN-OK" "$WORK/leg-pipe.out"; then
+    pass "exec piped stdin rode"
+else
+    fail "exec piped stdin leg: rc=$? $(tail -1 "$WORK/leg-pipe.out")"
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

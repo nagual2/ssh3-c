@@ -11,9 +11,13 @@
  *
  *   ssh3 [options] [user@]host[:port][/path] [command...]
  *
- * with a command the session is the exec request (the fin rides right
- * behind it, the remote stdout/stderr land on the local fds, the
- * exit-status becomes the process exit code); without one the session
+ * with a command the session is the exec request (the remote
+ * stdout/stderr land on the local fds, the exit-status becomes the
+ * process exit code); the piped stdin rides the exec (the ssh(1)
+ * canon), the pipe EOF half-closes the write side, the fin rides at
+ * the open only when no stdin rides (-n, the console stdin stays
+ * unarmed: the console bytes racing the fin rode garbage into the
+ * session channel); without a command the session
  * is pty-req+shell over the console: the raw-mode stdin (the console
  * API twin of the termios branch), UTF-8 code pages, the real window
  * size in the pty-req and the window-change request on the resize.
@@ -1392,8 +1396,9 @@ s3_cli_usage(const char *prog)
             "              form refuses: the value would eat the\n"
             "              destination)\n"
             " no command opens an interactive shell (pty on a console, the\n"
-            " stdin pipe pumps without one), a command runs exec; the server\n"
-            " certificate pins into %s\n",
+            " stdin pipe pumps without one), a command runs exec (the\n"
+            " piped stdin rides the exec, the console stdin stays off);\n"
+            " the server certificate pins into %s\n",
             prog, prog, S3_CLI_KH_LABEL);
 }
 
@@ -13859,12 +13864,13 @@ s3_cli_console_init(void)
     InitializeCriticalSection(&s3_cli_ring_cs);
 
     /* the -n run: the stdin stays unpumped (the EOF semantics of
-     * /dev/null), no reader thread rides; the exec run forwards no
-     * stdin either (the fin closes the write side at the open), the
-     * console bytes racing the fin would ride garbage into the
-     * session channel */
+     * /dev/null), no reader thread rides.  The exec run pumps the
+     * piped stdin (the ssh(1) canon: the bytes ride the session
+     * channel, the pipe EOF half-closes the write side); the console
+     * stdin stays unarmed - the console bytes racing the fin rode
+     * garbage into the session channel */
 
-    if (s3_cli_no_stdin || s3_cli_cmd != NULL) {
+    if (s3_cli_no_stdin || (s3_cli_cmd != NULL && s3_cli_console)) {
         DeleteCriticalSection(&s3_cli_ring_cs);
         return S3_OK;
     }
@@ -13894,10 +13900,11 @@ s3_cli_console_init(void)
     /* the stdin rides the event loop: the handler chunks the bytes
      * into the channel frames directly (the ring of the win build
      * exists because the console read is not selectable there); the
-     * exec run forwards no stdin (the fin closes the write side at
-     * the open), the pump stays unarmed */
+     * exec run pumps the piped stdin (the ssh(1) canon), the console
+     * stdin of an exec stays unarmed - the console bytes racing the
+     * fin rode garbage into the session channel */
 
-    if (s3_cli_no_stdin || s3_cli_cmd != NULL) {
+    if (s3_cli_no_stdin || (s3_cli_cmd != NULL && s3_cli_console)) {
         return S3_OK;
     }
 
@@ -14077,9 +14084,11 @@ s3_cli_stdin_read(s3_event_t *ev)
 
         if (s3_cli_fin_sent) {
 
-            /* the write side is gone (the exec fin), the late stdin
-             * has no transport to ride -- the win shape would fail
-             * the channel send, the eof gate stays honest */
+            /* the write side is gone (the -n or the console exec
+             * fin, or the pumped pipe already rode its eof), the
+             * late stdin has no transport to ride -- the win shape
+             * would fail the channel send, the eof gate stays
+             * honest */
 
             return;
         }
@@ -16595,7 +16604,12 @@ main(int argc, char **argv)
 
                 } else {
 
-                    if (s3_cli_cmd != NULL &&
+                    /* the exec fin rides at the open only when no
+                     * stdin rides the channel (-n, the console):
+                     * the piped stdin keeps the write side open,
+                     * its EOF half-closes (the tick gate) */
+
+                    if (s3_cli_cmd != NULL && (s3_cli_no_stdin || s3_cli_console) &&
                         s3_quic_shutdown_stream(s3_cli_chan, S3_WRITE_SHUTDOWN) != S3_OK) {
                         fprintf(stderr, "ssh3: the channel fin failed\n");
                         s3_cli_rc = S3_CLI_EXIT_ERROR;
