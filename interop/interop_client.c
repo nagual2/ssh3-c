@@ -4515,6 +4515,7 @@ struct s3_interop_cm_run_s {
 
 static unsigned    s3_interop_cm_master;
 static const char *s3_interop_cm_path;
+static const char *s3_interop_cm_sock; /* the --cm-path explicit socket */
 static const char *s3_interop_cm_op;
 static long        s3_interop_cm_idle_ms = 5000;
 
@@ -7626,6 +7627,10 @@ s3_interop_usage(const char *prog)
             "      control channel, the slave sessions run as session channels of\n"
             "      the shared connection, the verdict is S3CM-MASTER-LISTEN;\n"
             "      \"-M yes\" is the explicit master form, the bare -M is the same\n"
+            "  --cm-path p\n"
+            "      the master socket of -M on its own flag: -U keeps the bare\n"
+            "      username meaning, the -K master signs the Bearer JWT and\n"
+            "      authenticates like any client (the -K + -M conflict is gone)\n"
             "  -M auto\n"
             "      the dial probe against the -U path first: a live master wins\n"
             "      and the client runs as its slave (the -U path [-e cmd] branch,\n"
@@ -7755,6 +7760,10 @@ main(int argc, char **argv)
 
             } else if (strcmp(argv[i], "--stream-rx-mb") == 0 && i + 1 < argc) {
                 s3_interop_stream_rx_mb = atol(argv[i + 1]);
+                value = argv[i + 1];
+
+            } else if (strcmp(argv[i], "--cm-path") == 0 && i + 1 < argc) {
+                s3_interop_cm_sock = argv[i + 1];
                 value = argv[i + 1];
             }
 
@@ -8125,12 +8134,26 @@ main(int argc, char **argv)
     }
 
     /*
-     * the meanings of -U: the Basic auth of the CONNECT in the h3
-     * runs, the bare username in the pubkey mode (-K), the control
-     * socket path in the cm modes (the master, the auto mode, the
-     * control ops and the slave that never touches quic)
+     * the explicit master socket (--cm-path): the JWT master signs
+     * the iss=user claims from -U while the socket rides --cm-path -
+     * the -K + -M pair stops being a conflict, the master
+     * authenticates like any client
      */
-    if (s3_interop_u_raw != NULL) {
+    if (s3_interop_cm_sock != NULL) {
+
+        if (!s3_interop_cm_master || !s3_interop_h3_mode || s3_interop_u_raw == NULL ||
+            strchr(s3_interop_u_raw, ':') != NULL) {
+            s3_interop_usage(argv[0]);
+            return 1;
+        }
+
+        s3_interop_cm_path = s3_interop_cm_sock;
+
+        if (s3_interop_h3_path_user(s3_interop_u_raw) != S3_OK) {
+            return 1;
+        }
+
+    } else if (s3_interop_u_raw != NULL) {
 
         if (s3_interop_cm_master || s3_interop_cm_auto || s3_interop_cm_op != NULL ||
             !s3_interop_h3_mode) {
@@ -8208,7 +8231,8 @@ main(int argc, char **argv)
      * exporter into the inner conversation
      */
     if (s3_interop_pubkey_path != NULL &&
-        (!s3_interop_h3_mode || s3_interop_u_raw == NULL || s3_interop_cm_master ||
+        (!s3_interop_h3_mode || s3_interop_u_raw == NULL ||
+         (s3_interop_cm_master && s3_interop_cm_sock == NULL) ||
          s3_interop_cm_op != NULL || s3_interop_jump_phase || s3_interop_oidc_issuer != NULL ||
          s3_interop_oidc_raw != NULL)) {
         s3_interop_usage(argv[0]);

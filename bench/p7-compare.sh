@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # P7 control bench: ssh3-c vs Go fork vs OpenSSH on one loopback stand (R3 metrics).
 #
-#   p7-compare.sh [--stage all|throughput|handshake|mux|cpu|manyfiles] [--rounds 7]
+#   p7-compare.sh [--stage all|throughput|handshake|mux|cpu|manyfiles|dircopy] [--rounds 7]
 #                 [--handshake-runs 30] [--mux-iters 100] [--mux-blocks 3]
 #                 [--files N] [--work /tmp/p7bench] [--c-build DIR] [--go-bin DIR]
 #
@@ -35,6 +35,7 @@ GO_BIN=/tmp/p7bench/bin
 STAGE=all ROUNDS=7 HS_RUNS=30 MUX_ITERS=100 MUX_BLOCKS=3
 PORT_C=8022 PORT_GO=8023 PORT_SSH=2222
 SIZE_BIG=512 SIZE_SMALL=8 FILES_N=2000
+DIRTREE_SMALL=2000 DIRTREE_BIG=50
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -107,6 +108,29 @@ gen_manyfiles() { # the many-small-files tree: FILES_N x 4096 B under $DEV_SHM/m
     log "manyfiles: generated $FILES_N files ($(du -sh "$DEV_SHM/many-src" | cut -f1))"
 }
 
+gen_dirtree() { # the cold-copy tree: 3 levels, DIRTREE_SMALL x 32 KiB + DIRTREE_BIG x 1 MiB
+    local src="$DEV_SHM/dirtree-src" i lvl
+    if [ -d "$src" ] &&
+       [ "$(find "$src" -type f 2>/dev/null | wc -l)" -eq "$((DIRTREE_SMALL + DIRTREE_BIG))" ]; then
+        return 0
+    fi
+    rm -rf "$src"
+    dd if=/dev/urandom of="$DEV_SHM/.tpl32" bs=32768 count=1 status=none
+    dd if=/dev/urandom of="$DEV_SHM/.tpl1m" bs=1M count=1 status=none
+    for i in $(seq 0 $((DIRTREE_SMALL - 1))); do
+        lvl=$((i % 3))
+        mkdir -p "$src/lvl$lvl/d$((i % 7))"
+        cp "$DEV_SHM/.tpl32" "$src/lvl$lvl/d$((i % 7))/f$(printf %05d "$i").bin"
+    done
+    for i in $(seq 0 $((DIRTREE_BIG - 1))); do
+        lvl=$((i % 3))
+        mkdir -p "$src/lvl$lvl/big"
+        cp "$DEV_SHM/.tpl1m" "$src/lvl$lvl/big/b$(printf %02d "$i").bin"
+    done
+    rm -f "$DEV_SHM/.tpl32" "$DEV_SHM/.tpl1m"
+    log "dircopy: tree generated, $((DIRTREE_SMALL + DIRTREE_BIG)) files ($(du -sh "$src" | cut -f1))"
+}
+
 setup_stand() {
     cd "$WORK"
 
@@ -157,6 +181,7 @@ EOF
     gen_payload "$SIZE_BIG" "$DEV_SHM/p7bench.bin"
     gen_payload "$SIZE_SMALL" "$DEV_SHM/p7bench8.bin"
     gen_manyfiles
+    gen_dirtree
     : > "$WORK/known_hosts"
 }
 
@@ -288,13 +313,15 @@ xfer() {
         ;;
     go:push)
         # the fork sftp paths are HOME-relative only, p7shm -> /dev/shm
-        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" -f "$2" \
-            "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${4#$DEV_SHM/}" \
+        "$GO_CLIENT" -transfer -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -p "$PORT_GO" -U /ssh3-term "$2" \
+            "${BENCH_USER}@127.0.0.1:p7shm/${4#$DEV_SHM/}" \
             < /dev/null > /dev/null 2>"$LOGS/go-client.log"
         ;;
     go:pull)
-        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" -f \
-            "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/${2#$DEV_SHM/}" "$4" \
+        "$GO_CLIENT" -transfer -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -p "$PORT_GO" -U /ssh3-term \
+            "${BENCH_USER}@127.0.0.1:p7shm/${2#$DEV_SHM/}" "$4" \
             < /dev/null > /dev/null 2>"$LOGS/go-client.log"
         ;;
     c:push)
@@ -437,14 +464,11 @@ stage_mux() {
     local sock base
     echo "impl,blk,iter,ms" > "$csv"
 
-    # the C cm master cannot authenticate (the -U slot carries the socket
-    # path), the daemon restarts without -K: any non-empty Authorization
-    # passes (the open mode of app/ssh3_server.c); the wait covers the
-    # SIGTERM drain before the fresh bind
-    oldpid=$(cat "$WORK/c-server.pid")
-    kill "$oldpid" 2>/dev/null || true
-    wait_gone "$oldpid" 8 || { kill -9 "$oldpid" 2>/dev/null || true; sleep 0.5; }
-    start_c_server "" "-open"
+    # the C cm master authenticates like any client: --cm-path carries
+    # the control socket, -U stays the bare username, -K signs the
+    # Bearer JWT - the daemon keeps its -K stand mode, no open-mode
+    # restart (the 0/300 regression of 0.5.10 rode the open mode, not
+    # the master)
     probe c
 
     log "mux: $MUX_BLOCKS x $MUX_ITERS warm execs, impls: c go os"
@@ -454,8 +478,9 @@ stage_mux() {
             rm -f "$sock"
             case "$impl" in
             c)
-                setsid nohup "$C_CLIENT" -3 -C -M -U "$sock" -a "127.0.0.1:$PORT_C" \
-                    -t 600000 > "$LOGS/cm-c-master-$blk.log" 2>&1 < /dev/null &
+                setsid nohup "$C_CLIENT" -3 -C -M --cm-path "$sock" \
+                    -a "127.0.0.1:$PORT_C" -K "$WORK/bench_pkcs8.pem" \
+                    -U "${BENCH_USER}" -t 600000 > "$LOGS/cm-c-master-$blk.log" 2>&1 < /dev/null &
                 for i in $(seq 1 50); do
                     grep -q S3CM-MASTER-LISTEN "$LOGS/cm-c-master-$blk.log" 2>/dev/null && break
                     sleep 0.1
@@ -695,9 +720,10 @@ many_push() { # $1 = impl: the measured push, verified, cleaned
         many_verify "$DEV_SHM/p7out/many-c"
         ;;
     go)
-        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-            -f -r "$MANY_SRC" "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" \
-            < /dev/null > /dev/null 2>&1 || return 1
+        "$GO_CLIENT" -transfer -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -p "$PORT_GO" -U /ssh3-term -r "$MANY_SRC" \
+            "${BENCH_USER}@127.0.0.1:p7shm/p7out/many-go" \
+            < /dev/null > /dev/null 2>"$LOGS/many-go-client.log" || return 1
         many_verify "$DEV_SHM/p7out/many-go"
         ;;
     os)
@@ -722,9 +748,10 @@ many_pull() { # $1 = impl: the measured download of the seeded tree
         many_verify "$WORK/many-c-pull"
         ;;
     go)
-        "$GO_CLIENT" -insecure -privkey "$WORK/bench_pkcs8.pem" \
-            -f -r "${BENCH_USER}@127.0.0.1:$PORT_GO/ssh3-term:p7shm/p7out/many-go" "$WORK/many-go-pull" \
-            < /dev/null > /dev/null 2>&1 || return 1
+        "$GO_CLIENT" -transfer -insecure -privkey "$WORK/bench_pkcs8.pem" \
+            -p "$PORT_GO" -U /ssh3-term -r \
+            "${BENCH_USER}@127.0.0.1:p7shm/p7out/many-go" "$WORK/many-go-pull" \
+            < /dev/null > /dev/null 2>"$LOGS/many-go-client.log" || return 1
         many_verify "$WORK/many-go-pull"
         ;;
     os)
@@ -790,11 +817,100 @@ summary_manyfiles() { # $1 = csv (impl,dir,run,sec)
     done
 }
 
+# --- the dircopy stage: the cold first copy of the tree (the rsync
+# "copy, not backup" scenario - the remote starts empty, nothing to
+# diff), push only ---------------------------------------------------------
+
+DIR_BYTES=$(( (DIRTREE_SMALL * 32768) + (DIRTREE_BIG * 1048576) ))
+
+dirtree_verify() { # $1 = destination dir: the file count and the byte sum must match
+    [ "$(find "$1" -type f 2>/dev/null | wc -l)" -eq "$((DIRTREE_SMALL + DIRTREE_BIG))" ] || return 1
+    [ "$(find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s += $1} END{print s}')" -eq "$DIR_BYTES" ] ||
+        return 1
+}
+
+dirtree_cleanup() {
+    rm -rf "$DEV_SHM/p7out/dircopy-c" "$DEV_SHM/p7out/dircopy-go" "$DEV_SHM/p7out/dircopy-rsync"
+}
+
+dirtree_push() { # $1 = impl
+    case "$1" in
+    c)
+        "$C_CLIENT" -a "127.0.0.1:$PORT_C" -3 -J "put:$DEV_SHM/dirtree-src:p7out/dircopy-c" -r \
+            -K "$WORK/bench_pkcs8.pem" -U "${BENCH_USER}" -t 120000 > /dev/null 2>&1 || return 1
+        dirtree_verify "$DEV_SHM/p7out/dircopy-c"
+        ;;
+    go)
+        # P7_GO_COMPRESS (e.g. "none") pins the -C codec: the fork rides
+        # the full announce by default and pays the compress attempt on
+        # the incompressible payloads
+        if [ -n "${P7_GO_COMPRESS:-}" ]; then
+            "$GO_CLIENT" -transfer -C "$P7_GO_COMPRESS" -insecure -privkey "$WORK/bench_pkcs8.pem" \
+                -p "$PORT_GO" -U /ssh3-term -r "$DEV_SHM/dirtree-src" \
+                "${BENCH_USER}@127.0.0.1:p7shm/p7out/dircopy-go" \
+                < /dev/null > /dev/null 2>"$LOGS/dircopy-go-client.log" || return 1
+        else
+            "$GO_CLIENT" -transfer -insecure -privkey "$WORK/bench_pkcs8.pem" \
+                -p "$PORT_GO" -U /ssh3-term -r "$DEV_SHM/dirtree-src" \
+                "${BENCH_USER}@127.0.0.1:p7shm/p7out/dircopy-go" \
+                < /dev/null > /dev/null 2>"$LOGS/dircopy-go-client.log" || return 1
+        fi
+        dirtree_verify "$DEV_SHM/p7out/dircopy-go"
+        ;;
+    rsync)
+        rsync -a \
+            -e "ssh -p $PORT_SSH -i $WORK/bench_ed25519 -c $CIPHER -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=$WORK/known_hosts -o IdentitiesOnly=yes" \
+            "$DEV_SHM/dirtree-src" "${BENCH_USER}@127.0.0.1:p7shm/p7out/dircopy-rsync" \
+            < /dev/null > /dev/null 2>"$LOGS/dircopy-rsync.log" || return 1
+        dirtree_verify "$DEV_SHM/p7out/dircopy-rsync"
+        ;;
+    esac
+}
+
+stage_dircopy() {
+    local csv="$RES/dircopy.csv" round impl t0 t1 sec rc
+    echo "impl,run,sec" > "$csv"
+    log "dircopy: cold first copy, $((DIRTREE_SMALL + DIRTREE_BIG)) files / $((DIR_BYTES / 1048576)) MiB, impls: c go rsync"
+    for round in $(seq 0 "$ROUNDS"); do
+        assert_alive
+        for impl in c go rsync; do
+            dirtree_cleanup
+            t0=$(date +%s%N)
+            dirtree_push "$impl" && rc=0 || rc=1
+            t1=$(date +%s%N)
+            sec=$(awk -v ns=$((t1 - t0)) 'BEGIN{printf "%.3f", ns/1e9}')
+            [ "$rc" = 0 ] || log "dircopy $impl round $round FAILED, discarded"
+            [ "$rc" = 0 ] || continue
+            [ "$round" = 0 ] && continue
+            echo "$impl,$round,$sec" >> "$csv"
+            sleep 0.2
+        done
+    done
+    dirtree_cleanup
+    log "dircopy summary (cold first copy, $((DIR_BYTES / 1048576)) MiB tree):"
+    summary_dircopy "$csv"
+}
+
+summary_dircopy() { # $1 = csv (impl,run,sec); the NTP steps ride out as non-positive secs
+    local impl vals
+    for impl in c go rsync; do
+        vals=$(awk -F, -v i="$impl" 'NR > 1 && $1 == i && $3 > 0 {print $3}' "$1" | sort -g)
+        [ -n "$vals" ] || continue
+        echo "$vals" | awk -v i="$impl" -v mb="$((DIR_BYTES / 1048576))" '
+            {a[NR] = $1}
+            END {
+                med = (NR % 2) ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2
+                printf "  %-5s n=%d median=%.2fs MB/s=%.1f min=%.2f max=%.2f\n",
+                    i, NR, med, mb / med, a[1], a[NR]
+            }'
+    done
+}
+
 # --- main ----------------------------------------------------------------------
 # --- main ----------------------------------------------------------------------
 
 case "$STAGE" in
-all | throughput | handshake | mux | cpu | manyfiles) ;;
+all | throughput | handshake | mux | cpu | manyfiles | dircopy) ;;
 *) die "bad stage: $STAGE" ;;
 esac
 
@@ -844,7 +960,8 @@ start_servers() {
     probe os
 }
 
-if [ "$STAGE" = mux ] || [ "$STAGE" = handshake ] || [ "$STAGE" = manyfiles ]; then
+if [ "$STAGE" = mux ] || [ "$STAGE" = handshake ] || [ "$STAGE" = manyfiles ] ||
+    [ "$STAGE" = dircopy ]; then
     start_servers
 elif [ "$STAGE" = all ] || [ "$STAGE" = throughput ] || [ "$STAGE" = cpu ]; then
     start_servers
@@ -871,6 +988,10 @@ fi
 
 if [ "$STAGE" = all ] || [ "$STAGE" = manyfiles ]; then
     stage_manyfiles
+fi
+
+if [ "$STAGE" = all ] || [ "$STAGE" = dircopy ]; then
+    stage_dircopy
 fi
 
 stop_servers
