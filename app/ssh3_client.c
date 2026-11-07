@@ -1089,6 +1089,7 @@ static u_char           s3_cli_ring[S3_CLI_RING_SIZE];
 static size_t           s3_cli_ring_head;
 static size_t           s3_cli_ring_tail;
 static uintptr_t        s3_cli_thread;
+static unsigned         s3_cli_ring_ready; /* the ring cs lives (the B22 gate) */
 #endif
 
 static unsigned s3_cli_console; /* the stdin is a console */
@@ -13862,16 +13863,19 @@ s3_cli_console_init(void)
     }
 
     InitializeCriticalSection(&s3_cli_ring_cs);
+    s3_cli_ring_ready = 1;
 
     /* the -n run: the stdin stays unpumped (the EOF semantics of
      * /dev/null), no reader thread rides.  The exec run pumps the
      * piped stdin (the ssh(1) canon: the bytes ride the session
      * channel, the pipe EOF half-closes the write side); the console
      * stdin stays unarmed - the console bytes racing the fin rode
-     * garbage into the session channel */
+     * garbage into the session channel.  The ring critical section
+     * lives until the teardown in every shape: the session tick
+     * enters it unconditionally, an early delete here rode the tick
+     * into a freed section (the B22 segfault) */
 
     if (s3_cli_no_stdin || (s3_cli_cmd != NULL && s3_cli_console)) {
-        DeleteCriticalSection(&s3_cli_ring_cs);
         return S3_OK;
     }
 
@@ -13936,22 +13940,30 @@ static void
 s3_cli_console_done(void)
 {
 #if (S3_WIN32)
-    if (s3_cli_thread != 0) {
+    if (s3_cli_ring_ready) {
 
-        s3_cli_stop = 1;
+        if (s3_cli_thread != 0) {
 
-        /* the reader parks in ReadFile(); the console read wakes on
-         * the input or the handle close, the pipe read wakes on the
-         * writer close -- the main path reached the session end, the
-         * cancel is best effort */
+            s3_cli_stop = 1;
 
-        CancelIoEx(s3_cli_in_h, NULL);
+            /* the reader parks in ReadFile(); the console read wakes on
+             * the input or the handle close, the pipe read wakes on the
+             * writer close -- the main path reached the session end, the
+             * cancel is best effort */
 
-        WaitForSingleObject((HANDLE)s3_cli_thread, 1000);
-        CloseHandle((HANDLE)s3_cli_thread);
-        s3_cli_thread = 0;
+            CancelIoEx(s3_cli_in_h, NULL);
+
+            WaitForSingleObject((HANDLE)s3_cli_thread, 1000);
+            CloseHandle((HANDLE)s3_cli_thread);
+            s3_cli_thread = 0;
+        }
+
+        /* the ring section dies once, after the tick consumer is
+         * gone (the B22: an early delete rode the tick into the
+         * freed section) */
 
         DeleteCriticalSection(&s3_cli_ring_cs);
+        s3_cli_ring_ready = 0;
     }
 
     if (s3_cli_raw) {
