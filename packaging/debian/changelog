@@ -1,3 +1,14 @@
+ssh3-c (0.5.13-1) unstable; urgency=medium
+
+  * New upstream release 0.5.13: the B22 teardown segfault of the
+    win client rides closed (the ring critical section lives from
+    the console setup to the console done in every shape, the tick
+    consumer enters a live section), the plan entry B22 rides the
+    full diagnosis chain (Event Log, unhandled-filter stack,
+    addr2line).
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Sat, 07 Nov 2026 17:45:00 +0100
+
 ssh3-c (0.5.12-1) unstable; urgency=medium
 
   * New upstream release 0.5.12: the exec run pumps the piped stdin
