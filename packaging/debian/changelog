@@ -1,3 +1,14 @@
+ssh3-c (0.5.12-1) unstable; urgency=medium
+
+  * New upstream release 0.5.12: the exec run pumps the piped stdin
+    (the ssh(1) canon: `cat file | ssh3 host exec cmd` rides the
+    session channel, the pipe EOF half-closes the write side), the
+    fin at the open rides only for -n and the console stdin (the
+    console-bytes racing fix of 0.5.10 stays), the cli-compat e2e
+    leg 19 pins the canon.
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Sat, 07 Nov 2026 16:30:00 +0100
+
 ssh3-c (0.5.11-1) unstable; urgency=medium
 
   * New upstream release 0.5.11: the DCID-based demotion of the
