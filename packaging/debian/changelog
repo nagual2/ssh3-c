@@ -1,3 +1,17 @@
+ssh3-c (0.5.14-1) unstable; urgency=medium
+
+  * New upstream release 0.5.14: the server presents the full
+    certificate chain in the QUIC handshake (the leaf rides
+    SSL_CTX_use_certificate, the intermediates ride the extra chain
+    stack with the ownership moved to the ctx - the leaf-only side
+    was unverifiable for the client). The plan carries the trust
+    chasing track (10: the AIA + root program mirror of the go-fork
+    R7) and the live-deployment findings (11: the host migration,
+    the RPATH trap of the WSL build against the older system libssl,
+    the literal-IPv6 open item).
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Tue, 10 Nov 2026 16:35:24 +0100
+
 ssh3-c (0.5.13-1) unstable; urgency=medium
 
   * New upstream release 0.5.13: the B22 teardown segfault of the
