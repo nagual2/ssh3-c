@@ -118,10 +118,15 @@ s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key,
         goto failed;
     }
 
+    /*
+     * the leaf rides SSL_CTX_use_certificate(), the rest of the PEM
+     * chain rides the extra chain stack: the handshake must present
+     * the full chain, a leaf-only server side is unverifiable for
+     * the client (the intermediates are not in its trust store)
+     */
     x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-
     if (x509 == NULL) {
+        BIO_free(bio);
         s3_ssl_error(log, 0, "PEM_read_bio_X509() failed");
         goto failed;
     }
@@ -129,10 +134,27 @@ s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key,
     if (SSL_CTX_use_certificate(ssl->ctx, x509) != 1) {
         s3_ssl_error(log, 0, "SSL_CTX_use_certificate() failed");
         X509_free(x509);
+        BIO_free(bio);
         goto failed;
     }
 
     X509_free(x509);
+
+    while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        if (SSL_CTX_add_extra_chain_cert(ssl->ctx, x509) != 1) {
+            s3_ssl_error(log, 0, "SSL_CTX_add_extra_chain_cert() failed");
+            X509_free(x509);
+            BIO_free(bio);
+            goto failed;
+        }
+
+        /* the ownership of x509 moved to the ctx - no X509_free */
+    }
+
+    /* the EOF read of the PEM trail sets an error - clear it */
+    ERR_clear_error();
+
+    BIO_free(bio);
 
     bio = BIO_new_mem_buf(key, (int)key_len);
     if (bio == NULL) {
