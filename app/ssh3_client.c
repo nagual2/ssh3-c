@@ -15296,6 +15296,23 @@ main(int argc, char **argv)
         }
     }
 
+    /* the bare ipv6 shape: the colon inside the remainder means the
+     * operand rides the unbracketed literal (the port of the dial
+     * never carries a colon) - the honest refusal names the
+     * bracketed form instead of the misleading "cannot resolve
+     * <first label>" */
+
+    if (colon != NULL) {
+
+        const char *lim2 = (slash != NULL) ? slash : operand + strlen(operand);
+
+        if (memchr(colon + 1, ':', (size_t)(lim2 - colon - 1)) != NULL) {
+            fprintf(stderr,
+                    "ssh3: the bare IPv6 rides the bracketed form: user@[addr]:port\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
+
     if (slash != NULL) {
 
         unsigned oport;
@@ -15312,7 +15329,10 @@ main(int argc, char **argv)
             oport = (unsigned)atoi(colon + 1);
 
             if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+                fprintf(stderr,
+                    "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
+                    "user@[addr]:port)\n",
+                    argv[optind - 1]);
                 return S3_CLI_EXIT_ERROR;
             }
 
@@ -15339,7 +15359,10 @@ main(int argc, char **argv)
         unsigned oport = (unsigned)atoi(colon + 1);
 
         if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-            fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+            fprintf(stderr,
+                    "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
+                    "user@[addr]:port)\n",
+                    argv[optind - 1]);
             return S3_CLI_EXIT_ERROR;
         }
 
@@ -15705,6 +15728,12 @@ main(int argc, char **argv)
 
         if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
             fprintf(stderr, "ssh3: cannot resolve %s\n", s3_cli_host);
+
+            if (strchr(s3_cli_host, ':') != NULL) {
+                fprintf(stderr,
+                        "ssh3: the IPv6 literal rides the bracketed form: user@[addr]:port\n");
+            }
+
             s3_cli_net_cleanup();
             return S3_CLI_EXIT_ERROR;
         }

@@ -105,6 +105,13 @@ first word after the operand.
 The stdin stays /dev/null; no session (the forwards hold the
 run); force the pty (even without a local tty); never request the
 pty.
+.It Fl 4 , Fl 6
+The address family filter of the dial: the unforced run resolves
+both families and the first answer picks (the AAAA of the host
+rides the v6 without any pick); the picks force the family at the
+resolver hints (the
+.Fl J
+hops ride the same force).
 .It Fl q , Fl v , Fl V
 Quiet (the errors only); verbose (repeatable: -vv debug, -vvv
 everything); print the version.
