@@ -283,3 +283,26 @@ RPATH на приватную копию libssl (`ssh3c-libssl3` → `/usr/lib/s
 | 1 | Оперативный фикс на host-b: `patchelf --set-rpath /usr/lib/ssh3-c/lib /usr/sbin/ssh3-server` → ldd ведёт на бандловый libssl 3.5 | применён, сервер жив |
 | 2 | Для будущих ручных деплоев вне репо: собранный бинарник либо линковать к той же мажорной libssl, что у цели, либо сразу RPATH на бандловый libssl; diag-первые-шаги: `journalctl -u ssh3-server` до всяких tcpdump — crash-loop виден мгновенно | заметка в план |
 | 3 | Попутные клиентские UX-хвосты (релизный чеклист v0.5.14): дефолт порта 443 у Windows-клиента отсутствует (голый `user@host` → тихий таймаут вместо ошибки) — сделать дефолт 443 + явная ошибка; флага `-6` нет (и не нужен — AF по AAAA, но задокументировать); IPv6-адрес в URL — только скобочная форма, не-скобочная рвётся по первому `:` («cannot resolve 2001:db8») — в ошибку добавить подсказку про скобки | в релизный чеклист |
+
+## 12. Волна: Windows-клиент — inactive-холд и Ctrl+R reconnect (2026-11-10, ЗАКРЫТО)
+
+Поведение PuTTY-канона для интерактивной консоли Windows: разрыв соединения (ребут сервера,
+обрыв, жёсткий kill) не закрывает окно — title несёт метку `(inactive)`, баннер называет потерю,
+`Ctrl+R` пере-диалит resolved peer в том же процессе, `Ctrl+C`/крестик выходят (255). Служит
+только чистой интерактивной pty-консоли (exec/sftp/форварды/-N/CM/-J — прежний single-run
+контракт); юникс-ветка не менялась.
+
+| № | Пункт | Факт |
+|---|-------|------|
+| 1 | Механика (`app/ssh3_client.c`) | `s3_cli_inactive_gate/wait/key`, `s3_cli_console_title` (SetConsoleTitleW, PuTTY-форма `ssh3 user@host:port (inactive)`), фаза холда держит reader/ring живыми (полный teardown разделён: `s3_cli_teardown_net()` без `console_done`), сброс статик `s3_cli_reconnect_reset()` по образцу jump-сброса, наружный reconnect-цикл main |
+| 2 | Мгновенность холда | разрыв детектится по смерти **канала** (`s3_cli_chan_dead` в `s3_cli_chan_read`), а не по `qc==NULL` — finalize мёртвого conn едет на PTO-зондах минутами и держал окно-заложником |
+| 3 | Транспорт-фикс (обе платформы) | `s3_quic_input_handler`: UDP-recv `S3_ERROR` (win `WSAECONNRESET`-яд после send в закрытый порт, unix ECONNRESET-эхо) закрывает conn сразу — прежде silent-keep держал win-conn зомби вечно, и dead-path-зонды не успевали |
+| 4 | Re-entry консоли | повторный диал не пере-инициализирует живую консоль (гвард `ring_ready`): двойной `InitializeCriticalSection` + второй reader-поток глухили клавиатуру после reconnect |
+| 5 | Приёмка на живом стенде w11-test-vm (локальная учётка, 4 vCPU, автологин) | graceful рестарт демона → баннер мгновенный; `SIGKILL` демона (host-c-стенд, порт 18446, passfile-auth) → баннер за секунды (WSAECONNRESET → close); Ctrl+R → `SESSION-REUSED 0` (fresh — тикет сгорел) → новый шелл, клавиатура живая (`ffff` дошли до bash); Ctrl+C → выход; крестик → закрытие |
+| 6 | Доки | usage (win-блок), `packaging/debian/ssh3.1` §INACTIVE SESSION |
+
+Открытый хвост (отдельная волна): **0-RTT переиспользование не срабатывает** — второй диал при
+живом `c`-тикете даёт `SESSION-REUSED 0` (и WSL, и win-клиент против 0.5.14); exec-прогоны
+мгновенно закрытой сессии тикет вообще не собирают (NST не успевает). Тёплый 0-RTT — путь к
+суб-100 мс reconnect'ам. Попутно UX: `-o` ключи не канонизируют дефисы
+(`StrictHostKeyChecking` ≠ `strict-host-key-checking` — ошибка списка поддерживаемых).

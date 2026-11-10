@@ -699,6 +699,16 @@ s3_quic_input_handler(s3_event_t *rev)
         n = c->recv(c, buffer, sizeof(buffer));
 
         if (n <= 0) {
+
+            /* the udp socket died (the win WSAECONNRESET poison of a
+             * send into the closed port, the unix ECONNRESET echo):
+             * the transport is gone - the silent keep of the conn held
+             * the interactive hold hostage (the win zombi shape) */
+
+            if (n == (ssize_t)S3_ERROR) {
+                s3_quic_close_connection(c, S3_ERROR);
+            }
+
             return;
         }
 

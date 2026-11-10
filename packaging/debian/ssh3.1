@@ -109,6 +109,21 @@ pty.
 Quiet (the errors only); verbose (repeatable: -vv debug, -vvv
 everything); print the version.
 .El
+.Sh INACTIVE SESSION (WINDOWS)
+On a Windows console the connection loss does not close the
+window: the title bar carries the
+.Ql (inactive)
+mark, the banner names the loss and the interactive session holds
+until the
+.Cm Ctrl+R
+re-dials the resolved peer (a full fresh session in the same
+process, the known-hosts pins and the 0-RTT ticket of the peer
+ride again) or the
+.Cm Ctrl+C
+exits with the status 255. The shape serves the plain interactive
+console only: the exec, the sftp, the forwards, the
+.Fl N
+hold and the control master keep the single-run contract.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.ssh3/known_hosts
