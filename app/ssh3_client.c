@@ -1217,6 +1217,7 @@ static void     s3_cli_teardown(void);
 static void     s3_cli_teardown_net(void);
 static void     s3_cli_reconnect_reset(void);
 static void     s3_cli_tick_arm(void);
+static void     s3_cli_wait_wake(s3_event_t *ev);
 static s3_int_t s3_cli_sftp_append(const u_char *data, size_t n);
 static void     s3_cli_sftp_finish(void);
 static void     s3_cli_sftp_pump(void);
@@ -3790,8 +3791,8 @@ s3_cli_opt_key_eq(const char *a, const char *b)
             break;
         }
 
-        ca = *a;
-        cb = *b;
+        ca = *(const unsigned char *)a;
+        cb = *(const unsigned char *)b;
 
         if (ca >= 'A' && ca <= 'Z') {
             ca += 'a' - 'A';
@@ -14636,6 +14637,14 @@ s3_cli_tick_handler(s3_event_t *ev)
     }
 }
 
+/* the wake of the ticket-collection wait: the timer fires, the
+ * pump loop re-reads the clock and the ticket counter */
+static void
+s3_cli_wait_wake(s3_event_t *ev)
+{
+    (void)ev;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -16992,12 +17001,32 @@ main(int argc, char **argv)
 
         if (!s3_cli_reconnect_pending && !s3_cli_chan_dead && s3_cli_conf.ssl != NULL &&
             s3_cli_conf.ssl->tickets_n == s3_cli_tickets_at_dial) {
-            s3_msec_t until = s3_current_msec + 200;
+
+            /*
+             * the wait timer caps the epoll block: the idle timer of
+             * the conn rides 24 h, the bare deadline loop hangs
+             * inside the epoll wait when the exec closes faster than
+             * the NST flight (the jump shape) and the clock check
+             * never runs
+             */
+
+            s3_event_t wait_ev;
+            s3_msec_t  until = s3_current_msec + 200;
+
+            memset(&wait_ev, 0, sizeof(wait_ev));
+            wait_ev.handler = s3_cli_wait_wake;
+            wait_ev.log = &s3_cli_log;
+
+            s3_event_add_timer(&wait_ev, 200);
 
             while (s3_cli_conf.ssl->tickets_n == s3_cli_tickets_at_dial &&
                    s3_current_msec < until) {
                 s3_event_process_posted(&s3_cli_ctx, &s3_cli_ctx.posted_events);
                 s3_process_events_and_timers(&s3_cli_ctx);
+            }
+
+            if (wait_ev.timer_set) {
+                s3_event_del_timer(&wait_ev);
             }
         }
 

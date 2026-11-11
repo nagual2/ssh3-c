@@ -123,7 +123,12 @@ ride again) or the
 exits with the status 255. The shape serves the plain interactive
 console only: the exec, the sftp, the forwards, the
 .Fl N
-hold and the control master keep the single-run contract.
+hold and the control master keep the single-run contract. The warm
+re-dial rides the persistent ticket key of the daemon: the session
+resumes across the server restart, the lost lifetime costs one
+plain 1-RTT dial at most (the resumed handshake carries no new
+certificate: the pin verdict rides the certificate of the original
+session stored in the ticket).
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.ssh3/known_hosts

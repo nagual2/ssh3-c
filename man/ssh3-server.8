@@ -31,6 +31,7 @@
 .Op Fl -password-lockout-seconds Ar s
 .Op Fl -permit-open Ar spec
 .Op Fl -permit-listen Ar spec
+.Op Fl -session-ticket-key-file Ar file
 .Op Fl -gateway-ports Cm no | yes | clientspecified
 .Op Fl -help
 .Op Fl v
@@ -390,6 +391,26 @@ The lockout window of a failed account, default 60 (the reference
 .Cm -password-lockout-seconds ) .
 While it lasts the locked account answers 429 without the password
 backends being touched; a successful authentication clears the record.
+.It Fl -session-ticket-key-file Ar file
+The persistent session ticket key of the daemon: the tickets ride
+the
+.Ar file
+in the nginx 80-byte form (16 name + 32 hmac + 32 aes; the 48-byte
+legacy shapes the aes-128 and the short hmac). The default path
+lives beside the private key of
+.Fl k
+as
+.Pa session-ticket.key ;
+the missing file generates (the owner-only mode), the broken file
+regenerates and the tickets of the previous lifetime die, a failed
+path keeps the daemon alive - the keys stay in the process memory
+and the tickets die on the restart (the warning names it).
+With the file the tickets survive the daemon restart: the resumed
+client dials ride the warm 0-RTT across the lifetime.
+The file is part of the trust lineage of the resumed dials: the
+resumed handshake carries no new certificate and the client verdict
+rides the certificate of the original session stored in the ticket
+- the key file shares the protection domain of the private key.
 .It Fl -permit-open Ar spec
 The forward target policy of the
 .Cm direct-tcp

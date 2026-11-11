@@ -199,17 +199,19 @@
 
 **Календарь:** Mint 23 (base Ubuntu 26.04, OpenSSL 3.5.5) — декабрь 2026: апгрейд минисфорума (не в день релиза; полный бэкап) → RFS-пакеты напрямую, бандл-необходимость отпадает. WSL recreate на Ubuntu 26.04 — опция владельца. С 2026-10-21 хосты живут на bundled-канале 0.5.2-1 (server+client): v0.5.1 — пасс-3 аудит QUIC-стека с разбором отчёта (idle-таймер, путь локального адреса) и фикс wildcard-лисенера; v0.5.2 — волна A (jail SFTP, constant-time сравнения, фаззер h3-парсера, linux-клиент и checksums в ассетах). Раскатка на WSL и минисфорум сделана, откат на 0.4.1-1 отрепетирован (apt снимает ssh3c-libssl3 сам, по Breaks).
 
-## 10. Настоящее докачивание доверия (AIA + root program) — внесено 2026-11-08, не начато
+## 10. Настоящее докачивание доверия (AIA + root program) — внесено 2026-11-08; T1+T2 в рабочем дереве 2026-11-11 (коммитов нет), T3 не начат
 
 Зеркальный трек для C-порта: go-форк `project/ssh3/docs/ROADMAP.md` R7; якорь — `docs/CERT-VERIFICATION-CANON.md` (путь «системный CA-стор»); докачанное доверие само якорем не становится. Побудительный кейс 2026-11-08: Go-клиент на Windows строит цепочку по статичному содержимому сторов (автообновление корней SChannel не наследуется) — на серверных SKU без ISRG X1/X2 LE-цепочки не верифицируются; ssh3-c на Windows системные сторы не читает вовсе, лист сервера в QUIC-handshake ехал без цепочки (починено в s3_ssl.c в тот же день — сервер отдаёт full chain, зафиксировано до релиза).
 
 | № | Фаза | Содержание | Кэш |
 |---|------|-----------|-----|
-| 1 | T1 CA-bundle bootstrap | зашитый PEM + файл рядом: `SSL_CTX_load_verify_locations` — база уже есть в `src/os/unix/s3_https_fetch.c`, вынести в общий клиентский путь | bundle в комплекте клиента |
-| 2 | T2 AIA-chasing | недостающие intermediates по `caIssuers`-URL листа, рекурсивно до якоря; недоступность сети — работа на stale-кэше | `~/.ssh3/aia-cache/` |
+| 1 | T1 CA-bundle bootstrap — **в рабочем дереве 2026-11-11** | зашитый PEM + файл рядом — **сделано**: `src/ssh3/s3_ssh3_trust_roots.c` (генерированный hex-массив, C17 без `#embed`) из байт-точных PEM ISRG Root X1/X2 (`scripts/trust-roots/`, DER SHA-256 сверяются генератором `scripts/gen-trust-roots.py` против published-fingerprints — те же пины, что у Go `cabundle.go`); `s3_ssh3_aia_trust_bootstrap()` (`src/ssh3/s3_ssh3_aia.c`): embedded-корни в стор CTX (`X509_STORE_add_cert`) + юзер-бандл (`SSH3_CA_BUNDLE` env > `~/.ssh3/ca-bundle.pem`) через `SSL_CTX_load_verify_locations`; вызов в обоих клиентских CTX (dest + hop) до пинов; попутно bootstrap создаёт `~/.ssh3` (первый контакт: kh-аппенд/тикеты писали в несуществующий каталог — гонка с NST-персистом, e2e-находка) | bundle в комплекте клиента |
+| 2 | T2 AIA-chasing — **в рабочем дереве 2026-11-11** | недостающие intermediates по `caIssuers`-URL, рекурсивно до якоря; недоступность сети — работа на stale-кэше — **сделано**: `src/ssh3/s3_ssh3_aia.{c,h}` (порт `cmd/aia.go` на C-семантику); триггер — missing-issuer класс `chain_err` (2/20/51) при не-self-signed листе; retry-хендшейк **не нужен** (record-only волна B-вер) — чейз пост-хендшейк, точка потребления `s3_cli_cert_check_conn`; гейт — `X509_STORE_CTX`: якоря = стор CTX (system ∪ embedded ∪ bundle ∪ пины), fetched + предъявленные — untrusted, никогда в стор; кэш `~/.ssh3/aia-cache/<SHA-256(url)>.pem` (0600, DER/PEM ответы оба, кап тела 256 КиБ, глубина 8, fetch 5 с — `s3_https_fetch_to`, бюджет 20 с); pass1 cache-first (тёплый кэш — ноль сети), pass2 network-forced (stale/poisoned не клинит, перезапись за ним); rogue-ответ нейтрализует сигнатурный чек `issued_by` | `~/.ssh3/aia-cache/` |
 | 3 | T3 root program | `authrootstl.cab` (ctldl.windowsupdate.com): CAB-распаковка, CTL = PKCS#7 contentType `1.3.6.1.4.1.311.10.1` (спека MS-CRTD), подпись MS CTL-signer (signer зашит в бинарник — иначе циркулярное доверие), отбор корней; рядом `disallowedcertstl.cab` | бандл-файл, refresh по `nextUpdate` (7–30 дней); между обновлениями ноль запросов |
 
 Безопасность: докачанное не создаёт доверие само (обязано выстроиться к якорю); CTL — подпись + пин известной-good версии в бинарнике; AIA-трафик светит IP в сторону CA, но не целевой хост. Порядок T1 → T2 → T3; T3 не блокирует ни один пункт плана; вход — решение владельца о политике доверия (T1 допустимо включить сразу как запасной якорь).
+
+**Приёмка T1+T2 (2026-11-11, рабочий дереве):** ctest **52/52** release+asan (новый `tests/test_ssh3_aia.c` — 10 ног: caIssuers-извлечение, DER/PEM-парс, гейт, кэш round-trip, чейз-проходы, кэш stale/poisoned/offline, капы глубины/бюджета, bootstrap c fingerprint-пинами ISRG, complete-триггеры против живого TLS-хендшейка; сеть в юнитах — fetch-хук `s3_ssh3_aia_set_fetch`); mingw windows-core чисто; clang-format чисто; e2e `interop/aia-chase-e2e.sh` — **AIA-CHASE-E2E OK** (6 ног: leaf-only сервер + caIssuers-stub → chase+auth+пин, stale-кэш офлайн, rogue-ответ отказ, poisoned-кэш офлайн отказ, poisoned+stub → network-forced refresh, refresh-офлайн).
 
 ## 11. Находки сессии 2026-11-08/09 (переезд host-b→host-c, deployment на реальные хосты)
 
@@ -301,8 +303,29 @@ RPATH на приватную копию libssl (`ssh3c-libssl3` → `/usr/lib/s
 | 5 | Приёмка на живом стенде w11-test-vm (локальная учётка, 4 vCPU, автологин) | graceful рестарт демона → баннер мгновенный; `SIGKILL` демона (host-c-стенд, порт 18446, passfile-auth) → баннер за секунды (WSAECONNRESET → close); Ctrl+R → `SESSION-REUSED 0` (fresh — тикет сгорел) → новый шелл, клавиатура живая (`ffff` дошли до bash); Ctrl+C → выход; крестик → закрытие |
 | 6 | Доки | usage (win-блок), `packaging/debian/ssh3.1` §INACTIVE SESSION |
 
-Открытый хвост (отдельная волна): **0-RTT переиспользование не срабатывает** — второй диал при
+Хвост (закрыт волной 13, ниже): **0-RTT переиспользование не срабатывает** — второй диал при
 живом `c`-тикете даёт `SESSION-REUSED 0` (и WSL, и win-клиент против 0.5.14); exec-прогоны
-мгновенно закрытой сессии тикет вообще не собирают (NST не успевает). Тёплый 0-RTT — путь к
-суб-100 мс reconnect'ам. Попутно UX: `-o` ключи не канонизируют дефисы
-(`StrictHostKeyChecking` ≠ `strict-host-key-checking` — ошибка списка поддерживаемых).
+мгновенно закрытой сессии тикет вообще не собирают (NST не успевает). Попутно UX: `-o` ключи
+не канонизируют дефисы (`StrictHostKeyChecking` ≠ `strict-host-key-checking`).
+
+## 13. Волна: тёплый 0-RTT reconnect — персистентные тикет-ключи, сбор NST, `-o`-фолдинг (2026-11-11, ЗАКРЫТО)
+
+Диагноз оказался не «клиент не предложил» и не «сериализация DER»: OpenSSL 3.5 при
+вооружённом early data (`max_early_data > 0`) без `SSL_OP_NO_ANTI_REPLAY` выпускает
+**stateful-тикиеты** — тело тикета есть индекс внутреннего кэша сессий сервера
+(`construct_stateful_ticket`, ticket_key_cb не вызывается вовсе). Работавший «two runs
+against one daemon» стадии 2а ехал на этом кэше; рестарт демона убивал кэш вместе со всеми
+тикетами → честный 1-RTT. Рецепт nginx-канона: `SSL_OP_NO_ANTI_REPLAY` — тикеты становятся
+stateless (полное состояние сессии в теле), ответственность за replay забирает ssh3-слой
+(контракт 425/401, auth вне replay-окна — уже в коде).
+
+| № | Пункт | Факт |
+|---|-------|------|
+| 1 | Сервер: персистентные ключи (`s3_ssl.c`) | `s3_ssl_ticket_key_file()` — файл формата nginx 80 байт (16 name + 32 hmac + 32 aes; legacy 48 байт = aes-128/короткий hmac); нет файла → генерация 0600, битый → регенерация с warning. Дефолт пути — рядом с приватным ключом (`session-ticket.key`), флаг `--session-ticket-key-file`; отказ пути не валит демон (warning, ключи в памяти) |
+| 2 | Сервер: stateless-тикиеты | `SSL_OP_NO_ANTI_REPLAY` в `s3_ssl_create`; полёт урезан до одного тикета (`num_tickets(1)`), явный lifetime 12h (`SSL_CTX_set_timeout`) вместо молчаливого дефолта |
+| 3 | Клиент: сбор NST на быстром закрытии | счётчик `tickets_n` в ssl-conf; single-run выход качает event-цикл до свежего тикета или 200 мс (обычная цена ≈0; мёртвый коннект и reconnect-холд скипают) — кэш после каждого прогона несёт возобновляемый тикет |
+| 4 | Клиент: диагностика холодного диала | `-v`: `SSH3-TICKET-COLD <причина>` (файл/чужой хост/просрочен/битый) и `SSH3-TICKET-LOADED`; `s3_ssl_ticket_load` возвращает статус+причину |
+| 5 | Буфер строки кэша | stateless-тикет 1162 Б (hex 2324) резал `line[2048]` пополам — d2i давил обрезанный hex («cache line is damaged»); буфер зеркалит капу персист-стороны |
+| 6 | `-o`-фолдинг | ключи сворачивают регистр и `-`/`_` (`StrictHostKeyChecking` ≡ `strict-host-key-checking` ≡ `strict_host_key_checking`), длинные формы `-insecure`/`-strict-host-key-checking` тоже; леги 4b/4c client-opt-e2e |
+| 7 | Приёмка | unit `test_ssl_ticket_key_file` (формы файла, рестарт-персистентность ключа, регенерация, legacy); e2e `s3_test_quic_e2e_restart` (две жизни env, тот же ключ-файл, REUSED 1 + свежий NST); `early-product-e2e.sh` лег 3 «рестарт демона → REUSED 1» + diag-маркеры; живой пробник cold-exec → restart → warm — зелёный |
+| 8 | Trust model resumed-диалов | resumed-handshake не предъявляет НОВЫЙ сертификат — вердикт едет по сертификату исходной сессии из тикета (`SSL_get1_peer_certificate` возвращает peer-cert сессии): пин(a)+тикет эпохи a → тёплый диал проходит (лег 5 WARM-CONTINUITY), холодный диал ловит ротацию (лег 5b PIN-MISMATCH, дрель MITM), сессия чужой эпохи под старым пином → отказ (лег 6b RESUME-PIN-REJECT). Ранний скип проверки (нет серта pre-handshake, `s3_cli_early_init`) покрыт hs_done-вердиктом и 425/401-ретраем (B17). Механика Residence: файл тикет-ключа — тот же домен компрометации, что priv.key (0600, рядом); кандидат волны 14 — continuity-заголовок сервера; API `SSL_set_quic_tls_early_data_context` в OpenSSL 3.5 нет — TLS-слойный биндинг недоступен |

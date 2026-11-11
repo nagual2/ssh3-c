@@ -11,8 +11,13 @@
 #      pty and records the pin (the ACCEPT-NEW-PINNED marker)
 #   4. the pinned host passes strict=yes (the STRICT-PINNED-OK
 #      marker), the case-insensitive spelling rides too
-#   5. the daemon certificate rotates: the pinned host refuses on
-#      the mismatch (the PIN-MISMATCH-REJECT marker, the MITM shape)
+#   5. the daemon certificate rotates: the warm dial rides the
+#      ticket-key continuity (the session certificate == the pin,
+#      the WARM-CONTINUITY-OK marker), the cold dial refuses on the
+#      mismatch (the PIN-MISMATCH-REJECT marker, the MITM shape)
+#   5b. the resumed verdict rides the session certificate: the
+#      foreign-session ticket under the old pin refuses (the
+#      RESUME-PIN-REJECT marker)
 #   6. the -o insecure accepts the rotated certificate (the
 #      INSECURE-OK marker), the pin store stays untouched
 #   8. the -insecure flag form crosses the rotated certificate (the
@@ -305,7 +310,27 @@ start_srv b || die "the daemon did not start: $(tail -3 "$SRVLOG")"
 
 PORT=$(srv_port)
 
-echo "== leg 5: the pin mismatch refuses (PIN-MISMATCH-REJECT)"
+echo "== leg 5: the warm dial rides the ticket-key continuity (WARM-CONTINUITY-OK)"
+
+# the resumed handshake carries no NEW certificate: the verdict
+# rides the certificate of the original session (the ticket of the
+# daemon-a lifetime stores the certificate a, the pin rides the
+# certificate a) - the rotated daemon decrypts the ticket (the
+# shared key file) and the dial passes
+
+if run_cli home-tofu "" "printf S3-WARM-CONTINUITY-OK" &&
+    grep -q "S3-WARM-CONTINUITY-OK" "$WORK/home-tofu.out"; then
+    pass "the warm dial crossed the rotated certificate on the ticket-key continuity"
+else
+    fail "the warm continuity leg: $(tail -1 "$WORK/home-tofu.err")"
+fi
+
+echo "== leg 5b: the cold dial refuses the rotated certificate (PIN-MISMATCH-REJECT)"
+
+# the MITM drill of the full handshake: no ticket - the certificate
+# is re-presented and the pin verdict fires
+
+rm -f "$WORK/home-tofu/.ssh3/tickets"
 
 if run_cli home-tofu "" "printf no"; then
     fail "the mismatch leg: the run exited 0"
@@ -327,6 +352,27 @@ if run_cli home-tofu "insecure" "printf S3-INSECURE-ROTATED-OK" &&
     pass "the insecure run crossed the pin mismatch"
 else
     fail "the insecure pinned leg: rc=$? $(tail -1 "$WORK/home-tofu.err")"
+fi
+
+echo "== leg 6b: the resumed verdict rides the session certificate (RESUME-PIN-REJECT)"
+
+# the home-tofu holds the daemon-b session (the leg-6 insecure
+# run collected it) under the pin of the certificate a: the resumed
+# handshake re-verifies the session's original certificate - the
+# foreign-session certificate refuses (the verdict machinery runs
+# on the resumed dials)
+
+if run_cli home-tofu "strict-host-key-checking=yes" "printf S3-RESUME-TRUST-OK"; then
+    fail "the resume verdict leg: the run exited 0"
+else
+    RC=$?
+
+    if [ "$RC" -eq 255 ] &&
+        grep -q "does not match the pin in known_hosts" "$WORK/home-tofu.err"; then
+        pass "the resumed dial refused the foreign-session certificate (rc $RC)"
+    else
+        fail "the resume verdict leg: rc=$RC $(tail -1 "$WORK/home-tofu.err")"
+    fi
 fi
 
 echo "== leg 7: -o insecure on the fresh home stays store-free"
