@@ -24,6 +24,9 @@
 #      not eaten
 #  11. -o ConnectTimeout=2 against a dead port: the setup timeout
 #      refuses inside ~4 s with the message (the B9-3 hang is gone)
+#  12. the -o key spellings fold: the camelCase and the underscore
+#      forms ride the same keys, the camel long-form flag too (the
+#      OPT-KEY-FOLD and OPT-FLAG-FOLD markers)
 #
 # the verdicts: CLIENT-OPT-E2E OK / FAILED, the leg markers on the
 # way
@@ -71,7 +74,7 @@ cleanup() {
     # pinning the tree (the leg failures inspect the .out and the
     # pin store then)
 
-    [ -n "$S3OPT_KEEP" ] || rm -rf "$WORK"
+    [ -n "${S3OPT_KEEP:-}" ] || rm -rf "$WORK"
 }
 
 trap cleanup EXIT INT TERM
@@ -261,6 +264,37 @@ if run_cli home-tofu "strict-host-key-checking=yes" "printf S3-STRICT-PINNED-OK"
 
 else
     fail "the strict pinned leg: rc=$? $(tail -1 "$WORK/home-tofu.err")"
+fi
+
+echo "== leg 4b: the -o key spellings fold (OPT-KEY-FOLD)"
+
+# the camelCase and the underscore spellings ride the same keys (the
+# ssh2 canon of the config rode already, the -o surface follows)
+
+if run_cli home-tofu "StrictHostKeyChecking=yes" "printf S3-OPT-CAMEL-OK" &&
+    grep -q "S3-OPT-CAMEL-OK" "$WORK/home-tofu.out" &&
+    run_cli home-tofu "strict_host_key_checking=yes" "printf S3-OPT-UNDER-OK" &&
+    grep -q "S3-OPT-UNDER-OK" "$WORK/home-tofu.out" &&
+    run_cli home-tofu "StrictHostKeyChecking" "printf S3-OPT-BARECAMEL-OK" &&
+    grep -q "S3-OPT-BARECAMEL-OK" "$WORK/home-tofu.out" &&
+    run_cli home-tofu "VerifyHostKeyDNS=no" "printf S3-OPT-DNS-OK" &&
+    grep -q "S3-OPT-DNS-OK" "$WORK/home-tofu.out"; then
+    pass "the camel and underscore -o spellings ride (OPT-KEY-FOLD)"
+else
+    fail "the -o spelling leg: $(tail -1 "$WORK/home-tofu.err")"
+fi
+
+echo "== leg 4c: the camel long-form flag rides (OPT-FLAG-FOLD)"
+
+mkdir -p "$WORK/home-flag"
+
+if printf 'yes\n' | timeout 30 script -qec \
+    "env HOME=$WORK/home-flag $BUILD/ssh3 -StrictHostKeyChecking accept-new -i $WORK/priv.pem client@127.0.0.1:$(srv_port)/ssh3-term printf S3-OPT-FLAGCAMEL-OK" \
+    /dev/null > "$WORK/home-flag.out" 2>&1 &&
+    grep -q "S3-OPT-FLAGCAMEL-OK" "$WORK/home-flag.out"; then
+    pass "the camel long-form flag rides (OPT-FLAG-FOLD)"
+else
+    fail "the flag spelling leg: $(tail -1 "$WORK/home-flag.out")"
 fi
 
 stop_srv

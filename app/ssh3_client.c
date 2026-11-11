@@ -1150,6 +1150,7 @@ static s3_int_t  s3_cli_fwd_parse(const char *arg);
 static s3_int_t  s3_cli_fwd_bind_parse(const char *host, size_t len, s3_cli_fwd_spec_t *spec);
 static s3_int_t  s3_cli_socks_parse(const char *arg);
 static int       s3_cli_streq_ci(const char *a, const char *b);
+static int       s3_cli_opt_key_eq(const char *a, const char *b);
 static void      s3_cli_note(const char *fmt, ...);
 static unsigned  s3_cli_escape_live(void);
 static void      s3_cli_operand_host(const char *src, size_t len);
@@ -3763,6 +3764,54 @@ s3_cli_streq_ci(const char *a, const char *b)
 }
 
 /*
+ * the -o key fold: the ASCII case and the '-'/'_' separators ride
+ * out (the ssh2 camel canon StrictHostKeyChecking, the hyphen form
+ * and the shell underscore land on one key); the shape of the
+ * return rides s3_cli_streq_ci: 0 equal, 1 differ
+ */
+
+static int
+s3_cli_opt_key_eq(const char *a, const char *b)
+{
+    for (;;) {
+
+        int ca, cb;
+
+        while (*a == '-' || *a == '_') {
+            a++;
+        }
+
+        while (*b == '-' || *b == '_') {
+            b++;
+        }
+
+        if (*a == '\0' || *b == '\0') {
+            break;
+        }
+
+        ca = *a;
+        cb = *b;
+
+        if (ca >= 'A' && ca <= 'Z') {
+            ca += 'a' - 'A';
+        }
+
+        if (cb >= 'A' && cb <= 'Z') {
+            cb += 'a' - 'A';
+        }
+
+        if (ca != cb) {
+            return 1;
+        }
+
+        a++;
+        b++;
+    }
+
+    return !(*a == '\0' && *b == '\0');
+}
+
+/*
  * the pending note of the parse: the deprecated warnings queue here
  * (a fixed budget, the overflow drops), the end of the parse flushes
  * them to the stderr unless -q silenced the run
@@ -4406,12 +4455,12 @@ s3_cli_opt_parse(const char *arg)
 
     if (arg != NULL && strchr(arg, '=') == NULL) {
 
-        if (s3_cli_streq_ci(arg, "insecure") == 0) {
+        if (s3_cli_opt_key_eq(arg, "insecure") == 0) {
             s3_cli_opt_insecure = 1;
             return S3_OK;
         }
 
-        if (s3_cli_streq_ci(arg, "strict-host-key-checking") == 0) {
+        if (s3_cli_opt_key_eq(arg, "strict-host-key-checking") == 0) {
             s3_cli_opt_strict = S3_CLI_SHK_YES;
             s3_cli_have_strict = 1;
             return S3_OK;
@@ -4461,7 +4510,7 @@ s3_cli_opt_parse(const char *arg)
 
     memcpy(val, eq + 1, n + 1);
 
-    if (strcmp(key, "insecure") == 0) {
+    if (s3_cli_opt_key_eq(key, "insecure") == 0) {
 
         if (s3_cli_streq_ci(val, "yes") == 0 || s3_cli_streq_ci(val, "true") == 0 ||
             strcmp(val, "1") == 0) {
@@ -4479,7 +4528,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "strict-host-key-checking") == 0) {
+    if (s3_cli_opt_key_eq(key, "strict-host-key-checking") == 0) {
 
         s3_int_t v = s3_cli_shk_parse(val);
 
@@ -4494,7 +4543,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "verifyhostkeydns") == 0) {
+    if (s3_cli_opt_key_eq(key, "verifyhostkeydns") == 0) {
 
         s3_int_t v = s3_cli_sshfp_parse(val);
 
@@ -4509,7 +4558,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "connecttimeout") == 0) {
+    if (s3_cli_opt_key_eq(key, "connecttimeout") == 0) {
 
         /* the ssh(1) canon: the seconds, 0 = the deadline not armed */
 
@@ -4528,7 +4577,7 @@ s3_cli_opt_parse(const char *arg)
     /* the ssh2 canon keys (the P8 wave): each maps onto the twin
      * short flag, the CLI-wins tracking rides along */
 
-    if (strcmp(key, "port") == 0) {
+    if (s3_cli_opt_key_eq(key, "port") == 0) {
 
         unsigned v = (unsigned)atoi(val);
 
@@ -4543,7 +4592,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "user") == 0) {
+    if (s3_cli_opt_key_eq(key, "user") == 0) {
 
         if (strlen(val) >= sizeof(s3_cli_user)) {
             fprintf(stderr, "ssh3: -o User= is too long\n");
@@ -4556,7 +4605,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "identityfile") == 0) {
+    if (s3_cli_opt_key_eq(key, "identityfile") == 0) {
 
         /* the ssh2 repeatable list carries one identity here, the
          * first wins and the rest note */
@@ -4578,7 +4627,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "forwardagent") == 0) {
+    if (s3_cli_opt_key_eq(key, "forwardagent") == 0) {
 
         if (s3_cli_streq_ci(val, "yes") == 0 || strcmp(val, "1") == 0) {
             s3_cli_agent_mode = 1;
@@ -4596,19 +4645,19 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "localforward") == 0) {
+    if (s3_cli_opt_key_eq(key, "localforward") == 0) {
         return s3_cli_fwd_parse(val);
     }
 
-    if (strcmp(key, "remoteforward") == 0) {
+    if (s3_cli_opt_key_eq(key, "remoteforward") == 0) {
         return s3_cli_rev_parse_spec(val);
     }
 
-    if (strcmp(key, "dynamicforward") == 0) {
+    if (s3_cli_opt_key_eq(key, "dynamicforward") == 0) {
         return s3_cli_socks_parse(val);
     }
 
-    if (strcmp(key, "proxyjump") == 0) {
+    if (s3_cli_opt_key_eq(key, "proxyjump") == 0) {
 
         if (s3_cli_streq_ci(val, "none") == 0) {
             s3_cli_jump_on = 0;
@@ -4620,11 +4669,11 @@ s3_cli_opt_parse(const char *arg)
         return s3_cli_jump_parse(val);
     }
 
-    if (strcmp(key, "escapechar") == 0) {
+    if (s3_cli_opt_key_eq(key, "escapechar") == 0) {
         return s3_cli_escape_parse(val);
     }
 
-    if (strcmp(key, "controlmaster") == 0) {
+    if (s3_cli_opt_key_eq(key, "controlmaster") == 0) {
 
         if (s3_cli_streq_ci(val, "yes") == 0 || strcmp(val, "1") == 0) {
             s3_cli_cm_master = 1;
@@ -4651,7 +4700,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "controlpath") == 0) {
+    if (s3_cli_opt_key_eq(key, "controlpath") == 0) {
 
         if (strlen(val) >= sizeof(s3_cli_cm_path)) {
             fprintf(stderr, "ssh3: -o ControlPath= is too long\n");
@@ -4664,7 +4713,7 @@ s3_cli_opt_parse(const char *arg)
         return S3_OK;
     }
 
-    if (strcmp(key, "controlpersist") == 0) {
+    if (s3_cli_opt_key_eq(key, "controlpersist") == 0) {
 
         if (s3_cli_streq_ci(val, "no") == 0 || strcmp(val, "0") == 0) {
 
@@ -14673,7 +14722,8 @@ main(int argc, char **argv)
 
                 if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
                     strcmp(argv[n], "--sftp") == 0 || strcmp(argv[n], "--agent-key") == 0 ||
-                    strcmp(argv[n], "-strict-host-key-checking") == 0) {
+                    (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
+                     s3_cli_opt_key_eq(argv[n] + 1, "strict-host-key-checking") == 0)) {
                     n++;
                 }
 
@@ -14896,7 +14946,8 @@ main(int argc, char **argv)
                     drop = 2;
                 }
 
-            } else if (strcmp(argv[n], "-insecure") == 0) {
+            } else if (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
+                       s3_cli_opt_key_eq(argv[n] + 1, "insecure") == 0) {
 
                 /* the test-mode TLS as a flag: the pin check skips
                  * entirely - the -o insecure twin rides the same
@@ -14908,7 +14959,8 @@ main(int argc, char **argv)
 
                 drop = 1;
 
-            } else if (strcmp(argv[n], "-strict-host-key-checking") == 0) {
+            } else if (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
+                       s3_cli_opt_key_eq(argv[n] + 1, "strict-host-key-checking") == 0) {
 
                 /*
                  * the unknown-host policy of the TOFU as a flag: the
