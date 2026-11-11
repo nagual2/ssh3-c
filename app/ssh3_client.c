@@ -15541,6 +15541,23 @@ main(int argc, char **argv)
         }
     }
 
+    /* the bare ipv6 shape: the colon inside the remainder means the
+     * operand rides the unbracketed literal (the port of the dial
+     * never carries a colon) - the honest refusal names the
+     * bracketed form instead of the misleading "cannot resolve
+     * <first label>" */
+
+    if (colon != NULL) {
+
+        const char *lim2 = (slash != NULL) ? slash : operand + strlen(operand);
+
+        if (memchr(colon + 1, ':', (size_t)(lim2 - colon - 1)) != NULL) {
+            fprintf(stderr,
+                    "ssh3: the bare IPv6 rides the bracketed form: user@[addr]:port\n");
+            return S3_CLI_EXIT_ERROR;
+        }
+    }
+
     if (slash != NULL) {
 
         unsigned oport;
@@ -15557,7 +15574,10 @@ main(int argc, char **argv)
             oport = (unsigned)atoi(colon + 1);
 
             if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-                fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+                fprintf(stderr,
+                    "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
+                    "user@[addr]:port)\n",
+                    argv[optind - 1]);
                 return S3_CLI_EXIT_ERROR;
             }
 
@@ -15584,7 +15604,10 @@ main(int argc, char **argv)
         unsigned oport = (unsigned)atoi(colon + 1);
 
         if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
-            fprintf(stderr, "ssh3: bad port in %s\n", argv[optind - 1]);
+            fprintf(stderr,
+                    "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
+                    "user@[addr]:port)\n",
+                    argv[optind - 1]);
             return S3_CLI_EXIT_ERROR;
         }
 
@@ -15915,6 +15938,66 @@ main(int argc, char **argv)
     (void)s3_cli_tofu_prepare();
 
     if (s3_cli_fork_bg_validate() != S3_OK) {
+        s3_cli_net_cleanup();
+        return S3_CLI_EXIT_ERROR;
+    }
+
+    /* the resolution first: the unforced literal dials its own
+     * family (the inet_pton fast-path, the scope-id forms fall back
+     * to the resolver), the name rides getaddrinfo - the unforced
+     * run passes AF_UNSPEC and takes the first answer (the ssh
+     * order), the -4/-6 pick filters at the hints; the chain targets
+     * carry the resolved family-tagged form on the wire */
+
+    memset(&sa4, 0, sizeof(sa4));
+    memset(&sa6, 0, sizeof(sa6));
+
+    if (s3_cli_family == AF_UNSPEC && inet_pton(AF_INET, s3_cli_host, &sa4.sin_addr) == 1) {
+        sa4.sin_family = AF_INET;
+        sa4.sin_port = htons((u_short)s3_cli_port);
+        memcpy(&s3_cli_sa, &sa4, sizeof(sa4));
+        s3_cli_sa_len = sizeof(sa4);
+
+    } else if (s3_cli_family == AF_UNSPEC &&
+               inet_pton(AF_INET6, s3_cli_host, &sa6.sin6_addr) == 1) {
+        sa6.sin6_family = AF_INET6;
+        sa6.sin6_port = htons((u_short)s3_cli_port);
+        memcpy(&s3_cli_sa, &sa6, sizeof(sa6));
+        s3_cli_sa_len = sizeof(sa6);
+
+    } else {
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = s3_cli_family;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        if (getaddrinfo(s3_cli_host, NULL, &hints, &res) != 0 || res == NULL) {
+            fprintf(stderr, "ssh3: cannot resolve %s\n", s3_cli_host);
+
+            if (strchr(s3_cli_host, ':') != NULL) {
+                fprintf(stderr,
+                        "ssh3: the IPv6 literal rides the bracketed form: user@[addr]:port\n");
+            }
+
+            s3_cli_net_cleanup();
+            return S3_CLI_EXIT_ERROR;
+        }
+
+        s3_cli_sa_len = res->ai_addrlen;
+        memcpy(&s3_cli_sa, res->ai_addr, s3_cli_sa_len);
+
+        if (s3_cli_sa.ss_family == AF_INET6) {
+            ((struct sockaddr_in6 *)&s3_cli_sa)->sin6_port = htons((u_short)s3_cli_port);
+
+        } else {
+            ((struct sockaddr_in *)&s3_cli_sa)->sin_port = htons((u_short)s3_cli_port);
+        }
+
+        freeaddrinfo(res);
+    }
+
+    if (s3_event_ctx_init(&s3_cli_ctx, &s3_cli_log) != S3_OK) {
+        fprintf(stderr, "ssh3: the event context failed\n");
         s3_cli_net_cleanup();
         return S3_CLI_EXIT_ERROR;
     }
