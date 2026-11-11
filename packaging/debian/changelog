@@ -1,3 +1,19 @@
+ssh3-c (0.5.16-1) unstable; urgency=medium
+
+  * New upstream release 0.5.16: the warm 0-RTT reconnect closes
+    (the wave 13: the persistent session ticket keys of the daemon
+    survive the restart - the nginx 80-byte key file beside the
+    private key, the stateless tickets ride SSL_OP_NO_ANTI_REPLAY),
+    the exec one-shot collects the NST before the teardown, the -o
+    key spellings fold (the camel and the underscore land on the
+    hyphen keys), the win console reconnect (the wave 12: the
+    (inactive) hold, the Ctrl+R re-dial, the Ctrl+C exit), the
+    trust bootstrap and the AIA chase ride (the embedded ISRG
+    roots, the caIssuers walk of the missing-issuer chains, the
+    fetched certificates stay untrusted), the go-server oidc leg.
+
+ -- nagual2 <912140+nagual2@users.noreply.github.com>  Wed, 11 Nov 2026 23:59:00 +0100
+
 ssh3-c (0.5.15-1) unstable; urgency=medium
 
   * New upstream release 0.5.15: the bare ipv6 operand names the
