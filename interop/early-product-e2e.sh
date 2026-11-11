@@ -9,6 +9,14 @@
 #      425 (RFC 8470, the auth stays out of the replay window) and
 #      the post-handshake retry carries the credentials - the exec
 #      finishes clean
+#   3. the daemon restart keeps the warm dial (the wave 13): the
+#      persistent ticket key file beside the private key decrypts the
+#      stateless tickets of the previous daemon lifetime - the third
+#      run resumes across the restart
+#
+# the runs 1 and 2 pin the exec one-shot collection already: run 1
+# is a single-run exec and its NST (the client wait of the wave 13)
+# is exactly what run 2 resumes
 #
 # usage: early-product-e2e.sh (WSL)
 set -u
@@ -86,6 +94,12 @@ else
     fail "no ~/.ssh3/tickets after the cold run"
 fi
 
+if grep -q "SSH3-TICKET-COLD" "$W/r1.err"; then
+    pass "the cold dial named the cache reason (the -v diag)"
+else
+    fail "no SSH3-TICKET-COLD marker on the cold run"
+fi
+
 echo "== 2: the warm cache flies the CONNECT in the early window"
 
 run_cli r2
@@ -96,6 +110,12 @@ if [ "$RC" -eq 0 ] && grep -q "SSH3-SESSION-REUSED 1" "$W/r2.err"; then
     pass "the warm run resumed the session (rc 0, reused 1)"
 else
     fail "the warm run: rc=$RC $(tail -3 "$W/r2.err")"
+fi
+
+if grep -q "SSH3-TICKET-LOADED" "$W/r2.err"; then
+    pass "the warm dial loaded the cache (the -v diag)"
+else
+    fail "no SSH3-TICKET-LOADED marker on the warm run"
 fi
 
 # the refusal of the early flight rides either the 425 (the request
@@ -109,6 +129,35 @@ elif grep -q "INTEROP-H3-REJECT code=401" "$SRVLOG"; then
     pass "the early CONNECT drew the loopback 401 and the retry carried the auth"
 else
     fail "no early-flight refusal (425/401) in the daemon log"
+fi
+
+echo "== 3: the daemon restart keeps the warm dial (the persistent key)"
+
+kill "$SRVPID" 2>/dev/null
+wait "$SRVPID" 2>/dev/null
+
+# the fresh daemon lifetime loads the ticket key file beside the
+# private key (the default path of the wave 13) - the stateless
+# tickets of the first lifetime keep decrypting
+
+setsid nohup env SSH3C_PROTO=1 "$BUILD/ssh3-server" -3 -l "127.0.0.1:$p" \
+    -c "$W/cert.pem" -k "$W/key.pem" -K "$W/authorized_keys" \
+    > "$SRVLOG" 2>&1 < /dev/null &
+
+SRVPID=$!
+sleep 1
+
+grep -q INTEROP-LISTEN "$SRVLOG" ||
+    die "the restarted daemon did not come up: $(tail -2 "$SRVLOG")"
+
+run_cli r3
+
+RC=$?
+
+if [ "$RC" -eq 0 ] && grep -q "SSH3-SESSION-REUSED 1" "$W/r3.err"; then
+    pass "the warm dial survived the daemon restart (rc 0, reused 1)"
+else
+    fail "the restart run: rc=$RC $(tail -3 "$W/r3.err")"
 fi
 
 kill "$SRVPID" 2>/dev/null

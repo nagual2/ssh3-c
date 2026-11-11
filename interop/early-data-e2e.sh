@@ -2,12 +2,13 @@
 # the 0-RTT negative e2e (RFC 8470, the 425 gate, the P6 debts wave):
 #
 #   1. one plain s3interop_server -3 started with S3_H3_FORCE_EARLY=1:
-#      the synthetic probe makes the RFC 8470 branch fire once (no
-#      shipped client sends TLS 0-RTT early data yet — the server
-#      never advertises max_early_data, the session resumption is not
-#      wired — so the !handshaked gate has no natural trigger; the
-#      knob exercises the same verdict the real early-data request
-#      takes)
+#      the synthetic probe makes the RFC 8470 branch fire once (the
+#      shipped client sends the TLS 0-RTT early data only on the
+#      warm cache - the s3interop probes stay cold - so the
+#      !handshaked gate has no natural trigger here; the knob
+#      exercises the same verdict the real early-data request takes;
+#      the warm-cache flight rides early-product-e2e.sh since the
+#      stage 2a)
 #   2. the first client run (-3 -C) reads INTEROP-H3-STATUS 425 and
 #      fails, the server logs INTEROP-H3-REJECT code=425
 #   3. the retry (a fresh connection, the probe spent) rides the
