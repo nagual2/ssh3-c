@@ -101,11 +101,11 @@ s3_https_url_split(const char *url, unsigned *tls, char *host, size_t host_max, 
 }
 
 static void
-s3_https_socket_timeout(int fd)
+s3_https_socket_timeout(int fd, unsigned timeout_sec)
 {
     struct timeval tv;
 
-    tv.tv_sec = S3_HTTPS_TIMEOUT_SEC;
+    tv.tv_sec = (long)timeout_sec;
     tv.tv_usec = 0;
 
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
@@ -117,7 +117,7 @@ s3_https_socket_timeout(int fd)
 
 static BIO *
 s3_https_connect(const char *host, const char *port, unsigned tls, const char *ca_file,
-                 SSL_CTX **ctx_out)
+                 unsigned timeout_sec, SSL_CTX **ctx_out)
 {
     SSL_CTX *ctx;
     SSL     *ssl;
@@ -142,7 +142,7 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
     fd = BIO_get_fd(bio, NULL);
 
     if (fd >= 0) {
-        s3_https_socket_timeout(fd);
+        s3_https_socket_timeout(fd, timeout_sec);
     }
 
     if (!tls) {
@@ -319,8 +319,9 @@ s3_https_read_response(BIO *bio, unsigned *status, s3_str_t *response)
 }
 
 s3_int_t
-s3_https_fetch(const char *url, const char *method, const s3_str_t *body, const char *content_type,
-               const char *ca_file, unsigned *status, s3_str_t *response)
+s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
+                  const char *content_type, const char *ca_file, unsigned timeout_sec,
+                  unsigned *status, s3_str_t *response)
 {
     char        host[256], port[8], req[8192];
     unsigned    tls;
@@ -338,7 +339,7 @@ s3_https_fetch(const char *url, const char *method, const s3_str_t *body, const 
         return S3_ERROR;
     }
 
-    bio = s3_https_connect(host, port, tls, ca_file, &ctx);
+    bio = s3_https_connect(host, port, tls, ca_file, timeout_sec, &ctx);
 
     if (bio == NULL) {
         return S3_ERROR;
@@ -416,4 +417,14 @@ s3_https_fetch(const char *url, const char *method, const s3_str_t *body, const 
     *response = out;
 
     return S3_OK;
+}
+
+/* the default of the OIDC callers: the 15s per-phase socket timeout */
+
+s3_int_t
+s3_https_fetch(const char *url, const char *method, const s3_str_t *body, const char *content_type,
+               const char *ca_file, unsigned *status, s3_str_t *response)
+{
+    return s3_https_fetch_to(url, method, body, content_type, ca_file, S3_HTTPS_TIMEOUT_SEC, status,
+                             response);
 }

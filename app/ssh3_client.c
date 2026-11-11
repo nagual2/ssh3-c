@@ -127,6 +127,7 @@ typedef unsigned short u_short;
 #include <s3_quic_connection.h>
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
+#include <s3_ssh3_aia.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_compress.h>
 #include <s3_ssh3_frame.h>
@@ -5137,6 +5138,21 @@ s3_cli_cert_check_conn(s3_connection_t *conn, const char *hostkey)
      * first fatal X509_V_ERR_* otherwise */
 
     chain_err = s3_ssl_chain_err(SSL_get_app_data(conn->ssl->connection));
+
+    /*
+     * the AIA chase (PLAN.md 10, T2, canon 2.6): the missing-issuer
+     * class of the recorded error walks the caIssuers urls of the
+     * presented certificates and rebuilds the chain offline - the
+     * fetched intermediates ride the gate only (never the store), so
+     * the verdict below sees the completed chain as any other.  The
+     * machine input re-reads the fresh verdict, the ssh3 layer
+     * enforces it before any credential rides (the B17 order)
+     */
+
+    if (chain_err != X509_V_OK &&
+        s3_ssh3_aia_complete(conn->ssl->connection, chain_err, &s3_cli_log) == S3_OK) {
+        chain_err = X509_V_OK;
+    }
 
     self_signed = X509_self_signed(cert, 1) == 1;
     san_ok = s3_cli_san_ok(cert, hostkey);
@@ -11124,6 +11140,13 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
         return S3_ERROR;
     }
 
+    /* the CA-bundle bootstrap of the hop (PLAN.md 10, T1): the
+     * embedded ISRG roots and the user bundle ride the anchors next
+     * to the system paths (the win build carries no default cert
+     * dir), the pins land behind them */
+
+    s3_ssh3_aia_trust_bootstrap(conf->ssl->ctx, &s3_cli_log);
+
     /* the pinned anchors of the hop ride the hop store before the
      * dial (canon 2.2, the main conn loads its own) */
 
@@ -16238,6 +16261,13 @@ main(int argc, char **argv)
             s3_cli_teardown();
             return S3_CLI_EXIT_ERROR;
         }
+
+        /* the CA-bundle bootstrap (PLAN.md 10, T1): the embedded ISRG
+         * roots and the user bundle ride the anchors next to the
+         * system paths - the bundled win build carries no default
+         * cert dir, the LE chains anchor on the embedded roots */
+
+        s3_ssh3_aia_trust_bootstrap(s3_cli_conf.ssl->ctx, &s3_cli_log);
 
         /* the pinned anchors ride the store before the dial (canon 2.2:
          * the anchor of the chain is the pins union the system CAs) */

@@ -35,4 +35,15 @@ s3_int_t s3_https_fetch(const char *url, const char *method, const s3_str_t *bod
                         const char *content_type, const char *ca_file, unsigned *status,
                         s3_str_t *response);
 
+/*
+ * the timeout twin: the same one blocking request, the socket timeout
+ * of one phase (connect, handshake, read) rides the caller - the AIA
+ * chase passes the 5s per-fetch cap of the canon there, the OIDC
+ * callers keep the s3_https_fetch default
+ */
+
+s3_int_t s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
+                           const char *content_type, const char *ca_file, unsigned timeout_sec,
+                           unsigned *status, s3_str_t *response);
+
 #endif /* _S3_HTTPS_FETCH_H_INCLUDED_ */

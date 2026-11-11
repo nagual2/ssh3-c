@@ -117,6 +117,8 @@ if(WIN32)
         src/ssh3/s3_ssh3_reverse.c
         src/ssh3/s3_ssh3_sshfp.c
         src/ssh3/s3_ssh3_hostkey.c
+        src/ssh3/s3_ssh3_aia.c
+        src/ssh3/s3_ssh3_trust_roots.c
         src/ssh3/s3_ssh3_dos_guard.c
         src/ssh3/s3_ssh3_sftp_codec.c
         src/ssh3/s3_ssh3_sftp_cli.c
@@ -203,6 +205,7 @@ if(WIN32)
         test_ssh3_reverse
         test_sshfp
         test_ssh3_hostkey
+        test_ssh3_aia
         test_os_win
     )
 
@@ -384,6 +387,8 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_reverse.c
     src/ssh3/s3_ssh3_sshfp.c
     src/ssh3/s3_ssh3_hostkey.c
+    src/ssh3/s3_ssh3_aia.c
+    src/ssh3/s3_ssh3_trust_roots.c
     src/ssh3/s3_ssh3_agent.c
     src/ssh3/s3_ssh3_agent_client.c
     src/ssh3/s3_ssh3_sftp_codec.c
@@ -597,6 +602,7 @@ set(S3_TESTS
     test_ssh3_reverse
     test_sshfp
     test_ssh3_hostkey
+    test_ssh3_aia
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
     test_ssh3_sftp_jail
