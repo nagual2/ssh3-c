@@ -67,6 +67,19 @@ struct s3_ssl_s {
     unsigned server_c; /* the peer speaks the ssh3-c retry contract */
 
     /*
+     * the session ticket key of the server (s3_ssl_ticket_key_file):
+     * the nginx 80-byte form rides the 32/32 lens, the 48-byte legacy
+     * file rides 16/16 (aes-128 + the short hmac); the zero aes_len
+     * keeps the keys in the OpenSSL process memory (the restart
+     * loses them, the pre-wave-13 shape)
+     */
+    u_char ticket_key_name[16];
+    u_char ticket_hmac_key[32];
+    u_char ticket_aes_key[32];
+    size_t ticket_hmac_len;
+    size_t ticket_aes_len;
+
+    /*
      * the record-only verify verdict of the last handshake (the
      * client role): the callback stores the first fatal x509 error
      * and never aborts - the ssh3 layer enforces the verdict before
@@ -83,6 +96,18 @@ struct s3_ssl_s {
 
 void s3_ssl_ticket_load(s3_ssl_t *ssl);
 void s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session);
+
+/*
+ * the persistent session ticket key of the server (the nginx-form
+ * file, 80 bytes: 16 name + 32 hmac + 32 aes; the 48-byte legacy
+ * 16/16/16 rides too): the missing or the broken file regenerates
+ * with the fresh random key (the 0600 mode), the tickets issued by
+ * the previous daemon lifetime keep decrypting - the warm 0-RTT
+ * reconnect survives the restart.  NULL path is a no-op (the
+ * in-memory keys of the OpenSSL process ride on).  Returns
+ * S3_OK / S3_ERROR (the caller rides on with the in-memory keys).
+ */
+s3_int_t s3_ssl_ticket_key_file(s3_ssl_t *ssl, const char *path);
 
 /*
  * the PEM strings may be file contents or in-memory certificates;

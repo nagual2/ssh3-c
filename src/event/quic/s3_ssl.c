@@ -3,9 +3,19 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+/*
+ * the ticket key callback rides the nginx shape - the shape of the
+ * SSL_CTX_set_tlsext_ticket_key_cb man page sample: HMAC_Init_ex is
+ * deprecated since 3.0 but the callback contract hands the HMAC_CTX
+ * in, the suppression is scoped to this translation unit
+ */
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 
@@ -23,12 +33,15 @@
 #include <direct.h>
 #endif
 
+#include <s3_errno.h>
 #include <s3_ssl.h>
 #include <s3_string.h>
 
 static int s3_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                                  const unsigned char *in, unsigned int inlen, void *arg);
 static int s3_ssl_client_verify_cb(int ok, X509_STORE_CTX *sctx);
+static int s3_ssl_ticket_key_cb(SSL *ssl, unsigned char name[], unsigned char iv[],
+                                EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc);
 
 /*
  * the interop probe: TLS secrets on stderr in the NSS keylog format,
@@ -194,6 +207,32 @@ s3_ssl_create(s3_log_t *log, const char *cert, size_t cert_len, const char *key,
      */
 
     SSL_CTX_set_session_cache_mode(ssl->ctx, SSL_SESS_CACHE_SERVER);
+
+    /*
+     * the ticket flight of the wave 13: one ticket per handshake (the
+     * smaller flight lands before a fast-close exec run tears the
+     * connection down) and the explicit lifetime (the silent OpenSSL
+     * default is short, the client cache drops the expired lines and
+     * the warm dial honestly goes 1-RTT); the key material itself
+     * rides s3_ssl_ticket_key_file() - the OpenSSL default keys live
+     * in the process memory only and die with the daemon
+     */
+
+    SSL_CTX_set_app_data(ssl->ctx, ssl);
+    SSL_CTX_set_num_tickets(ssl->ctx, 1);
+    SSL_CTX_set_timeout(ssl->ctx, 43200);
+
+    /*
+     * the stateless tickets of the wave 13: the built-in anti-replay
+     * window forces the stateful tickets (the cache index only - the
+     * restart kills the cache and every ticket with it, the wave-13
+     * mystery), the ssh3 layer owns the replay business instead (the
+     * 425/401 retry contract, the auth rides outside the early
+     * window) - the tickets carry the full session state and the
+     * persistent key file decrypts them after the restart
+     */
+
+    SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_ANTI_REPLAY);
 
     return ssl;
 
@@ -508,6 +547,219 @@ s3_ssl_ticket_load(s3_ssl_t *ssl)
     }
 
     fclose(src);
+}
+
+/*
+ * the binary open of the win build rides the text translation off
+ * (the key bytes carry 0x0a freely, the CRT default would corrupt
+ * them both ways)
+ */
+
+#if (S3_WIN32)
+#define S3_SSL_OPEN_BINARY O_BINARY
+#else
+#define S3_SSL_OPEN_BINARY 0
+#endif
+
+static int
+s3_ssl_ticket_key_cb(SSL *ssl_conn, unsigned char name[], unsigned char iv[], EVP_CIPHER_CTX *ectx,
+                     HMAC_CTX *hctx, int enc)
+{
+    s3_ssl_t         *ssl_conf;
+    const EVP_CIPHER *cipher;
+
+    ssl_conf = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl_conn));
+
+    if (ssl_conf == NULL || ssl_conf->ticket_aes_len == 0) {
+        return 0; /* the keys never landed: no tickets this ctx */
+    }
+
+    cipher = ssl_conf->ticket_aes_len == 16 ? EVP_aes_128_cbc() : EVP_aes_256_cbc();
+
+    if (enc == 1) {
+
+        /* the encrypt side: the fresh iv, the current key signs and
+         * seals, the name rides the ticket head */
+
+        if (RAND_bytes(iv, EVP_CIPHER_iv_length(cipher)) != 1) {
+            s3_ssl_error(ssl_conf->log, 0, "RAND_bytes() failed");
+            return -1;
+        }
+
+        if (EVP_EncryptInit_ex(ectx, cipher, NULL, ssl_conf->ticket_aes_key, iv) != 1) {
+            s3_ssl_error(ssl_conf->log, 0, "EVP_EncryptInit_ex() failed");
+            return -1;
+        }
+
+        if (HMAC_Init_ex(hctx, ssl_conf->ticket_hmac_key, (int)ssl_conf->ticket_hmac_len,
+                         EVP_sha256(), NULL) != 1) {
+            s3_ssl_error(ssl_conf->log, 0, "HMAC_Init_ex() failed");
+            return -1;
+        }
+
+        s3_memcpy(name, ssl_conf->ticket_key_name, 16);
+
+        return 1;
+    }
+
+    /* the decrypt side: the name miss is a plain 1-RTT handshake,
+     * not an error (the OpenSSL default keys of the previous daemon
+     * lifetime ride this road) */
+
+    if (s3_memcmp(name, ssl_conf->ticket_key_name, 16) != 0) {
+        return 0;
+    }
+
+    if (HMAC_Init_ex(hctx, ssl_conf->ticket_hmac_key, (int)ssl_conf->ticket_hmac_len, EVP_sha256(),
+                     NULL) != 1) {
+        s3_ssl_error(ssl_conf->log, 0, "HMAC_Init_ex() failed");
+        return -1;
+    }
+
+    if (EVP_DecryptInit_ex(ectx, cipher, NULL, ssl_conf->ticket_aes_key, iv) != 1) {
+        s3_ssl_error(ssl_conf->log, 0, "EVP_DecryptInit_ex() failed");
+        return -1;
+    }
+
+    /* the nginx shape: the TLS 1.3 ticket renews in place */
+
+    if (SSL_version(ssl_conn) == TLS1_3_VERSION) {
+        return 2;
+    }
+
+    return 1;
+}
+
+static s3_int_t
+s3_ssl_ticket_key_generate(s3_ssl_t *ssl, const char *path)
+{
+    u_char   buf[80];
+    s3_err_t err;
+    int      fd, n;
+
+    if (RAND_bytes(buf, (int)sizeof(buf)) != 1) {
+        s3_ssl_error(ssl->log, 0, "RAND_bytes() failed");
+        return S3_ERROR;
+    }
+
+    /* the nginx 80-byte layout: 16 name + 32 hmac + 32 aes, the
+     * owner-only mode (the file is the plain-text of every ticket
+     * the daemon ever issued) */
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | S3_SSL_OPEN_BINARY, 0600);
+
+    if (fd == -1) {
+        err = s3_errno;
+        s3_log_error(S3_LOG_ERR, ssl->log, err, "open() \"%s\" failed", path);
+        return S3_ERROR;
+    }
+
+    n = (int)write(fd, buf, sizeof(buf));
+    (void)close(fd);
+
+    if (n != (int)sizeof(buf)) {
+        s3_log_error(S3_LOG_ERR, ssl->log, 0, "write() \"%s\" returned %d", path, n);
+        return S3_ERROR;
+    }
+
+    s3_memcpy(ssl->ticket_key_name, buf, 16);
+    s3_memcpy(ssl->ticket_hmac_key, buf + 16, 32);
+    s3_memcpy(ssl->ticket_aes_key, buf + 48, 32);
+    ssl->ticket_hmac_len = 32;
+    ssl->ticket_aes_len = 32;
+
+    s3_memzero(buf, sizeof(buf));
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssl_ticket_key_file(s3_ssl_t *ssl, const char *path)
+{
+    u_char   buf[80];
+    s3_err_t err;
+    int      fd, n;
+
+    if (ssl == NULL || ssl->ctx == NULL) {
+        return S3_ERROR;
+    }
+
+    if (path == NULL) {
+        return S3_OK;
+    }
+
+    fd = open(path, O_RDONLY | S3_SSL_OPEN_BINARY);
+
+    if (fd == -1) {
+
+        err = s3_errno;
+
+        if (err != S3_ENOENT) {
+            s3_log_error(S3_LOG_ERR, ssl->log, err, "open() \"%s\" failed", path);
+            return S3_ERROR;
+        }
+
+        /* the first lifetime of the key: generate and arm */
+
+        if (s3_ssl_ticket_key_generate(ssl, path) != S3_OK) {
+            return S3_ERROR;
+        }
+
+        s3_log_error(S3_LOG_INFO, ssl->log, 0, "session ticket key %s generated", path);
+
+        SSL_CTX_set_app_data(ssl->ctx, ssl);
+        SSL_CTX_set_tlsext_ticket_key_cb(ssl->ctx, s3_ssl_ticket_key_cb);
+
+        return S3_OK;
+    }
+
+    n = (int)read(fd, buf, sizeof(buf));
+    (void)close(fd);
+
+    if (n < 0) {
+        err = s3_errno;
+        s3_log_error(S3_LOG_ERR, ssl->log, err, "read() \"%s\" failed", path);
+        return S3_ERROR;
+    }
+
+    if (n == 80) {
+
+        s3_memcpy(ssl->ticket_key_name, buf, 16);
+        s3_memcpy(ssl->ticket_hmac_key, buf + 16, 32);
+        s3_memcpy(ssl->ticket_aes_key, buf + 48, 32);
+        ssl->ticket_hmac_len = 32;
+        ssl->ticket_aes_len = 32;
+
+    } else if (n == 48) {
+
+        /* the legacy nginx form: aes-128 and the short hmac */
+
+        s3_memcpy(ssl->ticket_key_name, buf, 16);
+        s3_memset(ssl->ticket_hmac_key, 0, 32);
+        s3_memcpy(ssl->ticket_hmac_key, buf + 32, 16);
+        s3_memcpy(ssl->ticket_aes_key, buf + 16, 16);
+        ssl->ticket_hmac_len = 16;
+        ssl->ticket_aes_len = 16;
+
+    } else {
+
+        /* the broken file rides the regeneration: the old tickets
+         * die, the new lifetime starts clean */
+
+        s3_log_error(S3_LOG_WARN, ssl->log, 0, "session ticket key %s is %d bytes, regenerating",
+                     path, n);
+
+        if (s3_ssl_ticket_key_generate(ssl, path) != S3_OK) {
+            return S3_ERROR;
+        }
+    }
+
+    s3_memzero(buf, sizeof(buf));
+
+    SSL_CTX_set_app_data(ssl->ctx, ssl);
+    SSL_CTX_set_tlsext_ticket_key_cb(ssl->ctx, s3_ssl_ticket_key_cb);
+
+    return S3_OK;
 }
 
 void

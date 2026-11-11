@@ -1292,6 +1292,114 @@ s3_test_quic_e2e_exporter(void)
     return s3_test_failures;
 }
 
+/*
+ * the restart persistence of the wave 13: the first lifetime rides a
+ * full handshake against the server whose ticket key lives in the
+ * file, the client ticket lands in the cache file; the whole env
+ * dies (the daemon restart shape - the server ctx and the key
+ * material of the process with it) and the second cycle rebuilds
+ * both sides from the same files: the fresh server ctx loads the
+ * same key, the fresh client ctx loads the cached ticket - the
+ * handshake resumes (the SESSION-REUSED 1 of the product logs) and
+ * the fresh NST lands over the resumed session
+ */
+
+static int
+s3_test_quic_e2e_restart(void)
+{
+    s3_test_e2e_env_t *env = &s3_test_e2e;
+    char               key_path[] = "/tmp/s3rtkeyXXXXXX";
+    char               tkt_path[] = "/tmp/s3rttktXXXXXX";
+    int                i, fd;
+
+    fd = mkstemp(key_path);
+    S3_ASSERT(fd != -1);
+    (void)close(fd);
+    (void)unlink(key_path);
+
+    fd = mkstemp(tkt_path);
+    S3_ASSERT(fd != -1);
+    (void)close(fd);
+    (void)unlink(tkt_path);
+
+    /* --- the first lifetime: the handshake, the ticket lands */
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+
+    S3_ASSERT(s3_ssl_ticket_key_file(env->srv_conf.ssl, key_path) == S3_OK);
+
+    snprintf(env->cli_conf.ssl->ticket_path, sizeof(env->cli_conf.ssl->ticket_path), "%s",
+             tkt_path);
+    snprintf(env->cli_conf.ssl->ticket_key, sizeof(env->cli_conf.ssl->ticket_key), "%s",
+             "127.0.0.1:443");
+
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked &&
+            env->cli_conf.ssl->stored_session != NULL) {
+            break;
+        }
+    }
+
+    S3_ASSERT(env->cli->ssl->handshaked);
+    S3_ASSERT(env->cli_conf.ssl->stored_session != NULL);
+
+    /* the env dies whole: the daemon restart shape */
+
+    s3_test_env_done(env);
+
+    /* --- the restart: the fresh ctxs ride the same files */
+
+    s3_test_cli_received_len = 0;
+    s3_test_srv_received_len = 0;
+
+    S3_ASSERT(s3_test_env_init(env) == S3_OK);
+
+    S3_ASSERT(s3_ssl_ticket_key_file(env->srv_conf.ssl, key_path) == S3_OK);
+
+    snprintf(env->cli_conf.ssl->ticket_path, sizeof(env->cli_conf.ssl->ticket_path), "%s",
+             tkt_path);
+    snprintf(env->cli_conf.ssl->ticket_key, sizeof(env->cli_conf.ssl->ticket_key), "%s",
+             "127.0.0.1:443");
+
+    s3_ssl_ticket_load(env->cli_conf.ssl);
+    S3_ASSERT(env->cli_conf.ssl->stored_session != NULL);
+
+    S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
+
+    for (i = 0; i < S3_TEST_PUMP_LIMIT; i++) {
+
+        s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
+        s3_process_events_and_timers(&env->ctx);
+
+        if (env->cli->ssl != NULL && env->cli->ssl->handshaked) {
+            break;
+        }
+    }
+
+    S3_ASSERT(env->cli->ssl->handshaked);
+    S3_ASSERT(SSL_session_reused(env->cli->ssl->connection) == 1);
+
+    /* the fresh NST replaced the single-use ticket */
+
+    S3_ASSERT(env->cli_conf.ssl->stored_session != NULL);
+
+    s3_test_env_done(env);
+
+    (void)unlink(key_path);
+    (void)unlink(tkt_path);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_e2e(void)
 {
@@ -1300,6 +1408,7 @@ s3_test_quic_e2e(void)
     (void)s3_test_quic_e2e_idle_zero();
     (void)s3_test_quic_e2e_exporter();
     (void)s3_test_quic_e2e_early();
+    (void)s3_test_quic_e2e_restart();
 
     OPENSSL_cleanup();
 

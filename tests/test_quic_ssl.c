@@ -4,6 +4,8 @@
 
 #include <openssl/x509v3.h>
 
+#include <unistd.h>
+
 #include "s3_quic_tls_helper.h"
 
 /*
@@ -909,6 +911,116 @@ test_client_verify(void)
     return s3_test_failures;
 }
 
+/*
+ * the persistent session ticket key of the server (the wave 13): the
+ * missing file generates the nginx 80-byte form, the same file loads
+ * into the fresh ctx (the restart persistence), the broken file
+ * regenerates and the legacy 48-byte form rides the aes-128 shape
+ */
+
+static int
+test_ssl_ticket_key_file(void)
+{
+    u_char    cert[4096], key[4096], buf[80], name_a[16];
+    size_t    cert_len, key_len;
+    s3_str_t  alpn;
+    s3_ssl_t *ssl, *ssl2;
+    char      path[] = "/tmp/s3tkeyXXXXXX";
+    int       fd, i;
+    FILE     *f;
+
+    s3_test_tls_log_init();
+
+    S3_ASSERT(s3_test_tls_gen_cert(cert, &cert_len, key, &key_len) == 0);
+
+    alpn.data = (u_char *)s3_test_alpn;
+    alpn.len = S3_TEST_ALPN_LEN;
+
+    ssl = s3_ssl_create(&s3_test_tls_log, (const char *)cert, cert_len, (const char *)key, key_len,
+                        &alpn);
+    S3_ASSERT(ssl != NULL);
+
+    fd = mkstemp(path);
+    S3_ASSERT(fd != -1);
+    (void)close(fd);
+
+    /* the missing (the mkstemp left the empty file - wipe it to ride
+     * the first-lifetime branch) file generates the 80-byte form */
+
+    (void)unlink(path);
+
+    S3_ASSERT(s3_ssl_ticket_key_file(ssl, path) == S3_OK);
+    S3_ASSERT(ssl->ticket_aes_len == 32);
+    S3_ASSERT(ssl->ticket_hmac_len == 32);
+
+    f = fopen(path, "rb");
+    S3_ASSERT(f != NULL);
+    S3_ASSERT(fread(buf, 1, sizeof(buf), f) == sizeof(buf));
+    (void)fclose(f);
+
+    S3_ASSERT(memcmp(buf, ssl->ticket_key_name, 16) == 0);
+    S3_ASSERT(memcmp(buf + 16, ssl->ticket_hmac_key, 32) == 0);
+    S3_ASSERT(memcmp(buf + 48, ssl->ticket_aes_key, 32) == 0);
+
+    s3_memcpy(name_a, ssl->ticket_key_name, 16);
+
+    /* the same file loads into the fresh ctx: the tickets of the
+     * previous daemon lifetime keep decrypting */
+
+    ssl2 = s3_ssl_create(&s3_test_tls_log, (const char *)cert, cert_len, (const char *)key, key_len,
+                         &alpn);
+    S3_ASSERT(ssl2 != NULL);
+    S3_ASSERT(s3_ssl_ticket_key_file(ssl2, path) == S3_OK);
+    S3_ASSERT(memcmp(ssl->ticket_key_name, ssl2->ticket_key_name, 16) == 0);
+
+    /* the broken file regenerates: the new lifetime starts clean */
+
+    f = fopen(path, "wb");
+    S3_ASSERT(f != NULL);
+    fwrite("short", 1, 5, f);
+    (void)fclose(f);
+
+    S3_ASSERT(s3_ssl_ticket_key_file(ssl, path) == S3_OK);
+    S3_ASSERT(memcmp(ssl->ticket_key_name, name_a, 16) != 0);
+
+    f = fopen(path, "rb");
+    S3_ASSERT(f != NULL);
+    S3_ASSERT(fread(buf, 1, sizeof(buf), f) == sizeof(buf));
+    (void)fclose(f);
+
+    S3_ASSERT(memcmp(buf, ssl->ticket_key_name, 16) == 0);
+
+    /* the legacy 48-byte nginx form: aes-128 and the short hmac
+     * (16 name + 16 aes + 16 hmac) */
+
+    for (i = 0; i < 48; i++) {
+        buf[i] = (u_char)(i * 7 + 3);
+    }
+
+    f = fopen(path, "wb");
+    S3_ASSERT(f != NULL);
+    fwrite(buf, 1, 48, f);
+    (void)fclose(f);
+
+    S3_ASSERT(s3_ssl_ticket_key_file(ssl, path) == S3_OK);
+    S3_ASSERT(ssl->ticket_aes_len == 16);
+    S3_ASSERT(ssl->ticket_hmac_len == 16);
+    S3_ASSERT(memcmp(ssl->ticket_key_name, buf, 16) == 0);
+    S3_ASSERT(memcmp(ssl->ticket_aes_key, buf + 16, 16) == 0);
+    S3_ASSERT(memcmp(ssl->ticket_hmac_key, buf + 32, 16) == 0);
+
+    /* the NULL path is the no-op (the in-memory keys ride on) */
+
+    S3_ASSERT(s3_ssl_ticket_key_file(ssl, NULL) == S3_OK);
+
+    (void)unlink(path);
+
+    s3_ssl_free(ssl);
+    s3_ssl_free(ssl2);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_ssl(void)
 {
@@ -916,6 +1028,7 @@ s3_test_quic_ssl(void)
     (void)setvbuf(stdout, NULL, _IONBF, 0);
 
     test_ssl_create();
+    test_ssl_ticket_key_file();
     test_quic_tls_handshake();
     test_transport_params_roundtrip();
     test_client_verify();

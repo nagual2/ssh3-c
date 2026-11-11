@@ -7564,6 +7564,15 @@ s3_srv_usage(FILE *out, const char *prog)
             "      DefaultIdentitiesFileNames)\n"
             "  --url-path p: the CONNECT route, default /ssh3-term (the reference"
             " -url-path)\n"
+            "  --session-ticket-key-file f: the persistent session ticket key of"
+            " the daemon\n"
+            "      (the nginx 80-byte form: 16 name + 32 hmac + 32 aes; the"
+            " 48-byte legacy\n"
+            "      rides), default rides the private key directory; the missing"
+            " file\n"
+            "      generates (0600), the issued tickets survive the restart (the"
+            " warm\n"
+            "      0-RTT reconnect), the broken file regenerates\n"
             "  -H  the sftp jail directory override, default the user's home\n"
             "  --sftp-jail chroot|lexical: the sftp isolation, default chroot: every\n"
             "      sftp channel forks a child that chroots into the jail root and\n"
@@ -7691,6 +7700,7 @@ main(int argc, char **argv)
     const char *alpn_name = "h3";
     const char *url_path_arg = NULL, *permit_open_arg = NULL;
     const char *permit_listen_arg = NULL;
+    const char *ticket_key_arg = NULL;
     unsigned    dg_size = 1200;
     /* the 24 h idle of the ssh2 canon (ClientAliveInterval=0, the
      * ssh2IdleTimeout mirror of the fork cmd/ssh3.go), the -i flag
@@ -7957,6 +7967,9 @@ main(int argc, char **argv)
 
             } else if (strcmp(argv[n], "--url-path") == 0 && n + 1 < argc) {
                 url_path_arg = argv[n + 1];
+                value = argv[n + 1];
+            } else if (strcmp(argv[n], "--session-ticket-key-file") == 0 && n + 1 < argc) {
+                ticket_key_arg = argv[n + 1];
                 value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--enable-password-login") == 0) {
@@ -8703,6 +8716,65 @@ main(int argc, char **argv)
     if (s3_srv_conf.ssl == NULL) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "ssl init failed");
         return 1;
+    }
+
+    /*
+     * the persistent session ticket key (the wave 13): the flag rides
+     * first, the default lives beside the private key (the same
+     * directory, the session-ticket.key name); a failed path keeps
+     * the daemon alive - the keys stay in the OpenSSL process memory
+     * and the client tickets die on the restart (the pre-wave-13
+     * shape), the warning names the loss
+     */
+
+    {
+        char        ticket_key_path[1024];
+        const char *src = ticket_key_arg;
+
+        if (src != NULL) {
+
+            if (strlen(src) >= sizeof(ticket_key_path)) {
+                src = NULL; /* the flag path overflows the buffer */
+            }
+
+        } else {
+
+            /* the directory of the private key rides the default: the
+             * key file belongs to the same secret store (the
+             * /etc/ssh3 layout of the unit files) */
+
+            const char *s1 = strrchr(key_path, '/');
+            const char *s2 = strrchr(key_path, '\\');
+            const char *slash = (s1 > s2) ? s1 : s2;
+
+            if (slash != NULL) {
+
+                size_t dlen = (size_t)(slash - key_path) + 1;
+
+                if (dlen + sizeof("session-ticket.key") <= sizeof(ticket_key_path)) {
+                    memcpy(ticket_key_path, key_path, dlen);
+                    memcpy(ticket_key_path + dlen, "session-ticket.key",
+                           sizeof("session-ticket.key"));
+                    src = ticket_key_path;
+                }
+
+            } else {
+                src = "session-ticket.key";
+            }
+        }
+
+        if (src != NULL) {
+
+            if (src != ticket_key_path) {
+                memcpy(ticket_key_path, src, strlen(src) + 1);
+            }
+
+            if (s3_ssl_ticket_key_file(s3_srv_conf.ssl, ticket_key_path) != S3_OK) {
+                s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                             "the session ticket keys stay in the process memory"
+                             " (the client tickets die on the restart)");
+            }
+        }
     }
 
     s3_srv_conf.gso_enabled = 1;
