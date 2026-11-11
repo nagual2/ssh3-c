@@ -66,6 +66,10 @@ struct s3_ssl_s {
     char     ticket_key[300];
     unsigned server_c; /* the peer speaks the ssh3-c retry contract */
 
+    /* the fresh NST arrivals of this ssl: the client single-run exit
+     * waits on the delta (the exec one-shot collects the flight) */
+    unsigned tickets_n;
+
     /*
      * the session ticket key of the server (s3_ssl_ticket_key_file):
      * the nginx 80-byte form rides the 32/32 lens, the 48-byte legacy
@@ -94,8 +98,14 @@ struct s3_ssl_s {
     unsigned chain_seen;
 };
 
-void s3_ssl_ticket_load(s3_ssl_t *ssl);
-void s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session);
+/*
+ * the cache load of the dial: S3_OK when a resumable session rides
+ * the conf, S3_DECLINED with the reason text (the -v diag of the
+ * cold dial) when the file is missing, the line is not ours, the
+ * ticket expired or the record is damaged
+ */
+s3_int_t s3_ssl_ticket_load(s3_ssl_t *ssl, const char **reason);
+void     s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session);
 
 /*
  * the persistent session ticket key of the server (the nginx-form

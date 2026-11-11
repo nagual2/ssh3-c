@@ -471,22 +471,30 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
  * silent - a cold cache is a plain 1-RTT dial
  */
 
-void
-s3_ssl_ticket_load(s3_ssl_t *ssl)
+s3_int_t
+s3_ssl_ticket_load(s3_ssl_t *ssl, const char **reason)
 {
-    u_char       der[2048];
-    u_char      *p;
-    size_t       dlen;
-    char         line[2048];
+    u_char  der[2048];
+    u_char *p;
+    size_t  dlen;
+    /* the record cap rides the persist side (the stateless ticket
+     * of the wave 13 carries the full session state - 1162 B and
+     * counting, the old 2048 line cut the hex mid-way) */
+    char         line[1024 + sizeof(der) * 2 + 2];
     const char  *hex;
     long         age;
     SSL_SESSION *session;
     FILE        *src;
+    s3_int_t     rc = S3_DECLINED;
+
+    if (reason != NULL) {
+        *reason = "the cache file is missing";
+    }
 
     src = fopen(ssl->ticket_path, "r");
 
     if (src == NULL) {
-        return;
+        return rc;
     }
 
     while (fgets(line, sizeof(line), src) != NULL) {
@@ -516,11 +524,17 @@ s3_ssl_ticket_load(s3_ssl_t *ssl)
                 ssl->server_c = 0;
                 hex = line + klen + 3;
             } else {
+                if (reason != NULL) {
+                    *reason = "the cache line is damaged";
+                }
                 break; /* an unknown form: no flight this dial */
             }
         }
 
         if (!s3_ssl_ticket_unhex(der, &dlen, hex) || dlen == 0) {
+            if (reason != NULL) {
+                *reason = "the cache line is damaged";
+            }
             break;
         }
 
@@ -529,6 +543,9 @@ s3_ssl_ticket_load(s3_ssl_t *ssl)
 
         if (session == NULL) {
             ERR_clear_error();
+            if (reason != NULL) {
+                *reason = "the cache line is damaged";
+            }
             break;
         }
 
@@ -538,15 +555,29 @@ s3_ssl_ticket_load(s3_ssl_t *ssl)
 
         if (age > (long)SSL_SESSION_get_timeout(session)) {
             SSL_SESSION_free(session);
+            if (reason != NULL) {
+                *reason = "the cached ticket expired";
+            }
             break;
         }
 
         ssl->stored_session = session;
+        rc = S3_OK;
+
+        if (reason != NULL) {
+            *reason = NULL;
+        }
 
         break;
     }
 
     fclose(src);
+
+    if (rc != S3_OK && reason != NULL && *reason == NULL) {
+        *reason = "the cache holds no line for this host";
+    }
+
+    return rc;
 }
 
 /*
@@ -816,6 +847,7 @@ s3_ssl_client_new_session_cb(SSL *ssl, SSL_SESSION *session)
     }
 
     ssl_conf->stored_session = session;
+    ssl_conf->tickets_n++;
 
     /* the persistence of the 0-RTT stage 2: the cache file rides */
 

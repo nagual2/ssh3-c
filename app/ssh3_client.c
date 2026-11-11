@@ -1108,6 +1108,7 @@ static unsigned s3_cli_reconnect_pending;
  * window must not wait for the grave-wagon */
 
 static unsigned s3_cli_chan_dead;
+static unsigned s3_cli_tickets_at_dial;
 
 static unsigned s3_cli_console; /* the stdin is a console */
 static unsigned s3_cli_raw;     /* the raw mode is on */
@@ -14650,6 +14651,8 @@ main(int argc, char **argv)
     struct addrinfo       hints, *res = NULL;
     struct sockaddr_in    sa4;
     struct sockaddr_in6   sa6;
+    s3_int_t              rc;
+    const char           *treason;
 
     /* the net bootstrap (the winsock startup of win, the signal flags
      * of unix) */
@@ -16251,7 +16254,18 @@ main(int argc, char **argv)
                 snprintf(s3_cli_conf.ssl->ticket_key, sizeof(s3_cli_conf.ssl->ticket_key), "%s",
                          tkey);
 
-                s3_ssl_ticket_load(s3_cli_conf.ssl);
+                rc = s3_ssl_ticket_load(s3_cli_conf.ssl, &treason);
+
+                /* the cache diag of the cold dial: the -v marker of
+                 * the reason (the missing file, the foreign host, the
+                 * expiry, the damage) - the plain run stays silent */
+
+                if (s3_cli_vcount >= 1 || s3_cli_level_explicit) {
+                    fprintf(stderr, rc == S3_OK ? "SSH3-TICKET-LOADED\n" : "SSH3-TICKET-COLD %s\n",
+                            rc == S3_OK ? "" : treason);
+                }
+
+                s3_cli_tickets_at_dial = s3_cli_conf.ssl->tickets_n;
 
                 /* the warm cache arms the 0-RTT flight: the CONNECT
                  * leaves inside the early-data branch of the stream init
@@ -16323,32 +16337,32 @@ main(int argc, char **argv)
              * SIGTERM instead of holding the loop to its deadline - the
              * session phases keep their own graceful shapes */
 
-        if (s3_cli_stop && s3_cli_phase != S3_CLI_PH_SESSION) {
-            fprintf(stderr, "ssh3: terminated\n");
-            s3_cli_rc = S3_CLI_EXIT_ERROR;
-            break;
-        }
+            if (s3_cli_stop && s3_cli_phase != S3_CLI_PH_SESSION) {
+                fprintf(stderr, "ssh3: terminated\n");
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                break;
+            }
 
 #if (S3_WIN32)
-        /* the interactive hold fires on the channel death, not on the
-         * quic grave-wagon: the finalize of a dead conn rides the PTO
-         * probes for minutes, the window must hold at once */
+            /* the interactive hold fires on the channel death, not on the
+             * quic grave-wagon: the finalize of a dead conn rides the PTO
+             * probes for minutes, the window must hold at once */
 
-        if (s3_cli_chan_dead && s3_cli_inactive_gate()) {
-            s3_cli_rc = S3_CLI_EXIT_ERROR;
-            (void)s3_cli_inactive_wait(); /* the reconnect_pending rides */
-            break;
-        }
+            if (s3_cli_chan_dead && s3_cli_inactive_gate()) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                (void)s3_cli_inactive_wait(); /* the reconnect_pending rides */
+                break;
+            }
 #else
-        /* the diag shape of the linux repro: the same hold without the
-         * win guard, the banner proves the chain end to end */
+            /* the diag shape of the linux repro: the same hold without the
+             * win guard, the banner proves the chain end to end */
 
-        if (s3_cli_chan_dead && s3_cli_console && s3_cli_tty && s3_cli_cmd == NULL) {
-            s3_cli_rc = S3_CLI_EXIT_ERROR;
-            fprintf(stderr, "ssh3 - the connection is lost: all sessions inactive\n");
-            (void)s3_quic_close_connection(s3_cli_conn, S3_OK);
-            break;
-        }
+            if (s3_cli_chan_dead && s3_cli_console && s3_cli_tty && s3_cli_cmd == NULL) {
+                s3_cli_rc = S3_CLI_EXIT_ERROR;
+                fprintf(stderr, "ssh3 - the connection is lost: all sessions inactive\n");
+                (void)s3_quic_close_connection(s3_cli_conn, S3_OK);
+                break;
+            }
 #endif
 
             /* the jump chain: a dead hop conversation strands the
@@ -16963,6 +16977,27 @@ main(int argc, char **argv)
                         s3_cli_hs_done, s3_cli_req_sent, s3_cli_status_seen, s3_cli_ch_sent);
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 break;
+            }
+        }
+
+        /*
+         * the single-run ticket collection (the wave 13): the exec
+         * one-shot closes before the server NST flight arrives, the
+         * cache keeps the burned ticket and the next dial rides the
+         * cold 1-RTT; the pump runs until the fresh ticket lands or
+         * the deadline passes - the usual cost is ~0 (the flight is
+         * in the first frames), the dead conn and the reconnect
+         * hold skip the wait
+         */
+
+        if (!s3_cli_reconnect_pending && !s3_cli_chan_dead && s3_cli_conf.ssl != NULL &&
+            s3_cli_conf.ssl->tickets_n == s3_cli_tickets_at_dial) {
+            s3_msec_t until = s3_current_msec + 200;
+
+            while (s3_cli_conf.ssl->tickets_n == s3_cli_tickets_at_dial &&
+                   s3_current_msec < until) {
+                s3_event_process_posted(&s3_cli_ctx, &s3_cli_ctx.posted_events);
+                s3_process_events_and_timers(&s3_cli_ctx);
             }
         }
 

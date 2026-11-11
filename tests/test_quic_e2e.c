@@ -1370,7 +1370,7 @@ s3_test_quic_e2e_restart(void)
     snprintf(env->cli_conf.ssl->ticket_key, sizeof(env->cli_conf.ssl->ticket_key), "%s",
              "127.0.0.1:443");
 
-    s3_ssl_ticket_load(env->cli_conf.ssl);
+    s3_ssl_ticket_load(env->cli_conf.ssl, NULL);
     S3_ASSERT(env->cli_conf.ssl->stored_session != NULL);
 
     S3_ASSERT(s3_quic_connect(env->cli, &env->cli_conf) == S3_OK);
