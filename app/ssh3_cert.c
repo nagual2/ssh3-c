@@ -44,7 +44,9 @@
 #endif
 
 #include <s3_errno.h>
+#ifndef S3_CERT_NO_TICKETKEY
 #include <s3_ssl.h>
+#endif
 #include <s3_trust_store.h>
 
 /* the default source of the trust bundle update (the Mozilla set
@@ -76,7 +78,12 @@ s3_cert_usage(const char *prog)
             "the phase 3/4 commands (the client certificates, the ssh3-ca):\n"
             "\n"
             "  keygen | selfsign | csr | sign\n"
-            "              riding their own waves (PLAN.md 14)\n",
+            "              riding their own waves (PLAN.md 14)\n"
+            "\n"
+            "the instrument:\n"
+            "\n"
+            "  probe        print the openssl version and the trust set\n"
+            "              counters (own / system) - no dial, no network\n",
             prog);
 }
 
@@ -91,6 +98,54 @@ main(int argc, char **argv)
     if (argc < 2 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         s3_cert_usage(argv[0]);
         return argc < 2 ? 255 : 0;
+    }
+
+    if (strcmp(argv[1], "probe") == 0 || strcmp(argv[1], "--probe") == 0) {
+
+        /* the trust matrix instrument (the phase 2 acceptance): the
+         * openssl version, the own set, the system build - four
+         * lines, no dial, no network; the machine classes of the
+         * wave-14 matrix read this */
+
+        SSL_CTX *ctx;
+
+        printf("PROBE openssl=%s\n", OpenSSL_version(OPENSSL_VERSION));
+
+        ctx = SSL_CTX_new(TLS_client_method());
+
+        if (ctx == NULL) {
+            fprintf(stderr, "PROBE ctx failed\n");
+            return 255;
+        }
+
+        if (s3_trust_store_build(ctx, S3_TRUST_POLICY_OWN, &log) == S3_OK) {
+
+            STACK_OF(X509_OBJECT) *objs =
+                X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx));
+
+            printf("PROBE own=%d\n", sk_X509_OBJECT_num(objs));
+        }
+
+        SSL_CTX_free(ctx);
+
+        ctx = SSL_CTX_new(TLS_client_method());
+
+        if (ctx == NULL) {
+            fprintf(stderr, "PROBE ctx failed\n");
+            return 255;
+        }
+
+        {
+            s3_int_t              rc = s3_trust_store_build(ctx, S3_TRUST_POLICY_SYSTEM, &log);
+            STACK_OF(X509_OBJECT) *objs =
+                X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx));
+
+            printf("PROBE system-rc=%ld system=%d\n", (long)rc, sk_X509_OBJECT_num(objs));
+        }
+
+        SSL_CTX_free(ctx);
+
+        return 0;
     }
 
     if (strcmp(argv[1], "trust-update") == 0 || strcmp(argv[1], "--trust-update") == 0) {
@@ -113,6 +168,8 @@ main(int argc, char **argv)
         return s3_trust_update_run(url, &log) == S3_OK ? 0 : 255;
     }
 
+#ifndef S3_CERT_NO_TICKETKEY
+
     if (strcmp(argv[1], "ticket-key") == 0 || strcmp(argv[1], "--ticket-key") == 0) {
 
         if (argc != 3) {
@@ -122,6 +179,9 @@ main(int argc, char **argv)
 
         return s3_ssl_ticket_key_file_new(argv[2], &log) == S3_OK ? 0 : 255;
     }
+
+#endif /* S3_CERT_NO_TICKETKEY (the probe build: the ssl unit stays
+        * out, the ticket-key command rides the full build) */
 
     if (strcmp(argv[1], "keygen") == 0 || strcmp(argv[1], "selfsign") == 0 ||
         strcmp(argv[1], "csr") == 0 || strcmp(argv[1], "sign") == 0) {
