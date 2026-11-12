@@ -31,8 +31,8 @@
  */
 
 typedef enum {
-    S3_TRUST_POLICY_OWN = 0,    /* the embedded roots + the user bundles */
-    S3_TRUST_POLICY_SYSTEM = 1  /* the platform paths + the own set */
+    S3_TRUST_POLICY_OWN = 0,   /* the embedded roots + the user bundles */
+    S3_TRUST_POLICY_SYSTEM = 1 /* the platform paths + the own set */
 } s3_trust_policy_t;
 
 /*
@@ -65,5 +65,35 @@ s3_int_t s3_trust_store_build(SSL_CTX *ctx, s3_trust_policy_t policy, s3_log_t *
  */
 
 void s3_trust_store_set_bundle_path(const char *path);
+
+/*
+ * the trust update of the wave 14 phase 1c (the scheduler calls the
+ * product shape `ssh3 --trust-update` once a day): fetch the bundle
+ * body over the neutral fetch infra, validate it (every PEM block
+ * a certificate, the count floor), land it atomically
+ * (tmp+rename, 0600) into the state dir as trust-bundle.pem and
+ * write the manifest (the source url line, the sha256 line) next to
+ * it.  S3_OK lands a fresh bundle; any failure leaves the previous
+ * copy untouched - the stale bundle is the plain shape of the
+ * offline scheduler run
+ */
+
+typedef s3_int_t (*s3_trust_fetch_pt)(const char *url, s3_str_t *out);
+
+s3_int_t s3_trust_update_run(const char *url, s3_log_t *log);
+
+/* the test hooks: the fetch body (NULL rides the https transport),
+ * the landing dir (NULL rides ~/.ssh3), the count floor (0 rides
+ * the product floor of 30 certificates) */
+
+void s3_trust_update_set_fetch(s3_trust_fetch_pt fn);
+void s3_trust_update_set_dir(const char *dir);
+void s3_trust_update_set_min_certs(unsigned n);
+
+/* the path the last run landed (or would land) the bundle at; the
+ * build reads the same file - the update and the dial share one
+ * name */
+
+const char *s3_trust_bundle_path_get(void);
 
 #endif /* _S3_TRUST_STORE_H_INCLUDED_ */

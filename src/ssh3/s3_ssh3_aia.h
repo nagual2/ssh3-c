@@ -89,6 +89,10 @@ s3_int_t s3_ssh3_aia_bundle_path(char *buf, size_t cap);
 
 s3_int_t s3_ssh3_aia_state_dir(char *buf, size_t cap);
 
+/* the portable single-level mkdir (0700 unix, the win CRT form) */
+
+s3_int_t s3_ssh3_aia_mkdir(const char *dir);
+
 /* T2: the post-handshake chase of one connection.  S3_OK when the presented
  * chain now verifies against the anchors of the connection store (either it
  * already did, or the chase completed it), S3_DECLINED when the trigger does

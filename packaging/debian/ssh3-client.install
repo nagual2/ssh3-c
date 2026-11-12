@@ -1,1 +1,3 @@
 obj-x86_64-linux-gnu/ssh3 usr/bin/
+packaging/systemd/ssh3-trust-update.service usr/lib/systemd/user/
+packaging/systemd/ssh3-trust-update.timer usr/lib/systemd/user/

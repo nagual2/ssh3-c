@@ -53,7 +53,7 @@ static s3_int_t s3_ssh3_aia_default_fetch(const char *url, s3_str_t *body);
 /* the portable mkdir of the cache directory: the mode rides the unix
  * leg, the win one takes the single-argument form */
 
-static int
+s3_int_t
 s3_ssh3_aia_mkdir(const char *dir)
 {
 #if (S3_WIN32)

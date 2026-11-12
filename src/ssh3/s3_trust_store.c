@@ -11,12 +11,31 @@
  */
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
+#if (S3_WIN32)
+#include <direct.h>
+#define S3_TRUST_OPEN_BINARY O_BINARY
+#else
+#define S3_TRUST_OPEN_BINARY 0
+#endif
+
+#include <s3_https_fetch.h>
 #include <s3_ssh3_aia.h>
 #include <s3_trust_store.h>
+
+/* the update caps of the canon (the phase 1c): the fetch timeout
+ * of the bundle (the ~200 KiB body over a slow link), the body
+ * cap, the certificate count floor (the Mozilla set carries ~110) */
+
+#define S3_TRUST_UPDATE_TIMEOUT_SEC 30
+#define S3_TRUST_UPDATE_BODY_MAX    (4 * 1024 * 1024)
+#define S3_TRUST_UPDATE_FLOOR       30
 
 static const char *s3_trust_bundle_override;
 
@@ -27,14 +46,12 @@ s3_trust_policy_parse(const char *text, s3_trust_policy_t *policy)
         return -1;
     }
 
-    if (strcmp(text, "own") == 0 || strcmp(text, "OWN") == 0 ||
-        strcmp(text, "Own") == 0) {
+    if (strcmp(text, "own") == 0 || strcmp(text, "OWN") == 0 || strcmp(text, "Own") == 0) {
         *policy = S3_TRUST_POLICY_OWN;
         return 0;
     }
 
-    if (strcmp(text, "system") == 0 || strcmp(text, "SYSTEM") == 0 ||
-        strcmp(text, "System") == 0) {
+    if (strcmp(text, "system") == 0 || strcmp(text, "SYSTEM") == 0 || strcmp(text, "System") == 0) {
         *policy = S3_TRUST_POLICY_SYSTEM;
         return 0;
     }
@@ -58,6 +75,312 @@ void
 s3_trust_store_set_bundle_path(const char *path)
 {
     s3_trust_bundle_override = path;
+}
+
+/*
+ * the trust update (the phase 1c): the scheduler surface.  The
+ * validation walk rides PEM_read_bio_X509 to the end of the body -
+ * every block must parse, the floor counts (the product floor 30,
+ * the Mozilla set carries ~110); the landing is the tmp+rename
+ * swap the ticket cache uses, the manifest names the source and
+ * the sha256.  Any failure keeps the previous copy - the offline
+ * scheduler run is the plain shape
+ */
+
+static s3_trust_fetch_pt s3_update_fetch_hook;
+static char              s3_update_dir_override[1024];
+static unsigned          s3_update_min_certs;
+static char              s3_bundle_last[1024];
+
+void
+s3_trust_update_set_fetch(s3_trust_fetch_pt fn)
+{
+    s3_update_fetch_hook = fn;
+}
+
+void
+s3_trust_update_set_dir(const char *dir)
+{
+    if (dir != NULL && strlen(dir) < sizeof(s3_update_dir_override)) {
+        memcpy(s3_update_dir_override, dir, strlen(dir) + 1);
+    } else {
+        s3_update_dir_override[0] = '\0';
+    }
+}
+
+void
+s3_trust_update_set_min_certs(unsigned n)
+{
+    s3_update_min_certs = n;
+}
+
+const char *
+s3_trust_bundle_path_get(void)
+{
+    return s3_bundle_last[0] != '\0' ? s3_bundle_last : NULL;
+}
+
+/* the landing file of the bundle: the dir override of the tests or
+ * the state dir of the product + the fixed name */
+
+static s3_int_t
+s3_trust_bundle_file(char *buf, size_t cap)
+{
+    size_t len;
+
+    if (s3_update_dir_override[0] != '\0') {
+        len = strlen(s3_update_dir_override);
+
+        if (len + 2 + sizeof("trust-bundle.pem") > cap) {
+            return S3_ERROR;
+        }
+
+        memcpy(buf, s3_update_dir_override, len);
+        buf[len] = '/';
+        memcpy(buf + len + 1, "trust-bundle.pem", sizeof("trust-bundle.pem"));
+
+        return S3_OK;
+    }
+
+    if (s3_ssh3_aia_state_dir(buf, cap) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    len = strlen(buf);
+
+    if (len + 2 + sizeof("trust-bundle.pem") > cap) {
+        return S3_ERROR;
+    }
+
+    buf[len] = '/';
+    memcpy(buf + len + 1, "trust-bundle.pem", sizeof("trust-bundle.pem"));
+
+    return S3_OK;
+}
+
+static s3_int_t
+s3_trust_update_default_fetch(const char *url, s3_str_t *out)
+{
+    unsigned status = 0;
+    s3_str_t body;
+
+    s3_str_null(&body);
+
+    if (s3_https_fetch_to(url, "GET", NULL, NULL, NULL, S3_TRUST_UPDATE_TIMEOUT_SEC, &status,
+                          &body) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    if (status != 200) {
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    if (body.len == 0 || body.len > S3_TRUST_UPDATE_BODY_MAX) {
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    *out = body;
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_trust_update_run(const char *url, s3_log_t *log)
+{
+    char     path[1200], tmp[1300], man[1300], line[128];
+    u_char   md[EVP_MAX_MD_SIZE];
+    unsigned md_len;
+    s3_str_t body;
+    X509    *x509;
+    BIO     *bio;
+    unsigned count = 0, floor;
+    s3_int_t fd, ok;
+    int      n, i;
+    ssize_t  w;
+
+    if (url == NULL || url[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    if (s3_trust_bundle_file(path, sizeof(path)) != S3_OK) {
+        return S3_ERROR;
+    }
+
+    /* the state dir may not exist yet (the fresh home rides the
+     * scheduler before any pin write): the two levels go one by
+     * one - the same shape the aia cache takes */
+
+    {
+        char dir[1024];
+
+        if (s3_ssh3_aia_state_dir(dir, sizeof(dir)) == S3_OK) {
+
+            if (s3_ssh3_aia_mkdir(dir) != 0 && errno == ENOENT) {
+
+                char parent[1024];
+                int  i;
+
+                for (i = (int)strlen(dir) - 1; i >= 0; i--) {
+                    if (dir[i] == '/' || dir[i] == '\\') {
+                        break;
+                    }
+                }
+
+                if (i > 0 && i < (int)sizeof(parent)) {
+
+                    memcpy(parent, dir, (size_t)i);
+                    parent[i] = '\0';
+
+                    (void)s3_ssh3_aia_mkdir(parent);
+                    (void)s3_ssh3_aia_mkdir(dir);
+                }
+            }
+        }
+    }
+
+    /* the fetch: the test hook or the https transport */
+
+    s3_str_null(&body);
+
+    if (s3_update_fetch_hook != NULL) {
+
+        if (s3_update_fetch_hook(url, &body) != S3_OK) {
+            return S3_ERROR;
+        }
+
+    } else {
+
+        if (s3_trust_update_default_fetch(url, &body) != S3_OK) {
+            s3_log_error(S3_LOG_WARN, log, 0, "the trust bundle fetch of %s failed", url);
+            return S3_ERROR;
+        }
+    }
+
+    /* the validation walk: every PEM block parses, the floor
+     * counts (the truncated tail stops the walk short of the
+     * floor - the store copy stays) */
+
+    floor = s3_update_min_certs != 0 ? s3_update_min_certs : S3_TRUST_UPDATE_FLOOR;
+
+    bio = BIO_new_mem_buf(body.data, (int)body.len);
+
+    if (bio == NULL) {
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    for (;;) {
+
+        x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+
+        if (x509 == NULL) {
+            break;
+        }
+
+        count++;
+        X509_free(x509);
+    }
+
+    BIO_free(bio);
+    ERR_clear_error();
+
+    if (count < floor) {
+        s3_log_error(S3_LOG_WARN, log, 0,
+                     "the trust bundle of %s carries %ui certificates, the floor is %ui - riding "
+                     "without the update",
+                     url, (s3_uint_t)count, (s3_uint_t)floor);
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    /* the atomic landing: the tmp swap of the ticket cache shape,
+     * the manifest names the source and the sha256 */
+
+    n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) {
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | S3_TRUST_OPEN_BINARY, 0600);
+
+    if (fd == -1) {
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    w = write(fd, body.data, body.len);
+    ok = (w == (ssize_t)body.len);
+    (void)close(fd);
+
+    if (!ok) {
+        (void)unlink(tmp);
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    if (rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    {
+        size_t plen = strlen(path);
+
+        if (plen < sizeof(s3_bundle_last)) {
+            memcpy(s3_bundle_last, path, plen + 1);
+        }
+    }
+
+    /* the manifest: the source url line, the sha256 of the body */
+
+    if (!EVP_Digest(body.data, body.len, md, &md_len, EVP_sha256(), NULL)) {
+        ERR_clear_error();
+        s3_free(body.data);
+        return S3_ERROR;
+    }
+
+    for (i = 0; (unsigned)i < md_len; i++) {
+        sprintf(line + i * 2, "%02x", md[i]);
+    }
+    line[md_len * 2] = '\0';
+
+    n = snprintf(man, sizeof(man), "%s.man", path);
+
+    if (n > 0 && (size_t)n < sizeof(man)) {
+
+        fd = open(man, O_WRONLY | O_CREAT | O_TRUNC | S3_TRUST_OPEN_BINARY, 0600);
+
+        if (fd != -1) {
+            ssize_t mw = 0;
+            int     mok = 1;
+
+            mw = write(fd, url, strlen(url));
+            mok = mok && mw >= 0;
+            mw = write(fd, "\n", 1);
+            mok = mok && mw >= 0;
+            mw = write(fd, line, strlen(line));
+            mok = mok && mw >= 0;
+            mw = write(fd, "\n", 1);
+            mok = mok && mw >= 0;
+            (void)close(fd);
+
+            if (!mok) {
+                (void)unlink(man); /* the broken manifest dies */
+            }
+        }
+    }
+
+    s3_log_error(S3_LOG_INFO, log, 0, "the trust bundle of %s landed (%ui certificates, sha256 %s)",
+                 url, (s3_uint_t)count, line);
+
+    s3_free(body.data);
+
+    return S3_OK;
 }
 
 /* one bundle file into the store: the absent file is the plain

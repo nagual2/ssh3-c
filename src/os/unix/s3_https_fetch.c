@@ -7,8 +7,11 @@
  * discovery/JWKS/token endpoints (no curl in the product)
  */
 
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+
+#include <s3_errno.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -21,10 +24,15 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-/* the winsock setsockopt takes the const char * optval */
+/* the winsock setsockopt/getsockopt take the char * optval (the
+ * non-const prototype of the mingw headers) */
 
-#define s3_https_sockopt_val(p) ((const char *)(p))
+#define s3_https_sockopt_val(p) ((char *)(p))
 #else
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <s3_errno.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -100,116 +108,282 @@ s3_https_url_split(const char *url, unsigned *tls, char *host, size_t host_max, 
     return S3_OK;
 }
 
-static void
-s3_https_socket_timeout(int fd, unsigned timeout_sec)
-{
-    struct timeval tv;
-
-    tv.tv_sec = (long)timeout_sec;
-    tv.tv_usec = 0;
-
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
-}
-
 /* the connected (and handshaked for https) BIO; the ctx out lives
  * until the caller freed the bio chain, the ssl does not own it */
+
+/* the non-blocking toggle and the close of the walk socket: the
+ * unix legs ride fcntl/close, the win one rides the ioctlsocket
+ * (the FIONBIO toggle) and the closesocket of the winsock canon */
+
+#if (S3_WIN32)
+static int
+s3_https_nb(int fd)
+{
+    u_long on = 1;
+
+    return ioctlsocket((SOCKET)fd, FIONBIO, &on);
+}
+
+static int
+s3_https_blk(int fd)
+{
+    u_long off = 0;
+
+    return ioctlsocket((SOCKET)fd, FIONBIO, &off);
+}
+
+static void
+s3_https_close(int fd)
+{
+    (void)closesocket((SOCKET)fd);
+}
+#else
+static int
+s3_https_nb(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+
+    return fl == -1 ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static int
+s3_https_blk(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+
+    return fl == -1 ? -1 : fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+}
+
+static void
+s3_https_close(int fd)
+{
+    (void)close(fd);
+}
+#endif
 
 static BIO *
 s3_https_connect(const char *host, const char *port, unsigned tls, const char *ca_file,
                  unsigned timeout_sec, SSL_CTX **ctx_out)
 {
-    SSL_CTX *ctx;
-    SSL     *ssl;
-    BIO     *bio;
-    int      fd;
+    struct addrinfo hints, *res = NULL, *ri;
+    SSL_CTX        *ctx;
+    SSL            *ssl;
+    BIO            *bio;
+    int             fd = -1;
 
     *ctx_out = NULL;
 
-    bio = BIO_new_connect(host);
+    /*
+     * the resolver walk (the happy-eyeballs-lite of the fetch): the
+     * answers ride in the resolver order, the first connect wins -
+     * the single-address shape of BIO_new_connect died on the
+     * hosts carrying both families where the first answer is not
+     * the reachable one (the curl.se observation of the wave 14)
+     */
 
-    if (bio == NULL) {
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0 || res == NULL) {
         return NULL;
     }
 
-    BIO_set_conn_port(bio, port);
+    for (ri = res; ri != NULL; ri = ri->ai_next) {
 
-    if (BIO_do_connect(bio) != 1) {
-        BIO_free_all(bio);
-        return NULL;
-    }
+        struct timeval tv;
+        int            err, n;
+        fd_set         wset;
 
-    fd = BIO_get_fd(bio, NULL);
+        fd = socket(ri->ai_family, ri->ai_socktype, ri->ai_protocol);
 
-    if (fd >= 0) {
-        s3_https_socket_timeout(fd, timeout_sec);
-    }
+        if (fd == -1) {
+            continue;
+        }
 
-    if (!tls) {
-        return bio;
-    }
+        tv.tv_sec = (long)timeout_sec;
+        tv.tv_usec = 0;
 
-    ctx = SSL_CTX_new(TLS_client_method());
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
 
-    if (ctx == NULL) {
-        BIO_free_all(bio);
-        return NULL;
-    }
+        /* the non-blocking connect capped by the poll: the dead
+         * first answer costs the timeout window, not the dial */
 
-    if (ca_file != NULL) {
+        s3_https_nb(fd);
 
-        /* the verified mode: the pinned trust store, the hostname match */
+        if (connect(fd, ri->ai_addr, ri->ai_addrlen) != 0) {
 
-        if (SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1) {
+            err = s3_socket_errno;
+
+            if (err != S3_EINPROGRESS && err != S3_EAGAIN) {
+                s3_https_close(fd);
+                fd = -1;
+                continue;
+            }
+
+            FD_ZERO(&wset);
+            FD_SET(fd, &wset);
+
+            n = select(fd + 1, NULL, &wset, NULL, &tv);
+
+            if (n <= 0) {
+                s3_https_close(fd);
+                fd = -1;
+                continue;
+            }
+
+            {
+                socklen_t elen = sizeof(err);
+
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, s3_https_sockopt_val(&err), &elen) != 0 ||
+                    err != 0) {
+                    s3_https_close(fd);
+                    fd = -1;
+                    continue;
+                }
+            }
+        }
+
+        /* the connect spoke the non-blocking walk: the ssl reads
+         * want the blocking shape back (the instant-connect path
+         * left the O_NONBLOCK set - the handshake rode WANT_READ
+         * forever) */
+
+        s3_https_blk(fd);
+
+        if (!tls) {
+
+            freeaddrinfo(res);
+
+            bio = BIO_new_socket(fd, BIO_CLOSE);
+
+            if (bio == NULL) {
+                s3_https_close(fd);
+            }
+
+            return bio;
+        }
+
+        ctx = SSL_CTX_new(TLS_client_method());
+
+        if (ctx == NULL) {
+            s3_https_close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /*
+         * the compact group list of the fetch: the OpenSSL 3.5
+         * default ClientHello carries the post-quantum hybrid
+         * shares and grows past what a part of the public hosts
+         * accepts (the curl.se observation of the wave 14: the
+         * default ride dies with the unexpected eof while reading,
+         * the classic groups ride lands) - the fetch speaks the
+         * three classic curves, the QUIC layer keeps its own
+         * defaults
+         */
+
+        if (SSL_CTX_set1_groups_list(ctx, "X25519:P-256:P-384") != 1) {
             SSL_CTX_free(ctx);
-            BIO_free_all(bio);
+            freeaddrinfo(res);
             return NULL;
         }
 
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (ca_file != NULL) {
 
-    } else {
+            /* the verified mode: the pinned trust store, the
+             * hostname match */
 
-        /* the loopback test issuers ship a self-signed certificate */
+            if (SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1) {
+                SSL_CTX_free(ctx);
+                s3_https_close(fd);
+                fd = -1;
+                continue;
+            }
 
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+        } else {
+
+            /* the loopback test issuers ship a self-signed
+             * certificate */
+
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        }
+
+        ssl = SSL_new(ctx);
+
+        if (ssl == NULL) {
+            SSL_CTX_free(ctx);
+            s3_https_close(fd);
+            fd = -1;
+            continue;
+        }
+
+        SSL_set_connect_state(ssl);
+        /* the SNI name of the dial: the literal v4/v6 addresses ride
+         * without the extension (the RFC 6066 canon: the address
+         * literal is not a name, the strict edges refuse the
+         * address SNI and close the handshake) */
+
+        {
+            struct in_addr  a4;
+            struct in6_addr a6;
+
+            if (inet_pton(AF_INET, host, &a4) != 1 && inet_pton(AF_INET6, host, &a6) != 1) {
+                SSL_set_tlsext_host_name(ssl, host);
+            }
+        }
+
+        SSL_set_fd(ssl, fd);
+
+        /* the handshake rides the s_client shape (SSL_connect on the
+         * fd, the socket BIO skipped - the BIO_f_ssl stack of the
+         * first cut wedged the SYSCALL-eof shapes) */
+
+        {
+            int hsret = SSL_connect(ssl);
+
+            if (hsret == 1) {
+
+                /* the handshake completed: this answer is the dial
+                 * (the walk owns the loop, the ctx hands to the
+                 * caller); the ssl-BIO wraps the fd for the
+                 * downstream BIO_read/write, the ownership rides the
+                 * BIO (the close flag) */
+
+                bio = BIO_new(BIO_f_ssl());
+
+                if (bio == NULL) {
+                    SSL_free(ssl);
+                    SSL_CTX_free(ctx);
+                    s3_https_close(fd);
+                    fd = -1;
+                    continue;
+                }
+
+                BIO_set_ssl(bio, ssl, BIO_CLOSE);
+
+                freeaddrinfo(res);
+                *ctx_out = ctx;
+
+                return bio;
+            }
+
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            s3_https_close(fd);
+            fd = -1;
+            bio = NULL;
+            continue;
+        }
     }
 
-    ssl = SSL_new(ctx);
+    freeaddrinfo(res);
 
-    if (ssl == NULL) {
-        SSL_CTX_free(ctx);
-        BIO_free_all(bio);
-        return NULL;
-    }
-
-    if (ca_file != NULL) {
-        SSL_set1_host(ssl, host);
-    }
-
-    SSL_set_tlsext_host_name(ssl, host);
-
-    bio = BIO_push(BIO_new(BIO_f_ssl()), bio);
-
-    if (bio == NULL) {
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        return NULL;
-    }
-
-    BIO_set_ssl(bio, ssl, BIO_CLOSE);
-
-    if (BIO_do_handshake(bio) != 1) {
-        BIO_free_all(bio);
-        SSL_CTX_free(ctx);
-        return NULL;
-    }
-
-    *ctx_out = ctx;
-
-    return bio;
+    return NULL;
 }
-
 /*
  * the request is one write, the response is read to the EOF; the
  * header block ends at CRLFCRLF, the body is what remains (no
@@ -324,7 +498,7 @@ s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
                   unsigned *status, s3_str_t *response)
 {
     char        host[256], port[8], req[8192];
-    unsigned    tls;
+    unsigned    tls = 0;
     SSL_CTX    *ctx;
     BIO        *bio;
     size_t      blen, req_len;
@@ -335,8 +509,13 @@ s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
 
     s3_str_null(&out);
 
-    if (s3_https_url_split(url, &tls, host, sizeof(host), port, sizeof(port), &slash) != S3_OK) {
-        return S3_ERROR;
+    {
+        s3_int_t src =
+            s3_https_url_split(url, &tls, host, sizeof(host), port, sizeof(port), &slash);
+
+        if (src != S3_OK) {
+            return S3_ERROR;
+        }
     }
 
     bio = s3_https_connect(host, port, tls, ca_file, timeout_sec, &ctx);
