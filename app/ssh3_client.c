@@ -128,6 +128,7 @@ typedef unsigned short u_short;
 #include <s3_quic_output.h>
 #include <s3_quic_streams.h>
 #include <s3_ssh3_aia.h>
+#include <s3_trust_store.h>
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_compress.h>
 #include <s3_ssh3_frame.h>
@@ -603,8 +604,9 @@ enum {
     S3_CLI_SHK_ACCEPT_NEW /* the unknown first use auto-pins, the changed host refuses */
 };
 
-static unsigned s3_cli_opt_insecure;
-static unsigned s3_cli_opt_strict;
+static unsigned          s3_cli_opt_insecure;
+static s3_trust_policy_t s3_cli_trust_policy = S3_TRUST_POLICY_OWN;
+static unsigned          s3_cli_opt_strict;
 
 enum { S3_CLI_SSHFP_NO = 0, S3_CLI_SSHFP_ASK, S3_CLI_SSHFP_YES };
 
@@ -1376,8 +1378,11 @@ s3_cli_usage(const char *prog)
             "              forwardagent, port, user, identityfile, localforward,\n"
             "              remoteforward, dynamicforward, proxyjump,\n"
             "              escapechar, controlmaster, controlpath,\n"
-            "              controlpersist; the unknown key refuses with the\n"
-            "              list (exit 255)\n"
+            "              controlpersist, truststore (own|system: the anchor\n"
+            "              set of the dial - own carries the embedded roots\n"
+            "              and the user bundles, system adds the platform\n"
+            "              store; the default own); the unknown key refuses\n"
+            "              with the list (exit 255)\n"
             "  -x | -Y     accepted, ignored (no X11)\n"
             "\n the deprecated aliases (the legacy shapes ride):\n"
             "  -X          the agent forwarding (use -A)\n"
@@ -1398,6 +1403,8 @@ s3_cli_usage(const char *prog)
             "  --agent-key pubfile  the JWT signs with the ssh-agent key\n"
             "              whose public part matches pubfile (SSH_AUTH_SOCK,\n"
             "              ed25519 or rsa)\n"
+            "  --trust-store own|system  the anchor set of the dial (the\n"
+            "              -o TrustStore twin; the default own)\n"
             "  --sftp put|get:local:remote | SRC DST  the transfer: the\n"
             "              positional form derives the direction from the\n"
             "              leading colon of the remote operand (the session\n"
@@ -3551,6 +3558,21 @@ s3_cli_cfg_apply(const char *key, const char *val)
         return S3_OK;
     }
 
+    if (s3_cli_streq_ci(key, "truststore") == 0) {
+
+        s3_trust_policy_t v;
+
+        /* the config tolerance of the ssh2 canon: an unparsable
+         * value rides the default silently (the newer keyword of
+         * the older client) */
+
+        if (s3_trust_policy_parse(val, &v) == 0) {
+            s3_cli_trust_policy = v;
+        }
+
+        return S3_OK;
+    }
+
     /* the unknown key ignores silently (the ssh2 tolerance of the
      * newer keywords in the older clients) */
 
@@ -3735,7 +3757,7 @@ s3_cli_cfg_load(const char *host)
 static const char s3_cli_opt_keys[] =
     "insecure, strict-host-key-checking, verifyhostkeydns, forwardagent, port, user, identityfile,"
     " localforward, remoteforward, dynamicforward, proxyjump, escapechar, controlmaster,"
-    " controlpath, controlpersist, connecttimeout";
+    " controlpath, controlpersist, connecttimeout, truststore";
 
 /* the ASCII case-insensitive compare of the -o texts (the fork
  * accepts any case of the key and the value) */
@@ -4557,6 +4579,20 @@ s3_cli_opt_parse(const char *arg)
 
         s3_cli_opt_sshfp = (unsigned)v;
         s3_cli_have_sshfp = 1;
+
+        return S3_OK;
+    }
+
+    if (s3_cli_opt_key_eq(key, "truststore") == 0) {
+
+        s3_trust_policy_t v;
+
+        if (s3_trust_policy_parse(val, &v) != 0) {
+            fprintf(stderr, "ssh3: -o TrustStore= wants own|system\n");
+            return S3_ERROR;
+        }
+
+        s3_cli_trust_policy = v;
 
         return S3_OK;
     }
@@ -11140,12 +11176,13 @@ s3_cli_jump_dial(s3_event_ctx_t *ctx, s3_cli_jump_hop_t *hop, s3_fd_t fd,
         return S3_ERROR;
     }
 
-    /* the CA-bundle bootstrap of the hop (PLAN.md 10, T1): the
-     * embedded ISRG roots and the user bundle ride the anchors next
-     * to the system paths (the win build carries no default cert
-     * dir), the pins land behind them */
+    /* the trust store of the hop rides the session policy (the
+     * wave 14), the pins land behind it */
 
-    s3_ssh3_aia_trust_bootstrap(conf->ssl->ctx, &s3_cli_log);
+    if (s3_trust_store_build(conf->ssl->ctx, s3_cli_trust_policy, &s3_cli_log) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_cli_log, 0, "the trust store build failed");
+        return S3_ERROR;
+    }
 
     /* the pinned anchors of the hop ride the hop store before the
      * dial (canon 2.2, the main conn loads its own) */
@@ -14757,6 +14794,7 @@ main(int argc, char **argv)
 
                 if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
                     strcmp(argv[n], "--sftp") == 0 || strcmp(argv[n], "--agent-key") == 0 ||
+                    strcmp(argv[n], "--trust-store") == 0 ||
                     (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
                      s3_cli_opt_key_eq(argv[n] + 1, "strict-host-key-checking") == 0)) {
                     n++;
@@ -14820,6 +14858,20 @@ main(int argc, char **argv)
                 s3_cli_usage(argv[0]);
                 s3_cli_net_cleanup();
                 return 0;
+
+            } else if (strcmp(argv[n], "--trust-store") == 0 && n + 1 < argc) {
+
+                /* the trust policy of the dial (the wave 14): the
+                 * own set or the system union, the bad value stops
+                 * the run before any dial */
+
+                if (s3_trust_policy_parse(argv[n + 1], &s3_cli_trust_policy) != 0) {
+                    fprintf(stderr, "ssh3: --trust-store wants own|system\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--agent-key") == 0 && n + 1 < argc) {
 
@@ -15552,8 +15604,7 @@ main(int argc, char **argv)
         const char *lim2 = (slash != NULL) ? slash : operand + strlen(operand);
 
         if (memchr(colon + 1, ':', (size_t)(lim2 - colon - 1)) != NULL) {
-            fprintf(stderr,
-                    "ssh3: the bare IPv6 rides the bracketed form: user@[addr]:port\n");
+            fprintf(stderr, "ssh3: the bare IPv6 rides the bracketed form: user@[addr]:port\n");
             return S3_CLI_EXIT_ERROR;
         }
     }
@@ -15575,9 +15626,9 @@ main(int argc, char **argv)
 
             if (oport == 0 || oport > 65535 || (size_t)(colon - operand) >= sizeof(s3_cli_host)) {
                 fprintf(stderr,
-                    "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
-                    "user@[addr]:port)\n",
-                    argv[optind - 1]);
+                        "ssh3: bad port in %s (the IPv6 literal rides the bracketed form: "
+                        "user@[addr]:port)\n",
+                        argv[optind - 1]);
                 return S3_CLI_EXIT_ERROR;
             }
 
@@ -16345,12 +16396,15 @@ main(int argc, char **argv)
             return S3_CLI_EXIT_ERROR;
         }
 
-        /* the CA-bundle bootstrap (PLAN.md 10, T1): the embedded ISRG
-         * roots and the user bundle ride the anchors next to the
-         * system paths - the bundled win build carries no default
-         * cert dir, the LE chains anchor on the embedded roots */
+        /* the trust store of the dial (PLAN.md 14, phase 1a): the
+         * policy picks the anchor set - the own set (the embedded
+         * roots + the user bundles) or the system union */
 
-        s3_ssh3_aia_trust_bootstrap(s3_cli_conf.ssl->ctx, &s3_cli_log);
+        if (s3_trust_store_build(s3_cli_conf.ssl->ctx, s3_cli_trust_policy, &s3_cli_log) != S3_OK) {
+            fprintf(stderr, "ssh3: the trust store build failed\n");
+            s3_cli_teardown();
+            return S3_CLI_EXIT_ERROR;
+        }
 
         /* the pinned anchors ride the store before the dial (canon 2.2:
          * the anchor of the chain is the pins union the system CAs) */

@@ -245,6 +245,35 @@ s3_ssh3_aia_trust_bootstrap(SSL_CTX *ctx, s3_log_t *log)
 }
 
 s3_int_t
+s3_ssh3_aia_state_dir(char *buf, size_t cap)
+{
+    const char *home;
+    int         n;
+
+    if (buf == NULL || cap == 0) {
+        return S3_ERROR;
+    }
+
+    home = s3_ssh3_aia_home();
+
+    if (home == NULL || home[0] == '\0') {
+        return S3_ERROR;
+    }
+
+#if (S3_WIN32)
+    n = snprintf(buf, cap, "%s\\.ssh3", home);
+#else
+    n = snprintf(buf, cap, "%s/.ssh3", home);
+#endif
+
+    if (n <= 0 || (size_t)n >= cap) {
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
+s3_int_t
 s3_ssh3_aia_bundle_path(char *buf, size_t cap)
 {
     const char *home, *override;

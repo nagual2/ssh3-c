@@ -82,6 +82,13 @@ typedef struct {
 s3_int_t s3_ssh3_aia_trust_bootstrap(SSL_CTX *ctx, s3_log_t *log);
 s3_int_t s3_ssh3_aia_bundle_path(char *buf, size_t cap);
 
+/*
+ * the client state directory (~/.ssh3, the win profile shape on the
+ * windows leg): the shared base of the bundle paths and the caches
+ */
+
+s3_int_t s3_ssh3_aia_state_dir(char *buf, size_t cap);
+
 /* T2: the post-handshake chase of one connection.  S3_OK when the presented
  * chain now verifies against the anchors of the connection store (either it
  * already did, or the chase completed it), S3_DECLINED when the trigger does

@@ -82,9 +82,26 @@ file (the default ~/.ssh/config when it exists; none or
 /dev/null disables): HostName, Port, User, IdentityFile,
 ForwardAgent, LocalForward, RemoteForward, DynamicForward,
 ProxyJump, EscapeChar, StrictHostKeyChecking, ControlMaster,
-ControlPath, ControlPersist.
+ControlPath, ControlPersist, TrustStore.
 .It Fl o Ar Key=Value
 A client option override, repeatable, case-insensitive.
+.It Fl -trust-store Ar own|system
+The anchor set of the dial (the
+.Fl o Cm TrustStore
+twin, the config key
+.Cm TrustStore
+rides too).
+.Cm own
+(the default) carries the embedded root certificates of the build
+plus the user bundles (~/.ssh3/trust-bundle.pem, the
+.Ev SSH3_CA_BUNDLE
+or ~/.ssh3/ca-bundle.pem file).
+.Cm system
+adds the platform certificate store over the own set - the union
+is never worse than the system store alone; an unavailable store
+rides the own set with a warning.
+The host pins of known_hosts ride the verdict machine whatever the
+policy is.
 .It Fl insecure
 The test-mode TLS: any peer certificate is accepted (the pin check
 skips; the
