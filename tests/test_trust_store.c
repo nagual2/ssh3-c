@@ -159,10 +159,15 @@ test_build_system_union(void)
     sys_n = s3_store_certs(ctx_sys);
 
     /* the union contract: at least the own set, strictly more with
-     * the platform certificate present */
+     * the platform certificate present (the unix strict part rides
+     * the SSL_CERT_FILE fixture; the win strict part rides the
+     * machine stores - the assert rides the unix leg only) */
 
     S3_ASSERT(sys_n >= own_n);
+
+#if !(S3_WIN32)
     S3_ASSERT(sys_n == own_n + 1);
+#endif
 
     s3_test_env_set("SSL_CERT_FILE", "");
     (void)unlink(path);

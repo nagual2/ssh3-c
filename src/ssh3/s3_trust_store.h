@@ -67,6 +67,25 @@ s3_int_t s3_trust_store_build(SSL_CTX *ctx, s3_trust_policy_t policy, s3_log_t *
 void s3_trust_store_set_bundle_path(const char *path);
 
 /*
+ * the platform system store bridge (the phase 2, PLAN.md 14): the
+ * os-layer call of the system trust store —
+ *
+ *   unix  - the default verify paths of the OpenSSL build
+ *           (/etc/ssl/certs et al)
+ *   win   - the Crypt32 stores (the ROOT and the CA enumerated
+ *           into the anchors, the Disallowed store rides the deny
+ *           filter), the certificates the SChannel auto-update
+ *           keeps fresh - the bridge reads the result of the
+ *           system-wide update
+ *
+ * S3_OK applies the paths/store; S3_DECLINED reports the platform
+ * carries none (the empty store, the no-op stub) - the caller
+ * rides the own set with the warning (the union contract).
+ */
+
+s3_int_t s3_trust_system_paths_apply(SSL_CTX *ctx, s3_log_t *log);
+
+/*
  * the trust update of the wave 14 phase 1c (the scheduler calls the
  * product shape `ssh3 --trust-update` once a day): fetch the bundle
  * body over the neutral fetch infra, validate it (every PEM block

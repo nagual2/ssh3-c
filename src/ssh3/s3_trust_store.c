@@ -420,7 +420,7 @@ s3_int_t
 s3_trust_store_build(SSL_CTX *ctx, s3_trust_policy_t policy, s3_log_t *log)
 {
     char path[1024];
-    int  system_paths = 0;
+    s3_int_t system_paths;
 
     if (ctx == NULL || log == NULL) {
         return S3_ERROR;
@@ -471,19 +471,19 @@ s3_trust_store_build(SSL_CTX *ctx, s3_trust_policy_t policy, s3_log_t *log)
         return S3_OK;
     }
 
-    /* the platform paths of the system policy: unix rides the
-     * default cert dir/file of the OpenSSL build; the win build of
-     * the phase 1 carries no platform bridge yet - the empty result
-     * is the warning, the own set already rides (the union never
-     * refuses the dial) */
+    /* the platform paths of the system policy: the os-layer bridge
+     * (the unix leg rides the default cert dir/file of the OpenSSL
+     * build, the win leg rides the Crypt32 ROOT/CA enumeration with
+     * the Disallowed deny filter - the SChannel auto-update keeps
+     * the stores fresh); the empty result is the warning, the own
+     * set already rides (the union never refuses the dial) */
 
-    system_paths = SSL_CTX_set_default_verify_paths(ctx);
+    system_paths = s3_trust_system_paths_apply(ctx, log);
 
-    if (system_paths == 1) {
+    if (system_paths == S3_OK) {
         s3_log_error(S3_LOG_INFO, log, 0, "the system certificate store rides the anchors");
 
     } else {
-        ERR_clear_error();
         s3_log_error(S3_LOG_WARN, log, 0,
                      "the system certificate store is not available, riding the own set");
     }

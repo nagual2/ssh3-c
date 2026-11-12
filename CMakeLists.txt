@@ -129,6 +129,7 @@ if(WIN32)
         src/ssh3/s3_ssh3_oidc.c
         src/ssh3/s3_ssh3_oidc_client.c
         src/os/unix/s3_https_fetch.c
+        src/os/win/s3_trust_paths.c
     )
 
     target_include_directories(s3core
@@ -155,7 +156,9 @@ if(WIN32)
 
     # iphlpapi: the GetAdaptersAddresses of the sshfp resolver's
     # server list (the windows port of sshfp_dns_windows.go)
-    target_link_libraries(s3core PUBLIC ws2_32 iphlpapi)
+    # crypt32: the system certificate stores of the trust store
+    # bridge (the ROOT/CA/Disallowed enumeration, PLAN.md 14)
+    target_link_libraries(s3core PUBLIC ws2_32 iphlpapi crypt32)
     target_compile_options(s3core PRIVATE -Wall -Wextra -Werror)
 
     # the QUIC crypto layer (HKDF/AEAD, the OpenSSL QUIC TLS API); the
@@ -347,6 +350,7 @@ set(S3_CORE_SOURCES
     src/core/s3_crc32.c
     src/os/unix/s3_errno.c
     src/os/unix/s3_cmsg.c
+    src/os/unix/s3_trust_paths.c
     src/event/s3_event.c
     src/event/s3_event_posted.c
     src/event/s3_event_timer.c
