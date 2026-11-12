@@ -129,10 +129,6 @@ typedef unsigned short u_short;
 #include <s3_quic_streams.h>
 #include <s3_ssh3_aia.h>
 #include <s3_trust_store.h>
-
-/* the default source of the scheduler update (the Mozilla
- * set of the curl distribution, the PEM form) */
-#define S3_CLI_TRUST_UPDATE_URL "https://curl.se/ca/cacert.pem"
 #include <s3_ssh3_channel.h>
 #include <s3_ssh3_compress.h>
 #include <s3_ssh3_frame.h>
@@ -1409,13 +1405,6 @@ s3_cli_usage(const char *prog)
             "              ed25519 or rsa)\n"
             "  --trust-store own|system  the anchor set of the dial (the\n"
             "              -o TrustStore twin; the default own)\n"
-            "  --trust-update  fetch the trust bundle, validate and land it\n"
-            "              atomically as ~/.ssh3/trust-bundle.pem (the manifest\n"
-            "              next to it names the source and the sha256; the\n"
-            "              previous copy stays on any failure) - the scheduler\n"
-            "              calls this once a day, exit 0 fresh / 255 stale\n"
-            "  --trust-update-url url  the source override (the default\n"
-            "              https://curl.se/ca/cacert.pem, the Mozilla set)\n"
             "  --sftp put|get:local:remote | SRC DST  the transfer: the\n"
             "              positional form derives the direction from the\n"
             "              leading colon of the remote operand (the session\n"
@@ -14733,7 +14722,6 @@ main(int argc, char **argv)
     struct sockaddr_in6   sa6;
     s3_int_t              rc;
     const char           *treason;
-    const char           *trust_update_url = NULL;
 
     /* the net bootstrap (the winsock startup of win, the signal flags
      * of unix) */
@@ -14807,7 +14795,6 @@ main(int argc, char **argv)
                 if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
                     strcmp(argv[n], "--sftp") == 0 || strcmp(argv[n], "--agent-key") == 0 ||
                     strcmp(argv[n], "--trust-store") == 0 ||
-                    strcmp(argv[n], "--trust-update-url") == 0 ||
                     (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
                      s3_cli_opt_key_eq(argv[n] + 1, "strict-host-key-checking") == 0)) {
                     n++;
@@ -14866,31 +14853,6 @@ main(int argc, char **argv)
                     s3_cli_level_explicit = 1;
                     value = argv[n + 1];
                 }
-
-            } else if (strcmp(argv[n], "--trust-update") == 0) {
-
-                /* the scheduler surface (the phase 1c): fetch the
-                 * bundle, validate, land atomically; the exit code
-                 * names the verdict - the stale copy stays on any
-                 * failure. The stderr rides the log (the scheduler
-                 * journal picks the verdict lines) */
-
-                s3_cli_log.fd = 2;
-
-                if (s3_trust_update_run(trust_update_url != NULL ? trust_update_url
-                                                                 : S3_CLI_TRUST_UPDATE_URL,
-                                        &s3_cli_log) != S3_OK) {
-                    s3_cli_net_cleanup();
-                    return S3_CLI_EXIT_ERROR;
-                }
-
-                s3_cli_net_cleanup();
-                return 0;
-
-            } else if (strcmp(argv[n], "--trust-update-url") == 0 && n + 1 < argc) {
-
-                trust_update_url = argv[n + 1];
-                value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--help") == 0) {
                 s3_cli_usage(argv[0]);

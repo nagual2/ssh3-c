@@ -230,6 +230,12 @@ if(WIN32)
     # shell32: the ShellExecuteA of the oidc provider tab (the --oidc-*)
     target_link_libraries(ssh3 PRIVATE s3core shell32)
 
+    # the PKI utility (PLAN.md 14, the split decision): the one-shot
+    # certificate life outside the always-running daemon
+    add_executable(ssh3-cert app/ssh3_cert.c)
+    target_compile_options(ssh3-cert PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3-cert PRIVATE s3core)
+
     # the icon + VERSIONINFO object (go-winres, app/winres/): linked
     # as an external COFF object, regenerate on a version bump
     set_source_files_properties(app/winres/rsrc_windows_amd64.syso
@@ -510,6 +516,12 @@ if(NOT S3_BUILD_FUZZ)
     add_executable(ssh3 app/ssh3_client.c)
     target_compile_options(ssh3 PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3 PRIVATE s3core Threads::Threads)
+
+    # the PKI utility (PLAN.md 14, the split decision): the one-shot
+    # certificate life outside the always-running daemon
+    add_executable(ssh3-cert app/ssh3_cert.c)
+    target_compile_options(ssh3-cert PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3-cert PRIVATE s3core Threads::Threads)
 endif()
 
 # the fuzz harnesses link the libFuzzer runtime through their own

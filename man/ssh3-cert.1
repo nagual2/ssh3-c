@@ -1,0 +1,52 @@
+.Dd November 12, 2026
+.Dt SSH3-CERT 1
+.Os ssh3-c
+.Sh NAME
+.Nm ssh3-cert
+.Nd the PKI utility of the ssh3-c set
+.Sh DESCRIPTION
+.Nm
+carries the one-shot operations of the certificate life outside the
+always-running daemon
+(.Xr ssh3-server 8 ) :
+the OpenWrt flash and the resident memory of the daemon stay clean
+of the PKI waves (the client certificates, the
+ssh3-ca).
+The daemon consumes the ready files this utility prepares; the
+rotation rides the reopen channel.
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Cm trust-update Op Fl -trust-update-url Ar url
+Fetch the trust bundle, validate it (every PEM block a
+certificate, the count floor) and land it atomically as
+.Pa ~/.ssh3/trust-bundle.pem
+- the manifest next to it names the source and the SHA-256; the
+previous copy stays on any failure (the offline scheduler run is
+the plain shape).
+Exit 0 lands a fresh bundle, 255 keeps the stale one.
+The default source is
+.Li https://curl.se/ca/cacert.pem
+(the Mozilla set of the curl distribution); the scheduler units
+.Pa ssh3-trust-update.{service,timer}
+call this once a day.
+.It Cm ticket-key Ar file
+Generate a session ticket key file (the nginx 80-byte form: 16
+name + 32 hmac + 32 aes, 0600) the daemon reads at the start -
+the pre-seeded key survives the first daemon lifetime (the
+.Xr ssh3-server 8
+.Fl -session-ticket-key-file
+twin of the wave 13).
+.It Cm keygen | Cm selfsign | Cm csr | Cm sign
+The phase 3/4 commands (the client certificates, the ssh3-ca):
+the stubs refuse with the phase note for now.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.ssh3/trust-bundle.pem , Pa ~/.ssh3/trust-bundle.pem.man
+The landed bundle and its manifest.
+.It Pa ~/.ssh3/aia-cache/
+The fetched intermediate cache of the client chase.
+.El
+.Sh SEE ALSO
+.Xr ssh3 1 ,
+.Xr ssh3-server 8

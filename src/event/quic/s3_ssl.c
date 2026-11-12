@@ -661,6 +661,46 @@ s3_ssl_ticket_key_cb(SSL *ssl_conn, unsigned char name[], unsigned char iv[], EV
     return 1;
 }
 
+s3_int_t
+s3_ssl_ticket_key_file_new(const char *path, s3_log_t *log)
+{
+    u_char   buf[80];
+    s3_err_t err;
+    int      fd, n;
+
+    if (path == NULL || path[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    if (RAND_bytes(buf, (int)sizeof(buf)) != 1) {
+        s3_ssl_error(log, 0, "RAND_bytes() failed");
+        return S3_ERROR;
+    }
+
+    /* the same 80-byte layout the server arm reads (16 name + 32
+     * hmac + 32 aes), the owner-only mode */
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | S3_SSL_OPEN_BINARY, 0600);
+
+    if (fd == -1) {
+        err = s3_errno;
+        s3_log_error(S3_LOG_ERR, log, err, "open() \"%s\" failed", path);
+        return S3_ERROR;
+    }
+
+    n = (int)write(fd, buf, sizeof(buf));
+    (void)close(fd);
+
+    if (n != (int)sizeof(buf)) {
+        s3_log_error(S3_LOG_ERR, log, 0, "write() \"%s\" returned %d", path, n);
+        return S3_ERROR;
+    }
+
+    s3_memzero(buf, sizeof(buf));
+
+    return S3_OK;
+}
+
 static s3_int_t
 s3_ssl_ticket_key_generate(s3_ssl_t *ssl, const char *path)
 {

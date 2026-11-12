@@ -120,6 +120,16 @@ void     s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session);
 s3_int_t s3_ssl_ticket_key_file(s3_ssl_t *ssl, const char *path);
 
 /*
+ * the standalone generation of a session ticket key file (the
+ * ssh3-cert ticket-key command): the same nginx 80-byte layout the
+ * server arm reads, the fresh random key, 0600. The server picks
+ * the file up on the next start (or the reload) - the pre-seeded
+ * key survives the first daemon lifetime already
+ */
+
+s3_int_t s3_ssl_ticket_key_file_new(const char *path, s3_log_t *log);
+
+/*
  * the PEM strings may be file contents or in-memory certificates;
  * alpn is the wire-format list, like for SSL_set_alpn_protos()
  */

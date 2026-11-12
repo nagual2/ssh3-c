@@ -102,17 +102,10 @@ is never worse than the system store alone; an unavailable store
 rides the own set with a warning.
 The host pins of known_hosts ride the verdict machine whatever the
 policy is.
-.It Fl -trust-update
-Fetch the trust bundle, validate it (every PEM block a
-certificate, the count floor) and land it atomically as
-~/.ssh3/trust-bundle.pem - the manifest next to it names the
-source and the SHA-256; the previous copy stays on any failure
-(the offline scheduler run is the plain shape). Exit 0 lands a
-fresh bundle, 255 keeps the stale one.
-.It Fl -trust-update-url Ar url
-The source override of the update (the default
-.Li https://curl.se/ca/cacert.pem ,
-the Mozilla set of the curl distribution).
+The trust bundle update rides the
+.Xr ssh3-cert 1
+utility (the scheduler surface moved off the client of the wave
+14).
 .It Fl insecure
 The test-mode TLS: any peer certificate is accepted (the pin check
 skips; the
