@@ -1163,6 +1163,161 @@ s3_ssl_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen
     return SSL_TLSEXT_ERR_OK;
 }
 
+/* the server-side client certificate verdict (the phase 3): the
+ * per-conn app_data carries the s3_ssl_conn_t the callback writes
+ * into (the record-only canon — the handshake lives, the ssh3
+ * layer reads the verdict after it) */
+
+static int
+s3_ssl_server_client_cert_cb(int ok, X509_STORE_CTX *sctx)
+{
+    SSL           *ssl_conn;
+    s3_ssl_conn_t *sc;
+
+    ssl_conn = X509_STORE_CTX_get_ex_data(sctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+
+    if (ssl_conn == NULL) {
+        return ok;
+    }
+
+    sc = SSL_get_app_data(ssl_conn);
+
+    if (sc == NULL) {
+        return ok;
+    }
+
+    if (!ok && sc->client_cert_err == 0) {
+        sc->client_cert_err = X509_STORE_CTX_get_error(sctx);
+    }
+
+    return 1; /* the record-only shape: the handshake lives */
+}
+
+s3_int_t
+s3_ssl_server_client_cert(s3_ssl_t *ssl, const char *ca_file, unsigned require)
+{
+    STACK_OF(X509_NAME) * ca_names;
+
+    if (ssl == NULL || ssl->ctx == NULL || ca_file == NULL || ca_file[0] == '\0') {
+        return S3_ERROR;
+    }
+
+    if (SSL_CTX_load_verify_locations(ssl->ctx, ca_file, NULL) != 1) {
+        s3_ssl_error(ssl->log, 0, "load_verify_locations(\"%s\") failed", ca_file);
+        return S3_ERROR;
+    }
+
+    ca_names = SSL_load_client_CA_file(ca_file);
+
+    if (ca_names == NULL) {
+        s3_ssl_error(ssl->log, 0, "load_client_CA_file(\"%s\") failed", ca_file);
+        return S3_ERROR;
+    }
+
+    SSL_CTX_set_client_CA_list(ssl->ctx, ca_names);
+
+    /* the peer verify turns on for the client certificates; the
+     * require mode dies the handshake without one (the FAIL shape
+     * of the OpenSSL canon), the optional keeps it and the ssh3
+     * layer falls to the other backends */
+
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER | (require ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0),
+                       s3_ssl_server_client_cert_cb);
+
+    s3_log_error(S3_LOG_INFO, ssl->log, 0, "the client certificates ride %s (the ca %s)",
+                 require ? "required" : "optional", ca_file);
+
+    return S3_OK;
+}
+
+void
+s3_ssl_conn_verify_client(s3_ssl_conn_t *ssl_conn, unsigned require)
+{
+    if (ssl_conn == NULL || ssl_conn->connection == NULL) {
+        return;
+    }
+
+    /* the live connection born before the arm: the verify mode
+     * carries per-conn (the SSL_new defaults of the earlier shape
+     * rode NONE) */
+
+    SSL_set_verify(ssl_conn->connection,
+                   SSL_VERIFY_PEER | (require ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0),
+                   s3_ssl_server_client_cert_cb);
+}
+
+s3_int_t
+s3_ssl_client_cert_verdict(s3_ssl_conn_t *ssl_conn, long *err, u_char **der, size_t *len)
+{
+    X509 *cert;
+
+    if (ssl_conn == NULL || ssl_conn->connection == NULL) {
+        return S3_ERROR;
+    }
+
+    *err = ssl_conn->client_cert_err;
+
+    if (ssl_conn->client_cert_der != NULL) {
+        *der = ssl_conn->client_cert_der;
+        *len = ssl_conn->client_cert_der_len;
+        ssl_conn->client_cert_der = NULL;
+
+        return S3_OK;
+    }
+
+    cert = SSL_get1_peer_certificate(ssl_conn->connection);
+
+    if (cert == NULL) {
+        return S3_DECLINED;
+    }
+
+    {
+        size_t  clen;
+        u_char *p;
+
+        clen = (size_t)i2d_X509(cert, NULL);
+
+        p = s3_alloc(clen, NULL);
+
+        if (p == NULL) {
+            X509_free(cert);
+            return S3_ERROR;
+        }
+
+        {
+            u_char *pp = p;
+
+            (void)i2d_X509(cert, &pp);
+        }
+
+        X509_free(cert);
+
+        *der = p;
+        *len = clen;
+    }
+
+    ssl_conn->client_cert_der = NULL;
+    ssl_conn->client_cert_der_len = 0;
+
+    return S3_OK;
+}
+
+s3_int_t
+s3_ssl_client_cert_load(s3_ssl_t *conf, X509 *cert, EVP_PKEY *key)
+{
+    if (conf == NULL || conf->ctx == NULL || cert == NULL || key == NULL) {
+        return S3_ERROR;
+    }
+
+    if (SSL_CTX_use_certificate(conf->ctx, cert) != 1 ||
+        SSL_CTX_use_PrivateKey(conf->ctx, key) != 1 || SSL_CTX_check_private_key(conf->ctx) != 1) {
+        s3_ssl_error(conf->log, 0, "the client cert pair load failed");
+        return S3_ERROR;
+    }
+
+    return S3_OK;
+}
+
 s3_int_t
 s3_ssl_create_connection(s3_ssl_t *ssl, s3_connection_t *c)
 {
@@ -1179,6 +1334,16 @@ s3_ssl_create_connection(s3_ssl_t *ssl, s3_connection_t *c)
         return S3_ERROR;
     }
 
+    SSL_set_app_data(ssl_conn->connection, ssl_conn);
+
+    /* the verify mode of the ctx carries to the new connection (the
+     * client certificates of the phase 3 arm the ctx before the
+     * accept — the per-conn copy rides the OpenSSL shape of the
+     * SSL_new defaults) */
+
+    SSL_set_verify(ssl_conn->connection, SSL_CTX_get_verify_mode(ssl->ctx),
+                   SSL_CTX_get_verify_callback(ssl->ctx));
+
     SSL_set_accept_state(ssl_conn->connection);
 
     c->ssl = ssl_conn;
@@ -1193,6 +1358,11 @@ s3_ssl_shutdown(s3_connection_t *c)
     s3_ssl_conn_t *ssl_conn;
 
     ssl_conn = c->ssl;
+
+    if (ssl_conn != NULL && ssl_conn->client_cert_der != NULL) {
+        s3_free(ssl_conn->client_cert_der);
+        ssl_conn->client_cert_der = NULL;
+    }
 
     if (ssl_conn == NULL || ssl_conn->connection == NULL) {
         return S3_OK;

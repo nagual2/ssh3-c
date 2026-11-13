@@ -753,9 +753,16 @@ s3_test_verify_handshake(s3_test_env_t *env, s3_ssl_t *conf)
         for (n = 0; n < S3_TEST_TLS_LEVELS; n++) {
 
             if (env->cli.out_len[n] > env->cli_off[n]) {
-                S3_ASSERT(s3_test_feed_crypto(
-                              &env->conn, (s3_uint_t)n, env->cli.out[n] + env->cli_off[n],
-                              env->cli.out_len[n] - env->cli_off[n], &env->cli_off[n]) == S3_OK);
+
+                /* the dead handshake of the require leg feeds the
+                 * S3_ERROR — the caller decides what the death
+                 * means (the verdict legs) */
+
+                if (s3_test_feed_crypto(&env->conn, (s3_uint_t)n, env->cli.out[n] + env->cli_off[n],
+                                        env->cli.out_len[n] - env->cli_off[n],
+                                        &env->cli_off[n]) != S3_OK) {
+                    return S3_ERROR;
+                }
             }
         }
 
@@ -1021,6 +1028,199 @@ test_ssl_ticket_key_file(void)
     return s3_test_failures;
 }
 
+/*
+ * the client certificates of the server (the phase 3): the
+ * handshake-level unit — the server arms the client-cert policy
+ * (the CA file), the client presents the pair or stays keyless:
+ *
+ *   require + the ca-signed leaf        -> the handshake lives,
+ *                                          the verdict is clean
+ *   require + the keyless client        -> the handshake dies
+ *   optional + the keyless client       -> the handshake lives,
+ *                                          the verdict declined
+ *   optional + the foreign-signed leaf  -> the handshake lives
+ *                                          (the record-only), the
+ *                                          verdict error (unknown ca)
+ */
+
+static int
+test_server_client_cert(void)
+{
+    char      ca_pem_path[] = "/tmp/s3cclcaXXXXXX";
+    u_char    pem[4096], pem_key[4096];
+    size_t    pem_len = 0, pem_key_len = 0;
+    s3_str_t  alpn;
+    s3_ssl_t *srv_conf, *cli_conf;
+    X509     *ca_x = NULL, *leaf_x = NULL, *foreign_x = NULL;
+    EVP_PKEY *ca_k = NULL, *leaf_k = NULL, *foreign_k = NULL;
+    FILE     *ca_file;
+
+    static s3_test_env_t env;
+
+    X509     *srv_x = NULL;
+    EVP_PKEY *srv_k = NULL;
+    s3_test_tls_log_init();
+
+    alpn.data = (u_char *)s3_test_alpn;
+    alpn.len = S3_TEST_ALPN_LEN;
+
+    S3_ASSERT(s3_test_gen_ca(&ca_x, &ca_k) == 0);
+    S3_ASSERT(s3_test_gen_leaf(ca_x, ca_k, &leaf_x, &leaf_k) == 0);
+    S3_ASSERT(s3_test_gen_selfsigned(&foreign_x, &foreign_k) == 0);
+    S3_ASSERT(s3_test_gen_selfsigned(&srv_x, &srv_k) == 0);
+
+    S3_ASSERT(s3_test_x509_pem(srv_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(srv_k, pem_key, &pem_key_len) == 0);
+
+    /* --- leg 1: the require + the ca-signed leaf rides --- */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    /* the ca file of the server policy: the pem of the ca_x into
+     * the tmp (after the env_init, the server pair rode pem) */
+
+    {
+
+        S3_ASSERT(s3_test_x509_pem(ca_x, pem, &pem_len) == 0);
+
+        ca_file = fopen(ca_pem_path, "wb");
+        S3_ASSERT(ca_file != NULL);
+        fwrite(pem, 1, pem_len, ca_file);
+        (void)fclose(ca_file);
+    }
+
+    srv_conf = env.conf.ssl;
+    S3_ASSERT(s3_ssl_server_client_cert(srv_conf, ca_pem_path, 1) == S3_OK);
+    s3_ssl_conn_verify_client(env.conn.ssl, 1);
+
+    cli_conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(cli_conf != NULL);
+    S3_ASSERT(s3_ssl_client_cert_load(cli_conf, leaf_x, leaf_k) == S3_OK);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, cli_conf) == S3_OK);
+
+    /* the server per-conn verdict: the clean chain, the der rides */
+
+    {
+        long    err = 0;
+        u_char *der = NULL;
+        size_t  der_len = 0;
+
+        S3_ASSERT(s3_ssl_client_cert_verdict(env.conn.ssl, &err, &der, &der_len) == S3_OK);
+        printf("CC-L1 err=%ld\n", err);
+        S3_ASSERT(err == 0);
+        S3_ASSERT(der != NULL && der_len > 0);
+
+        s3_free(der);
+    }
+
+    s3_test_env_done(&env);
+    s3_ssl_free(cli_conf);
+
+    /* the server pair back into pem: the ca file write clobbered it */
+
+    S3_ASSERT(s3_test_x509_pem(srv_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(srv_k, pem_key, &pem_key_len) == 0);
+
+    /* --- leg 2: the require + the keyless client dies --- */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    srv_conf = env.conf.ssl;
+    S3_ASSERT(s3_ssl_server_client_cert(srv_conf, ca_pem_path, 1) == S3_OK);
+    s3_ssl_conn_verify_client(env.conn.ssl, 1);
+
+    cli_conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(cli_conf != NULL);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, cli_conf) != S3_OK);
+
+    s3_test_env_done(&env);
+    s3_ssl_free(cli_conf);
+
+    /* the server pair back into pem: the ca file write clobbered it */
+
+    S3_ASSERT(s3_test_x509_pem(srv_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(srv_k, pem_key, &pem_key_len) == 0);
+
+    /* --- leg 3: the optional + the keyless client lives, declined --- */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    srv_conf = env.conf.ssl;
+    S3_ASSERT(s3_ssl_server_client_cert(srv_conf, ca_pem_path, 0) == S3_OK);
+    s3_ssl_conn_verify_client(env.conn.ssl, 0);
+
+    cli_conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(cli_conf != NULL);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, cli_conf) == S3_OK);
+
+    {
+        long    err = 0;
+        u_char *der = NULL;
+        size_t  der_len = 0;
+
+        S3_ASSERT(s3_ssl_client_cert_verdict(env.conn.ssl, &err, &der, &der_len) == S3_DECLINED);
+        S3_ASSERT(der == NULL);
+    }
+
+    s3_test_env_done(&env);
+    s3_ssl_free(cli_conf);
+
+    /* the server pair back into pem: the ca file write clobbered it */
+
+    S3_ASSERT(s3_test_x509_pem(srv_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(srv_k, pem_key, &pem_key_len) == 0);
+
+    /* --- leg 4: the foreign-signed leaf verifies to the error --- */
+
+    S3_ASSERT(s3_test_env_init(&env, pem, pem_len, pem_key, pem_key_len) == S3_OK);
+
+    srv_conf = env.conf.ssl;
+    S3_ASSERT(s3_ssl_server_client_cert(srv_conf, ca_pem_path, 0) == S3_OK);
+    s3_ssl_conn_verify_client(env.conn.ssl, 0);
+
+    cli_conf = s3_ssl_client_create(&s3_test_tls_log, &alpn);
+    S3_ASSERT(cli_conf != NULL);
+    S3_ASSERT(s3_ssl_client_cert_load(cli_conf, foreign_x, foreign_k) == S3_OK);
+
+    S3_ASSERT(s3_test_verify_handshake(&env, cli_conf) == S3_OK);
+
+    {
+        long    err = 0;
+        u_char *der = NULL;
+        size_t  der_len = 0;
+
+        S3_ASSERT(s3_ssl_client_cert_verdict(env.conn.ssl, &err, &der, &der_len) == S3_OK);
+        S3_ASSERT(err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT);
+        S3_ASSERT(der != NULL && der_len > 0);
+
+        s3_free(der);
+    }
+
+    s3_test_env_done(&env);
+    s3_ssl_free(cli_conf);
+
+    /* the server pair back into pem: the ca file write clobbered it */
+
+    S3_ASSERT(s3_test_x509_pem(srv_x, pem, &pem_len) == 0);
+    S3_ASSERT(s3_test_key_pem(srv_k, pem_key, &pem_key_len) == 0);
+
+    (void)unlink(ca_pem_path);
+
+    X509_free(ca_x);
+    EVP_PKEY_free(ca_k);
+    X509_free(leaf_x);
+    EVP_PKEY_free(leaf_k);
+    X509_free(foreign_x);
+    EVP_PKEY_free(foreign_k);
+    X509_free(srv_x);
+    EVP_PKEY_free(srv_k);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_quic_ssl(void)
 {
@@ -1032,6 +1232,7 @@ s3_test_quic_ssl(void)
     test_quic_tls_handshake();
     test_transport_params_roundtrip();
     test_client_verify();
+    test_server_client_cert();
 
     /* release the one-time openssl allocations for the leak check */
     OPENSSL_cleanup();

@@ -10,6 +10,8 @@
  * PLAN.md 8.2: getpwnam + getspnam + crypt_r) and the sshd
  * authorized_keys iterator; the wiring picks the checks it speaks
  */
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <s3_core.h>
 
@@ -23,6 +25,9 @@
 #endif
 
 #include <shadow.h>
+
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <s3_ssh3_auth_srv.h>
 
@@ -765,4 +770,104 @@ s3_ssh3_auth_authorized_keys_next(const u_char **pos, const u_char *end, s3_str_
     *pos = p;
 
     return S3_DONE;
+}
+
+/*
+ * the identity mapping of the client certificate (the phase 3,
+ * PLAN.md 14): the SAN URI (spki:user) wins, then the SAN email
+ * (the local part), then the CN — the user name of the session.
+ * The getpwnam gate rides the caller (the auth user gate of the
+ * server), the mapping only names
+ */
+
+s3_int_t
+s3_ssh3_auth_cert_user(X509 *cert, char *buf, size_t cap)
+{
+    GENERAL_NAMES *sans;
+    s3_int_t       rc = S3_DECLINED;
+    int            i, n;
+
+    if (cert == NULL || buf == NULL || cap == 0) {
+        return S3_ERROR;
+    }
+
+    /* the mapper owns the buf: the caller passes the uninitia­lized
+     * one, the email fallback checks the emptiness */
+
+    buf[0] = '\0';
+
+    sans = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+
+    if (sans != NULL) {
+
+        n = sk_GENERAL_NAME_num(sans);
+
+        for (i = 0; i < n && rc != S3_OK; i++) {
+
+            GENERAL_NAME *gn = sk_GENERAL_NAME_value(sans, i);
+            const char   *text;
+            size_t        tlen;
+
+            if (gn->type == GEN_URI) {
+
+                text = (const char *)ASN1_STRING_get0_data(gn->d.uniformResourceIdentifier);
+                tlen = (size_t)ASN1_STRING_length(gn->d.uniformResourceIdentifier);
+
+                /* the spki:user form of the ssh3 uri canon */
+
+                if (tlen > 5 && s3_strncmp(text, "spki:", 5) == 0) {
+                    text += 5;
+                    tlen -= 5;
+
+                    if (tlen > 0 && tlen < cap) {
+                        memcpy(buf, text, tlen);
+                        buf[tlen] = '\0';
+                        rc = S3_OK;
+                    }
+                }
+
+            } else if (gn->type == GEN_EMAIL && rc == S3_DECLINED) {
+
+                /* the email falls behind every spki the
+                 * certificate carries (the first pass collects the
+                 * uris, the email rides the fallback) */
+
+                text = (const char *)ASN1_STRING_get0_data(gn->d.rfc822Name);
+                tlen = (size_t)ASN1_STRING_length(gn->d.rfc822Name);
+
+                if (tlen > 0 && tlen < cap && buf[0] == '\0') {
+                    memcpy(buf, text, tlen);
+                    buf[tlen] = '\0';
+                    rc = S3_OK;
+                }
+            }
+        }
+
+        GENERAL_NAMES_free(sans);
+    }
+
+    if (rc != S3_OK) {
+
+        /* the CN fallback: the last common name of the subject */
+
+        {
+            X509_NAME *name = X509_get_subject_name(cert);
+            int        ni = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
+
+            if (ni >= 0) {
+
+                ASN1_STRING *cn_asn = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, ni));
+
+                size_t clen = (size_t)ASN1_STRING_length(cn_asn);
+
+                if (clen > 0 && clen < cap) {
+                    memcpy(buf, ASN1_STRING_get0_data(cn_asn), clen);
+                    buf[clen] = '\0';
+                    rc = S3_OK;
+                }
+            }
+        }
+    }
+
+    return rc;
 }

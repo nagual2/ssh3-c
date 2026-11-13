@@ -400,6 +400,8 @@ static char        s3_cli_target[640];  /* the CONNECT :path with the ?user= */
 static char        s3_cli_hostkey[768]; /* the known_hosts key, host:port/path */
 static char        s3_cli_keyfile[1024];
 static char        s3_cli_agent_keyfile[1024]; /* the --agent-key pubkey match */
+static char        s3_cli_certfile[1024];      /* the --cert of the phase 3 */
+static char        s3_cli_certkey[1024];       /* the --key of the phase 3 */
 static char        s3_cli_basic[512];
 static char        s3_cli_bearer[2048];
 static const char *s3_cli_auth_value;
@@ -1405,6 +1407,9 @@ s3_cli_usage(const char *prog)
             "              ed25519 or rsa)\n"
             "  --trust-store own|system  the anchor set of the dial (the\n"
             "              -o TrustStore twin; the default own)\n"
+            "  --cert pem --key pem  the client certificate of the phase\n"
+            "              3: the pair rides the CertificateRequest of the\n"
+            "              server (--client-cert-ca wiring of the server)\n"
             "  --sftp put|get:local:remote | SRC DST  the transfer: the\n"
             "              positional form derives the direction from the\n"
             "              leading colon of the remote operand (the session\n"
@@ -14794,7 +14799,8 @@ main(int argc, char **argv)
 
                 if (strcmp(argv[n], "--log-level") == 0 || strcmp(argv[n], "--password") == 0 ||
                     strcmp(argv[n], "--sftp") == 0 || strcmp(argv[n], "--agent-key") == 0 ||
-                    strcmp(argv[n], "--trust-store") == 0 ||
+                    strcmp(argv[n], "--trust-store") == 0 || strcmp(argv[n], "--cert") == 0 ||
+                    strcmp(argv[n], "--key") == 0 ||
                     (argv[n][0] == '-' && argv[n][1] != '-' && argv[n][1] != '\0' &&
                      s3_cli_opt_key_eq(argv[n] + 1, "strict-host-key-checking") == 0)) {
                     n++;
@@ -14870,6 +14876,34 @@ main(int argc, char **argv)
                     s3_cli_net_cleanup();
                     return S3_CLI_EXIT_ERROR;
                 }
+
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--cert") == 0 && n + 1 < argc) {
+
+                /* the client certificate of the phase 3: the PEM of
+                 * the leaf (the chain file rides too); the server
+                 * sees it on the CertificateRequest */
+
+                if (strlen(argv[n + 1]) >= sizeof(s3_cli_certfile)) {
+                    fprintf(stderr, "ssh3: --cert path is too long\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                snprintf(s3_cli_certfile, sizeof(s3_cli_certfile), "%s", argv[n + 1]);
+
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--key") == 0 && n + 1 < argc) {
+
+                if (strlen(argv[n + 1]) >= sizeof(s3_cli_certkey)) {
+                    fprintf(stderr, "ssh3: --key path is too long\n");
+                    s3_cli_net_cleanup();
+                    return S3_CLI_EXIT_ERROR;
+                }
+
+                snprintf(s3_cli_certkey, sizeof(s3_cli_certkey), "%s", argv[n + 1]);
 
                 value = argv[n + 1];
 
@@ -16394,6 +16428,29 @@ main(int argc, char **argv)
             fprintf(stderr, "ssh3: the ssl init failed\n");
             s3_cli_teardown();
             return S3_CLI_EXIT_ERROR;
+        }
+
+        /* the client certificate of the phase 3: the pair loads into
+         * the ctx, the CertificateRequest of the server carries it;
+         * the mismatch refuses at the dial (the canon of the ssl) */
+
+        if (s3_cli_certfile[0] != '\0' || s3_cli_certkey[0] != '\0') {
+
+            if (s3_cli_certfile[0] == '\0' || s3_cli_certkey[0] == '\0') {
+                fprintf(stderr, "ssh3: --cert and --key ride together\n");
+                s3_cli_teardown();
+                return S3_CLI_EXIT_ERROR;
+            }
+
+            if (SSL_CTX_use_certificate_chain_file(s3_cli_conf.ssl->ctx, s3_cli_certfile) != 1 ||
+                SSL_CTX_use_PrivateKey_file(s3_cli_conf.ssl->ctx, s3_cli_certkey,
+                                            SSL_FILETYPE_PEM) != 1 ||
+                SSL_CTX_check_private_key(s3_cli_conf.ssl->ctx) != 1) {
+                fprintf(stderr, "ssh3: the client certificate load failed\n");
+                s3_ssl_error(&s3_cli_log, 0, "the client certificate load");
+                s3_cli_teardown();
+                return S3_CLI_EXIT_ERROR;
+            }
         }
 
         /* the trust store of the dial (PLAN.md 14, phase 1a): the

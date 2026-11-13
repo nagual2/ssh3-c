@@ -13,6 +13,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/x509v3.h>
+
 #include <s3_ssh3_auth_srv.h>
 
 #include "s3_test.h"
@@ -587,6 +589,93 @@ s3_test_default_chain(void)
     return s3_test_failures;
 }
 
+/*
+ * the identity mapping of the client certificates (the phase 3):
+ * the three SAN/CN shapes the mappers ride
+ */
+
+static int
+test_cert_user(void)
+{
+    EVP_PKEY *pkey = EVP_RSA_gen(2048);
+    char      buf[256];
+    s3_int_t  rc;
+    int       casei;
+
+    struct {
+        const char *uri;
+        const char *email;
+        const char *cn;
+        const char *want;
+        const char *name;
+    } cases[] = {
+        {"spki:alice", NULL, "ignored-cn", "alice", "spki"},
+        {NULL, "bob@example.com", "ignored-cn", "bob@example.com", "email"},
+        {NULL, NULL, "carol", "carol", "cn"},
+    };
+
+    S3_ASSERT(pkey != NULL);
+
+    for (casei = 0; casei < 3; casei++) {
+
+        X509      *cert;
+        X509_NAME *name;
+
+        cert = X509_new();
+        S3_ASSERT(cert != NULL);
+
+        X509_set_version(cert, 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+        X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+        X509_gmtime_adj(X509_getm_notAfter(cert), 86400);
+        X509_set_pubkey(cert, pkey);
+
+        name = X509_get_subject_name(cert);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)cases[casei].cn,
+                                   -1, -1, 0);
+        X509_set_issuer_name(cert, name);
+
+        if (cases[casei].uri != NULL) {
+
+            char exttext[256];
+
+            snprintf(exttext, sizeof(exttext), "URI:%s", cases[casei].uri);
+
+            X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, exttext);
+
+            S3_ASSERT(san != NULL);
+            X509_add_ext(cert, san, -1);
+            X509_EXTENSION_free(san);
+        }
+
+        if (cases[casei].email != NULL) {
+
+            char exttext[256];
+
+            snprintf(exttext, sizeof(exttext), "email:%s", cases[casei].email);
+
+            X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, exttext);
+
+            S3_ASSERT(san != NULL);
+            X509_add_ext(cert, san, -1);
+            X509_EXTENSION_free(san);
+        }
+
+        X509_sign(cert, pkey, EVP_sha256());
+
+        rc = s3_ssh3_auth_cert_user(cert, buf, sizeof(buf));
+
+        S3_ASSERT(rc == S3_OK);
+        S3_ASSERT(strcmp(buf, cases[casei].want) == 0);
+
+        X509_free(cert);
+    }
+
+    EVP_PKEY_free(pkey);
+
+    return s3_test_failures;
+}
+
 static int
 s3_test_ssh3_auth_srv(void)
 {
@@ -598,6 +687,7 @@ s3_test_ssh3_auth_srv(void)
     (void)s3_test_password_system();
     (void)s3_test_authorized_keys();
     (void)s3_test_default_chain();
+    (void)test_cert_user();
 
     return s3_test_failures;
 }

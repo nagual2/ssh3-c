@@ -63,6 +63,7 @@
 #include <unistd.h>
 
 #include <openssl/rand.h>
+#include <openssl/x509.h>
 
 #include <s3_cmsg.h>
 #include <s3_h3.h>
@@ -180,6 +181,21 @@ static unsigned s3_srv_proto_mode;
  */
 static const char *s3_srv_passfile;
 static unsigned    s3_srv_password_enabled = 1;
+
+/*
+ * the client certificates of the server (the phase 3, PLAN.md 14):
+ * the CA file names the trusted issuers (the anchors load into the
+ * server ssl ctx, the CA names ride the CertificateRequest), the
+ * policy — none (the default, no CertificateRequest at all),
+ * optional (the presented chain verifies to the pass, the absence
+ * falls to the other backends), require (the handshake dies
+ * without one). The user of the session maps from the certificate
+ * identity (the SAN spki:/email, the CN fallback) through the auth
+ * user gate
+ */
+
+static const char *s3_srv_client_cert_ca;
+static int         s3_srv_client_cert_require; /* -1 none-default, 0 none, 1 optional, 2 require */
 
 /*
  * the system account verifier (--password-system on|off, PLAN.md
@@ -1368,7 +1384,9 @@ typedef struct {
     char user[128];
 
     /* the verdict of the CONNECT (200 = the conversation is
-     * authenticated, the reverse forward may bind) */
+     * authenticated, the reverse forward may bind); 0 rides the
+     * not-decided shape of the client-cert skip guard (the init
+     * rides the preauth find) */
 
     unsigned code;
 
@@ -2602,7 +2620,7 @@ s3_srv_h3_oidc_verdict(s3_srv_preauth_t *pa, s3_connection_t *pc)
 static void
 s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
 {
-    unsigned          code;
+    unsigned          code = 0;
     unsigned          dos_slot = 0;
     s3_ssh3_version_t ver;
 
@@ -2692,46 +2710,136 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
 
             dos_slot = 1;
 
-            s3_str_t header;
+            /* the client certificate step (the phase 3): the first
+             * in the chain when the policy arms it — the presented
+             * chain verified (the ssl record-only verdict) maps the
+             * identity through the auth gate to the 200; the
+             * optional absence falls to the other backends, the
+             * failed verification refuses */
 
-            header.data = pa->auth;
-            header.len = pa->auth_len;
+            if (s3_srv_client_cert_ca != NULL) {
 
-            if (s3_srv_oidc_issuer != NULL) {
+                long          ccerr = 0;
+                u_char       *ccder = NULL;
+                size_t        ccdlen = 0;
+                s3_int_t      vrc;
+                X509         *cc = NULL;
+                const u_char *ccp;
 
-                code = s3_srv_h3_oidc_verdict(pa, pc);
+                vrc = s3_ssl_client_cert_verdict(pa->pc->ssl, &ccerr, &ccder, &ccdlen);
 
-            } else if (pa->auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+                if (vrc == S3_ERROR || (vrc == S3_OK && ccerr != 0)) {
 
-                /* the pubkey step: the Bearer token verifies against
-                 * the -K files, or against the default identities
-                 * chain of the session user when none is given (the
-                 * reference always runs it) */
+                    s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                                 "the client certificate failed the verification (err %ld)", ccerr);
+                    code = 401;
 
-                code = s3_srv_h3_jwt_verdict(pa);
+                } else if (vrc == S3_OK) {
 
-            } else if (s3_srv_passfile != NULL || s3_srv_password_system) {
+                    /* the leaf back from the DER (the mapping reads
+                     * the X509) */
 
-                /* the Basic step: the password backends decide (the
-                 * -P file, then the system accounts); the login is
-                 * on by default (the PasswordAuthentication yes of
-                 * the sshd canon, the wave 1e), the explicit off
-                 * (--enable-password-login off) closes the step with
-                 * 401 - the sshd PasswordAuthentication no shape */
+                    ccp = ccder;
+                    cc = d2i_X509(NULL, &ccp, (long)ccdlen);
 
-                code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict(pa) : 401;
+                    if (cc != NULL) {
 
-            } else if (s3_srv_keyfiles_n == 0) {
+                        s3_str_t user;
 
-                /* the open harness mode: no auth mechanism is wired,
-                 * any authorization header passes (the interop
-                 * fixtures send a filler token) */
+                        s3_str_null(&user);
 
-                code = pa->auth_len ? 200 : 401;
+                        {
+                            char ubuf[256];
 
-            } else {
-                code = 401;
+                            if (s3_ssh3_auth_cert_user(cc, ubuf, sizeof(ubuf)) == S3_OK) {
+
+                                user.data = (u_char *)ubuf;
+                                user.len = strlen(ubuf);
+                            }
+                        }
+
+                        if (user.len == 0) {
+                            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                                         "the client certificate carries no identity");
+                            X509_free(cc);
+                            s3_free(ccder);
+                            code = 401;
+
+                        } else if (s3_srv_auth_user_gate(pa, &user) != S3_OK) {
+
+                            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                                         "the client certificate identity %s is not a "
+                                         "system account",
+                                         user.data);
+                            X509_free(cc);
+                            s3_free(ccder);
+                            code = 401;
+
+                        } else {
+
+                            s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
+                                         "the client certificate identity rides: %s", pa->user);
+                            X509_free(cc);
+                            s3_free(ccder);
+                            code = 200;
+                        }
+
+                    } else {
+                        s3_free(ccder);
+                        code = 401;
+                    }
+
+                } else {
+
+                    /* the optional absence: the other backends ride
+                     * (the fall-through to the oidc/jwt/basic chain) */
+                }
             }
+
+            if (code == 0) {
+
+                s3_str_t header;
+
+                header.data = pa->auth;
+                header.len = pa->auth_len;
+
+                if (s3_srv_oidc_issuer != NULL) {
+
+                    code = s3_srv_h3_oidc_verdict(pa, pc);
+
+                } else if (pa->auth_len > 0 && s3_ssh3_auth_jwt_bearer(&header) == S3_OK) {
+
+                    /* the pubkey step: the Bearer token verifies against
+                     * the -K files, or against the default identities
+                     * chain of the session user when none is given (the
+                     * reference always runs it) */
+
+                    code = s3_srv_h3_jwt_verdict(pa);
+
+                } else if (s3_srv_passfile != NULL || s3_srv_password_system) {
+
+                    /* the Basic step: the password backends decide (the
+                     * -P file, then the system accounts); the login is
+                     * on by default (the PasswordAuthentication yes of
+                     * the sshd canon, the wave 1e), the explicit off
+                     * (--enable-password-login off) closes the step with
+                     * 401 - the sshd PasswordAuthentication no shape */
+
+                    code = s3_srv_password_enabled ? s3_srv_h3_basic_verdict(pa) : 401;
+
+                } else if (s3_srv_keyfiles_n == 0) {
+
+                    /* the open harness mode: no auth mechanism is wired,
+                     * any authorization header passes (the interop
+                     * fixtures send a filler token) */
+
+                    code = pa->auth_len ? 200 : 401;
+
+                } else {
+                    code = 401;
+                }
+
+            } /* the client-cert skip guard */
         }
 
     } else {
@@ -7146,6 +7254,7 @@ s3_srv_h3_accept(s3_connection_t *c, s3_quic_stream_t *qs)
     pa->pc = pc;
     pa->conv_id = qs->id;
     pa->responded = 0;
+    pa->code = 0; /* the not-decided shape of the client-cert guard */
     pa->len = 0;
     pa->out_len = 0;
     pa->method_len = 0;
@@ -7564,6 +7673,11 @@ s3_srv_usage(FILE *out, const char *prog)
             "      DefaultIdentitiesFileNames)\n"
             "  --url-path p: the CONNECT route, default /ssh3-term (the reference"
             " -url-path)\n"
+            "  --client-cert-ca f --client-cert none|optional|require: the\n"
+            "      client certificates (the phase 3): the ca anchors the\n"
+            "      client chains, the require dies the handshake without\n"
+            "      one, the optional falls to the other backends, the\n"
+            "      identity maps from the SAN (spki:/email) or the CN\n"
             "  --session-ticket-key-file f: the persistent session ticket key of"
             " the daemon\n"
             "      (the nginx 80-byte form: 16 name + 32 hmac + 32 aes; the"
@@ -7970,6 +8084,36 @@ main(int argc, char **argv)
                 value = argv[n + 1];
             } else if (strcmp(argv[n], "--session-ticket-key-file") == 0 && n + 1 < argc) {
                 ticket_key_arg = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--client-cert-ca") == 0 && n + 1 < argc) {
+
+                /* the client certificate anchors (the phase 3): the
+                 * file of the trusted issuers, the option implies
+                 * the optional policy until the require rides */
+
+                s3_srv_client_cert_ca = argv[n + 1];
+                value = argv[n + 1];
+
+            } else if (strcmp(argv[n], "--client-cert") == 0 && n + 1 < argc) {
+
+                /* the client certificate policy: none (the default),
+                 * optional, require — the require without the ca
+                 * file refuses at the wiring */
+
+                s3_srv_client_cert_require = 0;
+
+                if (strcmp(argv[n + 1], "none") == 0) {
+                    ;
+                } else if (strcmp(argv[n + 1], "optional") == 0) {
+                    s3_srv_client_cert_require = 1;
+                } else if (strcmp(argv[n + 1], "require") == 0) {
+                    s3_srv_client_cert_require = 2;
+                } else {
+                    fprintf(stderr, "ssh3-server: --client-cert wants none|optional|require\n");
+                    return 1;
+                }
+
                 value = argv[n + 1];
 
             } else if (strcmp(argv[n], "--enable-password-login") == 0) {
@@ -8715,6 +8859,26 @@ main(int argc, char **argv)
 
     if (s3_srv_conf.ssl == NULL) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "ssl init failed");
+        return 1;
+    }
+
+    /*
+     * the client certificates wiring (the phase 3): the ca file
+     * loads the anchors and arms the CertificateRequest; the
+     * require without the ca file stops the daemon at the start
+     * (the config error, not the runtime fall)
+     */
+
+    if (s3_srv_client_cert_ca == NULL && s3_srv_client_cert_require == 2) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
+                     "--client-cert require wants --client-cert-ca <file>");
+        return 1;
+    }
+
+    if (s3_srv_client_cert_ca != NULL &&
+        s3_ssl_server_client_cert(s3_srv_conf.ssl, s3_srv_client_cert_ca,
+                                  s3_srv_client_cert_require == 2) != S3_OK) {
+        s3_log_error(S3_LOG_ERR, &s3_srv_log, 0, "the client cert wiring failed");
         return 1;
     }
 

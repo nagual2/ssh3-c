@@ -5,6 +5,8 @@
 #ifndef _S3_SSH3_AUTH_SRV_H_INCLUDED_
 #define _S3_SSH3_AUTH_SRV_H_INCLUDED_
 
+#include <openssl/x509.h>
+
 #include <s3_base.h>
 
 /*
@@ -114,5 +116,16 @@ s3_int_t s3_ssh3_auth_system_user_known(const s3_str_t *user);
 
 s3_int_t s3_ssh3_auth_authorized_keys_next(const u_char **pos, const u_char *end, s3_str_t *keytype,
                                            s3_str_t *b64);
+
+/*
+ * the identity mapping of the client certificate (the phase 3,
+ * PLAN.md 14): the SAN URI (spki:) wins, then the SAN email, then
+ * the CN — the user name of the session. cert is the leaf the
+ * client presented (the ssl layer hands it out). S3_OK fills the
+ * buf, S3_DECLINED when the certificate carries no usable
+ * identity
+ */
+
+s3_int_t s3_ssh3_auth_cert_user(X509 *cert, char *buf, size_t cap);
 
 #endif /* _S3_SSH3_AUTH_SRV_H_INCLUDED_ */

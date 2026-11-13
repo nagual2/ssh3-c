@@ -29,6 +29,19 @@ struct s3_ssl_conn_s {
     unsigned handshaked : 1;
     unsigned no_wait_shutdown : 1;
     unsigned handshake_rejected : 1;
+
+    /*
+     * the client certificate verdict of the server side (the phase
+     * 3): the verify callback of the CertificateRequest records the
+     * first fatal x509 error and the DER of the presented leaf (the
+     * ssh3 layer reads the pair through s3_ssl_client_cert_* after
+     * the handshake - the record-only canon of the client verify)
+     * the DER rides malloc-ed, the shutdown frees it
+     */
+
+    long    client_cert_err;
+    u_char *client_cert_der;
+    size_t  client_cert_der_len;
 };
 
 /*
@@ -128,6 +141,49 @@ s3_int_t s3_ssl_ticket_key_file(s3_ssl_t *ssl, const char *path);
  */
 
 s3_int_t s3_ssl_ticket_key_file_new(const char *path, s3_log_t *log);
+
+/*
+ * the server side of the client certificates (the phase 3): the
+ * CA file names the trusted issuers of the client chains (the
+ * anchors load into the ctx, the CA names ride the
+ * CertificateRequest), the verify mode —
+ *
+ *   0 = optional: the peer verify turns on, a presented chain
+ *       verifies, the absence of the certificate keeps the
+ *       handshake (the ssh3 layer falls to the other auth
+ *       backends),
+ *   1 = require: FAIL_IF_NO_PEER_CERT rides - the handshake dies
+ *       without a presented certificate
+ *
+ * the verdict rides record-only: the callback stores the first
+ * fatal x509 error and the leaf DER per connection (the canon of
+ * the client verify, the B17 order), the ssh3 layer reads it
+ * through s3_ssl_client_cert_* after the handshake. Returns
+ * S3_OK / S3_ERROR.
+ */
+
+s3_int_t s3_ssl_server_client_cert(s3_ssl_t *ssl, const char *ca_file, unsigned require);
+
+/* the client certificate verdict of the connection: S3_OK when a
+ * presented chain verified clean, S3_DECLINED when no certificate
+ * rode (the optional policy), S3_ERROR on the failed verification
+ * (the err argument carries the first fatal x509 code). The der
+ * and len arguments hand the leaf DER out (the caller frees),
+ * NULL/0 when absent */
+
+s3_int_t s3_ssl_client_cert_verdict(s3_ssl_conn_t *ssl_conn, long *err, u_char **der, size_t *len);
+
+/* the per-connection re-arm of the client-cert verify (the live
+ * connection born before the arm — the test env shape): the same
+ * callback and the require flag of the policy */
+
+void s3_ssl_conn_verify_client(s3_ssl_conn_t *ssl_conn, unsigned require);
+
+/* the client side of the phase 3: the pair loads into the client
+ * conf ctx — the CertificateRequest of the server carries it. The
+ * mismatch refuses (the check of the canon). S3_OK / S3_ERROR */
+
+s3_int_t s3_ssl_client_cert_load(s3_ssl_t *conf, X509 *cert, EVP_PKEY *key);
 
 /*
  * the PEM strings may be file contents or in-memory certificates;
