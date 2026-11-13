@@ -193,8 +193,8 @@ s3_trust_system_paths_apply(SSL_CTX *ctx, s3_log_t *log)
         CertCloseStore(wstore, 0);
 
         if (dis.n != 0) {
-            s3_log_error(S3_LOG_INFO, log, 0, "the system deny list carries %u entr%cs",
-                         (s3_uint_t)dis.n, dis.n == 1 ? 'y' : (unsigned)'i');
+            s3_log_error(S3_LOG_INFO, log, 0, "the system deny list carries %ui entries",
+                         (s3_uint_t)dis.n);
         }
     }
 
@@ -225,7 +225,7 @@ s3_trust_system_paths_apply(SSL_CTX *ctx, s3_log_t *log)
     if (added != 0) {
 
         s3_log_error(S3_LOG_INFO, log, 0,
-                     "the system certificate stores ride the anchors (%u added, %u skipped)",
+                     "the system certificate stores ride the anchors (%ui added, %ui skipped)",
                      (s3_uint_t)added, (s3_uint_t)skipped);
 
         return S3_OK;

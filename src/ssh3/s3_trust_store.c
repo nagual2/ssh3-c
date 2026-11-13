@@ -419,7 +419,7 @@ s3_trust_store_bundle(SSL_CTX *ctx, const char *path, s3_log_t *log)
 s3_int_t
 s3_trust_store_build(SSL_CTX *ctx, s3_trust_policy_t policy, s3_log_t *log)
 {
-    char path[1024];
+    char     path[1024];
     s3_int_t system_paths;
 
     if (ctx == NULL || log == NULL) {

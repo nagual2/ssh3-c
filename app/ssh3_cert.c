@@ -44,6 +44,9 @@
 #endif
 
 #include <s3_errno.h>
+#if (S3_WIN32)
+#include <s3_os_init.h>
+#endif
 #ifndef S3_CERT_NO_TICKETKEY
 #include <s3_ssl.h>
 #endif
@@ -94,6 +97,16 @@ main(int argc, char **argv)
 
     log.fd = 2;
     log.log_level = S3_LOG_INFO;
+
+#if (S3_WIN32)
+    /* the winsock bootstrap of the fetch transport (the unix build
+     * carries no init; the trust-update talks https) */
+
+    if (s3_os_init() != S3_OK) {
+        fprintf(stderr, "ssh3-cert: the net bootstrap failed\n");
+        return 255;
+    }
+#endif
 
     if (argc < 2 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         s3_cert_usage(argv[0]);
