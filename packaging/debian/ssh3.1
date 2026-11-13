@@ -106,6 +106,20 @@ The trust bundle update rides the
 .Xr ssh3-cert 1
 utility (the scheduler surface moved off the client of the wave
 14).
+.It Fl -cert Ar pem , Fl -key Ar pem
+The client certificate pair of the phase 3: the PEM files load
+into the client ctx before the dial, the
+CertificateRequest of the server carries the leaf. The pair
+refuses at the dial on the mismatch. The server wires the policy
+through
+.Fl -client-cert-ca
+and
+.Fl -client-cert
+(the
+.Xr ssh3-server 8
+man: the none/optional/require shapes); the identity of the
+session maps from the certificate (the SAN spki:/email, the CN
+fallback) through the server's auth user gate.
 .It Fl insecure
 The test-mode TLS: any peer certificate is accepted (the pin check
 skips; the

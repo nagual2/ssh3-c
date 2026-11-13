@@ -31,6 +31,8 @@
 .Op Fl -password-lockout-seconds Ar s
 .Op Fl -permit-open Ar spec
 .Op Fl -permit-listen Ar spec
+.Op Fl -client-cert-ca Ar file
+.Op Fl -client-cert Cm none | optional | require
 .Op Fl -session-ticket-key-file Ar file
 .Op Fl -gateway-ports Cm no | yes | clientspecified
 .Op Fl -help
@@ -391,6 +393,29 @@ The lockout window of a failed account, default 60 (the reference
 .Cm -password-lockout-seconds ) .
 While it lasts the locked account answers 429 without the password
 backends being touched; a successful authentication clears the record.
+.It Fl -client-cert-ca Ar file
+The trusted issuers of the client certificate chains (the phase
+3): the file loads into the server anchors and the CA names ride
+the CertificateRequest the server sends to the clients. The
+setting implies the
+.Cm optional
+policy.
+.It Fl -client-cert Cm none | optional | require
+The client certificate policy (the default
+.Cm none
+sends no CertificateRequest at all).
+.Cm optional
+verifies the presented chain against the anchors (the
+.Fl -client-cert-ca
+file and the system roots when armed), a valid chain passes the
+auth (the identity maps from the SAN spki:/email or the CN
+through the auth user gate), the absence falls to the other
+backends (the oidc/jwt/basic chain).
+.Cm require
+dies the handshake without a presented certificate (the
+FAIL_IF_NO_PEER_CERT shape); require without
+.Fl -client-cert-ca
+stops the daemon at the start.
 .It Fl -session-ticket-key-file Ar file
 The persistent session ticket key of the daemon: the tickets ride
 the
