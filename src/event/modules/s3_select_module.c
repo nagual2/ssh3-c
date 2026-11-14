@@ -105,7 +105,14 @@ s3_select_init(s3_event_ctx_t *ctx)
 
     s3_event_flags = 0;
 
-    ctx->impl = NULL;
+    /*
+     * the select backend keeps its state in the process globals (the
+     * master fd sets and the index), the ctx impl carries the marker
+     * of the live backend - the ctx contract of the tests reads the
+     * non-null impl the same way the epoll module rides its epfd
+     */
+
+    ctx->impl = &master_read_fd_set;
 
     return S3_OK;
 }
