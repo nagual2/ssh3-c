@@ -176,7 +176,10 @@ s3_trust_system_paths_apply(SSL_CTX *ctx, s3_log_t *log)
     X509_STORE           *store;
     unsigned              added = 0, skipped = 0;
     static const wchar_t *names[] = { L"ROOT", L"CA" };
-    unsigned              i;
+    unsigned              i, scope;
+    static const DWORD    scopes[] = {
+        CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE
+    };
 
     if (ctx == NULL) {
         return S3_ERROR;
@@ -205,19 +208,29 @@ s3_trust_system_paths_apply(SSL_CTX *ctx, s3_log_t *log)
         return S3_ERROR;
     }
 
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    /* the two scopes of the browser canon: the CurrentUser stores
+     * (the user trust, no elevation) and the LocalMachine stores
+     * (the enterprise roots, the GPO deployed) - the walk rides
+     * both, the duplicates dedupe in the store */
 
-        wstore = CertOpenSystemStoreW(0, names[i]);
+    for (scope = 0; scope < sizeof(scopes) / sizeof(scopes[0]); scope++) {
 
-        if (wstore == NULL) {
-            s3_log_error(S3_LOG_WARN, log, (s3_err_t)GetLastError(),
-                         "CertOpenSystemStoreW(\"%ls\") failed", names[i]);
-            continue;
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+
+            wstore = CertOpenStore(CERT_STORE_PROV_SYSTEM_W,
+                                   X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                   scopes[scope], names[i]);
+
+            if (wstore == NULL) {
+                s3_log_error(S3_LOG_WARN, log, (s3_err_t)GetLastError(),
+                             "CertOpenStore(\"%ls\") failed", names[i]);
+                continue;
+            }
+
+            added += s3_trust_store_walk(wstore, store, &dis, &skipped);
+
+            CertCloseStore(wstore, 0);
         }
-
-        added += s3_trust_store_walk(wstore, store, &dis, &skipped);
-
-        CertCloseStore(wstore, 0);
     }
 
     s3_trust_disallows_free(&dis);
