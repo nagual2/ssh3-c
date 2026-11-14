@@ -96,6 +96,10 @@ gen_client_pair() { # $1 = name, $2 = SAN ext text (empty = no SAN)
 
 gen_client_pair alice "URI:spki:alice"
 gen_client_pair bob "email:bob@example.com"
+# the ghost pair: the identity no passwd entry backs (the run-as-off
+# leg; the gate must skip the getpwnam when the setuid is off)
+
+gen_client_pair ghost "URI:spki:ghost"
 
 # the foreign pair: the self-signed (the unknown issuer)
 
@@ -260,6 +264,35 @@ if grep -q "INTEROP-H3-REJECT code=401" "$W/srv-none.log" &&
     pass "the pair rode the handshake unnoticed, the auth refused as wired"
 else
     fail "the none leg: $(tail -1 "$W/leg5.err")"
+fi
+
+kill "$SRVPID" 2>/dev/null
+wait "$SRVPID" 2>/dev/null
+SRVPID=
+
+# --- leg 6: the require + run-as off + the passwd-less identity rides ---
+#
+# the unprivileged daemon shape (the live machines serve as a non-root
+# user, --run-as-user off): the client-cert path must skip the passwd
+# gate the same way the basic/jwt paths do - the mapped identity rides
+# the 200 without any passwd entry (the wave-14 live acceptance caught
+# the unconditional gate here)
+
+echo "== leg 6: require + run-as off + the passwd-less identity (CLIENT-CERT-RUNAS-OFF-OK)"
+
+start_srv "--client-cert-ca $W/ca.pem --client-cert require --run-as-user off" r6 ||
+    die "the run-as-off daemon did not start"
+
+HOME="$W/home6" timeout 30 "$BUILD/ssh3" -v -o StrictHostKeyChecking=accept-new \
+    -o insecure --cert "$W/ghost.pem" --key "$W/ghost.key" \
+    "ghost@127.0.0.1:$SRVPORT/ssh3-term" "echo RIDE > $W/who6" \
+    > "$W/leg6.out" 2> "$W/leg6.err"
+
+if [ -s "$W/who6" ] && grep -q "RIDE" "$W/who6" &&
+    ! grep -q "not a system account" "$SRVLOG" 2>/dev/null; then
+    pass "the run-as-off leg rode the cert identity (the unprivileged daemon shape)"
+else
+    fail "the run-as-off leg: $(tail -2 "$W/leg6.err")"
 fi
 
 kill "$SRVPID" 2>/dev/null

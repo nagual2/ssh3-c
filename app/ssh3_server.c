@@ -2731,7 +2731,8 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
                 if (vrc == S3_ERROR || (vrc == S3_OK && ccerr != 0)) {
 
                     s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
-                                 "the client certificate failed the verification (err %ld)", ccerr);
+                                 "the client certificate failed the verification (err %d)",
+                                 (int)ccerr);
                     code = 401;
 
                 } else if (vrc == S3_OK) {
@@ -2765,7 +2766,14 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
                             s3_free(ccder);
                             code = 401;
 
-                        } else if (s3_srv_auth_user_gate(pa, &user) != S3_OK) {
+                        } else if (s3_srv_run_as && s3_srv_auth_user_gate(pa, &user) != S3_OK) {
+
+                            /* the run-as shape: the identity no passwd
+                             * entry backs never spawns (the same gate
+                             * the basic/jwt paths ride); with the
+                             * run-as off the unprivileged daemon keeps
+                             * its own identity and the gate skips - the
+                             * cert verdict already anchored the trust */
 
                             s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
                                          "the client certificate identity %s is not a "
@@ -2778,7 +2786,8 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
                         } else {
 
                             s3_log_error(S3_LOG_INFO, &s3_srv_log, 0,
-                                         "the client certificate identity rides: %s", pa->user);
+                                         "the client certificate identity rides: %s",
+                                         (const char *)user.data);
                             X509_free(cc);
                             s3_free(ccder);
                             code = 200;
@@ -7400,7 +7409,8 @@ s3_srv_sd_listen_fds(int                     fds[S3_SRV_SD_LISTEN_MAX],
 
     if (n > S3_SRV_SD_LISTEN_MAX) {
         s3_log_error(S3_LOG_ERR, &s3_srv_log, 0,
-                     "socket activation passed %ld fds, at most %d serve", n, S3_SRV_SD_LISTEN_MAX);
+                     "socket activation passed %d fds, at most %d serve", (int)n,
+                     S3_SRV_SD_LISTEN_MAX);
         exit(1);
     }
 
