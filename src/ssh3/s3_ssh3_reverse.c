@@ -543,9 +543,12 @@ s3_ssh3_reverse_target_ntop(const s3_ssh3_forward_target_t *t, char *buf, size_t
 
     if (t->family == 4 && t->ip_len == 4) {
 
-        if (len < INET_ADDRSTRLEN) {
-            return S3_ERROR;
-        }
+        /*
+         * no upfront len gate: INET_ADDRSTRLEN/INET6_ADDRSTRLEN differ
+         * per platform (the POSIX 46 and the Windows 65), a buffer big
+         * enough for any textual address would be refused on Windows;
+         * inet_ntop() enforces its own space check and fails cleanly
+         */
 
         if (inet_ntop(AF_INET, t->ip, buf, (socklen_t)len) == NULL) {
             return S3_ERROR;
@@ -555,10 +558,6 @@ s3_ssh3_reverse_target_ntop(const s3_ssh3_forward_target_t *t, char *buf, size_t
     }
 
     if (t->family == 6 && t->ip_len == 16) {
-
-        if (len < INET6_ADDRSTRLEN) {
-            return S3_ERROR;
-        }
 
         if (inet_ntop(AF_INET6, t->ip, buf, (socklen_t)len) == NULL) {
             return S3_ERROR;
