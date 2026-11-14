@@ -97,31 +97,32 @@ s3_close_connection(s3_connection_t *c)
     c->write->active = 0;
 
     fd = c->fd;
-    c->fd = -1;
 
     /*
-     * the event-method interest drops here, before the socket closes:
-     * the Linux kernel detaches the descriptor from epoll on close(),
-     * but the winsock select keeps its own process-global fd set and
-     * the event index - a closed SOCKET value stays in both (the
-     * handles never reuse), every later select() answers WSAENOTSOCK
-     * and the stale index events match the ready set of a live socket
-     * (the mingw quic e2e crash of the wave 14). the CLOSE_EVENT flag
-     * tells the epoll method the descriptor is going away; the shared
-     * connections (the udp pseudo ones) keep the listener interest
+     * the event-method interest drops here, before the fd forgets its
+     * value and the socket closes: the Linux kernel detaches the
+     * descriptor from epoll on close(), but the winsock select keeps
+     * its own process-global fd set and the event index - a closed
+     * SOCKET value stays in both (the handles never reuse), every
+     * later select() answers WSAENOTSOCK and the stale index events
+     * match the ready set of a live socket (the mingw quic e2e crash
+     * of the wave 14). the del reads the live fd, so it must run
+     * before c->fd lands on -1; the CLOSE_EVENT flag tells the epoll
+     * method the descriptor is going away; the shared connections
+     * (the udp pseudo ones) keep the listener interest
      */
 
-    if (!c->shared) {
-        if (c->read->active) {
-            (void)s3_event_actions.del_event(c->read, S3_READ_EVENT, S3_CLOSE_EVENT);
-            c->read->active = 0;
-        }
-
-        if (c->write->active) {
-            (void)s3_event_actions.del_event(c->write, S3_WRITE_EVENT, S3_CLOSE_EVENT);
-            c->write->active = 0;
-        }
+    if (c->read->active) {
+        (void)s3_event_actions.del_event(c->read, S3_READ_EVENT, S3_CLOSE_EVENT);
+        c->read->active = 0;
     }
+
+    if (c->write->active) {
+        (void)s3_event_actions.del_event(c->write, S3_WRITE_EVENT, S3_CLOSE_EVENT);
+        c->write->active = 0;
+    }
+
+    c->fd = -1;
 
 #if (S3_WIN32)
     if (!c->shared && closesocket((SOCKET)fd) == SOCKET_ERROR) {
