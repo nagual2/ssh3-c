@@ -153,6 +153,12 @@ switch ($Action) {
         # the machine baseline: the serialised store of the probe
         # (the functional legs diff against it)
         $map.Keys.Count | Set-Content (Join-Path $SessionDir 'baseline-count.txt')
+
+        # the explicit verdict: without the exit the caller's
+        # $LASTEXITCODE stays whatever the previous native tool left
+        # (a fresh session carries $null - the snapshot verdict reads
+        # as a failure)
+        exit 0
     }
 
     'Restore' {
