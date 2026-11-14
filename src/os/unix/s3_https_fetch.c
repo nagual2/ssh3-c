@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 /* the socket timeout options of the blocking fetch: the winsock twins
  * ride the S3_WIN32 define (the file serves both builds, the BIO
@@ -170,6 +171,7 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
     SSL            *ssl;
     BIO            *bio;
     int             fd = -1;
+    time_t          deadline;
 
     *ctx_out = NULL;
 
@@ -189,11 +191,22 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
         return NULL;
     }
 
+    /*
+     * the walk deadline: the timeout belongs to the whole dial, not
+     * to the single address - the dual-stack hosts resolve the dead
+     * family first (the flapping v6 transit of the live machines),
+     * and the per-address window would burn the full budget on the
+     * dead prefixes before the reachable v4 ever got its turn
+     */
+
+    deadline = time(NULL) + timeout_sec;
+
     for (ri = res; ri != NULL; ri = ri->ai_next) {
 
         struct timeval tv;
         int            err, n;
         fd_set         wset;
+        time_t         remain;
 
         fd = socket(ri->ai_family, ri->ai_socktype, ri->ai_protocol);
 
@@ -201,7 +214,19 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
             continue;
         }
 
-        tv.tv_sec = (long)timeout_sec;
+        /* the remaining budget of the whole walk (the dead family
+         * prefixes share the deadline, the reachable one connects
+         * inside it) */
+
+        remain = deadline - time(NULL);
+
+        if (remain <= 0) {
+            s3_https_close(fd);
+            freeaddrinfo(res);
+            return NULL;
+        }
+
+        tv.tv_sec = (long)((remain < (time_t)timeout_sec) ? remain : timeout_sec);
         tv.tv_usec = 0;
 
         (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
