@@ -1,5 +1,5 @@
 Package: ssh3c-libssl3
-Version: @VERSION@
+Version: @VERSION@-1
 Architecture: @ARCH@
 Maintainer: ssh3-c maintainers <maintainers@example.com>
 Section: libs
