@@ -463,7 +463,10 @@ build_rpm() {
     strip_runpath "$top/SOURCES/ssh3-server"
     install -m 0755 "$CLIENT_BIN" "$top/SOURCES/ssh3"
     strip_runpath "$top/SOURCES/ssh3"
+    install -m 0755 "$BIN_DIR/ssh3-cert" "$top/SOURCES/ssh3-cert"
+    strip_runpath "$top/SOURCES/ssh3-cert"
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$top/SOURCES/ssh3.1.gz"
+    gzip -c "$SCRIPT_DIR/../man/ssh3-cert.1" > "$top/SOURCES/ssh3-cert.1.gz"
     install -m 0644 "$REPO_DIR/LICENSE" "$top/SOURCES/LICENSE"
     install -m 0644 "$REPO_DIR/THIRD-PARTY-NOTICES.md" "$top/SOURCES/THIRD-PARTY-NOTICES.md"
     install -m 0644 "$REPO_DIR/README.md" "$top/SOURCES/README.md"
@@ -571,8 +574,12 @@ build_apk_client() {
         "$stage/data/usr/share/man/man1"
     install -m 0755 "$CLIENT_BIN" "$stage/data/usr/bin/ssh3"
     strip_runpath "$stage/data/usr/bin/ssh3"
+    install -m 0755 "$BIN_DIR/ssh3-cert" "$stage/data/usr/bin/ssh3-cert"
+    strip_runpath "$stage/data/usr/bin/ssh3-cert"
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" \
         > "$stage/data/usr/share/man/man1/ssh3.1.gz"
+    gzip -c "$SCRIPT_DIR/../man/ssh3-cert.1" \
+        > "$stage/data/usr/share/man/man1/ssh3-cert.1.gz"
     apk_control "$stage" "$SCRIPT_DIR/apk/PKGINFO-client.in"
     apk_control_tar "$stage"
     tar --format=ustar --owner=0 --group=0 --numeric-owner \

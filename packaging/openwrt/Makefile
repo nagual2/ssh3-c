@@ -71,9 +71,10 @@ define Build/Prepare
 	$(TAR) -xzf $(TOPDIR)/dl/ssh3-c-$(PKG_VERSION).tar.gz -C $(PKG_BUILD_DIR)
 endef
 
-# build only the daemon target, not the bench/interop/test binaries
+# build only the daemon and the PKI utility, not the bench/interop/test
+# binaries
 define Build/Compile
-	$(call Build/Compile/Default,ssh3-server)
+	$(call Build/Compile/Default,ssh3-server ssh3-cert)
 endef
 
 # the cmake tree carries no install rules: the daemon binary copies
@@ -83,6 +84,8 @@ endef
 define Build/Install
 	$(INSTALL_DIR) $(PKG_INSTALL_DIR)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-server $(PKG_INSTALL_DIR)/usr/sbin/
+	$(INSTALL_DIR) $(PKG_INSTALL_DIR)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-cert $(PKG_INSTALL_DIR)/usr/bin/
 endef
 
 define Package/ssh3-server/install
@@ -146,5 +149,53 @@ define Package/ssh3-server-bundle/install
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-ssh3-server-cert $(1)/etc/uci-defaults/
 endef
 
+# the PKI utility of the phase 1d split: the certificate life (the
+# trust-update, the ticket-key generation) rides its own package - the
+# daemon packages stay lean on the flash-constrained targets.  the
+# system variant links the feed libopenssl (3.5+), the bundle variant
+# carries the OpenSSL pair under /usr/lib/ssh3-c/lib and a wrapper
+# feeds the loader path
+define Package/ssh3-cert
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=SSH
+  TITLE:=SSH3 PKI utility (trust-update, ticket-key)
+  DEPENDS:=+libopenssl +zlib +libzstd +liblz4
+endef
+
+define Package/ssh3-cert/description
+  The PKI life of the ssh3-c set: ssh3-cert trust-update refreshes the
+  trust bundle over the network (the systemd/schtasks/cron shapes),
+  ssh3-cert ticket-key generates the 80-byte session ticket key of the
+  daemon before its first start.  The CA subcommands (keygen, selfsign,
+  csr, sign) are placeholders of the frozen phase 4.
+endef
+
+define Package/ssh3-cert/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-cert $(1)/usr/bin/
+endef
+
+define Package/ssh3-cert-bundle
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=SSH
+  TITLE:=SSH3 PKI utility - bundled OpenSSL (no system libopenssl3)
+  DEPENDS:=+libc +zlib +libzstd +liblz4
+  CONFLICTS:=ssh3-cert
+endef
+
+define Package/ssh3-cert-bundle/install
+	$(INSTALL_DIR) $(1)/usr/lib/ssh3-c/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ssh3-cert $(1)/usr/lib/ssh3-c/bin/
+	$(INSTALL_DIR) $(1)/usr/lib/ssh3-c/lib
+	$(INSTALL_DATA) $(STAGING_DIR)/usr/lib/libssl.so.3 $(1)/usr/lib/ssh3-c/lib/
+	$(INSTALL_DATA) $(STAGING_DIR)/usr/lib/libcrypto.so.3 $(1)/usr/lib/ssh3-c/lib/
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/usr/bin/ssh3-cert $(1)/usr/bin/
+endef
+
 $(eval $(call BuildPackage,ssh3-server))
 $(eval $(call BuildPackage,ssh3-server-bundle))
+$(eval $(call BuildPackage,ssh3-cert))
+$(eval $(call BuildPackage,ssh3-cert-bundle))

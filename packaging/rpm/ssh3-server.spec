@@ -31,6 +31,8 @@ Source2:        THIRD-PARTY-NOTICES.md
 Source3:        README.md
 Source4:        ssh3
 Source5:        ssh3.1.gz
+Source6:        ssh3-cert
+Source7:        ssh3-cert.1.gz
 
 Requires:       openssl-libs >= 3.5
 Conflicts:      ssh3-go-client
@@ -80,8 +82,10 @@ mkdir -p %{buildroot}%{_sbindir}
 install -m 0755 %{SOURCE0} %{buildroot}%{_sbindir}/ssh3-server
 mkdir -p %{buildroot}%{_bindir}
 install -m 0755 %{SOURCE4} %{buildroot}%{_bindir}/ssh3
+install -m 0755 %{SOURCE6} %{buildroot}%{_bindir}/ssh3-cert
 mkdir -p %{buildroot}%{_mandir}/man1
 install -m 0644 %{SOURCE5} %{buildroot}%{_mandir}/man1/ssh3.1.gz
+install -m 0644 %{SOURCE7} %{buildroot}%{_mandir}/man1/ssh3-cert.1.gz
 
 %files
 %license LICENSE THIRD-PARTY-NOTICES.md
@@ -91,7 +95,9 @@ install -m 0644 %{SOURCE5} %{buildroot}%{_mandir}/man1/ssh3.1.gz
 %files -n ssh3-client
 %license LICENSE-CLIENT
 %attr(0755,root,root) %{_bindir}/ssh3
+%attr(0755,root,root) %{_bindir}/ssh3-cert
 %{_mandir}/man1/ssh3.1.gz
+%{_mandir}/man1/ssh3-cert.1.gz
 
 %changelog
 * Mon Oct 05 2026 ssh3-c maintainers <maintainers@example.com> - @VERSION@-1
