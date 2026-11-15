@@ -127,7 +127,7 @@ jobs:
           # preset (the cross toolchain preset of the preset file does
           # not apply)
           mkdir -p build/linux-arm64
-          cp build/linux-release/ssh3-server build/linux-release/ssh3 build/linux-arm64/
+          cp build/linux-release/ssh3-server build/linux-release/ssh3 build/linux-release/ssh3-cert build/linux-arm64/
 
       - name: Check the tag matches the binary version
         if: startsWith(github.ref, 'refs/tags/v')
