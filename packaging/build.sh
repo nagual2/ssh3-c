@@ -82,8 +82,14 @@ die() { printf 'build.sh: %s\n' "$1"; exit 1; }
 # paths, so the bundle wins for this binary only. the deb Depends line
 # mirrors the NEEDED of the bundle pair (libc6, zlib1g, libzstd1) - the
 # system libssl3t64/libssl3 is no longer required at all.
+#
+# the pool churn of Debian purges the superseded binary revisions -
+# the fetch walks the candidates and takes the first answer (the
+# bundled .so pair is what matters, the minor revision rides along)
+
 BUNDLE_LIB_DIR=/usr/lib/ssh3-c/lib
-LIBSSL3T64_URL="https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u3_${DEB_ARCH}.deb"
+LIBSSL3T64_BASE="https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~"
+LIBSSL3T64_REVS="deb13u3 deb13u2 deb13u4"
 BUNDLE_CACHE="$OUT_DIR/cache"
 BUNDLE_STAGE="$STAGE_ROOT/bundle"
 BUNDLE_DEB_ROOT="$BUNDLE_STAGE/root"
@@ -149,12 +155,32 @@ fetch_bundle() {
         return 0
     else
         mkdir -p "$BUNDLE_CACHE"
-        deb="$BUNDLE_CACHE/$(basename "$LIBSSL3T64_URL")"
-        if [ ! -e "$deb" ]; then
+
+        # the candidate walk: the newest revision first, the cache
+        # hits ride before the network (the cache file name follows
+        # the revision that supplied it)
+
+        for rev in $LIBSSL3T64_REVS; do
+
+            deb="$BUNDLE_CACHE/libssl3t64_3.5.7-1~${rev}_${DEB_ARCH}.deb"
+
+            if [ -e "$deb" ]; then
+                break
+            fi
+
             log "fetching the bundle source: $(basename "$deb")"
-            fetch_url "$LIBSSL3T64_URL" "$deb" \
-                || die "cannot fetch $LIBSSL3T64_URL (no network?) - provide LIBSSL_SRC=<deb|url|dir> or LOCAL_OPENSSL_DIR=<dir with a local OpenSSL 3.5 build>"
-        fi
+
+            if fetch_url "${LIBSSL3T64_BASE}${rev}_${DEB_ARCH}.deb" "$deb"; then
+                break
+            fi
+
+            rm -f "$deb"
+            deb=""
+
+        done
+
+        [ -n "$deb" ] \
+            || die "no libssl3t64 revision of the pool answered (${LIBSSL3T64_REVS}) - provide LIBSSL_SRC=<deb|url|dir> or LOCAL_OPENSSL_DIR=<dir with a local OpenSSL 3.5 build>"
     fi
 
     # the Debian deb layout: the multiarch directory + the copyright
