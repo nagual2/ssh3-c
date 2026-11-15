@@ -1,3 +1,17 @@
+ssh3-c (0.5.17-1) unstable; urgency=medium
+
+  * New upstream release 0.5.17: the pass 5 security review fix
+    wave - the aia chase fetch policy closes the blind ssrf and the
+    crlf request-line injection (the scheme allow-list, the private
+    range ban over the literals and the resolved answers, the
+    control-byte refusal in the fetcher itself), the qpack dynamic
+    table rides the raw allocator (the churn no longer grows the
+    demon), the capacity contracts (the ticket cache unhex, the
+    encoder insert probe, the agent req_sign), the exclusive
+    random-suffix tmps, the aia cache nofollow and the entry cap,
+    the chase budget borrow; the mingw exporter leg of the quic e2e
+    closed (38/38 windows-core)
+
 ssh3-c (0.5.16-1) unstable; urgency=medium
 
   * New upstream release 0.5.16: the warm 0-RTT reconnect closes
