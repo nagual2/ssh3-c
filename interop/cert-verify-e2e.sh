@@ -187,7 +187,11 @@ run_cli() {
     local home=$1
     shift
 
-    env HOME="$WORK/$home" "$@" timeout 30 "$BUILD/ssh3" \
+    # the -n of the headless ride: the harness stdin is /dev/null and
+    # the console pump cannot epoll it - the legs test the trust
+    # machinery, not the console
+
+    env HOME="$WORK/$home" "$@" timeout 30 "$BUILD/ssh3" -n -n \
         -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
         printf S3-CERT-OK < /dev/null > "$WORK/$home.out" 2>&1
 }
@@ -285,7 +289,7 @@ start_srv "$WORK/a.pem" "$WORK/a.key" a || die "the daemon start failed"
 
 mkdir -p "$WORK/home-ca"
 
-if env HOME="$WORK/home-ca" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-ca" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" -n \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ca.out" 2>&1; then
 
@@ -315,7 +319,7 @@ mkdir -p "$WORK/home-ren/.ssh3"
 pin_line "$WORK/a.pem" > "$WORK/home-ren/.ssh3/known_hosts"
 printf '\n' >> "$WORK/home-ren/.ssh3/known_hosts"
 
-if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" -n \
     -o strict-host-key-checking=yes -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ren-a.out" 2>&1; then
@@ -327,7 +331,14 @@ fi
 stop_srv
 start_srv "$WORK/b.pem" "$WORK/b.key" b || die "the daemon restart failed"
 
-if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
+# the cold dial of the rotation: the wave-13 warm ticket rides the
+# verdict of the ORIGINAL session certificate (leaf-a) - the rotation
+# is invisible to a resumed dial by design; the ticket cache drops
+# and the machine sees the fresh leaf-b
+
+rm -f "$WORK/home-ren/.ssh3/tickets"
+
+if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" -n \
     -o strict-host-key-checking=yes -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ren-b.out" 2>&1; then
@@ -350,7 +361,7 @@ else
     fail "the renewal leg: the rotated run refused rc=$? ($(tail -2 "$WORK/home-ren-b.out"))"
 fi
 
-if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-ren" SSL_CERT_FILE="$WORK/ca.pem" timeout 30 "$BUILD/ssh3" -n \
     -o strict-host-key-checking=yes -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ren-c.out" 2>&1; then
@@ -371,7 +382,7 @@ start_srv "$WORK/scert-s.pem" "$WORK/skey-s.pem" self || die "the daemon start f
 
 mkdir -p "$WORK/home-acc"
 
-if env HOME="$WORK/home-acc" timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+if env HOME="$WORK/home-acc" timeout 30 "$BUILD/ssh3" -n -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-acc.out" 2>&1; then
 
@@ -389,7 +400,7 @@ echo "== leg 4: the self-signed first contact refuses on a pipe with the default
 
 mkdir -p "$WORK/home-ask"
 
-if env HOME="$WORK/home-ask" timeout 30 "$BUILD/ssh3" -i "$WORK/priv.pem" \
+if env HOME="$WORK/home-ask" timeout 30 "$BUILD/ssh3" -n -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-ask.out" 2>&1; then
     fail "the ask leg: the pipe session connected"
@@ -419,7 +430,7 @@ FP_FAKE=0000000000000000000000000000000000000000000000000000000000000000
 mkdir -p "$WORK/home-fp"
 start_dns "$FP_FAKE" 1 || die "the dns stub start failed"
 
-if env HOME="$WORK/home-fp" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-fp" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" -n \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-fp.out" 2>&1; then
@@ -440,7 +451,7 @@ echo "== leg 6: the SSHFP verified record rides the accept-new pin (SSHFP-VERIFI
 mkdir -p "$WORK/home-fpv"
 start_dns "$FP_REAL" 1 || die "the dns stub start failed"
 
-if env HOME="$WORK/home-fpv" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-fpv" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" -n \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-fpv.out" 2>&1; then
@@ -466,7 +477,7 @@ echo "== leg 6b: the sshfp mismatch softens under strict-host-key-checking=no (S
 mkdir -p "$WORK/home-fpn"
 start_dns "$FP_FAKE" 1 || die "the dns stub start failed"
 
-if env HOME="$WORK/home-fpn" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" \
+if env HOME="$WORK/home-fpn" S3_SSHFP_DNS="127.0.0.1:$DNSPORT" timeout 30 "$BUILD/ssh3" -n \
     -o VerifyHostKeyDNS=yes -o strict-host-key-checking=no \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-fpn.out" 2>&1; then
@@ -481,7 +492,7 @@ echo "== leg 7: the release client carries no keylog without S3_KEYLOG (KEYLOG-G
 
 mkdir -p "$WORK/home-kl"
 
-env HOME="$WORK/home-kl" timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+env HOME="$WORK/home-kl" timeout 30 "$BUILD/ssh3" -n -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-kl.out" 2>&1
 
@@ -491,7 +502,7 @@ else
     pass "no keylog lines without S3_KEYLOG"
 fi
 
-env HOME="$WORK/home-kl" S3_KEYLOG=1 timeout 30 "$BUILD/ssh3" -o strict-host-key-checking=accept-new \
+env HOME="$WORK/home-kl" S3_KEYLOG=1 timeout 30 "$BUILD/ssh3" -n -o strict-host-key-checking=accept-new \
     -i "$WORK/priv.pem" "client@127.0.0.1:$SRVPORT/ssh3-term" \
     printf S3-CERT-OK < /dev/null > "$WORK/home-kl2.out" 2>&1
 
