@@ -377,7 +377,18 @@ build_deb_client() {
         "$stage/usr/bin"
     install -m 0755 "$client" "$stage/usr/bin/ssh3"
     set_runpath "$stage/usr/bin/ssh3"
+
+    # the PKI utility rides the client package (the phase 1d split:
+    # the certificate life is the admin's business, not the
+    # daemon's); the binary rides the same linux-release build
+
+    local cert="$BIN_DIR/ssh3-cert"
+    [ -x "$cert" ] || die "no ssh3-cert binary at '$cert' (cmake --build --preset linux-release)"
+    install -m 0755 "$cert" "$stage/usr/bin/ssh3-cert"
+    set_runpath "$stage/usr/bin/ssh3-cert"
+
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
+    gzip -c "$SCRIPT_DIR/../man/ssh3-cert.1" > "$stage/usr/share/man/man1/ssh3-cert.1.gz"
     install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
     sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-client/" \
         "$SCRIPT_DIR/deb/client-control-bundle" \
@@ -403,7 +414,17 @@ build_deb_client_sys() {
         "$stage/usr/bin"
     install -m 0755 "$client" "$stage/usr/bin/ssh3"
     strip_runpath "$stage/usr/bin/ssh3"
+
+    # the PKI utility rides the client package (the phase 1d split),
+    # the system channel keeps its own linkage (no RUNPATH)
+
+    local cert="$BIN_DIR/ssh3-cert"
+    [ -x "$cert" ] || die "no ssh3-cert binary at '$cert' (cmake --build --preset linux-release)"
+    install -m 0755 "$cert" "$stage/usr/bin/ssh3-cert"
+    strip_runpath "$stage/usr/bin/ssh3-cert"
+
     gzip -c "$SCRIPT_DIR/debian/ssh3.1" > "$stage/usr/share/man/man1/ssh3.1.gz"
+    gzip -c "$SCRIPT_DIR/../man/ssh3-cert.1" > "$stage/usr/share/man/man1/ssh3-cert.1.gz"
     install -m 0755 "$SCRIPT_DIR/deb/client-postinst" "$stage/DEBIAN/postinst"
     sed -e "s/@VERSION@/$debver/" -e "s/@ARCH@/$DEB_ARCH/" -e "s/@CONFLICT@/ssh3-client-bundle/" \
         "$SCRIPT_DIR/deb/client-control-sys" \
