@@ -51,6 +51,11 @@
 
 #define S3_HTTPS_TIMEOUT_SEC 15
 
+/* the per-address connect cap of the resolver walk: a SYN either
+ * lands or the path is dead - the blackhole prefixes move on */
+
+#define S3_HTTPS_CONNECT_CAP_SEC 5
+
 static s3_int_t
 s3_https_url_split(const char *url, unsigned *tls, char *host, size_t host_max, char *port,
                    size_t port_max, const char **path)
@@ -171,6 +176,7 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
     SSL            *ssl;
     BIO            *bio;
     int             fd = -1;
+    unsigned        n_addr = 0, attempt = 0;
     time_t          deadline;
 
     *ctx_out = NULL;
@@ -201,6 +207,20 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
 
     deadline = time(NULL) + timeout_sec;
 
+    /* the wave-15 scheduler diagnosis: the walk stages (the
+     * S3_CERT_DIAG env gates the stderr markers) */
+
+    if (getenv("S3_CERT_DIAG") != NULL) {
+        struct addrinfo *cnt;
+
+        for (cnt = res, n_addr = 0; cnt != NULL; cnt = cnt->ai_next) {
+            n_addr++;
+        }
+
+        fprintf(stderr, "FETCH-DIAG resolved host=%s addrs=%u\n", host, n_addr);
+        fflush(stderr);
+    }
+
     for (ri = res; ri != NULL; ri = ri->ai_next) {
 
         struct timeval tv;
@@ -214,9 +234,30 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
             continue;
         }
 
+        attempt++;
+
+        if (getenv("S3_CERT_DIAG") != NULL) {
+            char ip[64];
+
+            ip[0] = '\0';
+            inet_ntop(ri->ai_family,
+                      ri->ai_family == AF_INET6
+                          ? (const void *)&((struct sockaddr_in6 *)ri->ai_addr)->sin6_addr
+                          : (const void *)&((struct sockaddr_in *)ri->ai_addr)->sin_addr,
+                      ip, sizeof(ip));
+
+            fprintf(stderr, "FETCH-DIAG attempt=%u fam=%s ip=%s\n", attempt,
+                    ri->ai_family == AF_INET6 ? "v6" : "v4", ip);
+            fflush(stderr);
+        }
+
         /* the remaining budget of the whole walk (the dead family
-         * prefixes share the deadline, the reachable one connects
-         * inside it) */
+         * prefixes share the deadline) - and the per-address cap:
+         * the blackholed prefix (the SYN leaves, no answer comes)
+         * would otherwise eat the whole window and the reachable
+         * family never got its turn (the curl.se SYN_SENT of the
+         * wave-15 diagnosis); five seconds either connect the
+         * address or mark the path dead enough to move on */
 
         remain = deadline - time(NULL);
 
@@ -227,6 +268,11 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
         }
 
         tv.tv_sec = (long)((remain < (time_t)timeout_sec) ? remain : timeout_sec);
+
+        if (tv.tv_sec > S3_HTTPS_CONNECT_CAP_SEC) {
+            tv.tv_sec = S3_HTTPS_CONNECT_CAP_SEC;
+        }
+
         tv.tv_usec = 0;
 
         (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, s3_https_sockopt_val(&tv), sizeof(tv));
@@ -251,6 +297,11 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
             FD_SET(fd, &wset);
 
             n = select(fd + 1, NULL, &wset, NULL, &tv);
+
+            if (getenv("S3_CERT_DIAG") != NULL) {
+                fprintf(stderr, "FETCH-DIAG attempt=%u select=%d\n", attempt, n);
+                fflush(stderr);
+            }
 
             if (n <= 0) {
                 s3_https_close(fd);
@@ -394,6 +445,16 @@ s3_https_connect(const char *host, const char *port, unsigned tls, const char *c
                 *ctx_out = ctx;
 
                 return bio;
+            }
+
+            if (getenv("S3_CERT_DIAG") != NULL) {
+                unsigned long e = ERR_peek_last_error();
+                char             buf[128];
+
+                ERR_error_string_n(e, buf, sizeof(buf));
+                fprintf(stderr, "FETCH-DIAG attempt=%u tls-failed ret=%d sslerr=%d %s\n", attempt,
+                        hsret, SSL_get_error(ssl, hsret), e ? buf : "no queue");
+                fflush(stderr);
             }
 
             SSL_free(ssl);

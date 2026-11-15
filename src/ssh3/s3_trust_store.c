@@ -244,6 +244,14 @@ s3_trust_update_run(const char *url, s3_log_t *log)
 
     s3_str_null(&body);
 
+    /* the wave-15 scheduler diagnosis: the stage walk of the run
+     * (the S3_CERT_DIAG env gates the stderr markers) */
+
+    if (getenv("S3_CERT_DIAG") != NULL) {
+        fprintf(stderr, "CERT-DIAG pre-fetch url=%s\n", url);
+        fflush(stderr);
+    }
+
     if (s3_update_fetch_hook != NULL) {
 
         if (s3_update_fetch_hook(url, &body) != S3_OK) {
@@ -253,8 +261,17 @@ s3_trust_update_run(const char *url, s3_log_t *log)
     } else {
 
         if (s3_trust_update_default_fetch(url, &body) != S3_OK) {
+            if (getenv("S3_CERT_DIAG") != NULL) {
+                fprintf(stderr, "CERT-DIAG fetch-failed\n");
+                fflush(stderr);
+            }
             s3_log_error(S3_LOG_WARN, log, 0, "the trust bundle fetch of %s failed", url);
             return S3_ERROR;
+        }
+
+        if (getenv("S3_CERT_DIAG") != NULL) {
+            fprintf(stderr, "CERT-DIAG fetch-ok len=%zu\n", body.len);
+            fflush(stderr);
         }
     }
 
