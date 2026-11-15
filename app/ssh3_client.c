@@ -1614,6 +1614,65 @@ s3_cli_sha256_fp(const u_char *der, size_t len, char *fp)
     s3_cli_b64url(md, mdlen, fp + sizeof("SHA256:") - 1);
 }
 
+/*
+ * the exclusive tmp of the known_hosts rewrite: the random suffix
+ * rides the OpenSSL RNG, the O_EXCL refuses the preplant (the pass
+ * 5 review P2 - the predictable <path>.tmp let the local attacker
+ * race the symlink); the EEXIST collision retries a fresh suffix.
+ * The text-mode open keeps the win line endings the fopen("w")
+ * shape carried
+ */
+
+#if (S3_WIN32)
+#define S3_CLI_TMP_TEXT O_TEXT
+#else
+#define S3_CLI_TMP_TEXT 0
+#endif
+
+static int
+s3_cli_tmp_open(const char *path, char *tmp, size_t tmp_cap)
+{
+    static const char digits[] = "0123456789abcdef";
+    static const char tail[] = ".tmp";
+
+    u_char rnd[4];
+    size_t plen = strlen(path);
+    int    fd, attempt, k;
+
+    if (plen + 1 + sizeof(rnd) * 2 + sizeof(tail) > tmp_cap) {
+        return -1;
+    }
+
+    for (attempt = 0; attempt < 8; attempt++) {
+
+        if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+            return -1;
+        }
+
+        memcpy(tmp, path, plen);
+        tmp[plen] = '.';
+
+        for (k = 0; k < (int)sizeof(rnd); k++) {
+            tmp[plen + 1 + k * 2] = digits[rnd[k] >> 4];
+            tmp[plen + 2 + k * 2] = digits[rnd[k] & 0xf];
+        }
+
+        memcpy(tmp + plen + 1 + sizeof(rnd) * 2, tail, sizeof(tail));
+
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | S3_CLI_TMP_TEXT, 0600);
+
+        if (fd >= 0) {
+            return fd;
+        }
+
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
 /* === the platform primitives of the shared body: the net bootstrap,
  * the signal flags, the sleep and the pid of the sequential paths and
  * the known_helpers of the pin store === */
@@ -1745,6 +1804,7 @@ s3_cli_kh_replace(const char *kh_path, const char *hostkey, const char *body)
     const char *slash = strrchr(kh_path, '\\');
     size_t      dlen = slash != NULL ? (size_t)(slash - kh_path) : 0;
     FILE       *src, *dst;
+    int         tfd;
     unsigned    dropped = 0;
 
     if (slash == NULL || dlen >= sizeof(dir)) {
@@ -1756,17 +1816,23 @@ s3_cli_kh_replace(const char *kh_path, const char *hostkey, const char *body)
 
     CreateDirectoryA(dir, NULL);
 
-    snprintf(tmp, sizeof(tmp), "%s.tmp", kh_path);
-
     src = fopen(kh_path, "r");
 
     if (src == NULL) {
         return s3_cli_kh_append(kh_path, body);
     }
 
-    dst = fopen(tmp, "w");
+    tfd = s3_cli_tmp_open(kh_path, tmp, sizeof(tmp));
+
+    if (tfd < 0) {
+        fclose(src);
+        return S3_ERROR;
+    }
+
+    dst = fdopen(tfd, "w");
 
     if (dst == NULL) {
+        close(tfd);
         fclose(src);
         return S3_ERROR;
     }
@@ -2006,7 +2072,7 @@ s3_cli_kh_replace(const char *kh_path, const char *hostkey, const char *body)
         return s3_cli_kh_append(kh_path, body);
     }
 
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = s3_cli_tmp_open(kh_path, tmp, sizeof(tmp));
 
     if (fd < 0) {
         fclose(src);

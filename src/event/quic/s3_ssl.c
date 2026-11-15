@@ -267,14 +267,19 @@ s3_ssl_ticket_hex(char *dst, size_t dst_cap, const u_char *src, size_t len)
 }
 
 static int
-s3_ssl_ticket_unhex(u_char *dst, size_t *len, const char *src)
+s3_ssl_ticket_unhex(u_char *dst, size_t dst_cap, size_t *len, const char *src)
 {
     size_t n, i;
     int    hi, lo;
 
     n = strlen(src);
 
-    if (n == 0 || n % 2 != 0) {
+    /* the capacity rides the caller: the cache line is the
+     * attacker-flappable input (the crafted ticket of the server),
+     * the oversize hex refuses before the first write (the pass 5
+     * review - the ~511-byte smash over the der[2048]) */
+
+    if (n == 0 || n % 2 != 0 || n / 2 > dst_cap) {
         return 0;
     }
 
@@ -309,6 +314,55 @@ s3_ssl_ticket_unhex(u_char *dst, size_t *len, const char *src)
     *len = n / 2;
 
     return 1;
+}
+
+/* the exclusive tmp of the atomic rewrite: the random suffix rides
+ * the OpenSSL RNG, the O_EXCL refuses the preplant (the pass 5
+ * review P2 - the predictable <path>.tmp let the local attacker
+ * race the symlink); the EEXIST collision retries a fresh suffix */
+
+static int
+s3_ssl_tmp_open(const char *path, char *tmp, size_t tmp_cap)
+{
+    static const char digits[] = "0123456789abcdef";
+    static const char tail[] = ".tmp";
+
+    u_char rnd[4];
+    size_t plen = s3_strlen(path);
+    int    fd, attempt, k;
+
+    if (plen + 1 + sizeof(rnd) * 2 + sizeof(tail) > tmp_cap) {
+        return -1;
+    }
+
+    for (attempt = 0; attempt < 8; attempt++) {
+
+        if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+            return -1;
+        }
+
+        memcpy(tmp, path, plen);
+        tmp[plen] = '.';
+
+        for (k = 0; k < (int)sizeof(rnd); k++) {
+            tmp[plen + 1 + k * 2] = digits[rnd[k] >> 4];
+            tmp[plen + 2 + k * 2] = digits[rnd[k] & 0xf];
+        }
+
+        memcpy(tmp + plen + 1 + sizeof(rnd) * 2, tail, sizeof(tail));
+
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+        if (fd >= 0) {
+            return fd;
+        }
+
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+
+    return -1;
 }
 
 /* the portable mkdir of the cache directory: the mode rides the
@@ -393,8 +447,6 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
         fclose(src);
     }
 
-    snprintf(tmp, sizeof(tmp), "%s.tmp", ssl->ticket_path);
-
     /* the .ssh3 directory may not exist yet (a run without the pin
      * writes never made it); the home above it may be missing too -
      * mkdir is not recursive, the two levels go one by one */
@@ -434,7 +486,7 @@ s3_ssl_ticket_persist(s3_ssl_t *ssl, SSL_SESSION *session)
         }
     }
 
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = s3_ssl_tmp_open(ssl->ticket_path, tmp, sizeof(tmp));
 
     if (fd == -1) {
         return;
@@ -531,7 +583,7 @@ s3_ssl_ticket_load(s3_ssl_t *ssl, const char **reason)
             }
         }
 
-        if (!s3_ssl_ticket_unhex(der, &dlen, hex) || dlen == 0) {
+        if (!s3_ssl_ticket_unhex(der, sizeof(der), &dlen, hex) || dlen == 0) {
             if (reason != NULL) {
                 *reason = "the cache line is damaged";
             }

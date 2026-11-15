@@ -46,6 +46,12 @@
 #define S3_AIA_FETCH_TIMEOUT_SEC 5
 #define S3_AIA_BUDGET_SEC        20
 
+/* the bound of the cache entries the chase stores (the pass 5
+ * review P2: the attacker-driven urls of the certificates grew the
+ * cache directory without a limit) */
+
+#define S3_AIA_CACHE_ENTRIES_MAX 64
+
 /* the user bundle: the env wins, the default rides next to known_hosts */
 
 #define S3_AIA_BUNDLE_ENV   "SSH3_CA_BUNDLE"
@@ -66,7 +72,7 @@
  * the unit tests
  */
 
-typedef s3_int_t (*s3_ssh3_aia_fetch_pt)(const char *url, s3_str_t *body);
+typedef s3_int_t (*s3_ssh3_aia_fetch_pt)(const char *url, unsigned timeout_sec, s3_str_t *body);
 
 typedef struct {
     X509_STORE          *anchors;   /* the trust the chase must land in, never mutated */
@@ -105,6 +111,30 @@ s3_int_t s3_ssh3_aia_complete(SSL *conn, long chain_err, s3_log_t *log);
  * (no network in the units), NULL restores the default transport */
 
 void s3_ssh3_aia_set_fetch(s3_ssh3_aia_fetch_pt fn);
+
+/*
+ * the url policy of the chase (the pass 5 review P1): the caIssuers url
+ * rides the certificate of the peer - the attacker-flappable input. The
+ * admissible url is the http/https scheme only, no control bytes (the
+ * CRLF of the request-line injection), no loopback/private/link-local
+ * target - the literals and the resolved answers alike. The resolve
+ * override injects the answers into the units (no network there), NULL
+ * restores the default getaddrinfo walk. S3_AIA_ALLOW_PRIVATE restores
+ * the unrestricted dial for the corporate PKI shapes
+ */
+
+typedef s3_int_t (*s3_ssh3_aia_resolve_pt)(const char *host, struct sockaddr_storage *addrs,
+                                           size_t *n, size_t cap);
+
+void s3_ssh3_aia_set_resolve(s3_ssh3_aia_resolve_pt fn);
+
+/* the range rules over one resolved address (the pins ride the units) */
+
+int s3_ssh3_aia_addr_private(const struct sockaddr *sa);
+
+/* 1 when the url may dial, 0 when the policy refuses it */
+
+int s3_ssh3_aia_url_admissible(const char *url);
 
 /* the testable core below: the chase machinery, free of the ssl layer */
 

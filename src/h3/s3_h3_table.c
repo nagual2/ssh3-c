@@ -227,15 +227,18 @@ s3_h3_insert(s3_connection_t *c, s3_str_t *name, s3_str_t *value)
                   dt->base + dt->nelts, name, value, size);
 
     /*
-     * ssh3-c: the entries live in the connection pool and die with it
-     * (nginx: ngx_alloc, released per-entry in the table cleanup)
+     * ssh3-c: the entries ride the raw allocator and the evict frees
+     * them per-entry (nginx: ngx_alloc + ngx_free); the pool arena
+     * never returned the evicted memory - the attacker-driven insert
+     * churn grew the demon for the connection lifetime (the pass 5
+     * review P1)
      */
-    p = s3_palloc(c->pool, sizeof(s3_h3_field_t) + name->len + value->len);
-    if (p == NULL) {
+    field = s3_alloc(sizeof(s3_h3_field_t) + name->len + value->len, c->log);
+    if (field == NULL) {
         return S3_ERROR;
     }
 
-    field = (s3_h3_field_t *)p;
+    p = (u_char *)field;
 
     field->name.data = p + sizeof(s3_h3_field_t);
     field->name.len = name->len;
@@ -324,16 +327,19 @@ s3_h3_set_capacity(s3_connection_t *c, s3_uint_t capacity)
 
     if (max > prev_max) {
         /*
-         * ssh3-c: the index array lives in the pool, the previous
-         * array dies with it (nginx: ngx_alloc + ngx_free)
+         * ssh3-c: the index array rides the raw allocator, the
+         * replaced array frees immediately (nginx: ngx_alloc +
+         * ngx_free) - the pool shape grew the demon on every
+         * capacity oscillation of the peer (the pass 5 review P1)
          */
-        elts = s3_palloc(c->pool, (max + 1) * sizeof(void *));
+        elts = s3_alloc((max + 1) * sizeof(void *), c->log);
         if (elts == NULL) {
             return S3_ERROR;
         }
 
         if (dt->elts) {
             s3_memcpy(elts, dt->elts, dt->nelts * sizeof(void *));
+            s3_free(dt->elts);
         }
 
         dt->elts = elts;
@@ -348,10 +354,25 @@ void
 s3_h3_cleanup_table(s3_h3_session_t *h3c)
 {
     /*
-     * ssh3-c: the entries and the index array live in the connection
-     * pool (nginx frees the malloc'ed ones here); nothing to release
+     * ssh3-c: the entries and the index arrays ride the raw
+     * allocator now - the session teardown frees what the evictions
+     * have not (nginx frees the malloc'ed ones here)
      */
-    (void)h3c;
+    s3_uint_t k;
+
+    for (k = 0; k < h3c->table.nelts; k++) {
+        s3_free(h3c->table.elts[k]);
+    }
+
+    for (k = 0; k < h3c->encoder.nelts; k++) {
+        s3_free(h3c->encoder.elts[k]);
+    }
+
+    s3_free(h3c->table.elts);
+    h3c->table.elts = NULL;
+
+    s3_free(h3c->encoder.elts);
+    h3c->encoder.elts = NULL;
 }
 
 static s3_int_t
@@ -374,7 +395,11 @@ s3_h3_evict(s3_connection_t *c, size_t target)
         s3_log_debug4(S3_LOG_DEBUG_EVENT, c->log, 0, "http3 evict [%ui] \"%V\":\"%V\" size:%uz",
                       dt->base, &field->name, &field->value, size);
 
-        /* ssh3-c: pool memory, no per-entry free (nginx: ngx_free) */
+        /* the per-entry free returns the memory to the process (the
+         * pass 5 review P1: the arena kept every evicted entry) */
+
+        s3_free(field);
+
         dt->size -= size;
     }
 
@@ -898,13 +923,14 @@ s3_h3_enc_capacity(s3_connection_t *c, s3_uint_t capacity)
 
     max = capacity / 32;
 
-    elts = s3_palloc(c->pool, (max + 1) * sizeof(void *));
+    elts = s3_alloc((max + 1) * sizeof(void *), c->log);
     if (elts == NULL) {
         return S3_ERROR;
     }
 
     if (et->elts) {
         s3_memcpy(elts, et->elts, et->nelts * sizeof(void *));
+        s3_free(et->elts);
     }
 
     et->elts = elts;
@@ -935,8 +961,24 @@ s3_h3_enc_insert(s3_connection_t *pc, s3_str_t *name, s3_str_t *value)
 
     p = buf;
 
-    /* the capacity instruction rides the first insert (RFC 9204
-     * 4.3.1): the peer decoder applies it before the entries */
+    /* the size rides the probe form of the encoders first: the
+     * instruction must refuse before the first write (the pass 5
+     * review P0-in-waiting - the check after the write is one
+     * refactor away from the stack smash); the capacity instruction
+     * rides the first insert (RFC 9204 4.3.1): the peer decoder
+     * applies it before the entries */
+
+    n = (size_t)s3_h3_encode_insert_literal(NULL, name, value);
+
+    if (et->insert_count == 0) {
+        n += (size_t)s3_h3_encode_insert_capacity(NULL, et->capacity);
+    }
+
+    if (n > sizeof(buf)) {
+        return S3_DECLINED;
+    }
+
+    p = buf;
 
     if (et->insert_count == 0) {
         p = (u_char *)s3_h3_encode_insert_capacity(p, et->capacity);
@@ -945,14 +987,17 @@ s3_h3_enc_insert(s3_connection_t *pc, s3_str_t *name, s3_str_t *value)
     p = (u_char *)s3_h3_encode_insert_literal(p, name, value);
     n = (size_t)(p - buf);
 
-    if (n > sizeof(buf) || s3_h3_enc_send_instruction(pc, buf, n) != S3_OK) {
+    if (s3_h3_enc_send_instruction(pc, buf, n) != S3_OK) {
         return S3_DECLINED;
     }
 
-    field = s3_palloc(pc->pool, sizeof(s3_h3_field_t) + name->len + value->len);
+    field = s3_alloc(sizeof(s3_h3_field_t) + name->len + value->len, pc->log);
     if (field == NULL) {
         return S3_DECLINED;
     }
+
+    /* the raw allocator for the encoder entries too: the cleanup
+     * frees what the session still holds (the pass 5 review P1) */
 
     field->name.data = (u_char *)field + sizeof(s3_h3_field_t);
     field->name.len = name->len;

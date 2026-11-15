@@ -160,13 +160,22 @@ s3_ssh3_agent_cli_req_identities(u_char *p)
 }
 
 size_t
-s3_ssh3_agent_cli_req_sign(u_char *p, const u_char *blob, size_t blen, const u_char *data,
-                           size_t dlen)
+s3_ssh3_agent_cli_req_sign(u_char *p, size_t cap, const u_char *blob, size_t blen,
+                           const u_char *data, size_t dlen)
 {
     u_char  *body = p + 4;
     u_char  *q = body;
     uint32_t flags = 0;
     size_t   n;
+
+    /* the output capacity contract: the request is 4 (length) + 1
+     * (message) + 4 + blob + 4 + data + 4 (flags); the oversize
+     * refuse returns 0 before the first byte lands (the pass 5
+     * review - the callers sized the buffer by convention alone) */
+
+    if (cap < 17 || blen > cap - 17 || dlen > cap - 17 - blen) {
+        return 0;
+    }
 
     /* the algo rides the head of the key blob: the rsa keys sign the
      * sha-256 variant, the rest take the default */
@@ -349,7 +358,7 @@ s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen, const 
         return S3_ERROR;
     }
 
-    req_len = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, dlen);
+    req_len = s3_ssh3_agent_cli_req_sign(req, sizeof(req), blob, blen, data, dlen);
 
     if (!WriteFile(pipe, req, (DWORD)req_len, &put, NULL) || put != (DWORD)req_len) {
         CloseHandle(pipe);
@@ -429,7 +438,7 @@ s3_ssh3_agent_cli_sign(const char *sock, const u_char *blob, size_t blen, const 
         return S3_ERROR;
     }
 
-    req_len = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, dlen);
+    req_len = s3_ssh3_agent_cli_req_sign(req, sizeof(req), blob, blen, data, dlen);
 
     if (write(fd, req, req_len) != (ssize_t)req_len) {
         close(fd);

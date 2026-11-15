@@ -29,6 +29,25 @@
 
 #if (S3_WIN32)
 #include <direct.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
+
+#include <dirent.h>
+
+/* the cache store refuses the symlinked target (the pass 5 review
+ * P2: the preplanted link let the poisoned writes persist outside
+ * the cache); the platforms without the flag ride without it - the
+ * win open() carries no symlink-following in this path */
+
+#if defined(O_NOFOLLOW)
+#define S3_AIA_O_NOFOLLOW O_NOFOLLOW
+#else
+#define S3_AIA_O_NOFOLLOW 0
 #endif
 
 #include <s3_https_fetch.h>
@@ -39,7 +58,10 @@
 extern const unsigned char s3_ssh3_trust_roots_pem[];
 extern const size_t        s3_ssh3_trust_roots_pem_len;
 
-static s3_int_t s3_ssh3_aia_default_fetch(const char *url, s3_str_t *body);
+static s3_int_t s3_ssh3_aia_default_fetch(const char *url, unsigned timeout_sec, s3_str_t *body);
+static s3_int_t s3_ssh3_aia_default_resolve(const char *host, struct sockaddr_storage *addrs,
+                                            size_t *n, size_t cap);
+static int      s3_ssh3_aia_v4_private(uint32_t v4);
 
 /* the binary open of the win build rides the text translation off
  * (the same shape the ticket cache uses) */
@@ -332,6 +354,290 @@ s3_ssh3_aia_set_fetch(s3_ssh3_aia_fetch_pt fn)
     s3_ssh3_aia_fetch_hook = fn;
 }
 
+/*
+ * the pass 5 review P1: the caIssuers url rides the certificate of
+ * the peer - the attacker-flappable input.  the fetch policy refuses
+ * the shapes that turn the chase into the client-side probe: the
+ * control bytes (the CRLF of the request-line injection), the
+ * non-http schemes, the loopback/private/link-local targets (the
+ * literals and the resolved answers alike).  S3_AIA_ALLOW_PRIVATE
+ * restores the unrestricted dial for the corporate PKI shapes - the
+ * env is the machine owner's territory, the certificate cannot set
+ * it
+ */
+
+static s3_ssh3_aia_resolve_pt s3_ssh3_aia_resolve_hook;
+
+void
+s3_ssh3_aia_set_resolve(s3_ssh3_aia_resolve_pt fn)
+{
+    s3_ssh3_aia_resolve_hook = fn;
+}
+
+static int
+s3_ssh3_aia_v4_private(uint32_t v4)
+{
+    /* the loopback, the this-net, the private, the carrier NAT, the
+     * link-local, the broadcast, the multicast and the reserved top */
+
+    if ((v4 >> 24) == 127 || (v4 >> 24) == 0 || (v4 >> 24) == 10 ||
+        (v4 & 0xffc00000) == 0x64400000 || (v4 & 0xffff0000) == 0xa9fe0000 ||
+        (v4 & 0xfff00000) == 0xac100000 || (v4 & 0xffff0000) == 0xc0a80000 || (v4 >> 28) >= 0xe) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+s3_ssh3_aia_zero_n(const u_char *b, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (b[i] != 0) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int
+s3_ssh3_aia_scheme_is(const char *url, const char *scheme)
+{
+    size_t i;
+
+    for (i = 0; scheme[i] != '\0'; i++) {
+
+        char c = url[i];
+
+        if (c == '\0') {
+            return 0;
+        }
+
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+
+        if (c != scheme[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int
+s3_ssh3_aia_addr_private(const struct sockaddr *sa)
+{
+    const struct sockaddr_in  *a4;
+    const struct sockaddr_in6 *a6;
+    const u_char              *b;
+    uint32_t                   v4;
+
+    if (sa == NULL) {
+        return 1;
+    }
+
+    if (sa->sa_family == AF_INET) {
+
+        a4 = (const struct sockaddr_in *)sa;
+
+        return s3_ssh3_aia_v4_private(ntohl(a4->sin_addr.s_addr));
+    }
+
+    if (sa->sa_family == AF_INET6) {
+
+        a6 = (const struct sockaddr_in6 *)sa;
+        b = (const u_char *)&a6->sin6_addr;
+
+        /* the v4-mapped answers ride the v4 rules */
+
+        if (s3_ssh3_aia_zero_n(b, 10) && b[10] == 0xff && b[11] == 0xff) {
+            v4 = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) | ((uint32_t)b[14] << 8) |
+                 (uint32_t)b[15];
+
+            return s3_ssh3_aia_v4_private(v4);
+        }
+
+        /* the unspecified, the loopback, the ULA, the link-local,
+         * the multicast */
+
+        if (s3_ssh3_aia_zero_n(b, 16) || (s3_ssh3_aia_zero_n(b, 15) && b[15] == 1)) {
+            return 1;
+        }
+
+        if ((b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) || b[0] == 0xff) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    return 1;
+}
+
+static s3_int_t
+s3_ssh3_aia_default_resolve(const char *host, struct sockaddr_storage *addrs, size_t *n, size_t cap)
+{
+    struct addrinfo hints, *res, *ri;
+    size_t          k = 0;
+
+    s3_memzero(&hints, sizeof(hints));
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+        return S3_ERROR;
+    }
+
+    for (ri = res; ri != NULL && k < cap; ri = ri->ai_next) {
+        s3_memcpy(&addrs[k], ri->ai_addr, ri->ai_addrlen);
+        k++;
+    }
+
+    freeaddrinfo(res);
+
+    *n = k;
+
+    return S3_OK;
+}
+
+int
+s3_ssh3_aia_url_admissible(const char *url)
+{
+    const char             *p, *slash;
+    char                    host[256];
+    size_t                  n, i, naddr, k;
+    struct sockaddr_storage addrs[8];
+
+    if (url == NULL || url[0] == '\0') {
+        return 0;
+    }
+
+    /* the control bytes refuse on the whole string: the CRLF of the
+     * request-line injection, the tabs and the spaces of the header
+     * shaping - no legitimate caIssuers url carries them */
+
+    for (i = 0; url[i] != '\0'; i++) {
+        if ((u_char)url[i] < 0x21 || (u_char)url[i] == 0x7f) {
+            return 0;
+        }
+    }
+
+    /* the scheme: the http family only, the case folded - the IA5
+     * string of the certificate carries the case the CA chose */
+
+    if (s3_ssh3_aia_scheme_is(url, "http://")) {
+        p = url + 7;
+
+    } else if (s3_ssh3_aia_scheme_is(url, "https://")) {
+        p = url + 8;
+
+    } else {
+        return 0;
+    }
+
+    slash = strchr(p, '/');
+
+    n = (slash != NULL) ? (size_t)(slash - p) : s3_strlen(p);
+
+    if (n == 0 || n >= sizeof(host)) {
+        return 0;
+    }
+
+    s3_memcpy(host, p, n);
+    host[n] = '\0';
+
+    /* the brackets of the v6 literal come off (the port rides behind
+     * the closing bracket); the bare host carries the port split: a
+     * single colon is the port separator (the host:port form of the
+     * canon urls), two or more are the unbracketed v6 - not the
+     * fetcher shape (the url_split canon) */
+
+    if (host[0] == '[') {
+
+        char *rb = strchr(host, ']');
+
+        if (rb == NULL) {
+            return 0;
+        }
+
+        if (rb[1] != '\0' && rb[1] != ':') {
+            return 0;
+        }
+
+        memmove(host, host + 1, (size_t)(rb - host - 1));
+        host[rb - host - 1] = '\0';
+
+    } else {
+
+        char *colon = strrchr(host, ':');
+
+        if (colon != NULL) {
+
+            if (strchr(host, ':') != colon) {
+                return 0;
+            }
+
+            *colon = '\0';
+        }
+    }
+
+    if (getenv("S3_AIA_ALLOW_PRIVATE") != NULL) {
+        return 1;
+    }
+
+    /* the literals ride the range rules directly, the names walk the
+     * resolved answers (the rebinding covers both); the resolve
+     * failure refuses - the fetch would fail the same dial anyway */
+
+    {
+        struct sockaddr_storage sa;
+        u_char                  bin[sizeof(struct in6_addr)];
+
+        if (inet_pton(AF_INET, host, bin) == 1) {
+
+            struct sockaddr_in *a4 = (struct sockaddr_in *)&sa;
+
+            s3_memzero(&sa, sizeof(sa));
+
+            a4->sin_family = AF_INET;
+            s3_memcpy(&a4->sin_addr, bin, 4);
+
+            return !s3_ssh3_aia_addr_private((const struct sockaddr *)&sa);
+        }
+
+        if (inet_pton(AF_INET6, host, bin) == 1) {
+
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&sa;
+
+            s3_memzero(&sa, sizeof(sa));
+
+            a6->sin6_family = AF_INET6;
+            s3_memcpy(&a6->sin6_addr, bin, 16);
+
+            return !s3_ssh3_aia_addr_private((const struct sockaddr *)&sa);
+        }
+    }
+
+    if (s3_ssh3_aia_resolve_hook != NULL
+            ? s3_ssh3_aia_resolve_hook(host, addrs, &naddr, 8) != S3_OK
+            : s3_ssh3_aia_default_resolve(host, addrs, &naddr, 8) != S3_OK) {
+        return 0;
+    }
+
+    for (k = 0; k < naddr; k++) {
+        if (s3_ssh3_aia_addr_private((const struct sockaddr *)&addrs[k])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 void
 s3_ssh3_aia_chase_init(s3_ssh3_aia_chase_t *ch, X509_STORE *anchors, const char *cache_dir)
 {
@@ -355,15 +661,23 @@ s3_ssh3_aia_chase_init(s3_ssh3_aia_chase_t *ch, X509_STORE *anchors, const char 
  */
 
 static s3_int_t
-s3_ssh3_aia_default_fetch(const char *url, s3_str_t *body)
+s3_ssh3_aia_default_fetch(const char *url, unsigned timeout_sec, s3_str_t *body)
 {
     unsigned status = 0;
     s3_str_t out;
 
     s3_str_null(&out);
 
-    if (s3_https_fetch_to(url, "GET", NULL, NULL, NULL, S3_AIA_FETCH_TIMEOUT_SEC, &status, &out) !=
-        S3_OK) {
+    /* the policy of the pass 5 review rides the real transport only:
+     * the injected hook of the tests is the no-network contract, the
+     * fixture urls dial nothing - the refusal looks like every other
+     * failed fetch to the chase */
+
+    if (!s3_ssh3_aia_url_admissible(url)) {
+        return S3_ERROR;
+    }
+
+    if (s3_https_fetch_to(url, "GET", NULL, NULL, NULL, timeout_sec, &status, &out) != S3_OK) {
         return S3_ERROR;
     }
 
@@ -689,7 +1003,36 @@ s3_ssh3_aia_cache_store(const char *dir, const char *url, X509 *cert)
         return S3_ERROR;
     }
 
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | S3_AIA_OPEN_BINARY, 0600);
+    /* the entry cap (the pass 5 review P2): the cache directory
+     * bounds at the constant, the fresh unique url skips the store
+     * on the full cache - the walk itself never dials less */
+
+    {
+        DIR           *d = opendir(dir);
+        unsigned       entries = 0;
+        struct dirent *de;
+
+        if (d != NULL) {
+
+            while ((de = readdir(d)) != NULL) {
+
+                size_t nlen = strlen(de->d_name);
+
+                if (nlen > 4 && strcmp(de->d_name + nlen - 4, ".pem") == 0) {
+                    entries++;
+                }
+            }
+
+            closedir(d);
+        }
+
+        if (entries >= S3_AIA_CACHE_ENTRIES_MAX) {
+            BIO_free(bio);
+            return S3_ERROR;
+        }
+    }
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | S3_AIA_O_NOFOLLOW | S3_AIA_OPEN_BINARY, 0600);
 
     if (fd == -1) {
         BIO_free(bio);
@@ -786,10 +1129,25 @@ s3_ssh3_aia_fetch_issuer(s3_ssh3_aia_chase_t *ch, X509 *child, const char *url,
     {
         s3_str_t body;
         X509    *fresh;
+        long     left;
+        unsigned timeout;
+
+        /* the budget borrow (the pass 5 review P2): the chase
+         * deadline caps the per-fetch window - the deep chains rode
+         * the full 5s per hop past the 20s budget */
+
+        left = (long)ch->deadline - (long)time(NULL);
+
+        if (left < 1) {
+            return NULL;
+        }
+
+        timeout =
+            (left < (long)S3_AIA_FETCH_TIMEOUT_SEC) ? (unsigned)left : S3_AIA_FETCH_TIMEOUT_SEC;
 
         s3_str_null(&body);
 
-        if (ch->fetch(url, &body) != S3_OK) {
+        if (ch->fetch(url, timeout, &body) != S3_OK) {
             return NULL;
         }
 

@@ -923,6 +923,60 @@ s3_test_enc_roundtrip(void)
     s3_test_close(e.fd);
 }
 
+static void
+s3_test_table_churn(void)
+{
+    /* the pass 5 review P1 pin: the capacity oscillation with the
+     * insert churn must not grow the process - the evict frees the
+     * entries per-call and the index array replaces itself with a
+     * free of the previous one; the shape rides the ASAN red on any
+     * double free and the invariants pin the bounded state */
+
+    static s3_test_env_t e;
+
+    s3_str_t name = s3_string("churn");
+    u_char   big[2048];
+    s3_str_t value;
+    int      i;
+
+    memset(big, 'x', sizeof(big));
+
+    value.data = big;
+    value.len = sizeof(big);
+
+    if (s3_test_env_init(&e) != S3_OK) {
+        printf("FAIL env init\n");
+        s3_test_failures++;
+        return;
+    }
+
+    for (i = 0; i < 500; i++) {
+
+        /* the oscillation: the high capacity admits the big entry,
+         * the low capacity evicts it (the encoder-stream shape of
+         * the finding) */
+
+        S3_ASSERT(s3_h3_set_capacity(e.c, 4096) == S3_OK);
+        S3_ASSERT(s3_h3_insert(e.c, &name, &value) == S3_OK);
+        S3_ASSERT(s3_h3_set_capacity(e.c, 64) == S3_OK);
+
+        S3_ASSERT(e.h3c->table.size <= 4096);
+    }
+
+    /* the low capacity evicted everything: the bounded table */
+
+    S3_ASSERT(e.h3c->table.nelts == 0);
+    S3_ASSERT(e.h3c->table.size == 0);
+
+    s3_h3_cleanup_table(e.h3c);
+
+    s3_test_close(e.fd);
+
+    while (e.npools > 0) {
+        s3_destroy_pool(e.pools[--e.npools]);
+    }
+}
+
 static int
 s3_test_h3_qpack(void)
 {
@@ -933,6 +987,8 @@ s3_test_h3_qpack(void)
     s3_test_prefix();
     s3_test_encoders();
     s3_test_enc_instructions();
+
+    s3_test_table_churn();
 
     if (s3_test_env_init(&e) != S3_OK) {
         printf("FAIL env init\n");

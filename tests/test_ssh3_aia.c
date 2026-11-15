@@ -33,6 +33,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#if (S3_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif
+
 #include <s3_ssh3_aia.h>
 #include "s3_test.h"
 
@@ -130,9 +138,11 @@ s3_aia_hook_add(const char *url, const char *pem)
 }
 
 static s3_int_t
-s3_aia_hook_fetch(const char *url, s3_str_t *body)
+s3_aia_hook_fetch(const char *url, unsigned timeout_sec, s3_str_t *body)
 {
     unsigned i;
+
+    (void)timeout_sec;
 
     s3_aia_hook_calls++;
 
@@ -980,6 +990,172 @@ test_chase_caps(void)
     return s3_test_failures;
 }
 
+/*
+ * the url policy of the chase (the pass 5 review P1): the range
+ * rules over the resolved addresses, the admissibility of the urls -
+ * the literals, the resolved answers (the injected resolve hook),
+ * the control bytes, the schemes, the allow-private env
+ */
+
+static s3_int_t
+s3_test_policy_resolve(const char *host, struct sockaddr_storage *addrs, size_t *n, size_t cap)
+{
+    struct sockaddr_in *a4;
+    const char         *answer;
+
+    (void)host;
+    (void)cap;
+
+    /* the stub answers with the address the leg planted: the verdict
+     * rides the S3_TEST_POLICY_ADDR env of the leg */
+
+    answer = getenv("S3_TEST_POLICY_ADDR");
+
+    if (answer == NULL) {
+        return S3_ERROR;
+    }
+
+    s3_memzero(&addrs[0], sizeof(addrs[0]));
+
+    a4 = (struct sockaddr_in *)&addrs[0];
+    a4->sin_family = AF_INET;
+    a4->sin_port = 0;
+
+    if (inet_pton(AF_INET, answer, &a4->sin_addr) != 1) {
+        return S3_ERROR;
+    }
+
+    *n = 1;
+
+    return S3_OK;
+}
+
+static int
+test_url_policy(void)
+{
+    struct sockaddr_in  a4;
+    struct sockaddr_in6 a6;
+
+    /* the v4 range rules */
+
+    memset(&a4, 0, sizeof(a4));
+    a4.sin_family = AF_INET;
+
+#define S3_T_V4(text, expect)                                                                      \
+    do {                                                                                           \
+        S3_ASSERT(inet_pton(AF_INET, text, &a4.sin_addr) == 1);                                    \
+        S3_ASSERT(s3_ssh3_aia_addr_private((const struct sockaddr *)&a4) == (expect));             \
+    } while (0)
+
+    S3_T_V4("127.0.0.1", 1);
+    S3_T_V4("10.0.0.1", 1);
+    S3_T_V4("172.16.5.5", 1);
+    S3_T_V4("192.168.1.1", 1);
+    S3_T_V4("169.254.9.9", 1);
+    S3_T_V4("100.64.0.1", 1);
+    S3_T_V4("0.0.0.0", 1);
+    S3_T_V4("255.255.255.255", 1);
+    S3_T_V4("224.0.0.1", 1);
+    S3_T_V4("1.1.1.1", 0);
+    S3_T_V4("8.8.8.8", 0);
+    S3_T_V4("52.1.2.3", 0);
+
+#undef S3_T_V4
+
+    /* the v6 range rules */
+
+    memset(&a6, 0, sizeof(a6));
+    a6.sin6_family = AF_INET6;
+
+#define S3_T_V6(text, expect)                                                                      \
+    do {                                                                                           \
+        S3_ASSERT(inet_pton(AF_INET6, text, &a6.sin6_addr) == 1);                                  \
+        S3_ASSERT(s3_ssh3_aia_addr_private((const struct sockaddr *)&a6) == (expect));             \
+    } while (0)
+
+    S3_T_V6("::1", 1);
+    S3_T_V6("::", 1);
+    S3_T_V6("fd00::1", 1);
+    S3_T_V6("fc00::1", 1);
+    S3_T_V6("fe80::1", 1);
+    S3_T_V6("ff02::1", 1);
+    S3_T_V6("::ffff:127.0.0.1", 1);
+    S3_T_V6("::ffff:1.1.1.1", 0);
+    S3_T_V6("2606:4700::1111", 0);
+
+#undef S3_T_V6
+
+    /* the literals: the bans and the admissions, no resolver rides */
+
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://127.0.0.1:48080/inter.pem") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://[::1]/x") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://[::1]:8443/x") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://10.1.2.3/aia") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://[fd00::5]/aia") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1/aia") == 1);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1:8080/aia") == 1);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://[2606:4700::1111]/aia") == 1);
+
+    /* the control bytes: the CRLF of the request-line injection and
+     * the header shaping refuse on the whole string */
+
+    S3_ASSERT(s3_ssh3_aia_url_admissible(
+                  "http://1.1.1.1/a\r\nInjected: 1\r\n\r\nGET /s HTTP/1.1\r\n") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1/a\nb") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1/a\tb") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1/a b") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://exa\rmple.com/a") == 0);
+
+    /* the schemes: the http family only, the case folded */
+
+    S3_ASSERT(s3_ssh3_aia_url_admissible("ftp://1.1.1.1/a") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("file:///etc/passwd") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("gopher://1.1.1.1/") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("1.1.1.1/a") == 0);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("HTTP://1.1.1.1/a") == 1);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("HTTPS://1.1.1.1/a") == 1);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("https://1.1.1.1/a") == 1);
+
+    /* the unbracketed multi-colon shape is not the fetcher form */
+
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://::1/x") == 0);
+
+    /* the names walk the resolved answers: the injected resolve hook
+     * answers what the leg plants, the network stays out */
+
+    s3_ssh3_aia_set_resolve(s3_test_policy_resolve);
+
+    s3_aia_setenv("S3_TEST_POLICY_ADDR", "10.0.0.5");
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://policy.example/aia") == 0);
+
+    s3_aia_setenv("S3_TEST_POLICY_ADDR", "93.184.216.34");
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://policy.example/aia") == 1);
+
+    /* the resolve failure refuses - the dial would fail the same */
+
+    s3_aia_setenv("S3_TEST_POLICY_ADDR", "not-an-address");
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://policy.example/aia") == 0);
+
+    /* the allow-private env restores the unrestricted dial (the
+     * corporate PKI knob), the control bytes stay refused with it */
+
+    s3_aia_setenv("S3_AIA_ALLOW_PRIVATE", "1");
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://127.0.0.1:48080/inter.pem") == 1);
+    S3_ASSERT(s3_ssh3_aia_url_admissible("http://1.1.1.1/a\r\nb") == 0);
+
+#if (S3_WIN32)
+    _putenv_s("S3_AIA_ALLOW_PRIVATE", "");
+    _putenv_s("S3_TEST_POLICY_ADDR", "");
+#else
+    unsetenv("S3_AIA_ALLOW_PRIVATE");
+    unsetenv("S3_TEST_POLICY_ADDR");
+#endif
+
+    s3_ssh3_aia_set_resolve(NULL);
+
+    return s3_test_failures;
+}
+
 static int
 test_bootstrap(void)
 {
@@ -1377,6 +1553,7 @@ test_ssh3_aia(void)
     (void)test_chase_caps();
     (void)test_bootstrap();
     (void)test_complete();
+    (void)test_url_policy();
 
     s3_aia_fixture_free();
 

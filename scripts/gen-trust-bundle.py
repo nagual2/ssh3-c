@@ -153,7 +153,7 @@ def main() -> int:
 
 #include <stddef.h>
 
-const unsigned char s3_ssh3_trust_roots_pem[] = {{
+const unsigned char s3_ssh3_trust_roots_pem[{len(blob)}] = {{
 """
 
     body = []
@@ -164,7 +164,7 @@ const unsigned char s3_ssh3_trust_roots_pem[] = {{
     tail = f"""
 }};
 
-const size_t s3_ssh3_trust_roots_pem_len = {len(blob)};
+const size_t s3_ssh3_trust_roots_pem_len = sizeof(s3_ssh3_trust_roots_pem);
 
 /* the empty line keeps the canon of the tree */
 """

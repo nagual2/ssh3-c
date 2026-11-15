@@ -530,7 +530,7 @@ s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
     int         req_n;
     s3_int_t    rc;
     s3_str_t    out, path;
-    const char *slash;
+    const char *slash, *q;
 
     s3_str_null(&out);
 
@@ -539,6 +539,24 @@ s3_https_fetch_to(const char *url, const char *method, const s3_str_t *body,
             s3_https_url_split(url, &tls, host, sizeof(host), port, sizeof(port), &slash);
 
         if (src != S3_OK) {
+            return S3_ERROR;
+        }
+    }
+
+    /* the control bytes refuse on the host and the path before the
+     * dial: the url pieces ride the request line raw (the pass 5
+     * review - the CRLF of the request-line injection and the
+     * smuggling against the backend behind the socket); no
+     * legitimate url carries them */
+
+    for (q = host; *q != '\0'; q++) {
+        if ((u_char)*q < 0x21 || (u_char)*q == 0x7f) {
+            return S3_ERROR;
+        }
+    }
+
+    for (q = slash; *q != '\0'; q++) {
+        if ((u_char)*q < 0x21 || (u_char)*q == 0x7f) {
             return S3_ERROR;
         }
     }

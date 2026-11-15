@@ -253,6 +253,25 @@ run_cli() {
     rm -f "$WORK/$home/.ssh3/tickets"
 
     env -u SSL_CERT_FILE -u SSL_CERT_DIR HOME="$WORK/$home" SSH3_CA_BUNDLE="$WORK/root.pem" \
+        S3_AIA_ALLOW_PRIVATE=1 \
+        timeout 30 "$CLI" -n \
+        -o strict-host-key-checking=accept-new -i "$WORK/priv.pem" \
+        "client@127.0.0.1:$SRVPORT/ssh3-term" printf S3-AIA-OK < /dev/null > "$out" 2>&1
+}
+
+# the policy leg runner: the same dial without the allow-private knob -
+# the loopback caIssuers target rides the default refusal (the pass 5
+# review P1: the certificate-controlled url dials nothing private)
+
+run_cli_locked() {
+
+    local home=$1
+    local out=$2
+
+    mkdir -p "$WORK/$home/.ssh3"
+    rm -f "$WORK/$home/.ssh3/tickets"
+
+    env -u SSL_CERT_FILE -u SSL_CERT_DIR HOME="$WORK/$home" SSH3_CA_BUNDLE="$WORK/root.pem" \
         timeout 30 "$CLI" -n \
         -o strict-host-key-checking=accept-new -i "$WORK/priv.pem" \
         "client@127.0.0.1:$SRVPORT/ssh3-term" printf S3-AIA-OK < /dev/null > "$out" 2>&1
@@ -356,6 +375,34 @@ if grep -q S3-AIA-OK "$WORK/leg6.out"; then
 else
     fail "the refresh-offline dial failed: $(tail -2 "$WORK/leg6.out" | tr '\n' ' ')"
 fi
+
+echo "== leg 7: the private caIssuers target refuses live (no knob)"
+
+start_stub "$(cat "$WORK/i1.pem")" leg7 || die "the stub did not start"
+
+run_cli_locked home7 "$WORK/leg7.out"
+
+if grep -q S3-AIA-OK "$WORK/leg7.out"; then
+    fail "the private caIssuers target dialed: the policy gate did not hold"
+else
+    pass "the loopback caIssuers target refused (the policy gate held)"
+fi
+
+# the blind-SSRF proof: the attacker-controlled listener saw nothing
+# but the readiness probe of the stub itself - the python http.server
+# logs every GET; one line is the probe, the second would be the dial
+
+sleep 0.3
+
+hits=$(grep -c "GET /inter.pem" "$WORK/stub-leg7.log" 2>/dev/null || true)
+
+if [ "${hits:-0}" -gt 1 ]; then
+    fail "the stub received the client request: the gate refused after the dial"
+else
+    pass "the stub log carries the probe only (the refusal rode before the dial)"
+fi
+
+stop_stub
 
 if [ "$FAILURES" = "0" ]; then
     echo "AIA-CHASE-E2E OK"

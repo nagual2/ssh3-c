@@ -76,7 +76,7 @@ s3_test_agent_req_sign(void)
 
     /* the ed25519 request: no flag */
 
-    n = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, sizeof(data));
+    n = s3_ssh3_agent_cli_req_sign(req, sizeof(req), blob, blen, data, sizeof(data));
     S3_ASSERT(n == 4 + 1 + 4 + blen + 4 + sizeof(data) + 4);
     S3_ASSERT(req[4] == 13);
     S3_ASSERT(memcmp(req + 5, "\000\000\000\013ssh-ed25519", 15) == 0);
@@ -90,10 +90,28 @@ s3_test_agent_req_sign(void)
     memcpy(blob + 11, "\000\000\000 ", 4);
     blen = 11 + 4 + 32;
 
-    n = s3_ssh3_agent_cli_req_sign(req, blob, blen, data, sizeof(data));
+    n = s3_ssh3_agent_cli_req_sign(req, sizeof(req), blob, blen, data, sizeof(data));
     flen = ((uint32_t)req[n - 4] << 24) | ((uint32_t)req[n - 3] << 16) |
            ((uint32_t)req[n - 2] << 8) | (uint32_t)req[n - 1];
     S3_ASSERT(flen == 2);
+
+    /* the capacity contract: the oversize refuse returns 0 before
+     * the first byte lands (the pass 5 review) */
+
+    n = s3_ssh3_agent_cli_req_sign(req, 16, blob, blen, data, sizeof(data));
+    S3_ASSERT(n == 0);
+
+    n = s3_ssh3_agent_cli_req_sign(req, 17 + blen, blob, blen, data, sizeof(data));
+    S3_ASSERT(n == 0);
+
+    n = s3_ssh3_agent_cli_req_sign(req, 18 + blen, blob, blen, data, sizeof(data));
+    S3_ASSERT(n == 0);
+
+    n = s3_ssh3_agent_cli_req_sign(req, 18 + blen + sizeof(data), blob, blen, data, sizeof(data));
+    S3_ASSERT(n == 0);
+
+    n = s3_ssh3_agent_cli_req_sign(req, 19 + blen + sizeof(data), blob, blen, data, sizeof(data));
+    S3_ASSERT(n == 19 + blen + sizeof(data));
 
     /* the identities request: five bytes */
 

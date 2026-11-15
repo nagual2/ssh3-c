@@ -17,8 +17,11 @@
 
 set -u
 
-BIN=~/git/ssh3-c/build/linux-release/ssh3-server
-BUILD=~/git/ssh3-c/build/linux-release
+# the build rides the tree of the script (the S3CV_BUILD pin overrides
+# for the debug runs against a foreign build)
+
+BUILD=${S3CV_BUILD:-$(cd "$(dirname "$0")/.." && pwd)/build/linux-release}
+BIN=$BUILD/ssh3-server
 
 # the optional pin of the tree (the debug run): S3OPT_WORK + S3OPT_KEEP
 
