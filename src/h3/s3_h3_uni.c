@@ -161,6 +161,7 @@ s3_h3_init_uni_stream(s3_connection_t *c)
     us = s3_pcalloc(c->pool, sizeof(s3_h3_uni_stream_t));
     if (us == NULL) {
         s3_quic_finalize_connection(pc, S3_H3_ERR_INTERNAL_ERROR, "memory allocation error");
+        s3_event_timer_close_site("h3-uni-init-allocfail");
         s3_close_connection(c);
         return;
     }
@@ -214,6 +215,7 @@ s3_h3_close_uni_stream(s3_connection_t *c)
      * destroys the pool and the pool cleanup runs the quic stream
      * shutdown (s3_quic_stream_cleanup_handler())
      */
+    s3_event_timer_close_site("h3-uni-close");
     s3_close_connection(c);
 }
 

@@ -16,10 +16,38 @@
 
 #define s3_test_close(fd) closesocket((SOCKET)(fd))
 
+/*
+ * the wave-14 mingw isolation: the raw stack of the fatal exception -
+ * the return addresses resolve offline against the symbol table, the
+ * module base prints next to them for the ASLR shift
+ */
+
+static LONG WINAPI
+s3_test_crash_handler(EXCEPTION_POINTERS *ep)
+{
+    void  *stack[32];
+    USHORT n, i;
+
+    fprintf(stderr, "CRASH exc=0x%08lx addr=%p base=%p\n", (long)ep->ExceptionRecord->ExceptionCode,
+            ep->ExceptionRecord->ExceptionAddress, (void *)(uintptr_t)GetModuleHandleA(NULL));
+
+    n = CaptureStackBackTrace(0, 32, stack, NULL);
+
+    for (i = 0; i < n; i++) {
+        fprintf(stderr, "  #%02u %p\n", (unsigned)i, stack[i]);
+    }
+
+    fflush(stderr);
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void
 s3_test_winsock_init(void)
 {
     WSADATA wsd;
+
+    SetUnhandledExceptionFilter(s3_test_crash_handler);
 
     WSAStartup(MAKEWORD(2, 2), &wsd);
 }

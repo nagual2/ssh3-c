@@ -638,6 +638,8 @@ s3_test_env_init(s3_test_e2e_env_t *env)
 static void
 s3_test_env_done(s3_test_e2e_env_t *env)
 {
+    s3_event_timer_tree_dump(NULL, "env-done-enter");
+
     if (env->server != NULL && env->server->udp != NULL) {
         s3_quic_connection_t *qc = s3_quic_get_connection(env->server);
 
@@ -653,6 +655,8 @@ s3_test_env_done(s3_test_e2e_env_t *env)
             s3_quic_close_connection(env->cli, S3_ABORT);
         }
     }
+
+    s3_event_timer_tree_dump(NULL, "env-done-after-closes");
 
     if (env->cli_conf.ssl != NULL) {
         s3_ssl_free(env->cli_conf.ssl);
@@ -682,12 +686,15 @@ s3_test_env_done(s3_test_e2e_env_t *env)
     /*
      * the pool of the event context: the next case re-initializes the
      * context, and the overwritten pool would be a leak (the receive
-     * buffers live there)
+     * buffers live there); the shutdown (not the bare pool destroy) -
+     * the method done resets the process-global select state (the fd
+     * sets and the event index), the bare destroy left the index
+     * entries pointing into the freed pool and the next case walked
+     * the zombies (the wave-14 mingw AV, the select dispatch walk)
      */
 
     if (env->ctx.pool != NULL) {
-        s3_destroy_pool(env->ctx.pool);
-        env->ctx.pool = NULL;
+        s3_event_ctx_shutdown(&env->ctx);
     }
 }
 
@@ -1245,6 +1252,7 @@ s3_test_quic_e2e_exporter(void)
 {
     s3_test_e2e_env_t *env = &s3_test_e2e;
     u_char             cli_mat[32], srv_mat[32], cli_other[32];
+    char               tag[32];
     int                i;
 
     s3_test_cli_received_len = 0;
@@ -1262,6 +1270,9 @@ s3_test_quic_e2e_exporter(void)
 
         s3_event_process_posted(&env->ctx, &env->ctx.posted_events);
         s3_process_events_and_timers(&env->ctx);
+
+        snprintf(tag, sizeof(tag), "exporter-iter-%d", i);
+        s3_event_timer_tree_dump(NULL, tag);
 
         if (env->cli->ssl != NULL && env->cli->ssl->handshaked && env->server != NULL &&
             env->server->ssl != NULL && env->server->ssl->handshaked) {

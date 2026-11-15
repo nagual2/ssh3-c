@@ -135,4 +135,6 @@ s3_close_connection(s3_connection_t *c)
     if (c->pool != NULL) {
         s3_destroy_pool(c->pool); /* runs the cleanup handlers */
     }
+
+    s3_event_timer_close_audit(c, fd);
 }

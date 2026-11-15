@@ -181,6 +181,19 @@ void      s3_event_expire_timers(s3_event_ctx_t *ctx);
 void      s3_event_add_timer(s3_event_t *ev, s3_msec_t timer);
 void      s3_event_del_timer(s3_event_t *ev);
 
+/*
+ * the wave-14 mingw isolation: the S3_TIMER_DUMP dump of the live
+ * timer tree (the no-op without the env; owner != NULL marks the
+ * nodes whose events belong to the given connection) and the
+ * pre-close audit - the own nodes of a raw close are the entries
+ * that will dangle after the pool destroy
+ */
+void s3_event_timer_tree_dump(const void *owner, const char *label);
+void s3_event_timer_close_audit(s3_connection_t *c, s3_fd_t fd);
+
+/* the raw-close call-site breadcrumb (the S3_TIMER_DUMP no-op) */
+void s3_event_timer_close_site(const char *site);
+
 void s3_event_process_posted(s3_event_ctx_t *ctx, s3_queue_t *posted);
 
 #define s3_post_event(ev, q)                                                                       \

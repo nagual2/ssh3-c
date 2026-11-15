@@ -220,6 +220,7 @@ s3_quic_close_streams(s3_connection_t *c, s3_quic_connection_t *qc)
          * unlike the reference, s3_close_connection() destroys the
          * stream pool itself and runs the cleanup handler
          */
+        s3_event_timer_close_site("streams-uninit");
         s3_close_connection(qs->connection);
     }
 
@@ -281,6 +282,7 @@ s3_quic_close_streams(s3_connection_t *c, s3_quic_connection_t *qc)
         sc = qs->connection;
 
         if (sc != NULL) {
+            s3_event_timer_close_site("streams-force-tail");
             s3_close_connection(sc);
         }
     }
@@ -859,6 +861,7 @@ s3_quic_create_stream(s3_connection_t *c, uint64_t id)
     cln = s3_pool_cleanup_add(pool, 0);
     if (cln == NULL) {
         /* runs the cleanup handler, the pool is destroyed inside */
+        s3_event_timer_close_site("stream-cleanup-allocfail");
         s3_close_connection(sc);
         s3_queue_insert_tail(&qc->streams.free, &qs->queue);
         qc->reusable = reusable;

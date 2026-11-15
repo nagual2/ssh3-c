@@ -891,6 +891,7 @@ quic_done:
     }
 
     /* destroys the connection pool with the quic connection in it */
+    s3_event_timer_close_site("quic-done-canonical");
     s3_close_connection(c);
 }
 
