@@ -300,32 +300,66 @@ s3_select_del_connection(s3_event_ctx_t *ctx, s3_connection_t *c)
 static void
 s3_select_repair_fd_sets(s3_event_ctx_t *ctx)
 {
-    u_int          i;
-    socklen_t      len;
-    int            n;
-    s3_err_t       err;
+    u_int          i, k, j, keep;
     s3_socket_t    s;
     struct fd_set *sets[2];
-    s3_uint_t      k;
+    s3_int_t       claimed;
 
     sets[0] = &master_read_fd_set;
     sets[1] = &master_write_fd_set;
 
+    /*
+     * the probe-free repair: the winsock getsockopt() on a closed
+     * handle whose kernel slot the system re-armed for a non-socket
+     * object crashes the process (the mingw quic e2e exit 5) - the
+     * live registry is the event index instead: every value of the
+     * set must be claimed by an active index connection, the rest
+     * are the stale closes and drop in place
+     */
+
     for (k = 0; k < 2; k++) {
+
+        keep = 0;
 
         for (i = 0; i < sets[k]->fd_count; i++) {
 
             s = sets[k]->fd_array[i];
-            len = sizeof(int);
+            claimed = 0;
 
-            if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&n, &len) == SOCKET_ERROR) {
-                err = s3_socket_errno;
+            for (j = 0; j < nevents; j++) {
 
-                s3_log_error(S3_LOG_ALERT, ctx->log, err, "invalid descriptor #%ud in fd_set",
-                             (s3_uint_t)i);
+                s3_event_t      *ev;
+                s3_connection_t *c;
 
-                FD_CLR(s, sets[k]);
+                ev = event_index[j];
+                c = (s3_connection_t *)ev->data;
+
+                if (ev->active && c->fd == (s3_fd_t)s) {
+                    claimed = 1;
+                    break;
+                }
             }
+
+            if (!claimed) {
+                s3_log_error(S3_LOG_ALERT, ctx->log, 0,
+                             "stale descriptor #%ud dropped from the set", (s3_uint_t)i);
+                continue;
+            }
+
+            if (keep != i) {
+                sets[k]->fd_array[keep] = s;
+            }
+
+            keep++;
+        }
+
+        sets[k]->fd_count = keep;
+
+        if (k == 0) {
+            max_read = keep;
+
+        } else {
+            max_write = keep;
         }
     }
 }
