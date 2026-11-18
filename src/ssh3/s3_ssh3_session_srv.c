@@ -1331,6 +1331,13 @@ s3_ssh3_session_srv_watch(s3_ssh3_session_srv_t *s, s3_pool_t *watch_pool, s3_lo
 
         s->out_watch = s3_ssh3_session_watch_conn(s);
 
+        /* the recycled connection carries the closed flags of its
+         * previous unwatch - the fresh arm clears them, or the
+         * dispatch drops every wake-up of the re-armed watch */
+
+        s->out_watch->read->closed = 0;
+        s->out_watch->write->closed = 0;
+
         if (s->out_watch == NULL ||
             s3_event_actions.add_event(s->out_watch->read, S3_READ_EVENT, 0) != S3_OK) {
             /* the watch recycles, the session stays unwatched */
@@ -1349,6 +1356,9 @@ s3_ssh3_session_srv_watch(s3_ssh3_session_srv_t *s, s3_pool_t *watch_pool, s3_lo
         }
 
         s->err_watch->fd = s->stderr_fd;
+
+        s->err_watch->read->closed = 0;
+        s->err_watch->write->closed = 0;
 
         if (s3_event_actions.add_event(s->err_watch->read, S3_READ_EVENT, 0) != S3_OK) {
             s3_ssh3_session_unwatch_fd(&s->err_watch, s->stderr_fd);

@@ -3153,8 +3153,47 @@ s3_cli_jump_hop_defaults(s3_cli_jump_hop_t *hop)
 
 static unsigned s3_cli_early_done;
 
+/*
+ * the session token of the wave 16: the 16 random bytes hexed, sent
+ * on every non-early CONNECT; the reconnect of the same process
+ * carries the same token - the server parks the dying session under
+ * it and the next dial attaches the old shell instead of the fresh
+ * one.  S3_SESSION_TOKEN overrides the generation (the deterministic
+ * e2e and the scheduler diagnostics)
+ */
+
+static char s3_cli_session_token[33];
+
+static void
+s3_cli_session_token_init(void)
+{
+    u_char rnd[16];
+    int    i;
+
+    if (s3_cli_session_token[0] != '\0') {
+        return;
+    }
+
+    {
+        const char *env = getenv("S3_SESSION_TOKEN");
+
+        if (env != NULL && strlen(env) == 32) {
+            memcpy(s3_cli_session_token, env, 33);
+            return;
+        }
+    }
+
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        return;
+    }
+
+    for (i = 0; i < 16; i++) {
+        snprintf(s3_cli_session_token + i * 2, 3, "%02x", rnd[i]);
+    }
+}
+
 static size_t s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target,
-                                   const char *auth);
+                                   const char *auth, const char *session_token);
 
 static s3_int_t
 s3_cli_early_init(s3_connection_t *c)
@@ -3204,12 +3243,12 @@ s3_cli_early_init(s3_connection_t *c)
 
     snprintf(authority, sizeof(authority), "%s:%u", s3_cli_host, s3_cli_port);
 
-    sec_len = s3_cli_h3_section_ex(NULL, authority, s3_cli_target, NULL);
+    sec_len = s3_cli_h3_section_ex(NULL, authority, s3_cli_target, NULL, NULL);
 
     p = frame;
     p = (u_char *)s3_h3_encode_varlen_int(p, S3_H3_FRAME_HEADERS);
     p = (u_char *)s3_h3_encode_varlen_int(p, sec_len);
-    sec_len = s3_cli_h3_section_ex(p, authority, s3_cli_target, NULL);
+    sec_len = s3_cli_h3_section_ex(p, authority, s3_cli_target, NULL, NULL);
     total = (size_t)(p - frame) + sec_len;
 
     m = s3_quic_stream_send(s3_cli_ctrl, frame, total);
@@ -3232,7 +3271,8 @@ s3_cli_early_init(s3_connection_t *c)
  */
 
 static size_t
-s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const char *auth)
+s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const char *auth,
+                     const char *session_token)
 {
     u_char *start = p;
 
@@ -3245,6 +3285,10 @@ s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const
         n += (size_t)s3_cli_h3_field_l(NULL, ":authority", authority);
         n += (size_t)s3_cli_h3_field_l(NULL, ":path", target);
         n += (size_t)s3_cli_h3_field_l(NULL, "user-agent", s3_cli_version_string());
+
+        if (session_token != NULL) {
+            n += (size_t)s3_cli_h3_field_l(NULL, "x-ssh3-session-token", session_token);
+        }
 
         if (auth != NULL) {
             n += (size_t)s3_cli_h3_field_l(NULL, "authorization", auth);
@@ -3261,6 +3305,10 @@ s3_cli_h3_section_ex(u_char *p, const char *authority, const char *target, const
     p = (u_char *)s3_cli_h3_field_l(p, ":path", target);
     p = (u_char *)s3_cli_h3_field_l(p, "user-agent", s3_cli_version_string());
 
+    if (session_token != NULL) {
+        p = (u_char *)s3_cli_h3_field_l(p, "x-ssh3-session-token", session_token);
+    }
+
     if (auth != NULL) {
         p = (u_char *)s3_cli_h3_field_l(p, "authorization", auth);
     }
@@ -3275,7 +3323,8 @@ s3_cli_h3_section(u_char *p)
 
     snprintf(authority, sizeof(authority), "%s:%u", s3_cli_host, s3_cli_port);
 
-    return s3_cli_h3_section_ex(p, authority, s3_cli_target, s3_cli_auth_value);
+    return s3_cli_h3_section_ex(p, authority, s3_cli_target, s3_cli_auth_value,
+                                s3_cli_session_token[0] != '\0' ? s3_cli_session_token : NULL);
 }
 
 /* the jump CONNECT section: the hop authority, the hop target
@@ -3288,7 +3337,7 @@ s3_cli_jump_h3_section(s3_cli_jump_hop_t *hop, u_char *p)
 
     snprintf(authority, sizeof(authority), "%s:%u", hop->host, hop->port);
 
-    return s3_cli_h3_section_ex(p, authority, hop->target, hop->auth);
+    return s3_cli_h3_section_ex(p, authority, hop->target, hop->auth, NULL);
 }
 
 /*
@@ -14210,6 +14259,20 @@ s3_cli_inactive_gate(void)
            !s3_cli_no_session && !s3_cli_no_stdin && !s3_cli_jump_on;
 }
 
+/*
+ * the pre-dial variant of the wave 16: the same interactive shape
+ * minus the tty - the tty arms with the session bring-up, the dial
+ * failures land on the hold before any session existed
+ */
+
+static unsigned
+s3_cli_inactive_gate_predial(void)
+{
+    return s3_cli_console && s3_cli_cmd == NULL && !s3_cli_sftp_spec_mode &&
+           s3_cli_fwd_count == 0 && s3_cli_rspec_count == 0 && !s3_cli_cm_master &&
+           !s3_cli_no_session && !s3_cli_no_stdin && !s3_cli_jump_on;
+}
+
 /* the console title (the PuTTY shape): the window carries the peer
  * while the session lives, the mark rides the inactive hold; the
  * internal text is utf-8, the console api is wide */
@@ -14262,17 +14325,32 @@ s3_cli_inactive_key(u_char b)
  * full teardown has not run), the poll drains the raw bytes
  */
 
+static unsigned s3_cli_inactive_wait_text(const char *line1, const char *mark);
+
 static unsigned
 s3_cli_inactive_wait(void)
+{
+    return s3_cli_inactive_wait_text("ssh3 - the connection is lost: all sessions inactive",
+                                     " (inactive)");
+}
+
+/*
+ * the banner variant of the wave 16: the dial failures hold the
+ * window with their own wording (the session never existed - the
+ * loss wording would lie)
+ */
+
+static unsigned
+s3_cli_inactive_wait_text(const char *line1, const char *mark)
 {
     u_char   chunk[64];
     size_t   len;
     unsigned k;
     unsigned rc = S3_CLI_INACT_IGNORE;
 
-    s3_cli_console_title(" (inactive)");
+    s3_cli_console_title(mark);
 
-    fprintf(stderr, "ssh3 - the connection is lost: all sessions inactive\n");
+    fprintf(stderr, "%s\n", line1);
     fprintf(stderr, "      Ctrl+R - reconnect, Ctrl+C - exit\n");
 
     while (rc == S3_CLI_INACT_IGNORE) {
@@ -16100,6 +16178,18 @@ main(int argc, char **argv)
      * order), the -4/-6 pick filters at the hints; the chain targets
      * carry the resolved family-tagged form on the wire */
 
+    s3_cli_session_token_init();
+
+#if (S3_WIN32)
+    /* the wave 16: the console comes up before the first dial - the
+     * hold of the dial failures needs the ring and the reader alive
+     * (the gate keeps the shape: the plain interactive console) */
+
+    if (s3_cli_inactive_gate_predial()) {
+        (void)s3_cli_console_init();
+    }
+#endif
+
     memset(&sa4, 0, sizeof(sa4));
     memset(&sa6, 0, sizeof(sa6));
 
@@ -16605,6 +16695,24 @@ main(int argc, char **argv)
 
         if (s3_quic_connect(cli, &s3_cli_conf) != S3_OK) {
             fprintf(stderr, "ssh3: the connect failed\n");
+
+#if (S3_WIN32)
+            /* the wave 16: the hold of the dial failure - the window
+             * stays, the retry rides Ctrl+R, the exit rides Ctrl+C */
+
+            if (s3_cli_inactive_gate_predial() && s3_cli_ring_ready) {
+                unsigned krc = s3_cli_inactive_wait_text(
+                    "ssh3 - the connection could not be established", " (not connected)");
+
+                if (krc == S3_CLI_INACT_RECONNECT) {
+                    s3_cli_reconnect_pending = 1;
+                    s3_cli_teardown_net();
+                    s3_cli_reconnect_reset();
+                    continue;
+                }
+            }
+#endif
+
             s3_cli_teardown();
             return S3_CLI_EXIT_ERROR;
         }
@@ -17274,6 +17382,24 @@ main(int argc, char **argv)
                 s3_current_msec > s3_cli_deadline) {
                 fprintf(stderr, "ssh3: the setup timed out (hs=%u req=%u status=%u ch=%u)\n",
                         s3_cli_hs_done, s3_cli_req_sent, s3_cli_status_seen, s3_cli_ch_sent);
+
+#if (S3_WIN32)
+                /* the wave 16: the hold of the timeout - the server
+                 * may be slow (the loaded peer), the retry rides
+                 * Ctrl+R, the exit rides Ctrl+C */
+
+                if (s3_cli_inactive_gate_predial() && s3_cli_ring_ready) {
+                    unsigned krc = s3_cli_inactive_wait_text(
+                        "ssh3 - the connection could not be established (timeout)",
+                        " (not connected)");
+
+                    if (krc == S3_CLI_INACT_RECONNECT) {
+                        s3_cli_reconnect_pending = 1;
+                        break; /* the pending dispatch re-dials */
+                    }
+                }
+#endif
+
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 break;
             }

@@ -88,6 +88,7 @@
 #include <s3_ssh3_request.h>
 #include <s3_ssh3_reverse.h>
 #include <s3_ssh3_session_srv.h>
+#include <s3_ssh3_session_park.h>
 #include <s3_ssh3_sftp_jail.h>
 #include <s3_ssh3_sftp_srv.h>
 #include <s3_ssh3_version.h>
@@ -1404,6 +1405,9 @@ typedef struct {
      */
     u_char auth[4096];
     size_t auth_len;
+    u_char token[33];
+    size_t token_len;
+    s3_ssh3_session_park_t *attach; /* the lot lookup of the respond */
     u_char ua[128];
     size_t ua_len;
     u_char authority[256];
@@ -1560,6 +1564,8 @@ struct s3_srv_h3_channel_s {
      * the same shape the static verdict buffers ride)
      */
     char sess_user[128];
+    char sess_token[33]; /* the client session token of the connect */
+    s3_ssh3_session_park_t *attach; /* the parked session to bind on the pty-req */
 
     /*
      * the forward side (direct-tcp / direct-udp): fwd_fd is the
@@ -1836,6 +1842,7 @@ s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
     static s3_str_t ua = s3_string("user-agent");
     static s3_str_t authority = s3_string(":authority");
     static s3_str_t scheme = s3_string(":scheme");
+    static s3_str_t token = s3_string("x-ssh3-session-token");
 
     if (f->name.len == method.len && s3_memcmp(f->name.data, method.data, method.len) == 0) {
         s3_srv_h3_store(pa->method, sizeof(pa->method), &pa->method_len, &f->value);
@@ -1859,6 +1866,9 @@ s3_srv_h3_capture(s3_srv_preauth_t *pa, s3_h3_parse_field_t *f)
 
     } else if (f->name.len == scheme.len && s3_memcmp(f->name.data, scheme.data, scheme.len) == 0) {
         s3_srv_h3_store(pa->scheme, sizeof(pa->scheme), &pa->scheme_len, &f->value);
+
+    } else if (f->name.len == token.len && s3_memcmp(f->name.data, token.data, token.len) == 0) {
+        s3_srv_h3_store(pa->token, sizeof(pa->token), &pa->token_len, &f->value);
     }
 
     /* the other field lines are irrelevant to the verdict */
@@ -2860,6 +2870,23 @@ s3_srv_h3_respond(s3_srv_preauth_t *pa, s3_connection_t *pc)
     if (code == 200) {
         s3_srv_report("INTEROP-H3-CONNECT-OK authlen=%zu\n", pa->auth_len);
 
+        /* the parked-session lookup of the wave 16: the fresh auth of
+         * the same user plus the same token binds the attach - the
+         * token alone grants nothing (the auth gate rode first) */
+
+        if (pa->token_len > 0) {
+            pa->attach = s3_ssh3_session_park_find(pa->user[0] != '\0' ? pa->user : NULL,
+                                                   (const char *)pa->token, time(NULL));
+        }
+
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "PARK-DIAG token=%s user=%s attach=%p count=%u\n",
+                    pa->token_len ? (const char *)pa->token : "-",
+                    pa->user[0] != '\0' ? pa->user : "-",
+                    (void *)pa->attach, s3_ssh3_session_park_count());
+            fflush(stderr);
+        }
+    
     } else {
         s3_srv_report("INTEROP-H3-REJECT code=%u\n", code);
     }
@@ -3438,6 +3465,76 @@ s3_srv_session_start(s3_srv_h3_channel_t *ch)
     return S3_OK;
 }
 
+/*
+ * the re-attach of a parked session (the wave 16): the lot hands the
+ * child and its pool back, the ring replays through the same 94 echo
+ * path the pump rides, the geometry re-applies, the watch re-arms
+ * over the channel pump - the old shell state (the login, the cwd,
+ * the env) lives in the child, nothing respawns
+ */
+
+static s3_int_t
+s3_srv_session_reattach(s3_srv_h3_channel_t *ch, uint64_t width, uint64_t height,
+                        uint64_t pixel_width, uint64_t pixel_height)
+{
+    s3_pool_t              *pool = NULL;
+    s3_ssh3_session_srv_t  *sess = NULL;
+    s3_uint_t               alg = 0;
+    u_char                 *replay;
+    size_t                  n;
+
+    s3_ssh3_session_park_t *rec = ch->attach;
+
+    ch->attach = NULL;
+
+    if (rec == NULL) {
+        return S3_ERROR;
+    }
+
+    /* the parked output replays before the fresh bytes: the ring
+     * feeds the echo path one take at a time, the take rides last */
+
+    replay = s3_palloc(s3_ssh3_session_park_pool(rec), S3_SSH3_PARK_RING_SIZE);
+
+    if (replay == NULL) {
+        return S3_ERROR;
+    }
+
+    while ((n = s3_ssh3_session_park_ring_take(rec, replay, S3_SSH3_PARK_RING_SIZE)) > 0) {
+
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "PARK-DIAG replay n=%zu\n", n);
+            fflush(stderr);
+        }
+
+        (void)s3_srv_h3_channel_echo(ch, replay, n);
+    }
+
+    s3_ssh3_session_park_take(rec, &pool, &sess, ch->agent_path, sizeof(ch->agent_path), &alg);
+
+    if (pool == NULL || sess == NULL) {
+        return S3_ERROR;
+    }
+
+    ch->sess_pool = pool;
+    ch->sess = sess;
+    ch->compress_alg = alg;
+
+    /* the geometry of the new console (the term of the child keeps
+     * its original value) */
+
+    if (width != 0 && height != 0) {
+        (void)s3_ssh3_session_srv_window_change(sess, width, height, pixel_width, pixel_height);
+    }
+
+    s3_srv_report("INTEROP-SESSION-ATTACH pid=%d\n", sess->pid);
+
+    return S3_OK;
+}
+
+static unsigned s3_srv_park_seconds = 300;
+static unsigned s3_srv_parked_max = 16;
+
 static void
 s3_srv_session_teardown(s3_srv_h3_channel_t *ch)
 {
@@ -3452,7 +3549,32 @@ s3_srv_session_teardown(s3_srv_h3_channel_t *ch)
 
     s3_ssh3_session_srv_unwatch(s);
 
-    /* the client may vanish mid-session: the process dies here */
+    /* the client may vanish mid-session: the child parks for the
+     * re-attach of the wave 16 (the token + the user must ride, the
+     * pty must live); the park moves the pool and the session out -
+     * the channel teardown below sees NULLs and only closes */
+
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "PARK-DIAG teardown pid=%d token=%s user=%s attach=%p pty=%u\n",
+                s->pid, ch->sess_token[0] != '\0' ? ch->sess_token : "-", ch->sess_user,
+                (void *)ch->attach, (unsigned)s->pty);
+        fflush(stderr);
+    }
+
+    if (s->pid > 0 && !s->exited && ch->attach == NULL && ch->sess_token[0] != '\0' &&
+        s->pty) {
+
+        s3_ssh3_session_park_t *rec = s3_ssh3_session_park_add(
+            ch->sess_pool, &s3_srv_log, ch->sess_pool, s, ch->sess_user, ch->sess_token,
+            ch->agent_path, ch->compress_alg, time(NULL));
+
+        if (rec != NULL) {
+            s3_srv_report("INTEROP-SESSION-PARK pid=%d\n", s->pid);
+            ch->sess_pool = NULL;
+            ch->sess = NULL;
+            return;
+        }
+    }
 
     if (s->pid > 0) {
         (void)kill((pid_t)s->pid, SIGKILL);
@@ -6962,6 +7084,18 @@ s3_srv_h3_channel_read(s3_event_t *ev)
 
                 case S3_SSH3_REQ_PTY:
 
+                    if (ch->attach != NULL &&
+                        s3_srv_session_reattach(ch, req.u.pty.width, req.u.pty.height,
+                                                req.u.pty.pixel_width,
+                                                req.u.pty.pixel_height) == S3_OK) {
+                        ch->sess_intent = 1;
+
+                        s3_srv_session_arm(ch);
+                        s3_srv_session_pump(ch);
+
+                        break;
+                    }
+
                     if (s3_srv_session_start(ch) != S3_OK ||
                         s3_ssh3_session_srv_pty_req(ch->sess, &req.u.pty.term, req.u.pty.width,
                                                     req.u.pty.height, req.u.pty.pixel_width,
@@ -7006,6 +7140,18 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                      */
                     if (!ch->sess_intent) {
                         fprintf(stderr, "ssh3-server: shell without the session intent\n");
+                        break;
+                    }
+
+                    /* the attached session (the wave 16): the shell
+                     * lives, the request rides as a no-op success -
+                     * the spawn would decline and hang the client */
+
+                    if (ch->sess != NULL && ch->sess->open && ch->attach == NULL &&
+                        ch->sess_token[0] != '\0') {
+                        s3_srv_session_arm(ch);
+                        s3_srv_session_pump(ch);
+
                         break;
                     }
 
@@ -7145,6 +7291,25 @@ s3_srv_h3_channel_accept(s3_connection_t *sc)
     /* the session identity of the conversation (P7.3) */
 
     s3_srv_channel_user_snapshot(ch);
+
+    /* the parked-session re-attach of the wave 16: the token rides
+     * the connect, the lookup ran at the respond (the auth passed) */
+
+    {
+        s3_srv_preauth_t *pa2 = s3_srv_preauth_find(ch->pc);
+
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "PARK-DIAG accept pa2=%p token_len=%zu\n", (void *)pa2,
+                    pa2 != NULL ? pa2->token_len : 0);
+            fflush(stderr);
+        }
+
+        if (pa2 != NULL && pa2->token_len > 0 && pa2->token_len < sizeof(ch->sess_token)) {
+            memcpy(ch->sess_token, pa2->token, pa2->token_len);
+            ch->sess_token[pa2->token_len] = '\0';
+            ch->attach = pa2->attach;
+        }
+    }
 
     rev = sc->read;
 
@@ -7871,6 +8036,38 @@ main(int argc, char **argv)
     if (getenv("SSH3C_PROTO") != NULL && strcmp(getenv("SSH3C_PROTO"), "1") == 0) {
         s3_srv_proto_mode = 1;
     }
+
+    /* the session parking lot of the wave 16: the lifetime and the
+     * table cap, 0 seconds disables the parking (the strict openssh
+     * compat - the teardown kills the child as before) */
+
+    if (getenv("SSH3_SESSION_PARK_SECONDS") != NULL) {
+        int secs = atoi(getenv("SSH3_SESSION_PARK_SECONDS"));
+
+        if (secs >= 0) {
+            s3_srv_park_seconds = (unsigned)secs;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_SESSION_PARK_SECONDS \"%s\", using the default",
+                         getenv("SSH3_SESSION_PARK_SECONDS"));
+        }
+    }
+
+    if (getenv("SSH3_PARKED_MAX") != NULL) {
+        int n = atoi(getenv("SSH3_PARKED_MAX"));
+
+        if (n >= 0 && n <= 256) {
+            s3_srv_parked_max = (unsigned)n;
+
+        } else {
+            s3_log_error(S3_LOG_WARN, &s3_srv_log, 0,
+                         "invalid SSH3_PARKED_MAX \"%s\", using the default",
+                         getenv("SSH3_PARKED_MAX"));
+        }
+    }
+
+    s3_ssh3_session_park_setup(s3_srv_parked_max, s3_srv_park_seconds);
 
     /*
      * the DoS guard knobs of the reference (server_auth/dos_guard.go):

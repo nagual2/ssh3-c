@@ -388,6 +388,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_conversation.c
     src/ssh3/s3_ssh3_dgram.c
     src/ssh3/s3_ssh3_session_srv.c
+    src/ssh3/s3_ssh3_session_park.c
     src/ssh3/s3_ssh3_auth_srv.c
     src/ssh3/s3_ssh3_dos_guard.c
     src/ssh3/s3_ssh3_oidc.c
@@ -609,6 +610,7 @@ set(S3_TESTS
     test_ssh3_conversation
     test_ssh3_dgram
     test_ssh3_session_srv
+    test_session_park
     test_ssh3_auth_srv
     test_ssh3_dos_guard
     test_ssh3_oidc
