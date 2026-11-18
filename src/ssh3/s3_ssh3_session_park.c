@@ -109,6 +109,11 @@ s3_park_timer_handler(s3_event_t *ev)
 {
     s3_ssh3_session_park_t *p = (s3_ssh3_session_park_t *)ev->data;
 
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "PARK-DIAG timer-fire p=%p used=%u\\n", (void *)p, (unsigned)p->used);
+        fflush(stderr);
+    }
+
     /* the drain of the parked life: the shell keeps producing, the
      * ring holds the tail for the re-attach replay */
 
@@ -206,6 +211,15 @@ s3_ssh3_session_park_add(s3_pool_t *watch_pool, s3_log_t *log, s3_pool_t *sess_p
     (void)watch_pool;
     p->parked_at = now;
     p->used = 1;
+
+    /* the pump of the old channel dies here: the reap watchdog
+     * re-arms itself through the pump tail (the sinks of the
+     * freed channel) and the parked markers dropped into the
+     * dead sinks forever - the parked drain rides the park
+     * timer alone */
+
+    sess->pump_cb = NULL;
+    sess->pump_ctx = NULL;
 
     for (i = 0; i < s3_park_max; i++) {
 

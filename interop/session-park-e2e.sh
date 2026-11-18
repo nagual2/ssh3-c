@@ -200,7 +200,7 @@ done
 grep -q "INTEROP-SESSION-ATTACH" "$SRVLOG" && pass "the re-dial attached the parked session" ||
     fail "the attach did not ride"
 
-sleep 2
+sleep 9
 
 exec 8>&-
 

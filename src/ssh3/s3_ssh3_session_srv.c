@@ -1158,6 +1158,12 @@ s3_ssh3_session_reap_timer(s3_event_t *ev)
 
     ev->timedout = 0;
 
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "PARK-DIAG reap-fire pid=%d cb=%p\n", s->pid,
+                (void *)s->pump_cb);
+        fflush(stderr);
+    }
+
     if (s->verdict_sent || s->pump_cb == NULL) {
         return;
     }

@@ -3797,6 +3797,12 @@ s3_srv_session_out_sink(void *ctx, const u_char *data, size_t len)
 
     rc = s3_srv_h3_channel_echo(ch, data, len);
 
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "PARK-DIAG out-sink len=%zu rc=%ld sc=%p\n", len, (long)rc,
+                (void *)ch->sc);
+        fflush(stderr);
+    }
+
     if (rc != S3_OK && rc != S3_BUSY) {
         fprintf(stderr, "ssh3-server: session output send failed\n");
     }

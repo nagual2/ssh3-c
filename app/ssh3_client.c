@@ -211,6 +211,15 @@ typedef int s3_cli_cm_h_t;
 #define S3_CLI_SETUP_TIMEOUT 30000
 
 /*
+ * the automatic reconnect interval of the hold (the wave 17): the
+ * banner retries the dial on its own while the window hangs - the
+ * parked session of the server attaches the old shell when it
+ * answers
+ */
+
+#define S3_CLI_RECONNECT_INTERVAL 30000
+
+/*
  * the quic conf guard of the same wave: the engine timer reads a 0
  * as "fire at once" (s3_event_add_timer keys on now+timer), so the
  * no-deadline canon is a day-sized value, not a zero - the server
@@ -5756,6 +5765,11 @@ s3_cli_chan_read(s3_event_t *ev)
     for (;;) {
 
         ssize_t n = sc->recv(sc, buf, sizeof(buf));
+
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "CHAN-DIAG recv n=%zd\n", n);
+            fflush(stderr);
+        }
 
         if (n == (ssize_t)S3_AGAIN) {
             return;
@@ -14347,18 +14361,35 @@ s3_cli_inactive_wait_text(const char *line1, const char *mark)
     size_t   len;
     unsigned k;
     unsigned rc = S3_CLI_INACT_IGNORE;
+    int      ms = 0; /* the hold dwell of the wave 17: the automatic retry */
 
     s3_cli_console_title(mark);
 
     fprintf(stderr, "%s\n", line1);
-    fprintf(stderr, "      Ctrl+R - reconnect, Ctrl+C - exit\n");
+    fprintf(stderr,
+            "      the auto-reconnect every %d s - Ctrl+R retry now, Ctrl+C exit\n",
+            S3_CLI_RECONNECT_INTERVAL / 1000);
 
     while (rc == S3_CLI_INACT_IGNORE) {
 
         Sleep(30);
+        ms += 30;
 
         if (!s3_cli_ring_ready) {
             break; /* the console died under the hold - exit the plain way */
+        }
+
+        /* the automatic retry of the wave 17: the same reconnect the
+         * Ctrl+R rides - the parked session of the server attaches
+         * the old shell when it answers.  the pending dispatch of the
+         * outer cycle dials through the reconnect_reset */
+
+        if (ms >= S3_CLI_RECONNECT_INTERVAL) {
+            s3_cli_reconnect_pending = 1;
+            s3_cli_console_title("");
+            fprintf(stderr, "      reconnecting...\n");
+
+            return S3_CLI_INACT_RECONNECT;
         }
 
         len = 0;
