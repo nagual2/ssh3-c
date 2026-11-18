@@ -220,6 +220,16 @@ typedef int s3_cli_cm_h_t;
 #define S3_CLI_RECONNECT_INTERVAL 30000
 
 /*
+ * the reconnect budget of the automatic mode (the -n): the retries
+ * cover the server parking window (the SSH3_SESSION_PARK_SECONDS
+ * default of 300 s at the 30 s interval = ten attempts), the budget
+ * resets on the first successful ride - the continuous outage
+ * exhausts it, the script exits with the error
+ */
+
+#define S3_CLI_RECONNECT_BUDGET_RETRIES 10
+
+/*
  * the quic conf guard of the same wave: the engine timer reads a 0
  * as "fire at once" (s3_event_add_timer keys on now+timer), so the
  * no-deadline canon is a day-sized value, not a zero - the server
@@ -1115,6 +1125,7 @@ static unsigned         s3_cli_ring_ready; /* the ring cs lives (the B22 gate) *
  */
 
 static unsigned s3_cli_reconnect_pending;
+static unsigned s3_cli_retry_count; /* the continuous-outage retries of the -n */
 
 /* the channel death mark (the recv error or the server fin before
  * the verdict): the interactive hold fires on it at once - the quic
@@ -6495,6 +6506,12 @@ s3_cli_sftp_read(s3_event_t *ev)
 
                 s3_cli_ch_peer_mps = conf.max_packet_size;
                 s3_cli_ch_confirmed = 1;
+
+                /* the ride resets the reconnect budget of the
+                 * automatic mode (the continuous outage exhausts
+                 * it, the fresh ride restarts the window) */
+
+                s3_cli_retry_count = 0;
 
                 /* the channel is confirmed: the parked INIT rides */
 
@@ -16786,6 +16803,15 @@ main(int argc, char **argv)
              * quic grave-wagon: the finalize of a dead conn rides the PTO
              * probes for minutes, the window must hold at once */
 
+            /* the automatic mode (-n): the silent reconnect, no
+             * banners - the retries cover the server parking window
+             * (the wave 17), the budget check rides the dispatch */
+
+            if (s3_cli_chan_dead && s3_cli_no_stdin) {
+                s3_cli_reconnect_pending = 1;
+                break;
+            }
+
             if (s3_cli_chan_dead && s3_cli_inactive_gate()) {
                 s3_cli_rc = S3_CLI_EXIT_ERROR;
                 (void)s3_cli_inactive_wait(); /* the reconnect_pending rides */
@@ -16828,6 +16854,14 @@ main(int argc, char **argv)
                  * banner marks the inactive state, the Ctrl+R arms the
                  * reconnect (the outer main loop re-dials), the Ctrl+C
                  * and the window close exit */
+
+                /* the automatic mode (-n): the silent reconnect (the
+                 * wave 17) */
+
+                if (s3_cli_no_stdin) {
+                    s3_cli_reconnect_pending = 1;
+                    break;
+                }
 
                 if (s3_cli_inactive_gate()) {
                     s3_cli_rc = S3_CLI_EXIT_ERROR;
@@ -17480,6 +17514,20 @@ main(int argc, char **argv)
         if (s3_cli_reconnect_pending) {
 
             s3_cli_reconnect_pending = 0;
+
+            /* the automatic mode (-n): the retries cover the server
+             * parking window, the exhausted budget exits the script
+             * with the error (the single line, no banners) */
+
+            if (s3_cli_no_stdin) {
+                s3_cli_retry_count++;
+
+                if (s3_cli_retry_count > S3_CLI_RECONNECT_BUDGET_RETRIES) {
+                    fprintf(stderr,
+                            "ssh3: the reconnect budget exhausted (the server session parking window)\n");
+                    break;
+                }
+            }
 
             s3_cli_teardown_net();
 
