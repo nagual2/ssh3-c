@@ -1,3 +1,17 @@
+ssh3-c (0.5.18-1) unstable; urgency=medium
+
+  * New upstream release 0.5.18: the session parking lot and the
+    re-attach of the wave 16/17 - the interactive and the exec
+    sessions of a dead connection park (the child lives, the output
+    drains into the bounded ring), the re-dial of the same token
+    attaches the parked session and the command never runs twice;
+    the win hold lands the dial failures on the banner (the wave 12
+    extension) and the hold auto-retries every 30 s; the -n mode
+    rides the silent reconnect with the budget of the parking
+    window (the exhausted budget exits 255); the ssh3-cert utility
+    rides the rpm/apk/openwrt channels; the deb version derives
+    from the binary (the release class of the failures closed)
+
 ssh3-c (0.5.17-1) unstable; urgency=medium
 
   * New upstream release 0.5.17: the pass 5 security review fix

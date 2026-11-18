@@ -129,6 +129,12 @@ s3_ssh3_session_cli_pend_append(s3_ssh3_session_cli_t *s, const u_char *data, si
 s3_int_t
 s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t len)
 {
+
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "CHAN-DIAG parse in=%zu\n", len);
+        fflush(stderr);
+    }
+
     s3_ssh3_msg_request_t  req;
     s3_ssh3_request_kind_t kind;
     const u_char          *msg, *p, *end;
