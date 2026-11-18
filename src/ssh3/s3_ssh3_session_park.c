@@ -370,6 +370,32 @@ s3_ssh3_session_park_drain(s3_ssh3_session_park_t *p)
 
         r = s3_ssh3_session_srv_read_output(s, buf, sizeof(buf));
 
+        /* the stderr pipe of the pipe-shaped sessions (the exec runs
+         * without a pty) drains into the same ring */
+
+        {
+            ssize_t e = s3_ssh3_session_srv_read_stderr(s, buf, sizeof(buf));
+
+            if (e > 0) {
+
+                if ((size_t)e >= sizeof(p->ring)) {
+                    e = sizeof(p->ring);
+                }
+
+                if (p->ring_len + (size_t)e > sizeof(p->ring)) {
+                    size_t drop = p->ring_len + (size_t)e - sizeof(p->ring);
+
+                    p->ring_head = (p->ring_head + drop) % sizeof(p->ring);
+                    p->ring_len -= drop;
+                }
+
+                for (ssize_t k = 0; k < e; k++) {
+                    p->ring[(p->ring_head + p->ring_len) % sizeof(p->ring)] = buf[k];
+                    p->ring_len++;
+                }
+            }
+        }
+
         if (getenv("S3_PARK_DIAG") != NULL) {
             fprintf(stderr, "PARK-DIAG drain r=%zd\n", r);
             fflush(stderr);

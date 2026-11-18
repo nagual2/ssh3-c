@@ -171,54 +171,26 @@ done
 grep -q "INTEROP-SESSION-PARK" "$SRVLOG" && pass "the session parked on the connection death" ||
     fail "the park did not ride ($(grep -cE 'PARK|CANCEL|ATTACH' "$SRVLOG") markers)"
 
-# the re-dial: the same token, the interactive shape (the attach
-# resumes the OLD shell - the exec cannot ride by design); the fifo
-# stdin closes after the replay lands - the client sends the input
-# EOF and the resumed shell exits with the verdict
-
-mkfifo "$WORK/in2.fifo"
+# the re-dial: the same token, the exec form - the attach rides at
+# the exec dispatch and the command of the re-dial is a NO-OP (the
+# original command already runs in the parked child): the parked+live
+# markers deliver, the command never runs twice (the wave 17)
 
 S3_SESSION_TOKEN=aabbccdd00112233445566778899aabb \
-    setsid nohup "$CLI" -insecure -i "$WORK/priv.pem" \
-    "client@127.0.0.1:$SRVPORT/ssh3-term" < "$WORK/in2.fifo" > "$WORK/run2.out" 2>&1 &
-CLI2PID=$!
-
-exec 8> "$WORK/in2.fifo"
-
-i=0
-
-while [ "$i" -lt 100 ]; do
-
-    if grep -q "INTEROP-SESSION-ATTACH" "$SRVLOG" 2>/dev/null; then
-        break
-    fi
-
-    sleep 0.1
-    i=$((i + 1))
-done
+    timeout 60 "$CLI" -n -insecure -i "$WORK/priv.pem" \
+    "client@127.0.0.1:$SRVPORT/ssh3-term" "echo ATTACH-RIDE" \
+    < /dev/null > "$WORK/run2.out" 2>&1
 
 grep -q "INTEROP-SESSION-ATTACH" "$SRVLOG" && pass "the re-dial attached the parked session" ||
     fail "the attach did not ride"
 
-sleep 9
+grep -qE "PARK-M-[2-9]|PARK-M-10" "$WORK/run2.out" &&
+    pass "the parked command output delivered (the ring + the live tail)" ||
+    fail "the command output is missing ($(tail -2 "$WORK/run2.out" | tr '\n' ' '))"
 
-exec 8>&-
-
-i=0
-
-while [ "$i" -lt 100 ]; do
-
-    if ! kill -0 "$CLI2PID" 2>/dev/null; then
-        break
-    fi
-
-    sleep 0.1
-    i=$((i + 1))
-done
-
-grep -qE "PARK-M-[5-9]|PARK-M-10" "$WORK/run2.out" &&
-    pass "the parked output replayed through the ring" ||
-    fail "the ring replay is missing ($(tail -2 "$WORK/run2.out" | tr '\n' ' '))"
+grep -q "ATTACH-RIDE" "$WORK/run2.out" &&
+    fail "the re-dial command re-ran (the no-op exec broke)" ||
+    pass "the re-dial command stayed a no-op (the command ran once)"
 
 # the control: the fresh dial (no token) - the new session, no parked
 # replay

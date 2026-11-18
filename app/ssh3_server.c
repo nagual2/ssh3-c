@@ -3555,14 +3555,13 @@ s3_srv_session_teardown(s3_srv_h3_channel_t *ch)
      * the channel teardown below sees NULLs and only closes */
 
     if (getenv("S3_PARK_DIAG") != NULL) {
-        fprintf(stderr, "PARK-DIAG teardown pid=%d token=%s user=%s attach=%p pty=%u\n",
+        fprintf(stderr, "PARK-DIAG teardown pid=%d token=%s user=%s attach=%p\n",
                 s->pid, ch->sess_token[0] != '\0' ? ch->sess_token : "-", ch->sess_user,
-                (void *)ch->attach, (unsigned)s->pty);
+                (void *)ch->attach);
         fflush(stderr);
     }
 
-    if (s->pid > 0 && !s->exited && ch->attach == NULL && ch->sess_token[0] != '\0' &&
-        s->pty) {
+    if (s->pid > 0 && !s->exited && ch->attach == NULL && ch->sess_token[0] != '\0') {
 
         s3_ssh3_session_park_t *rec = s3_ssh3_session_park_add(
             ch->sess_pool, &s3_srv_log, ch->sess_pool, s, ch->sess_user, ch->sess_token,
@@ -7118,6 +7117,23 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     break;
 
                 case S3_SSH3_REQ_EXEC:
+
+                    /* the parked-session re-attach (the wave 17): the
+                     * command already runs in the parked child - the
+                     * exec request rides as a no-op success, the ring
+                     * replay and the live output resume */
+
+                    if (ch->attach != NULL &&
+                        s3_srv_session_reattach(ch, 0, 0, 0, 0) == S3_OK) {
+                        ch->sess_intent = 1;
+
+                        s3_srv_report("INTEROP-SESSION-ATTACH\n");
+
+                        s3_srv_session_arm(ch);
+                        s3_srv_session_pump(ch);
+
+                        break;
+                    }
 
                     if (s3_srv_session_start(ch) != S3_OK ||
                         s3_ssh3_session_srv_exec(ch->sess, s3_srv_session_shell_of(ch),
