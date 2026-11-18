@@ -17525,6 +17525,7 @@ main(int argc, char **argv)
                 if (s3_cli_retry_count > S3_CLI_RECONNECT_BUDGET_RETRIES) {
                     fprintf(stderr,
                             "ssh3: the reconnect budget exhausted (the server session parking window)\n");
+                    s3_cli_rc = S3_CLI_EXIT_ERROR;
                     break;
                 }
             }
