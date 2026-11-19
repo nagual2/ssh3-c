@@ -1,4 +1,16 @@
-ssh3-c (0.5.19-1) unstable; urgency=medium
+ssh3-c (0.5.20-1) unstable; urgency=medium
+
+  * New upstream release 0.5.20: the errqueue fast-close of the dead
+    peers - the listener sockets switch IP_RECVERR/IPV6_RECVERR on,
+    the ICMP errors of the sent datagrams land in the errqueue, the
+    drain closes the connection of the dead peer ~200 ms after the
+    client death (the retransmit timeout rode ~10 s); the session
+    park fires before the pump drains the pty into the dead stream,
+    the ring replay keeps the output; the close posts instead of
+    cutting the teardown into the listener dispatch; the
+    ECONNREFUSED of the send path turns soft when the errqueue owns
+    the socket
+
 
   * New upstream release 0.5.19: the session parking and the
     re-attach wave lands - the interactive and the exec sessions of
