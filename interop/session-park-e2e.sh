@@ -177,7 +177,7 @@ grep -q "INTEROP-SESSION-PARK" "$SRVLOG" && pass "the session parked on the conn
 # markers deliver, the command never runs twice (the wave 17)
 
 S3_SESSION_TOKEN=aabbccdd00112233445566778899aabb \
-    timeout 60 "$CLI" -n -insecure -i "$WORK/priv.pem" \
+    timeout -k 5 60 "$CLI" -n -insecure -i "$WORK/priv.pem" \
     "client@127.0.0.1:$SRVPORT/ssh3-term" "echo ATTACH-RIDE" \
     < /dev/null > "$WORK/run2.out" 2>&1
 

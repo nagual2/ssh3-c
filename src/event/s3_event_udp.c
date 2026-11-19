@@ -83,6 +83,168 @@ s3_sockaddr_wildcard(const struct sockaddr *sa)
     return 0;
 }
 
+#if (S3_HAVE_QUIC) && defined(MSG_ERRQUEUE)
+
+/*
+ * the peer compare of the fast close: the errqueue delivers the
+ * destination address of the failed datagram in msg_name, the sockets
+ * of the listener rbtree match on the family, the port and the bytes
+ * of the address (the raw storage compare would read the padding)
+ */
+
+static s3_int_t
+s3_udp_peer_equal(struct sockaddr *sa1, void *sa2)
+{
+    struct sockaddr_in   *sin1, *sin2;
+    struct sockaddr_in6  *sin61, *sin62;
+    struct sockaddr      *sa = (struct sockaddr *)sa2;
+
+    if (sa1->sa_family != sa->sa_family) {
+        return 0;
+    }
+
+    if (sa1->sa_family == AF_INET) {
+        sin1 = (struct sockaddr_in *)sa1;
+        sin2 = (struct sockaddr_in *)sa2;
+
+        return sin1->sin_port == sin2->sin_port &&
+               sin1->sin_addr.s_addr == sin2->sin_addr.s_addr;
+    }
+
+    if (sa1->sa_family == AF_INET6) {
+        sin61 = (struct sockaddr_in6 *)sa1;
+        sin62 = (struct sockaddr_in6 *)sa2;
+
+        return sin61->sin6_port == sin62->sin6_port &&
+               s3_memcmp(&sin61->sin6_addr, &sin62->sin6_addr,
+                         sizeof(struct in6_addr)) == 0 &&
+               sin61->sin6_scope_id == sin62->sin6_scope_id;
+    }
+
+    return 0;
+}
+
+#define S3_UDP_ERRQUEUE_VICTIMS 8
+
+/*
+ * the errqueue drain of the fast close (the wave 18): one recvmsg()
+ * with MSG_ERRQUEUE carries the error of one dead datagram, the peer
+ * address rides in msg_name, the sockets of the listener rbtree match
+ * on it and the connections close (S3_ABORT, the silent drain) - the
+ * stream reads error out and the channel handlers see the death
+ * before the retransmit timeout
+ */
+
+static void
+s3_quic_errqueue_drain(s3_event_t *ev, s3_connection_t *lc, s3_udp_listen_t *ul)
+{
+
+    /* the log rides the release builds out: the param keeps its use */
+
+    (void)ev;
+
+    u_char                  ctrl[512];
+    u_char                  scratch[64];
+    struct sockaddr_storage esa;
+    struct iovec            iov;
+    s3_udp_msg_t            emsg;
+    s3_connection_t        *victims[S3_UDP_ERRQUEUE_VICTIMS];
+    size_t                  nv, i;
+    ssize_t                 n;
+    s3_rbtree_node_t       *node, *next, *sentinel;
+    s3_quic_socket_t       *qsock;
+
+    for (;;) {
+
+        s3_memzero(&emsg, sizeof(s3_udp_msg_t));
+
+        iov.iov_base = (void *)scratch;
+        iov.iov_len = sizeof(scratch);
+
+        emsg.msg_name = &esa;
+        emsg.msg_namelen = sizeof(esa);
+        emsg.msg_iov = &iov;
+        emsg.msg_iovlen = 1;
+        emsg.msg_control = ctrl;
+        emsg.msg_controllen = sizeof(ctrl);
+
+        n = recvmsg(lc->fd, &emsg, MSG_ERRQUEUE | MSG_DONTWAIT);
+
+        if (n < 0) {
+            /* the queue is empty (EAGAIN) or the platform declines */
+            return;
+        }
+
+        if (emsg.msg_namelen == 0) {
+            continue;
+        }
+
+        nv = 0;
+
+        node = s3_rbtree_min(ul->rbtree.root, ul->rbtree.sentinel);
+        sentinel = ul->rbtree.sentinel;
+
+        /* the next() of the last node returns NULL, the sentinel is
+         * the empty-tree shape: both end the walk */
+
+        while (node != NULL && node != sentinel) {
+
+            next = s3_rbtree_next(&ul->rbtree, node);
+
+            qsock = (s3_quic_socket_t *)node;
+
+            if (qsock->connection != NULL &&
+                s3_udp_peer_equal((struct sockaddr *)&esa, &qsock->sockaddr)) {
+
+                /*
+                 * the socket leaves the tree before the close: a
+                 * deferred close (the streams hold the teardown until
+                 * they drain) keeps the sockets registered until the
+                 * completion, the next errqueue entry would walk the
+                 * freed nodes - the strip makes every later entry a
+                 * no-op and the close of the completion skips the
+                 * double delete (the listen backlink is null)
+                 */
+
+                if (qsock->listen != NULL) {
+                    s3_rbtree_delete(&qsock->listen->rbtree, &qsock->node);
+                    qsock->listen = NULL;
+                }
+
+                for (i = 0; i < nv; i++) {
+                    if (victims[i] == qsock->connection) {
+                        break;
+                    }
+                }
+
+                if (i == nv && nv < S3_UDP_ERRQUEUE_VICTIMS) {
+                    victims[nv++] = qsock->connection;
+                }
+            }
+
+            node = next;
+        }
+
+        for (i = 0; i < nv; i++) {
+            s3_log_debug0(S3_LOG_DEBUG_EVENT, ev->log, 0,
+                          "errqueue dead peer, the quic connection closes");
+
+            /*
+             * the close posts instead of running here: the teardown
+             * (the streams, the h3 callbacks, the pool destroy) rides
+             * its own pass - the sync shape cut it into the middle of
+             * the listener dispatch and the stale stream events of the
+             * same batch processed the freed channel
+             */
+
+            s3_quic_finalize_connection(victims[i], S3_QUIC_ERR_INTERNAL_ERROR,
+                                        "errqueue dead peer");
+        }
+    }
+}
+
+#endif /* S3_HAVE_QUIC && MSG_ERRQUEUE */
+
 void
 s3_event_recvmsg(s3_event_t *ev)
 {
@@ -198,6 +360,14 @@ s3_event_recvmsg(s3_event_t *ev)
     }
 
 #else
+
+#if (S3_HAVE_QUIC) && defined(MSG_ERRQUEUE)
+
+    /* the errors of the dead peers ride before the normal receive */
+
+    s3_quic_errqueue_drain(ev, lc, ul);
+
+#endif
 
     n = s3_udp_recvmsg(lc->fd, &msg);
 

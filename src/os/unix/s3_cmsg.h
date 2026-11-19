@@ -47,4 +47,12 @@ s3_int_t s3_enable_pktinfo(int fd, struct sockaddr *sockaddr);
 
 #endif /* S3_HAVE_ADDRINFO_CMSG */
 
+/*
+ * enables the errqueue of a datagram socket (the fast close, the
+ * wave 18): the ICMP errors of the sent datagrams deliver with the
+ * option on, the listener drain closes the dead peer connections; a
+ * no-op where the platform has no IP_RECVERR
+ */
+s3_int_t s3_enable_recverr(int fd, struct sockaddr *sockaddr);
+
 #endif /* _S3_CMSG_H_INCLUDED_ */

@@ -4,6 +4,8 @@
  * Copyright (C) 2026 the ssh3-c authors
  */
 
+#include <netinet/in.h>
+
 #include <s3_core.h>
 
 #include <s3_udp_sendmsg_chain.h>
@@ -288,6 +290,39 @@ eintr:
 
             s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, err, "sendmsg() datagram too large");
             return (ssize_t)S3_DECLINED;
+
+#if defined(IP_RECVERR)
+
+        case S3_ECONNREFUSED:
+
+            /*
+             * the errqueue listener (the wave 18): with IP_RECVERR the
+             * kernel queues the ICMP report into the errqueue and the
+             * next sendmsg consumes the stale sk_err with this errno -
+             * the datagram itself is innocent, the report rides the
+             * errqueue and the listener drain closes the dead peer;
+             * the soft shape keeps the push cycle alive (the retransmit
+             * timer re-arms), the sockets without IP_RECVERR keep the
+             * fatal shape below - their death detection rides it
+             */
+
+            {
+                int      recverr = 0;
+                socklen_t len = sizeof(recverr);
+
+                if (getsockopt(c->fd, SOL_IP, IP_RECVERR, &recverr, &len) == 0 && recverr) {
+                    s3_log_debug0(S3_LOG_DEBUG_EVENT, c->log, err,
+                                  "sendmsg() refused, the errqueue owns the report");
+                    return (ssize_t)S3_AGAIN;
+                }
+            }
+
+            /* no IP_RECVERR on the socket: the error is fatal */
+
+            c->write->error = 1;
+            s3_log_error(S3_LOG_ERR, c->log, err, "sendmsg() failed");
+            return (ssize_t)S3_ERROR;
+#endif
 
         default:
             c->write->error = 1;

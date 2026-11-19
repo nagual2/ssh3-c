@@ -158,3 +158,46 @@ s3_enable_pktinfo(int fd, struct sockaddr *sockaddr)
 }
 
 #endif /* S3_HAVE_ADDRINFO_CMSG */
+
+s3_int_t
+s3_enable_recverr(int fd, struct sockaddr *sockaddr)
+{
+    int value = 1;
+
+    /*
+     * the errqueue of the fast close (the wave 18): the kernel
+     * delivers the ICMP errors of the sent datagrams only with the
+     * option on, the listener drain reads them via MSG_ERRQUEUE and
+     * closes the connection of the dead peer before the retransmit
+     * timeout burns the parked session output
+     */
+
+#if defined(IP_RECVERR) && defined(IPV6_RECVERR)
+
+    if (sockaddr->sa_family == AF_INET) {
+        if (setsockopt(fd, SOL_IP, IP_RECVERR, &value, sizeof(value)) == -1) {
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+    if (sockaddr->sa_family == AF_INET6) {
+        if (setsockopt(fd, SOL_IPV6, IPV6_RECVERR, &value, sizeof(value)) == -1) {
+            return S3_ERROR;
+        }
+
+        return S3_OK;
+    }
+
+#else
+
+    (void)fd;
+    (void)value;
+
+#endif
+
+    (void)sockaddr;
+
+    return S3_OK;
+}

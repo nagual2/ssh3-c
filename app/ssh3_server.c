@@ -6856,9 +6856,14 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                     ch->sess_token, ch->agent_path, ch->compress_alg, time(NULL));
 
                 if (rec != NULL) {
+
+                    /* the report reads the pid while the type is
+                     * complete: the park record is opaque here */
+
+                    s3_srv_report("INTEROP-SESSION-PARK pid=%d\n", (int)ch->sess->pid);
+
                     ch->sess_pool = NULL;
                     ch->sess = NULL;
-                    s3_srv_report("INTEROP-SESSION-PARK pid=%d\n", rec->sess->pid);
                 }
             }
 
@@ -7723,6 +7728,11 @@ s3_srv_sd_listen_fds(int                     fds[S3_SRV_SD_LISTEN_MAX],
         if (s3_enable_pktinfo(fds[i], (struct sockaddr *)&sa[i]) != S3_OK) {
             s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
                          "setsockopt(IP_PKTINFO) of the socket-activated fd %d failed", fds[i]);
+        }
+
+        if (s3_enable_recverr(fds[i], (struct sockaddr *)&sa[i]) != S3_OK) {
+            s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
+                         "setsockopt(IP_RECVERR) of the socket-activated fd %d failed", fds[i]);
         }
 
         if (sa[i].ss_family == AF_INET6) {
@@ -9069,6 +9079,18 @@ main(int argc, char **argv)
         if (s3_enable_pktinfo(fd, (struct sockaddr *)&listen_sa[0]) != S3_OK) {
             s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
                          "setsockopt(IP_PKTINFO) failed, the local address of a packet is unknown");
+        }
+
+        /*
+         * the errqueue of the fast close (the wave 18): the ICMP
+         * errors of the dead peers deliver with the option on, the
+         * listener drain closes the connection before the retransmit
+         * timeout (a failure is not fatal: the peers close slow)
+         */
+
+        if (s3_enable_recverr(fd, (struct sockaddr *)&listen_sa[0]) != S3_OK) {
+            s3_log_error(S3_LOG_ALERT, &s3_srv_log, s3_socket_errno,
+                         "setsockopt(IP_RECVERR) failed, the dead peers close slow");
         }
 
         if (s3_nonblocking(fd) != S3_OK) {
