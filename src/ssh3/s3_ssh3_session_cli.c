@@ -159,6 +159,12 @@ s3_ssh3_session_cli_input(s3_ssh3_session_cli_t *s, const u_char *data, size_t l
             goto partial;
         }
 
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "CHAN-DIAG parse type=%llu confirmed=%u\n",
+                    (unsigned long long)type, (unsigned)s->confirmed);
+            fflush(stderr);
+        }
+
         /* the session opens with the 91, nothing rides before it */
 
         if (!s->confirmed && type != S3_SSH3_MSG_CHANNEL_OPEN_CONFIRMATION) {
