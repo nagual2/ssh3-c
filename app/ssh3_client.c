@@ -5778,7 +5778,16 @@ s3_cli_chan_read(s3_event_t *ev)
         ssize_t n = sc->recv(sc, buf, sizeof(buf));
 
         if (getenv("S3_PARK_DIAG") != NULL) {
-            fprintf(stderr, "CHAN-DIAG recv n=%zd\n", n);
+            char dump[97];
+            size_t di, dn = n > 0 ? ((size_t)n < 32 ? (size_t)n : 32) : 0;
+
+            for (di = 0; di < dn; di++) {
+                snprintf(dump + di * 3, 4, "%02x ", buf[di]);
+            }
+
+            dump[dn * 3] = '\0';
+
+            fprintf(stderr, "CHAN-DIAG recv n=%zd head=%s\n", n, dump);
             fflush(stderr);
         }
 

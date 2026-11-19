@@ -3529,6 +3529,20 @@ s3_srv_session_reattach(s3_srv_h3_channel_t *ch, uint64_t width, uint64_t height
 
     s3_srv_report("INTEROP-SESSION-ATTACH pid=%d\n", sess->pid);
 
+    /* the pending replay and the live output ride the sess_timer of
+     * the channel: the recycled watch connections of the attached
+     * session do not deliver the readiness reliably (the epochs of
+     * the previous lives) - the 50 ms tick of the B19b backpressure
+     * pumps the queue until it drains */
+
+    if (!ch->sess_timer.timer_set) {
+        ch->sess_timer.data = ch;
+        ch->sess_timer.log = &s3_srv_log;
+        ch->sess_timer.handler = s3_srv_session_timer;
+
+        s3_event_add_timer(&ch->sess_timer, 50);
+    }
+
     return S3_OK;
 }
 
@@ -3709,6 +3723,20 @@ s3_srv_session_flush(s3_srv_h3_channel_t *ch)
 
         ssize_t m = s3_quic_stream_send(ch->sc, ch->sess_out, ch->sess_out_len);
 
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            char dump[97];
+            size_t di, dn = ch->sess_out_len < 32 ? ch->sess_out_len : 32;
+
+            for (di = 0; di < dn; di++) {
+                snprintf(dump + di * 3, 4, "%02x ", ch->sess_out[di]);
+            }
+            dump[dn * 3] = '\0';
+
+            fprintf(stderr, "PARK-DIAG send m=%zd left=%zu head=%s\n", m, ch->sess_out_len,
+                    dump);
+            fflush(stderr);
+        }
+
         if (m == (ssize_t)S3_AGAIN) {
             break;
         }
@@ -3851,6 +3879,12 @@ static void
 s3_srv_session_pump(s3_srv_h3_channel_t *ch)
 {
     s3_ssh3_session_srv_io_t io;
+
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "PARK-DIAG pump enter sc=%p sess=%p out_len=%zu\n", (void *)ch->sc,
+                (void *)ch->sess, ch->sess_out_len);
+        fflush(stderr);
+    }
 
     if (ch->sc == NULL) {
         return;

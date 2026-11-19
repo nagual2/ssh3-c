@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 #define S3_PARK_USER_MAX 128
-#define S3_PARK_TIMER_MS 250
+#define S3_PARK_TIMER_MS 500
 
 struct s3_ssh3_session_park_s {
     s3_pool_t             *sess_pool; /* owns the session struct */
