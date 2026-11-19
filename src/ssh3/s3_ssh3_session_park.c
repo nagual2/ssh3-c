@@ -50,10 +50,9 @@ static s3_ssh3_session_park_t **s3_park_table;
 static unsigned                 s3_park_max;
 static unsigned                 s3_park_lifetime;
 static unsigned                 s3_park_count;
-static s3_log_t                *s3_park_log;
 
 static void s3_park_kill_locked(s3_ssh3_session_park_t *p);
-static void s3_park_timer_handler(s3_event_t *ev);
+static void s3_park_drain_cb(void *ctx);
 
 void
 s3_ssh3_session_park_setup(unsigned max, unsigned lifetime_sec)
@@ -94,34 +93,19 @@ s3_ssh3_session_park_count(void)
     return s3_park_count;
 }
 
-static void
-s3_park_timer_arm(s3_ssh3_session_park_t *p)
-{
-    p->park_timer.log = s3_park_log;
-    p->park_timer.data = p;
-    p->park_timer.handler = s3_park_timer_handler;
-
-    s3_event_add_timer(&p->park_timer, S3_PARK_TIMER_MS);
-}
+/*
+ * the parked pump callback of the session watchdog: the reap timer
+ * of the module re-arms itself through this callback and the ring
+ * holds the shell output for the re-attach replay (the fresh event
+ * timer of the first shape never expired in the daemon context)
+ */
 
 static void
-s3_park_timer_handler(s3_event_t *ev)
+s3_park_drain_cb(void *ctx)
 {
-    s3_ssh3_session_park_t *p = (s3_ssh3_session_park_t *)ev->data;
-
-    if (getenv("S3_PARK_DIAG") != NULL) {
-        fprintf(stderr, "PARK-DIAG timer-fire p=%p used=%u\\n", (void *)p, (unsigned)p->used);
-        fflush(stderr);
-    }
-
-    /* the drain of the parked life: the shell keeps producing, the
-     * ring holds the tail for the re-attach replay */
+    s3_ssh3_session_park_t *p = ctx;
 
     s3_ssh3_session_park_drain(p);
-
-    if (p->used) {
-        s3_park_timer_arm(p);
-    }
 }
 
 static void
@@ -131,11 +115,10 @@ s3_park_kill_locked(s3_ssh3_session_park_t *p)
 
     if (s != NULL) {
 
-        s3_ssh3_session_srv_unwatch(s);
+        s->pump_cb = NULL;
+        s->pump_ctx = NULL;
 
-        if (p->park_timer.timer_set) {
-            s3_event_del_timer(&p->park_timer);
-        }
+        s3_ssh3_session_srv_unwatch(s);
 
         if (s->pid > 0) {
             (void)kill((pid_t)s->pid, SIGKILL);
@@ -212,14 +195,15 @@ s3_ssh3_session_park_add(s3_pool_t *watch_pool, s3_log_t *log, s3_pool_t *sess_p
     p->parked_at = now;
     p->used = 1;
 
-    /* the pump of the old channel dies here: the reap watchdog
-     * re-arms itself through the pump tail (the sinks of the
-     * freed channel) and the parked markers dropped into the
-     * dead sinks forever - the parked drain rides the park
-     * timer alone */
+    /*
+     * the parked drain takes the seat of the old channel pump: the
+     * reap watchdog of the module (100 ms, re-arms itself through
+     * the callback) keeps draining the pty into the ring - the
+     * markers of the parked shell hold for the re-attach replay
+     */
 
-    sess->pump_cb = NULL;
-    sess->pump_ctx = NULL;
+    sess->pump_cb = s3_park_drain_cb;
+    sess->pump_ctx = p;
 
     for (i = 0; i < s3_park_max; i++) {
 
@@ -230,13 +214,10 @@ s3_ssh3_session_park_add(s3_pool_t *watch_pool, s3_log_t *log, s3_pool_t *sess_p
         s3_park_table[i] = p;
         s3_park_count++;
 
-        /* the detached session keeps NO watch (the recycled watch
-         * connections of a detached life do not deliver) - the
-         * periodic timer drains the pty into the ring */
+        /* the session watch stays alive across the park: the fd
+         * readiness wakes the parked drain (and the reap watchdog
+         * ticks as the backstop) */
 
-        s3_ssh3_session_srv_unwatch(sess);
-
-        s3_park_timer_arm(p);
         s3_ssh3_session_park_drain(p);
 
         return p;
@@ -319,11 +300,10 @@ s3_ssh3_session_park_take(s3_ssh3_session_park_t *p, s3_pool_t **sess_pool,
     /* the parked drain stops: the timer dies, the attaching channel
      * re-arms the fd watches of the live pump */
 
-    if (p->park_timer.timer_set) {
-        s3_event_del_timer(&p->park_timer);
+    if (p->sess != NULL) {
+        p->sess->pump_cb = NULL;
+        p->sess->pump_ctx = NULL;
     }
-
-    s3_ssh3_session_srv_unwatch(p->sess);
 
     *sess_pool = p->sess_pool;
     *sess = p->sess;
