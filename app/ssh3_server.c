@@ -3548,6 +3548,7 @@ s3_srv_session_reattach(s3_srv_h3_channel_t *ch, uint64_t width, uint64_t height
 }
 
 static unsigned s3_srv_park_seconds = 300;
+static const char *s3_srv_pump_caller = "?";
 static unsigned s3_srv_parked_max = 16;
 
 static void
@@ -3917,7 +3918,8 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
 
         (void)poll(&pf, 1, 0);
 
-        fprintf(stderr, "PARK-DIAG pump fd=%d poll=%hd\n", pf.fd, pf.revents);
+        fprintf(stderr, "PARK-DIAG pump fd=%d poll=%hd caller=%s\n", pf.fd, pf.revents,
+                s3_srv_pump_caller);
         fflush(stderr);
     }
 
@@ -3982,6 +3984,8 @@ s3_srv_session_timer(s3_event_t *ev)
         return;
     }
 
+    s3_srv_pump_caller = "sess_timer";
+
     s3_srv_session_pump(ch);
 }
 
@@ -3990,6 +3994,8 @@ s3_srv_session_timer(s3_event_t *ev)
 static void
 s3_srv_session_pump_cb(void *ctx)
 {
+    s3_srv_pump_caller = "watch";
+
     s3_srv_session_pump((s3_srv_h3_channel_t *)ctx);
 }
 
@@ -6836,6 +6842,26 @@ s3_srv_h3_channel_read(s3_event_t *ev)
         }
 
         if (n < 0) {
+
+            /* the wave 17: the park rides BEFORE the cancel - the
+             * session fds stay alive across the connection death and
+             * the markers between the death and the park land in the
+             * ring (the dead sinks never see them) */
+
+            if (ch->attach == NULL && ch->sess_token[0] != '\0' && ch->sess != NULL &&
+                !ch->sess->exited) {
+
+                s3_ssh3_session_park_t *rec = s3_ssh3_session_park_add(
+                    ch->sess_pool, &s3_srv_log, ch->sess_pool, ch->sess, ch->sess_user,
+                    ch->sess_token, ch->agent_path, ch->compress_alg, time(NULL));
+
+                if (rec != NULL) {
+                    ch->sess_pool = NULL;
+                    ch->sess = NULL;
+                    s3_srv_report("INTEROP-SESSION-PARK pid=%d\n", rec->sess->pid);
+                }
+            }
+
             s3_srv_h3_channel_cancel(ch, "recv error");
             return;
         }
@@ -7176,6 +7202,8 @@ s3_srv_h3_channel_read(s3_event_t *ev)
                         ch->sess_intent = 1;
 
                         s3_srv_report("INTEROP-SESSION-ATTACH\n");
+
+                        s3_srv_pump_caller = "exec-attach";
 
                         s3_srv_session_arm(ch);
                         s3_srv_session_pump(ch);
