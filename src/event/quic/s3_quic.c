@@ -732,6 +732,11 @@ s3_quic_input_handler(s3_event_t *rev)
 
         rc = s3_quic_handle_datagram(c, &b, qc->conf);
 
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "QUIC-HD rc=%ld len=%zu\n", (long)rc, (size_t)(b.last - b.pos));
+            fflush(stderr);
+        }
+
         if (rc == S3_ERROR) {
             s3_quic_close_connection(c, S3_ERROR);
             return;
@@ -1433,6 +1438,12 @@ s3_quic_check_csid(s3_quic_connection_t *qc, s3_quic_header_t *pkt)
 static s3_int_t
 s3_quic_handle_frames(s3_connection_t *c, s3_quic_header_t *pkt)
 {
+
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "QUIC-HD-FRAMES\n");
+        fflush(stderr);
+    }
+
     u_char               *end, *p;
     ssize_t               len;
     s3_buf_t              buf;
