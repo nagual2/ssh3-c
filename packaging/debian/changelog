@@ -1,3 +1,16 @@
+ssh3-c (0.5.19-1) unstable; urgency=medium
+
+  * New upstream release 0.5.19: the session parking and the
+    re-attach wave lands - the interactive and the exec sessions of
+    a dead connection park (the child keeps running, the output
+    drains into the bounded ring through the session watch), the
+    re-dial of the same process attaches the parked session and the
+    command never runs twice; the win hold lands the dial failures
+    on the banner with the 30 s auto-reconnect; the -n mode rides
+    the silent reconnect with the budget covering the parking
+    window; the per-address connect cap of the resolver walk (the
+    blackhole prefixes move on after 5 s)
+
 ssh3-c (0.5.18-1) unstable; urgency=medium
 
   * New upstream release 0.5.18: the session parking lot and the
