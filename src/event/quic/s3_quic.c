@@ -721,6 +721,12 @@ s3_quic_input_handler(s3_event_t *rev)
          * poison path->received with pointer-magnitude garbage
          */
         b.start = buffer;
+
+        if (getenv("S3_PARK_DIAG") != NULL) {
+            fprintf(stderr, "QUIC-IN n=%zd\n", n);
+            fflush(stderr);
+        }
+
         b.pos = buffer;
         b.last = buffer + n;
 
