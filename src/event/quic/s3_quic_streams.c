@@ -1308,6 +1308,12 @@ s3_quic_handle_stream_frame(s3_connection_t *c, s3_quic_header_t *pkt, s3_quic_f
 
     qs = s3_quic_get_stream(c, f->stream_id);
 
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        fprintf(stderr, "STRM-DIAG sid=%llu len=%llu qs=%p\n",
+                (unsigned long long)f->stream_id, (unsigned long long)f->length, (void *)qs);
+        fflush(stderr);
+    }
+
     if (qs == NULL) {
         return S3_ERROR;
     }
