@@ -60,6 +60,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <openssl/rand.h>
@@ -3906,6 +3907,19 @@ s3_srv_session_pump(s3_srv_h3_channel_t *ch)
     io.output = s3_srv_session_out_sink;
     io.err = s3_srv_session_err_sink;
     io.exit = s3_srv_session_exit_sink;
+
+    if (getenv("S3_PARK_DIAG") != NULL) {
+        struct pollfd pf;
+
+        pf.fd = ch->sess->stdout_fd;
+        pf.events = 0;
+        pf.revents = 0;
+
+        (void)poll(&pf, 1, 0);
+
+        fprintf(stderr, "PARK-DIAG pump fd=%d poll=%hd\n", pf.fd, pf.revents);
+        fflush(stderr);
+    }
 
     (void)s3_ssh3_session_srv_pump(ch->sess, &io);
 
