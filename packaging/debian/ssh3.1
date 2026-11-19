@@ -171,6 +171,27 @@ resumes across the server restart, the lost lifetime costs one
 plain 1-RTT dial at most (the resumed handshake carries no new
 certificate: the pin verdict rides the certificate of the original
 session stored in the ticket).
+.Pp
+The hold auto-retries the dial every 30 seconds (the server may
+come back while the window hangs), Ctrl+R retries immediately.
+Since 0.5.18 the server parks the interactive and the exec sessions
+of a dead connection (the child keeps running, the output drains
+into a bounded ring): the re-dial carrying the session token of the
+same process attaches the parked session - the old shell state (the
+login, the cwd) survives, the buffered output replays, and a
+command never runs twice. The parking window is
+.Cm SSH3_SESSION_PARK_SECONDS
+(300 s, 0 disables) and the lot holds
+.Cm SSH3_PARKED_MAX
+sessions.
+.Sh AUTOMATIC MODE (-n)
+With the stdin closed (-n) the client stays silent: the connection
+loss rides the silent reconnect without banners - the retries cover
+the server parking window (ten retries at the 30 s interval by
+default), the first successful ride resets the budget and the
+exhausted budget exits with the status 255 and a single error line.
+The command of an exec ride never runs twice: the re-dial attaches
+the parked session of the original run.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.ssh3/known_hosts

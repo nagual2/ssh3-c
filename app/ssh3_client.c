@@ -16565,6 +16565,23 @@ main(int argc, char **argv)
                 return S3_CLI_EXIT_ERROR;
             }
 
+            /* the socket buffers of the QUIC dial: the peer rides the
+             * 65K datagrams (the max_udp_payload_size of the
+             * handshake) and the burst of a session replay arrives in
+             * a couple of them - the default ~200 KiB rcvbuf of the
+             * loopback burst shape dropped whole datagrams and the
+             * stream frames with them (the wave 16 replay leg: the
+             * client saw the channel header and the silence) */
+
+            {
+                int buf_sz = 1024 * 1024;
+
+                (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                                 (const char *)&buf_sz, sizeof(buf_sz));
+                (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                 (const char *)&buf_sz, sizeof(buf_sz));
+            }
+
             if (s3_nonblocking(fd) != S3_OK) {
                 fprintf(stderr, "ssh3: the nonblocking mode failed\n");
                 closesocket((SOCKET)fd);
