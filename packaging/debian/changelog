@@ -1,4 +1,11 @@
-ssh3-c (0.5.21-1) unstable; urgency=medium
+ssh3-c (0.5.22-1) unstable; urgency=medium
+
+  * New upstream release 0.5.22: the release line moves to main (the
+    trust-store branch merges), the trilingual PKI tools guide rides
+    the docs (ssh3-cert and ssh3-ca, RU/EN/DE), no code changes on
+    top of 0.5.21
+
+
 
   * New upstream release 0.5.21: the own certification authority
     rides (the wave 19, the unfreeze of the plan 14 phase 4) -
