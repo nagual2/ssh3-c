@@ -31,3 +31,9 @@ logs/
 
 # Local memory vault (EchoVault)
 .memory/
+
+# the coverage artifacts (the local and ci reports live outside the tree)
+coverage-summary.txt
+coverage.json
+coverage/
+cov-nofilter.txt
