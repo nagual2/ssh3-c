@@ -361,7 +361,7 @@ stateless (полное состояние сессии в теле), ответ
 | 1d | **Утилита `ssh3-cert` — разделение PKI-жизни от демона** (решение владельца 2026-11-12: OpenWrt flash/память) | новый бинарь: каркас с подкомандами — `trust-update` (перенесён с клиента: определение, pre-scan, dispatch, usage — сняты с `ssh3`), `ticket-key file` (генерация 80-байтного ключа до первого старта демона — `s3_ssl_ticket_key_file_new()` экспортирована из s3_ssl), `keygen/selfsign/csr/sign` — заглушки фаз 3/4. Аудит системных PKI-утилит: Ubuntu/Debian — openssl CLI предустановлен; **OpenWrt — openssl-util отдельный пакет, не гарантирован**; Windows — certutil/PowerShell системные (ed25519 не умеют), openssl — только с Git/vcpkg; ticket-key форма — системных утилит нет. Вывод: реализация через уже линкованную libcrypto (ни байта новых зависимостей). debian: `ssh3-cert.install` (usr/bin); man `ssh3-cert.1`; клиентский man — строка отсылает к ssh3-cert | **выполнено 2026-11-12** |
 | 2 | Системное хранилище + серверные сторы | win: Crypt32-мост (сторы ROOT/CA + Disallowed как диз-фильтр + докачка недостающих корней системными средствами); linux: формализация default paths; тот же билдер на сервере (потребность — верификация клиентских сертификатов фазы 3); живая приёмка → критерий решения владельца о дефолте `system` | **код в ветке feat/trust-store**: `s3_trust_system_paths_apply()` (os-развилка): unix — `SSL_CTX_set_default_verify_paths` (distro store, SSL_CERT_FILE/DIR хуки работают); win — `src/os/win/s3_trust_paths.c`: Crypt32 `CertOpenSystemStoreW` ROOT/CA → d2i → стор, `Disallowed` — exact-DER диз-фильтр (корни, выведенные SChannel-автообновлением, не входят); builder зовёт мост по политике `system`; юнит-развилка (unix strict-part, win ≥ own). ctest 53/53 release+asan, mingw чисто (crypt32 линкуется), формат чисто. **Остаток фазы 2: живая приёмка на реальной Windows машине** (Стор ROOT/CA с SChannel-докачкой, Disallowed-поведение) — критерий решения о дефолте `system`; серверная сторона — файл якорей уже потребляется builder'ом, специфика фазы 3. **живая приёмка выполнена 2026-11-13** (VM SSH3VPN-W11, `run-acceptance-vm.ps1`: снапшот стора, Crypt32-мост, ADD-ROOT и DISALLOW мутации с guard-rollback — зелёная). **докачка корней доказана живо 2026-11-14** (`tests/win/system-auto-update.ps1` в VM: ISRG Root X1 удалён из LocalMachine\Root → schannel-триггер letsencrypt.org → корень вернулся через Windows Update root program → dual-scope мост видит refill → guard-restore без дрейфа) — входной критерий решения владельца о дефолте `system` по докачке закрыт |
 | 3 | Клиентские сертификаты | TLS 1.3 client-cert в QUIC handshake; клиент `--cert/--key`; сервер: политика `ClientCert=none\|optional\|require` (дефолт none — совместимость), верификация клиентской цепочки против якорного аппарата фазы 2, маппинг SAN/CN → user как ещё один auth-backend; канон 2.x дополняется | **выполнено 2026-11-13** (`e3477ef`): сервер — `s3_ssl_server_client_cert(ssl, ca_file, require)` (CA-файл → якоря ctx + client CA list в CertificateRequest; verify `SSL_VERIFY_PEER` + `FAIL_IF_NO_PEER_CERT` при require; record-only callback → per-conn `client_cert_err`); вердикт — `s3_ssl_client_cert_verdict()` в цепочке auth (первый шаг при вооружённой политике; valid → маппинг через `s3_ssh3_auth_cert_user()` (SAN spki:/email → CN) → auth user gate → 200; absence при optional → старые бэкенды; require без CA → отказ на старте). Клиент — `--cert/--key` (пара в ctx через `use_certificate_chain_file`+`use_PrivateKey_file`+`check_private_key`, несоответствие — отказ на диале). Пер-конн re-arm — `s3_ssl_conn_verify_client()` (живые коннекты до arm). Юниты: handshake-ноги (require+leaf/require+keyless-умирает/optional+keyless-declined/foreign-err=18) в `test_quic_ssl`; маппинг spki/email/CN в `test_ssh3_auth_srv`. ctest 53/53 release+asan, mingw чисто. **выполнено 2026-11-14** (e2e + живая приёмка): interop `client-cert-e2e.sh` — 6/6 ног (добавлена нога 6: ghost-идентичность без passwd + `--run-as-user off` → 200, ловит регресс проводки); живая приёмка VM SSH3VPN-W11 → minisforum :8443 (require, run-as off, не-root демон) — **3/3 ноги зелёные**: require+alice (SAN spki) → 200, спавн под демоном (`rides: alice`); require без серта → отказ (255); foreign self-signed → 401, вердикт `err 18`. Попутно пойманы и исправлены: client-cert путь звал passwd-гейт **безусловно** (basic/jwt пути обёрнуты `s3_srv_run_as &&` — в живом не-root демоне узнаваемый по серту user без passwd-записи ложно 401) — guard поставлен; `s3_log_error` (кастомный slprintf) не знает `%ld`/`%.*s` — 3 вызова переведены на `%s`/`%d` с явными кастами, номер верификации печатается. **OpenWrt-нога 2026-11-14**: нативная сборка в OpenWrt-dev VM (gcc-14.3 дистрибутива, системные библиотеки, линковка против staging dev-версий той же релизной 3.5.9-r1) — юниты **53/53** (`tests/openwrt/livetest-units.sh`), живые dial-leg'и OpenWrt-клиент → igal (system+LE по SAN-имени, own+TOFU) и → WSL — **5/5** (`tests/openwrt/livetest-e2e.sh`: system+LE ride, own+TOFU ride, client-cert require+alice ride, отказ no-cert, отказ foreign) |
-| 4 | Собственный центр сертификации | ЗАМОРОЖЕНО. `ssh3-ca` (init / sign-server / sign-client / revoke / rotate): корень CA — один якорь инсталляции в trust-bundle; серверные серты от CA пинуются клиентом как обычные якоря; клиентские — верифицируются сервером механикой фазы 3. Вход — решение владельца | заморожено |
+| 4 | Собственный центр сертификации | **РАЗМОРОЖЕНО 2026-11-20 (решение владельца)** — волна 19, см. §19. `ssh3-ca` (init / sign-server / sign-client / revoke / rotate): корень CA — один якорь инсталляции в trust-bundle; серверные серты от CA пинуются клиентом как обычные якоря; клиентские — верифицируются сервером механикой фазы 3 | волна 19 |
 
 ## 15. Волна: pass 5 ревью безопасности — фикс-волна (2026-11-15, af5562d + b13d259)
 
@@ -422,3 +422,86 @@ cert-verify при инвокации из харнесса умирает на 
 прибор: дамп кадра на обеих сторонах (серверный frame hex vs клиентский parse hex).
 Параллельно: exec-сессии паркуюсь (e1fad9f, команда один раз, stderr в дренаж),
 SPEC-wire §17 (токен/парковка/реаттач/-n бюджет) + man AUTOMATIC MODE написаны.
+
+
+## 18. CVE-2026-121481: EVP_EncodeBlock heap overflow (OpenSSL) — трекинг (2026-11-20)
+
+Суть: переполнение буфера из-за целочисленного переполнения расчёта
+размера при кодировании Base64 через EVP_EncodeBlock() с входом,
+близким к INT_MAX (~1.5–2 ГБ одним вызовом). Исправление — OpenSSL
+4.0.4+; в ветку 3.5 бэкпорта пока нет (статус: дистро-трекеры Debian,
+Ubuntu, SUSE, RHEL, Gentoo, Arch).
+
+Оценка экспуризма ssh3-c (проверено 2026-11-20):
+
+| № | Поверхность | Вердикт |
+|---|-------------|---------|
+| 1 | Код ssh3-c: единственный вызов EVP_EncodeBlock — s3_ssh3_oidc.c:1684 (conversation nonce), вход `u_char raw[32]`, длина = sizeof (константа 32, ожидание n==44) | не затронут — триггер требует ~2 ГБ одним вызовом, недостижимо |
+| 2 | Бандл libssl3 + Windows DLL: OpenSSL 3.5.9 (29 Sep 2026), оба дерева (unix + mingw) | уязвимый код несётся, но через ssh3-c не достижим; трекинг за бэкпортом в 3.5.x |
+| 3 | Внутренние вызовы OpenSSL на пути атакующего (PEM/base64 крупного ввода) | нет — QUIC/TLS-путь base64 не использует |
+
+Действия: следить за микрорелизами 3.5.x (бэкпорт) — при появлении
+обновить оба дерева и пересобрать бандл/DLL; при апгрейде на 4.0.4+
+— отдельная волна (QUIC TLS API 3.5 — текущий пол). Код ssh3-c не
+меняется.
+
+### 18.1. Анализ апгрейда 3.5 → 4.0.4+ по каналам пакетов (2026-11-20)
+
+Факты 4.0: релиз 14.04.2026, новый ABI (soname libssl.so.4 /
+libcrypto.so.4), API, помеченные deprecated с 3.0, удалены; QUIC API
+стабилизирован; **4.0 — не LTS: поддержка до 14.05.2027** (4.1 вышла
+10.2026); 3.5 — LTS до 2030. Сборка ssh3-c сидит на пинned-тарболлах
+3.5.9 в трёх джобах CI (linux x86_64 / aarch64 / mingw64) + двух
+локальных деревьях; системные каналы ездят на дистро-пакеты.
+
+| № | Канал | Конфликт при 3.5 → 4.0.4 | Работа |
+|---|-------|--------------------------|--------|
+| 1 | deb bundle `ssh3c-libssl3` | внутри .so.3 → .so.4, имя пакета врёт («libssl3») | переименование пакета (ssh3c-libssl4) + Conflicts/Replaces + миграция хостов |
+| 2 | deb clean | `Depends: libssl3t64 (>= 3.5)` — на дистро с 4.x пакета libssl3t64 нет | имя пакета libssl3t64 зависит от релиза Debian; условные Depends или бандл-канал (старые дистро всё равно в бандле) |
+| 3 | rpm Fedora | авто-Requires по soname: so:libssl.so.3 → so:libssl.so.4 — нужен Fedora с OpenSSL 4 | сборка отложится до дистро-пакета 4.x |
+| 4 | apk Alpine | makedepends openssl-dev>=3.5 + авто so:libssl.so.3 — релиз с 4.x только в edge/future | тайминг за Alpine |
+| 5 | OpenWrt system | `DEPENDS:+libopenssl` — фида с 4.x может не быть | ждать фида; bundle-вариант не страдает |
+| 6 | OpenWrt bundle | musl-кросс 4.0 — пересборка пакета с внутренними либами | работа, без конфликта |
+| 7 | Windows | DLL имена libssl-3-x64 → libssl-4-x64 (import libs + Program Files ротация) | механика замены |
+| 8 | CI | три pinned URL + cache keys + имена деревьев openssl-3.5 → openssl-4.0 | рутинная правка |
+| 9 | Код ssh3-c | deprecated-since-3.0 API не используем (HMAC_Init_ex, TLS_client_method — не удалены); QUIC-входы стабилизированы | компиляция ожидаемо проходит; сверить QUIC-входы с migration guide 4.0 |
+| 10 | Coexistence | бандл .so.4 в /usr/lib/ssh3-c/lib (runpath) + система .so.3 — разные soname | конфликта нет — runpath развязывает |
+
+Стратегический конфликт: 4.0 не LTS (EOL 2027-05) — прыжок с 3.5 LTS
+(2030) ради CVE-фикса покупает 13 месяцев поддержки и немедленный
+чурн 4.1. Вектор: остаться на 3.5 LTS, ждать бэкпорт фикса в 3.5.x;
+4.x — когда целевые дистро понесут пакет и/или выйдет 4.x LTS.
+Поведенческий риск 4.0: более строгие дефолты верификации — прогоны
+trust stores (волна 14) и -insecure путей перепроверить.
+
+Быстродействие: готовых тестов версия-против-версии нет; стенд
+bench/p7-compare.sh (throughput 512МиБ/8МиБ, cold handshake, mux warm
+exec; медианы/p95, ротация c/go/openssh, sha256-гейт) параметризован
+--c-build — A/B 3.5 против 4.0 прогоняется сборкой второго дерева
+(~10–15 мин на сборку OpenSSL 4.0.4 + пересборка ssh3-c) и двумя
+прогонами стенда. Публичных 4.0-vs-3.5 цифр почти нет (экосистема
+измеряет rustls-vs-openssl). Рецепт A/B записан здесь.
+
+
+## 19. Волна 19: ssh3-ca — собственный центр сертификации (2026-11-20, РАЗМОРОЗКА по решению владельца)
+
+Решение владельца 2026-11-20: ssh3-ca разморозить, ssh3-cert — в
+пакет (release-ассеты + Windows-канал), Windows-клиент обновляется
+вместе с ssh3-cert.
+
+### Дизайн v1
+
+| № | Компонент | Содержание |
+|---|-----------|------------|
+| 1 | Бинарь `ssh3-ca` | `app/ssh3_ca.c`, ядро `src/ssh3/s3_ssh3_ca.{c,h}` — libcrypto X509-механика, ни одной новой зависимости |
+| 2 | State `~/.ssh3/ca/` | `ca.key` 0600 (ed25519 корень), `ca.pem` (самоподписанный корень 10 лет, CN=ssh3-ca), `index` (плоский текст: serial \| type \| subject \| notafter \| status), `crl.pem` (после первого revoke) |
+| 3 | `init` | генерация корня + индекс; существующий state — отказ (не затирать) |
+| 4 | `sign-server csr.pem` | CSR → серверный серт (SAN из CSR, 825 дней), вывод cert+chain; серт пинуется клиентом как обычный якорь |
+| 5 | `sign-client csr.pem user` | CSR → клиентский серт, SAN `spki:/email`/CN = user (маппинг механики фазы 3) |
+| 6 | `revoke serial\|file` | отметка в index + `crl.pem` перегенерация (CRL подписан корнем); энфорсмент CRL на сервере — следующий инкремент, граница задокументирована |
+| 7 | `rotate` | бэкап старого state, свежий init; старые серты требуют пере-выпуска (other-issuer) — печатается отчёт |
+| 8 | ssh3-cert: `keygen`/`csr` | заглушки фаз 3/4 → код: keygen (ed25519/rsa2048, 0600), csr (subject+SAN) — клиентская сторона потока |
+| 9 | Приёмка | юниты `tests/test_ssh3_ca.c` (red→green: init/sign×2/revoke/rotate/CSR-механика), e2e `interop/ca-e2e.sh` (init → sign-server → daemon с якорем → sign-client → dial --cert/--key → revoke → повторный dial отказ), ctest release+asan, mingw, man `ssh3-ca.1` |
+
+Границы v1: CRL-энфорсмент на сервере и chain-роторация сертов —
+следующие инкременты; пароль на ca.key — нет (0600 + владелец).

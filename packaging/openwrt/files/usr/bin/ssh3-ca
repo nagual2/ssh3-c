@@ -1,0 +1,8 @@
+#!/bin/sh
+# the bundle variant of the PKI utility: the real binary rides under
+# /usr/lib/ssh3-c/bin and the OpenSSL 3.5 pair under
+# /usr/lib/ssh3-c/lib - the loader path feeds here (the same shape the
+# ssh3-server-bundle init carries for the daemon)
+
+export LD_LIBRARY_PATH="/usr/lib/ssh3-c/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /usr/lib/ssh3-c/bin/ssh3-ca "$@"

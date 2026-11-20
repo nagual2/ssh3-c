@@ -120,6 +120,7 @@ if(WIN32)
         src/ssh3/s3_ssh3_aia.c
         src/ssh3/s3_ssh3_trust_roots.c
         src/ssh3/s3_trust_store.c
+        src/ssh3/s3_ssh3_ca.c
         src/ssh3/s3_ssh3_dos_guard.c
         src/ssh3/s3_ssh3_sftp_codec.c
         src/ssh3/s3_ssh3_sftp_cli.c
@@ -211,6 +212,7 @@ if(WIN32)
         test_ssh3_hostkey
         test_ssh3_aia
         test_trust_store
+        test_ssh3_ca
         test_os_win
     )
 
@@ -238,6 +240,12 @@ if(WIN32)
     add_executable(ssh3-cert app/ssh3_cert.c)
     target_compile_options(ssh3-cert PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3-cert PRIVATE s3core)
+
+    # the own CA of the wave 19: the root, the issuance, the CRL and
+    # the rotation of the state directory
+    add_executable(ssh3-ca app/ssh3_ca.c)
+    target_compile_options(ssh3-ca PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3-ca PRIVATE s3core)
 
     # the icon + VERSIONINFO object (go-winres, app/winres/): linked
     # as an external COFF object, regenerate on a version bump
@@ -403,6 +411,7 @@ set(S3_CORE_SOURCES
     src/ssh3/s3_ssh3_aia.c
     src/ssh3/s3_ssh3_trust_roots.c
     src/ssh3/s3_trust_store.c
+    src/ssh3/s3_ssh3_ca.c
     src/ssh3/s3_ssh3_agent.c
     src/ssh3/s3_ssh3_agent_client.c
     src/ssh3/s3_ssh3_sftp_codec.c
@@ -527,6 +536,10 @@ if(NOT S3_BUILD_FUZZ)
     add_executable(ssh3-cert app/ssh3_cert.c)
     target_compile_options(ssh3-cert PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(ssh3-cert PRIVATE s3core Threads::Threads)
+
+    add_executable(ssh3-ca app/ssh3_ca.c)
+    target_compile_options(ssh3-ca PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(ssh3-ca PRIVATE s3core Threads::Threads)
 endif()
 
 # the fuzz harnesses link the libFuzzer runtime through their own
@@ -625,6 +638,7 @@ set(S3_TESTS
     test_ssh3_hostkey
     test_ssh3_aia
     test_trust_store
+    test_ssh3_ca
     test_ssh3_sftp_codec
     test_ssh3_sftp_srv
     test_ssh3_sftp_jail

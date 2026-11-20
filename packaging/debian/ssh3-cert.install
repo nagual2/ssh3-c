@@ -1,1 +1,2 @@
 obj-x86_64-linux-gnu/ssh3-cert usr/bin/
+obj-x86_64-linux-gnu/ssh3-ca usr/bin/

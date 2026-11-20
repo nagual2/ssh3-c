@@ -1,0 +1,61 @@
+.Dd November 20, 2026
+.Dt SSH3-CA 1
+.Os ssh3-c
+.Sh NAME
+.Nm ssh3-ca
+.Nd the own certification authority of the ssh3-c set
+.Sh DESCRIPTION
+.Nm
+runs the certification authority of one installation (the wave 19,
+PLAN.md 19): the root, the issuance of the server and the client
+certificates from the CSRs, the revocation with the CRL, the
+rotation of the root.  The state lives in one directory
+.Sy SSH3_CA_DIR
+or
+.Pa ~/.ssh3/ca :
+.Pa ca.key
+(the root private key, 0600, ed25519),
+.Pa ca.pem
+(the self-signed root, 10 years),
+.Pa index
+(the flat ledger of the issuance),
+.Pa crl.pem
+(after the first revoke).
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Cm init Ar dir
+Generate the root and the fresh state directory.  An existing
+.Sy ca.key
+declines - the state never overwrites silently.
+.It Cm sign-server Ar csr.pem Ar out.pem
+Issue the server certificate of the CSR: the SAN rides the request,
+825 days, the chain (leaf + root) lands in
+.Ar out.pem .
+The server consumes the file directly
+(-c), the clients pin it as an ordinary anchor or trust the root.
+.It Cm sign-client Ar csr.pem Ar out.pem Ar user
+Issue the client certificate: the CN rides
+.Ar user ,
+the mapping of the server auth (the phase 3 of PLAN.md 14) reads
+the user from the CN and the SAN spki/email of the presented cert.
+.It Cm revoke Ar serial | Ar cert.pem
+Mark the certificate revoked (the serial of the issuance or the
+cert file), regenerate
+.Pa crl.pem .
+The CRL enforcement on the server side rides the next increment -
+the boundary documents PLAN.md 19.
+.It Cm rotate
+Back the whole state aside
+.Pa ( dir.old.<epoch> )
+and run init again.  The certs of the old root need a re-issuance
+(the other issuer) - the tool prints the count.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Sy SSH3_CA_DIR
+The state directory (the default ~/.ssh3/ca).
+.El
+.Sh SEE ALSO
+.Xr ssh3-cert 1 ,
+.Xr ssh3-server 8 ,
+.Xr ssh3 1

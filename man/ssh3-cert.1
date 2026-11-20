@@ -11,11 +11,20 @@ always-running daemon
 (.Xr ssh3-server 8 ) :
 the OpenWrt flash and the resident memory of the daemon stay clean
 of the PKI waves (the client certificates, the
-ssh3-ca).
+.Xr ssh3-ca 1 ).
 The daemon consumes the ready files this utility prepares; the
 rotation rides the reopen channel.
 .Sh COMMANDS
 .Bl -tag -width Ds
+.It Cm keygen Ar out.key Op Ar rsa
+Generate the client-side key of the ca flow (the wave 19): ed25519
+by default, rsa2048 rides the argument; the file lands 0600.
+.It Cm csr Ar key.pem Ar out.csr Ar cn Op Ar san-list
+Build the CSR of the ca flow: the CN rides the subject, the
+optional SAN list takes the
+.Li dns:/ip:/email:
+forms separated by commas.  The CA side signs it with
+.Xr ssh3-ca 1 .
 .It Cm trust-update Op Fl -trust-update-url Ar url
 Fetch the trust bundle, validate it (every PEM block a
 certificate, the count floor) and land it atomically as

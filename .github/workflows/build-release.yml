@@ -286,10 +286,10 @@ jobs:
           make -j"$(nproc)"
           make install_sw
 
-      - name: Build ssh3.exe (windows-core)
+      - name: Build ssh3.exe + ssh3-cert.exe (windows-core)
         run: |
           cmake --preset windows-core
-          cmake --build --preset windows-core
+          cmake --build --preset windows-core --target ssh3 ssh3-cert
 
       - name: Verify the icon + version resource is linked
         run: |
@@ -300,6 +300,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/windows-core/ssh3.exe dist/ssh3_windows_amd64.exe
+          cp build/windows-core/ssh3-cert.exe dist/ssh3-cert_windows_amd64.exe
           # the cross build links the openssl import libs: the exe needs
           # the two dlls alongside (the dev tree ships them the same way)
           find "$HOME/opt/openssl-3.5-mingw" \
@@ -342,6 +343,7 @@ jobs:
             dist/ssh3-server_linux_arm64
             dist/ssh3_linux_arm64
             dist/ssh3_windows_amd64.exe
+            dist/ssh3-cert_windows_amd64.exe
             dist/libssl-3-x64.dll
             dist/libcrypto-3-x64.dll
             dist/checksums.txt
@@ -356,6 +358,7 @@ jobs:
             - `ssh3_linux_amd64` / `ssh3_linux_arm64`: raw client binaries
             - `checksums.txt`: the sha256 of every asset of the release
             - `ssh3_windows_amd64.exe`: the Windows client, icon and version
+            - `ssh3-cert_windows_amd64.exe`: the PKI utility, rides the client update (the wave 19)
               resources embedded; needs `libssl-3-x64.dll` / `libcrypto-3-x64.dll`
               from this release next to it (or in PATH)
           generate_release_notes: true
