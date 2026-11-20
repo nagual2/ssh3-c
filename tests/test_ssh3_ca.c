@@ -399,11 +399,11 @@ test_ca_broken_csr(void)
 static int
 test_ca_rotate(void)
 {
-    X509  *old_root, *new_root;
-    FILE  *f;
-    size_t retired = 0, retired2 = 0;
+    X509    *old_root, *new_root;
+    FILE    *f;
+    size_t   retired = 0, retired2 = 0;
     s3_int_t rc;
-    char   backup[256];
+    char     backup[256];
 
     f = fopen(S3_TEST_DIR "/ca.pem", "rb");
     old_root = PEM_read_X509(f, NULL, NULL, NULL);
