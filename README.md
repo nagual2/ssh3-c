@@ -25,6 +25,7 @@ Russian; EN/DE are faithful translations.
 | 13 | [docs/PORTING-illumos.md](docs/PORTING-illumos.md) | illumos porting assessment: platform facts, the traffic-archiving pipeline, distributed ZFS (frozen plan item F6b) | RU |
 | 14 | [docs/PLAN-CURRENT.md](docs/PLAN-CURRENT.md) | the operational plan slice: from the last done item to the first not-done one (waves A/B, distro leftovers, frozen list) | RU |
 | 15 | [docs/COEXISTENCE.md](docs/COEXISTENCE.md) | the package co-installation control matrix (OpenSSH, the go fork, the two deb channels) + the acceptance procedure | RU · [EN](docs/COEXISTENCE.en.md) · [DE](docs/COEXISTENCE.de.md) |
+| 16 | [docs/PKI-TOOLS.md](docs/PKI-TOOLS.md) | the PKI tools guide with examples: ssh3-cert (keygen / csr / trust-update / ticket-key / probe) and ssh3-ca (init / sign-server / sign-client / revoke / rotate) - the full server and client cert flows of the wave 19 | RU · [EN](docs/PKI-TOOLS.en.md) · [DE](docs/PKI-TOOLS.de.md) |
 
 A pure-C17 SSH3 implementation in the nginx style: memory pools, buffer
 views, a chain interface for all I/O, a zero-copy data path. The target
