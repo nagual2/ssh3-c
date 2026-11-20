@@ -1,5 +1,15 @@
 # ssh3-c
 
+[![release](https://img.shields.io/github/v/tag/nagual2/ssh3-c?sort=semver&label=release)](https://github.com/nagual2/ssh3-c/releases)
+[![debian-package](https://github.com/nagual2/ssh3-c/actions/workflows/debian-package.yml/badge.svg?branch=main)](https://github.com/nagual2/ssh3-c/actions/workflows/debian-package.yml)
+[![build-release](https://github.com/nagual2/ssh3-c/actions/workflows/build-release.yml/badge.svg)](https://github.com/nagual2/ssh3-c/actions/workflows/build-release.yml)
+[![fuzz](https://github.com/nagual2/ssh3-c/actions/workflows/fuzz.yml/badge.svg)](https://github.com/nagual2/ssh3-c/actions/workflows/fuzz.yml)
+[![license](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
+[![language](https://img.shields.io/badge/language-C17-00599c)](docs/ARCHITECTURE.md)
+[![openssl](https://img.shields.io/badge/OpenSSL-%E2%89%A53.5%20QUIC-693324)](docs/DEPS-QUIC.md)
+[![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-4c9f3c)](docs/COEXISTENCE.md)
+[![spec](https://img.shields.io/badge/SSH3%20wire-rev%20nagual2%2F1-8a2be2)](docs/SPEC-wire.md)
+
 [English](README.md) | [Русский](README.ru.md) | **Deutsch**
 
 ## Dokumentation
