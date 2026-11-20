@@ -22,7 +22,7 @@
 # stub masked it with its own download fields)
 
 PKG_NAME:=ssh3-server
-PKG_VERSION:=0.5.20
+PKG_VERSION:=0.5.21
 PKG_RELEASE:=1
 
 include $(TOPDIR)/rules.mk

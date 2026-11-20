@@ -1,4 +1,13 @@
-ssh3-c (0.5.20-1) unstable; urgency=medium
+ssh3-c (0.5.21-1) unstable; urgency=medium
+
+  * New upstream release 0.5.21: the own certification authority
+    rides (the wave 19, the unfreeze of the plan 14 phase 4) -
+    ssh3-ca (init / sign-server / sign-client / revoke / rotate)
+    over one state directory, the client side rides ssh3-cert
+    keygen and csr; ssh3-cert ships the windows release assets and
+    rides the client update
+
+
 
   * New upstream release 0.5.20: the errqueue fast-close of the dead
     peers - the listener sockets switch IP_RECVERR/IPV6_RECVERR on,
