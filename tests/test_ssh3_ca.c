@@ -401,7 +401,8 @@ test_ca_rotate(void)
 {
     X509  *old_root, *new_root;
     FILE  *f;
-    size_t retired = 0;
+    size_t retired = 0, retired2 = 0;
+    s3_int_t rc;
     char   backup[256];
 
     f = fopen(S3_TEST_DIR "/ca.pem", "rb");
@@ -416,6 +417,21 @@ test_ca_rotate(void)
     /* the retired count rides: three live certs at the rotate point */
 
     S3_ASSERT(retired >= 1);
+
+    /* the corner: the rotate with the existing backup - the same
+     * epoch renames onto the non-empty directory and declines, the
+     * fresh epoch lands the second aside; both shapes leave a live
+     * state behind */
+
+    rc = s3_ssh3_ca_rotate(S3_TEST_DIR, NULL, &retired2);
+
+    S3_ASSERT(rc == S3_ERROR || rc == S3_OK);
+
+    if (rc == S3_OK) {
+        S3_ASSERT(retired2 >= 1);
+    }
+
+    S3_ASSERT(s3_test_file_exists(S3_TEST_DIR "/ca.pem"));
 
     /* the backup holds the old state: dir.old.<epoch> rides next to
      * the fresh one - the prefix scan finds it */
