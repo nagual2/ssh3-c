@@ -9,6 +9,7 @@
 [![openssl](https://img.shields.io/badge/OpenSSL-%E2%89%A53.5%20QUIC-693324)](docs/DEPS-QUIC.md)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-4c9f3c)](docs/COEXISTENCE.md)
 [![spec](https://img.shields.io/badge/SSH3%20wire-rev%20nagual2%2F1-8a2be2)](docs/SPEC-wire.md)
+[![unit coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nagual2/ssh3-c/main/docs/coverage-badge.json)](https://github.com/nagual2/ssh3-c/actions/workflows/coverage.yml)
 
 [English](README.md) | **Русский** | [Deutsch](README.de.md)
 

@@ -16,6 +16,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   coverage:
     name: unit coverage (gcovr)
@@ -70,6 +73,7 @@ jobs:
             --filter '^src/' --filter '^app/' \
             --txt coverage-summary.txt --txt-metric line \
             --json coverage.json \
+            --json-summary coverage-summary.json \
             --html-details coverage/coverage.html
 
           # the job summary: the module table of the txt report, the
@@ -83,10 +87,38 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Badge (the endpoint json lands on main)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          python3 - <<'PY'
+          import json
+
+          summary = json.load(open("coverage-summary.json"))
+          percent = round(summary["line_percent"])
+          color = "orange" if percent < 60 else ("yellowgreen" if percent < 80 else "brightgreen")
+
+          json.dump(
+              {
+                  "schemaVersion": 1,
+                  "label": "unit coverage",
+                  "message": f"{percent}%",
+                  "color": color,
+              },
+              open("docs/coverage-badge.json", "w"),
+          )
+          PY
+
+          git config user.name "ssh3-c coverage bot"
+          git config user.email "coverage@ssh3-c.invalid"
+          git add docs/coverage-badge.json
+          git commit -m "chore(coverage): the badge endpoint refreshes [skip ci]" || exit 0
+          git push origin main
+
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: |
             coverage-summary.txt
+            coverage-summary.json
             coverage.json
             coverage/
