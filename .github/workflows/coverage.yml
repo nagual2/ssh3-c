@@ -63,6 +63,8 @@ jobs:
 
       - name: Coverage report (src/ + app/ only)
         run: |
+          mkdir -p coverage
+
           gcovr -r . --object-directory build/coverage \
             --gcov-ignore-errors=no_working_dir_found \
             --filter '^src/' --filter '^app/' \
