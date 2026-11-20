@@ -1,0 +1,90 @@
+name: coverage
+
+# the unit coverage instrument (the wave 20): the product lines
+# executed by the ctest suite - the parser corners, the codecs and
+# the state machines; the app wiring rides the e2e legs and shows 0%
+# here by design
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - app/**
+      - tests/**
+      - CMakeLists.txt
+      - .github/workflows/coverage.yml
+  pull_request:
+    branches: [main]
+
+jobs:
+  coverage:
+    name: unit coverage (gcovr)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # the pinned openssl of the line: the same source and prefix as
+      # the build-release jobs (the library itself stays
+      # non-instrumented - it is the dependency, the report filters
+      # count our sources only)
+
+      - uses: actions/cache@v4
+        id: openssl
+        with:
+          path: ~/opt/openssl-3.5
+          key: openssl-3.5.9-linux-x86_64
+
+      - name: Build OpenSSL 3.5.9
+        if: steps.openssl.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 2 -o /tmp/openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+          tar -C /tmp -xzf /tmp/openssl.tar.gz
+          cd /tmp/openssl-3.5.9
+          ./Configure --prefix="$HOME/opt/openssl-3.5" --openssldir="$HOME/opt/openssl-3.5/ssl"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Install gcovr
+        run: python3 -m pip install --break-system-packages --quiet gcovr
+
+      - name: Configure (gcc --coverage)
+        run: >
+          cmake -S . -B build/coverage
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS='--coverage'
+          -DCMAKE_EXE_LINKER_FLAGS='--coverage'
+
+      - name: Build
+        run: cmake --build build/coverage -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build/coverage -j"$(nproc)" --output-on-failure
+
+      - name: Coverage report (src/ + app/ only)
+        run: |
+          gcovr -r . --object-directory build/coverage \
+            --gcov-ignore-errors=no_working_dir_found \
+            --filter '^src/' --filter '^app/' \
+            --txt coverage-summary.txt --txt-metric line \
+            --json coverage.json \
+            --html-details coverage/coverage.html
+
+          # the job summary: the module table of the txt report, the
+          # total rides the last line
+
+          {
+            echo "### Unit coverage (lines, src/ + app/)"
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-summary.txt
+            coverage.json
+            coverage/
